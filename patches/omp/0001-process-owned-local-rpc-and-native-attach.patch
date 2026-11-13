@@ -1,0 +1,3661 @@
+diff --git a/docs/rpc.md b/docs/rpc.md
+index b7913e8..78d2029 100644
+--- a/docs/rpc.md
++++ b/docs/rpc.md
+@@ -36,6 +36,40 @@ Behavior notes:
+ 
+ ## Transport and Framing
+ 
++### Reconnectable local host
++
++`--rpc-socket` switches only the transport and lifetime; without it stdio RPC retains its EOF shutdown behavior.
++
++Add `--session-settings` to keep all settings edits, including native `/model` role assignments, thinking defaults, and fallback-chain edits, in a process-local native `Settings.overlay()`. The overlay is installed before auth discovery, the model registry, and session construction. Native user/project/config-overlay reads, `modelRoles.judge` and its fallback policy, credentials, and runtime storage remain shared; no auth directory or model catalog is copied. Model changes still append ordinary session `model_change` records and restore on resume. The flag does not imply `--no-session`, and omitting it retains normal native settings persistence. Runtime-only settings edits themselves do not survive process restart; resume without a fresh `--model` to restore the transcript's selected model.
++
++`get_state.settingsScope` reports the actual native write boundary (`"session"` or `"persistent"`), including worker mirrors. Clients must reject routine preset mutation unless it is `"session"`; an older host omitting the field is not isolated. Add `--model-preset <name>` with `--session-settings` to apply one native `modelPresets.<name>` snapshot after constructing the session but before listening, announcing ready, or submitting the initial prompt. A private `--config` file may supply that frozen named entry. ACP is excluded because it has no single startup session. This flag invokes the native preset application path only for that startup session; it is not a model-role alias and does not create a saved preset.
++
++`get_state.modelSettings` is `{ modelRoles, defaultThinkingLevel }` read directly from the session's effective native settings. It is independent of the active `model` and `thinkingLevel`, never a request/name echo, and contains no auth or endpoint configuration. Compare this complete readback with the frozen expected snapshot after reconnect, restart, or a lost mutation acknowledgement; preset identity alone does not establish that roles and thinking applied. Older hosts omit this field rather than fabricating a settings snapshot. An exact `--model` seed may accompany `--model-preset` so initial session construction does not depend on an unrelated saved default being available; the native full-preset application still runs last.
++
++The native SDK helper `captureModelPreset(settings)` produces the same defined-role snapshot used by saving a preset and by RPC readback. Live preset mutation uses the native session-settlement predicate, also refusing compaction, session transition, and owned running jobs.
++
++An idle isolated host accepts `{ "type": "set_model_preset", "name": "high", "preset": { "modelRoles": { "default": "provider/model", "judge": "provider/judge" }, "defaultThinkingLevel": "high" } }`. The complete snapshot is installed as a runtime-owned native preset, then the same serialized native application path used by `/modelpreset switch` applies its full roles and thinking selection. Success returns `{ name, preset, model, thinkingLevel?, settingsScope: "session" }`, where `preset` is effective native readback, not an echo. Invalid/unavailable or shadowed applications fail explicitly; persistent or busy hosts refuse. Existing native preset names and files remain unchanged.
++
++For deliberately authorized first-run creation only, call `createModelPresetIfMissing(settings, name, preset)` from `config/model-presets` on a persisted native `Settings` instance. It uses the existing native YAML write lock, rereads the raw global record under that lock, and never replaces an existing same-name key, including hidden/null/invalid entries or a concurrent external insert. Existing higher-layer entries are preserved as well. It returns `{ kind: "created" | "preserved", preset }` with authoritative native readback after flush/reload, or `{ kind: "conflict", reason }`; malformed YAML is not quarantined or repaired by this optional bootstrap path. It does not acquire the role-mutation lock, so a multi-preset initializer may hold that native lock across its own validation/batch. Routine host selection must not use a persisted instance, and ordinary unconditional `setEntry` is not a no-clobber bootstrap API.
++
++```sh
++mkdir -m 700 /private/tmp/omp-host-$UID
++omp --mode rpc-ui --rpc-socket /private/tmp/omp-host-$UID/agent.sock \
++  --session /absolute/path/agent.jsonl --cwd /absolute/project -e /absolute/extension.ts
++omp attach /private/tmp/omp-host-$UID/agent.sock
++omp attach /private/tmp/omp-host-$UID/agent.sock --read-only
++```
++
++The socket directory must already exist, be owned by the current user, have mode `0700`, and not be a symlink. The host creates a `0600` Unix socket and refuses to overwrite any existing path, including stale sockets. Remove a stale socket explicitly only after checking its owning process. Each host process owns exactly one explicit absolute session file (created if absent); existing session cwd must match `--cwd`. Session replacement/navigation commands are rejected: start another host process for another session. The absolute socket path is exported as `OMP_RPC_SOCKET` before extensions load. Extensions connecting to their own host must not await ordinary RPC commands inside `session_start`, since startup holds those commands until the hook returns.
++
++RPC clients connect directly with the existing ready/version negotiation, JSONL commands, events, responses, and v2 chunks. Request IDs, event filters (including delta projection), protocol negotiation, and subagent subscriptions are independent per connection. Use the public `RpcClient` custom `spawn` transport; its `kill()` must close only that socket and its `exited` promise must settle on socket close. `RpcClient.request(command, { id, timeoutMs })` accepts a caller-persisted request ID without replay. `onExtensionUIRequest` and `respondToUI` expose the native UI side channel.
++
++Native `attach` reuses the existing Collab guest snapshot, event, transcript, subagent, and dialog rendering over the same private endpoint; no relay or second writer of the host session is started. Its local replica has a separate identity and always uses process-local session settings, so local model menus cannot persist operator role changes. Read-only guests cannot prompt, abort, run remote agent actions, or answer dialogs. Leaving or losing the attach connection exits the attach TUI, not the host.
++
++Disconnecting any RPC/controller/TUI client does not abort the session or drop its tools or unresolved dialogs. Host-tool and URI calls go only to their registering client; a disconnected capability owner fails its active calls explicitly, and the retained definitions remain unavailable until a client explicitly re-registers them. A spectator cannot clear another owner's registration. Dialogs retain their original RPC IDs, replay on reconnect, and appear in socket-host `get_state.data.pendingUiRequests`; `hostPid` identifies the authoritative OS process. The first valid answer across RPC and writable TUI surfaces wins and cancels the other presentations. A disconnect after submission but before confirmation is uncertain: there is no replay/result journal, and callers must not resend blindly.
++
++Send `{ "type": "shutdown_host", "id": "stop-1" }` (or call `RpcClient.shutdownHost()`) for graceful persisted shutdown. It returns `session_busy` while any run, queued/admitted/background work, pending approval, host capability call, or other outstanding command remains. This includes owned persistent services even when their result delivery is suppressed: `get_state.hasOwnedRunningWork` reports these independently of conversation quiescence (`isSettled` keeps its native meaning). A successful response acknowledges shutdown; wait for host exit `0` to confirm persistence. Persistence failures produce a notice and nonzero host exit. Stopping a socket client is only a disconnect, never an implicit host shutdown.
++
+ Protocol v1 stdout frames are a single JSON object followed by `\n`. The server caps each physical stdout frame at 1 MiB, including the newline. Inbound frames are always one unchunked JSONL object; clients SHOULD keep them within the advertised physical-frame limit. Input is not reassembled from `rpc_chunk` frames.
+ 
+ The initial ready frame uses protocol v1 and advertises the opt-in lossless transport:
+diff --git a/packages/coding-agent/scripts/gen-rpc/python.ts b/packages/coding-agent/scripts/gen-rpc/python.ts
+index 8b4f368..1b80051 100644
+--- a/packages/coding-agent/scripts/gen-rpc/python.ts
++++ b/packages/coding-agent/scripts/gen-rpc/python.ts
+@@ -62,6 +62,7 @@ const PYTHON_BINDING: PythonBinding = {
+ 		"prompt",
+ 		"abort_and_prompt",
+ 		"set_todos",
++		"set_model_preset",
+ 		"set_host_tools",
+ 		"set_host_uri_schemes",
+ 		"get_messages",
+diff --git a/packages/coding-agent/src/cli-commands.ts b/packages/coding-agent/src/cli-commands.ts
+index 3efdbad..c040fd0 100644
+--- a/packages/coding-agent/src/cli-commands.ts
++++ b/packages/coding-agent/src/cli-commands.ts
+@@ -25,6 +25,11 @@ function loadLaunchHelp(): typeof LaunchHelp.launchHelp {
+ }
+ 
+ export const commands: CommandEntry[] = [
++	{
++		name: "attach",
++		load: () => import("./commands/attach").then(m => m.default),
++		help: { description: "Attach the native TUI to a running local OMP host (attach <socket> [--read-only])" },
++	},
+ 	{
+ 		name: "launch",
+ 		load: () => import("./commands/launch").then(m => m.default),
+diff --git a/packages/coding-agent/src/cli/args.ts b/packages/coding-agent/src/cli/args.ts
+index cb32c57..5fed1dc 100644
+--- a/packages/coding-agent/src/cli/args.ts
++++ b/packages/coding-agent/src/cli/args.ts
+@@ -26,6 +26,10 @@ export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
+ 
+ export interface Args {
+ 	cwd?: string;
++	/** Private Unix socket for the process-owned reconnectable RPC host. */
++	rpcSocket?: string;
++	/** Local native Collab attach, never a second writer for the host file. */
++	attach?: { socket: string; readOnly: boolean };
+ 	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
+ 	addDir?: string[];
+ 	profile?: string;
+@@ -33,7 +37,11 @@ export interface Args {
+ 	allowHome?: boolean;
+ 	provider?: string;
+ 	model?: string;
++	/** Apply one native preset after session construction; requires --session-settings. */
++	modelPreset?: string;
+ 	config?: string[];
++	/** Keep native settings writes local to this process while persisting session history normally. */
++	sessionSettings?: boolean;
+ 	smol?: string;
+ 	slow?: string;
+ 	plan?: string;
+@@ -362,6 +370,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
+ 			result.fromCodex = true;
+ 		} else if (arg === "--no-session") {
+ 			result.noSession = true;
++		} else if (arg === "--session-settings") {
++			result.sessionSettings = true;
+ 		} else if (arg === "--no-tools") {
+ 			result.noTools = true;
+ 		} else if (arg === "--no-lsp") {
+diff --git a/packages/coding-agent/src/cli/flag-tables.ts b/packages/coding-agent/src/cli/flag-tables.ts
+index 6f6c04a..5cc8c97 100644
+--- a/packages/coding-agent/src/cli/flag-tables.ts
++++ b/packages/coding-agent/src/cli/flag-tables.ts
+@@ -131,6 +131,9 @@ function parseCostUsd(flag: string, value: string): number {
+  * a registered boolean extension can shadow them before profile bootstrap.
+  */
+ export const STRING_SETTERS: Record<string, StringSetter> = {
++	"--rpc-socket": (result, value) => {
++		result.rpcSocket = value;
++	},
+ 	"--cwd": (result, value) => {
+ 		result.cwd = value;
+ 	},
+@@ -158,6 +161,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
+ 	"--model": (result, value) => {
+ 		result.model = value;
+ 	},
++	"--model-preset": (result, value) => {
++		result.modelPreset = value;
++	},
+ 	"--smol": (result, value) => {
+ 		result.smol = value;
+ 	},
+@@ -357,6 +363,7 @@ export const VALUELESS_FLAGS: ReadonlySet<string> = new Set([
+ 	"--from-claude",
+ 	"--from-codex",
+ 	"--no-session",
++	"--session-settings",
+ 	"--no-tools",
+ 	"--no-lsp",
+ 	"--no-pty",
+diff --git a/packages/coding-agent/src/collab/display-name.ts b/packages/coding-agent/src/collab/display-name.ts
+index cdf2c09..d2e9834 100644
+--- a/packages/coding-agent/src/collab/display-name.ts
++++ b/packages/coding-agent/src/collab/display-name.ts
+@@ -4,7 +4,7 @@ import type { InteractiveModeContext } from "../modes/types";
+ import { cfgCollabDisplayName } from "./settings";
+ 
+ /** Display name for this process's user in collab sessions. */
+-export function collabDisplayName(ctx: InteractiveModeContext): string {
++export function collabDisplayName(ctx: Pick<InteractiveModeContext, "settings">): string {
+ 	const configured = cfgCollabDisplayName.get(ctx.settings).trim();
+ 	if (configured) return configured;
+ 	try {
+diff --git a/packages/coding-agent/src/collab/guest.ts b/packages/coding-agent/src/collab/guest.ts
+index 6548cb8..4a7cac5 100644
+--- a/packages/coding-agent/src/collab/guest.ts
++++ b/packages/coding-agent/src/collab/guest.ts
+@@ -46,6 +46,7 @@ import {
+ 	parseCollabLink,
+ } from "./protocol";
+ import { CollabSocket } from "./relay-client";
++import { LocalCollabSocket, type CollabGuestTransport } from "./local-client";
+ 
+ /** Commands a guest may run locally; everything else is host-only. */
+ export const COLLAB_GUEST_ALLOWED_COMMANDS: Record<string, true> = {
+@@ -207,7 +208,8 @@ function omittedStreamDeltas(
+ 
+ export class CollabGuestLink {
+ 	#ctx: InteractiveModeContext;
+-	#socket: CollabSocket | null = null;
++	#socket: CollabGuestTransport | null = null;
++	#onDetached: (() => void) | undefined;
+ 	#roomId = "";
+ 	/**
+ 	 * This guest's replica: its own session id and file for the guest's
+@@ -325,25 +327,34 @@ export class CollabGuestLink {
+ 		this.#ctx = ctx;
+ 	}
+ 
+-	async join(link: string): Promise<void> {
+-		const parsed = parseCollabLink(link);
+-		if ("error" in parsed) throw new Error(parsed.error);
++	async joinLocal(socket: string, readOnly: boolean, onDetached: () => void): Promise<void> {
++		this.#onDetached = onDetached;
++		await this.join("", { socket, readOnly });
++	}
++
++	async join(link: string, local?: { socket: string; readOnly: boolean }): Promise<void> {
++		const parsed = local ? undefined : parseCollabLink(link);
++		if (parsed && "error" in parsed) throw new Error(parsed.error);
+ 		if (this.#ctx.collabGuest || this.#left) throw new Error("Already in a collab session (/leave first)");
+-		this.#roomId = parsed.roomId;
+-		this.#writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
++		this.#roomId = parsed?.roomId ?? `local-${path.basename(local!.socket).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
++		this.#writeToken = local ? (local.readOnly ? undefined : Buffer.from("local").toString("base64url")) :
++			parsed?.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
+ 		this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
+ 		// Claim the process before any async setup or replica session transition.
+ 		this.#ctx.setCollabGuest(this);
+-		let key: CryptoKey;
++		let socket: CollabGuestTransport;
+ 		try {
+-			key = await importRoomKey(parsed.key);
++			if (local) socket = new LocalCollabSocket(local.socket);
++			else {
++				const key = await importRoomKey(parsed!.key);
++				socket = new CollabSocket({ wsUrl: parsed!.wsUrl, role: "guest", key });
++			}
+ 			if (this.#left) throw new Error("Collab join cancelled");
+ 		} catch (err) {
+ 			await this.#restoreLocalSession();
+ 			throw err;
+ 		}
+ 
+-		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+ 		this.#socket = socket;
+ 
+ 		const firstWelcome = Promise.withResolvers<void>();
+@@ -1002,7 +1013,7 @@ export class CollabGuestLink {
+ 		// over so extensions do not stay stuck on the host's last `agent_start`.
+ 		this.#reconcileLifecycle(false);
+ 		this.#restoration = this.#runRestoreLocalSession();
+-		this.#ctx.collabController?.resumeAfterGuest(this.#restoration);
++		if (!this.#onDetached) this.#ctx.collabController?.resumeAfterGuest(this.#restoration);
+ 		return this.#restoration;
+ 	}
+ 
+@@ -1019,6 +1030,7 @@ export class CollabGuestLink {
+ 		if (this.#ctx.collabGuest !== this) return false;
+ 		this.#ctx.setCollabGuest(undefined);
+ 		this.#ctx.syncRunningSubagentBadge();
++		this.#onDetached?.();
+ 		return this.#replicaActivated;
+ 	}
+ 
+@@ -1031,6 +1043,9 @@ export class CollabGuestLink {
+ 		this.#ctx.syncRunningSubagentBadge();
+ 		this.#ctx.resetObserverRegistry();
+ 		this.#clearTransientUi();
++		// A local attach has no independent session to restore or run. Dispose
++		// its replica with the terminal after the common guest cleanup above.
++		if (this.#onDetached) return;
+ 		// Replica file stays on disk: it is a valid session file outside the
+ 		// sessions dir, so it never shows up in /resume but remains readable.
+ 		if (this.#returnSessionFile) {
+diff --git a/packages/coding-agent/src/collab/host.ts b/packages/coding-agent/src/collab/host.ts
+index 1513297..a5ca33a 100644
+--- a/packages/coding-agent/src/collab/host.ts
++++ b/packages/coding-agent/src/collab/host.ts
+@@ -205,9 +205,20 @@ export class CollabRelayUnavailableError extends Error {
+ 	}
+ }
+ 
++/** Session ownership is independent of terminal presentation. */
++export type CollabHostContext = Pick<InteractiveModeContext, "session" | "sessionManager" | "settings"> &
++	Partial<Pick<InteractiveModeContext, "eventBus" | "subagentEventBus" | "collabHost" | "showStatus" | "updatePendingMessagesDisplay">> & {
++		statusLine?: Pick<InteractiveModeContext["statusLine"], "setCollabStatus" | "invalidate" | "getCachedContextBreakdown">;
++		ui?: Pick<InteractiveModeContext["ui"], "requestRender">;
++	};
++
++export type CollabHostTransport = Pick<CollabSocket,
++	"send" | "sendLatest" | "sendBatch" | "broadcastAdvisory" | "isServing" | "isAdmitting" |
++	"discardPendingSends" | "flush" | "close" | "onFrame" | "onControl" | "onPeerOverload">;
++
+ export class CollabHost {
+-	#ctx: InteractiveModeContext;
+-	#socket: CollabSocket | null = null;
++	#ctx: CollabHostContext;
++	#socket: CollabHostTransport | null = null;
+ 	#link = "";
+ 	#webLink = "";
+ 	#viewLink = "";
+@@ -262,7 +273,7 @@ export class CollabHost {
+ 	/** Bumped on every `message_start`; keys a streaming message's superseding updates. */
+ 	#messageSeq = 0;
+ 
+-	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
++	constructor(ctx: CollabHostContext, options: CollabHostOptions = {}) {
+ 		this.#ctx = ctx;
+ 		this.#instanceId = options.instanceId ?? randomBytes(8).toString("hex");
+ 		this.#generation = options.generation ?? 1;
+@@ -500,7 +511,7 @@ export class CollabHost {
+ 				return;
+ 			}
+ 			if (willReconnect) {
+-				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
++				this.#ctx.showStatus?.(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
+ 			} else {
+ 				void this.#teardown();
+ 				this.#ctx.session.emitNotice("warning", `Collab ended: ${reason}`, "collab");
+@@ -528,6 +539,24 @@ export class CollabHost {
+ 			this.#abortStart = null;
+ 		}
+ 
++		await this.#subscribe(true);
++	}
++
++	/** The private directory authenticates local peers; no relay is involved. */
++	async startLocal(socket: CollabHostTransport): Promise<void> {
++		if (this.ending || this.#socket) throw new Error("Collab host already started or stopped");
++		this.#socket = socket;
++		this.#relayConnected = true;
++		this.#writeToken = Buffer.from("local");
++		socket.onFrame = (frame, peer) => this.#handleFrame(frame, peer);
++		socket.onControl = msg => {
++			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
++		};
++		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
++		await this.#subscribe(false);
++	}
++
++	async #subscribe(publish: boolean): Promise<void> {
+ 		this.#startedAt = Date.now();
+ 		// Subscribe as soon as the relay is open. A guest can join as soon as the
+ 		// link is visible (auto-start installs the room before this resolves).
+@@ -555,7 +584,7 @@ export class CollabHost {
+ 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
+ 		this.#ctx.sessionManager.onEntryAppended = entry => {
+ 			if (isWireSessionEntry(entry) && this.#broadcastAllowed()) {
+-				const bounded = serializeReplicatedEntry(entry);
++				const bounded = serializeReplicatedEntry(this.#replicateEntry(entry));
+ 				const shrunk = bounded.value;
+ 				if (shrunk.type === "custom_message" && shrunk.customType === COLLAB_ENTRY_OMITTED_CUSTOM_TYPE) {
+ 					// The live path also emits a guest-visible notice: guests only
+@@ -572,6 +601,7 @@ export class CollabHost {
+ 		};
+ 		this.#updateStatusSegment();
+ 
++		if (!publish) return;
+ 		// Publish to the local host registry only after the relay connection
+ 		// succeeded. Publication failure warns but never breaks hosting (#6099).
+ 		// The in-flight task is tracked so a stop() that overtakes it withdraws
+@@ -580,7 +610,7 @@ export class CollabHost {
+ 			publication => publication,
+ 			err => {
+ 				logger.warn("Collab host registry publication failed", { error: String(err) });
+-				this.#ctx.showStatus("Collab host discovery unavailable (omp collab list will not show this session)", {
++				this.#ctx.showStatus?.("Collab host discovery unavailable (omp collab list will not show this session)", {
+ 					dim: true,
+ 				});
+ 				return null;
+@@ -677,8 +707,8 @@ export class CollabHost {
+ 		this.#peers.clear();
+ 		this.#socket?.close();
+ 		this.#socket = null;
+-		this.#ctx.statusLine.setCollabStatus(null);
+-		this.#ctx.ui.requestRender();
++		this.#ctx.statusLine?.setCollabStatus(null);
++		this.#ctx.ui?.requestRender();
+ 		// A publication still being created when the room ended is withdrawn
+ 		// before stop() resolves: a successor room reuses this instance
+ 		// endpoint, and this room's late cleanup must never unlink the winner.
+@@ -905,7 +935,9 @@ export class CollabHost {
+ 		// copy. Chunk frames are assembled from these strings only as the
+ 		// transport drains.
+ 		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
+-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
++		const snapshotEntries = this.#serializeSnapshotEntries(
++			snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry)),
++		);
+ 		const state = this.#buildState();
+ 		const welcome = encodeFrame({
+ 			t: "welcome",
+@@ -949,6 +981,20 @@ export class CollabHost {
+ 		this.#scheduleStateBroadcast();
+ 	}
+ 
++	#replicateEntry(entry: ReplicatedEntry): ReplicatedEntry {
++		// Private custom/checkpoint entries are deliberately not on the wire, but
++		// still sit between visible messages in the authoritative session tree.
++		// Point at the nearest replicated ancestor, not a missing private node;
++		// otherwise the native replica loader loses the active conversation.
++		let parentId = entry.parentId;
++		while (parentId !== null) {
++			const parent = this.#ctx.sessionManager.getEntry(parentId);
++			if (!parent || isWireSessionEntry(parent)) break;
++			parentId = parent.parentId;
++		}
++		return parentId === entry.parentId ? entry : { ...entry, parentId };
++	}
++
+ 	/**
+ 	 * Serialize every snapshot entry exactly once, bounded under
+ 	 * {@link MAX_REPLICATED_PAYLOAD_BYTES}. Only an entry that throws or exceeds
+@@ -1135,8 +1181,8 @@ export class CollabHost {
+ 			images && images.length > 0 ? [{ type: "text", text }, ...images] : text;
+ 		const details: CollabPromptDetails = { from: name };
+ 		if (this.#ctx.session.isStreaming) {
+-			this.#ctx.updatePendingMessagesDisplay();
+-			this.#ctx.ui.requestRender();
++			this.#ctx.updatePendingMessagesDisplay?.();
++			this.#ctx.ui?.requestRender();
+ 			this.#scheduleStateBroadcast();
+ 		}
+ 		this.#ctx.session
+@@ -1286,8 +1332,10 @@ export class CollabHost {
+ 		// Context numbers come from the status line's memoized breakdown so guests
+ 		// render exactly the same anchored, provider-real count the host's own
+ 		// status line shows.
+-		const breakdown = this.#ctx.statusLine.getCachedContextBreakdown();
+-		const tokens = breakdown.usedTokens ?? 0;
++		const breakdown = this.#ctx.statusLine?.getCachedContextBreakdown();
++		const usage = breakdown ? undefined : session.getContextUsage();
++		const tokens = breakdown?.usedTokens ?? usage?.tokens ?? 0;
++		const contextWindow = breakdown?.contextWindow ?? usage?.contextWindow ?? 0;
+ 		return {
+ 			isStreaming: session.isStreaming,
+ 			isAborting: session.isAborting,
+@@ -1298,8 +1346,8 @@ export class CollabHost {
+ 			thinkingLevel: session.thinkingLevel,
+ 			contextUsage: {
+ 				tokens,
+-				contextWindow: breakdown.contextWindow,
+-				percent: breakdown.contextWindow > 0 ? (tokens / breakdown.contextWindow) * 100 : 0,
++				contextWindow,
++				percent: contextWindow > 0 ? (tokens / contextWindow) * 100 : 0,
+ 			},
+ 			participants: this.participants,
+ 		};
+@@ -1456,8 +1504,8 @@ export class CollabHost {
+ 	}
+ 
+ 	#updateStatusSegment(): void {
+-		this.#ctx.statusLine.setCollabStatus({ role: "host", participantCount: this.#peers.size + 1 });
+-		this.#ctx.statusLine.invalidate();
+-		this.#ctx.ui.requestRender();
++		this.#ctx.statusLine?.setCollabStatus({ role: "host", participantCount: this.#peers.size + 1 });
++		this.#ctx.statusLine?.invalidate();
++		this.#ctx.ui?.requestRender();
+ 	}
+ }
+diff --git a/packages/coding-agent/src/commands/launch-help.ts b/packages/coding-agent/src/commands/launch-help.ts
+index b327632..8f6f8a3 100644
+--- a/packages/coding-agent/src/commands/launch-help.ts
++++ b/packages/coding-agent/src/commands/launch-help.ts
+@@ -18,6 +18,7 @@ export const launchHelp = {
+ 		model: Flags.string({
+ 			description: 'Model to use (fuzzy match: "opus", "gpt-5.2"; exact with a provider: "openai/gpt-5.2")',
+ 		}),
++		"model-preset": Flags.string({ description: "Apply a native model preset before the first prompt (requires --session-settings; not ACP)" }),
+ 		smol: Flags.string({ description: "Smol/fast model for lightweight tasks (or PI_SMOL_MODEL env)" }),
+ 		slow: Flags.string({ description: "Slow/reasoning model for thorough analysis (or PI_SLOW_MODEL env)" }),
+ 		plan: Flags.string({ description: "Plan model for architectural planning (or PI_PLAN_MODEL env)" }),
+@@ -53,10 +54,16 @@ export const launchHelp = {
+ 			description: "Output mode: text (default), json, rpc, or rpc-ui",
+ 			options: ["text", "json", "rpc", "acp", "rpc-ui"],
+ 		}),
++		"rpc-socket": Flags.string({
++			description: "Reconnectable RPC host socket in an owner-only 0700 directory (requires absolute --session and --cwd)",
++		}),
+ 		config: Flags.string({
+ 			description: "Load an extra config.yml-style overlay for this run (repeatable)",
+ 			multiple: true,
+ 		}),
++		"session-settings": Flags.boolean({
++			description: "Keep settings changes process-local; reuse native config, auth, and persistent session history",
++		}),
+ 		"add-dir": Flags.string({
+ 			description: "Add a workspace directory beyond the working directory (repeatable)",
+ 			multiple: true,
+@@ -151,6 +158,8 @@ export const launchHelp = {
+ 		}),
+ 	},
+ 	examples: [
++		`# Reconnectable local host (directory must already be private)\n  ${APP_NAME} --mode rpc-ui --rpc-socket /private/tmp/omp-host/agent.sock --session /absolute/session.jsonl --cwd /absolute/project`,
++		`# Native read-only TUI on that same host\n  ${APP_NAME} attach /private/tmp/omp-host/agent.sock --read-only`,
+ 		`# Interactive mode\n  ${APP_NAME}`,
+ 		`# Interactive mode with initial prompt\n  ${APP_NAME} "List all .ts files in src/"`,
+ 		`# Start working on a goal immediately\n  ${APP_NAME} --goal "Investigate the importer"`,
+diff --git a/packages/coding-agent/src/config/model-presets.ts b/packages/coding-agent/src/config/model-presets.ts
+index e7efe39..213527f 100644
+--- a/packages/coding-agent/src/config/model-presets.ts
++++ b/packages/coding-agent/src/config/model-presets.ts
+@@ -94,6 +94,15 @@ export function findActiveModelPreset(settings: Settings): string | undefined {
+ 	});
+ }
+ 
++/** Capture actual effective native roles and thinking policy, materializing only defined selectors. */
++export function captureModelPreset(settings: Settings): ModelPreset {
++	const modelRoles: Record<string, string> = {};
++	for (const [role, selector] of Object.entries(settings.getModelRoles())) {
++		if (selector) modelRoles[role] = selector;
++	}
++	return { modelRoles, defaultThinkingLevel: cfgDefaultThinkingLevel.get(settings) };
++}
++
+ /**
+  * Save the effective role assignments and `defaultThinkingLevel` as `name` in the
+  * global config, overwriting a preset of the same name. Only this entry is
+@@ -105,15 +114,46 @@ export function saveModelPreset(settings: Settings, name: string): ModelPreset {
+ 	if (!isValidModelPresetName(name)) {
+ 		throw new Error(`Invalid preset name "${name}": use a letter, then letters, digits, - or _`);
+ 	}
+-	const modelRoles: Record<string, string> = {};
+-	for (const [role, selector] of Object.entries(settings.getModelRoles())) {
+-		if (selector) modelRoles[role] = selector;
+-	}
+-	const preset: ModelPreset = { modelRoles, defaultThinkingLevel: cfgDefaultThinkingLevel.get(settings) };
++	const preset = captureModelPreset(settings);
+ 	cfgModelPresets.setEntry(settings, name, preset);
+ 	return preset;
+ }
+ 
++export type ModelPresetCreateResult =
++	| { kind: "created" | "preserved"; preset: ModelPreset }
++	| { kind: "conflict"; reason: string };
++
++/**
++ * Deliberately bootstrap one missing native preset without overwriting a concurrent same-name entry.
++ * Uses Settings' existing native YAML lock, then flushes/reloads authoritative readback. Does not
++ * acquire the role-mutation lock: a caller may already hold it around a multi-preset bootstrap.
++ */
++export async function createModelPresetIfMissing(
++	settings: Settings,
++	name: string,
++	preset: ModelPreset,
++): Promise<ModelPresetCreateResult> {
++	if (typeof name !== "string" || !isValidModelPresetName(name)) {
++		throw new Error(`Invalid preset name "${name}"`);
++	}
++	const parsed = parseModelPreset(preset);
++	if (typeof parsed === "string") throw new Error(`Invalid model preset "${name}": ${parsed}`);
++	const outcome = await settings.createModelPresetIfMissing(name, parsed);
++	if (outcome === "conflict") {
++		return { kind: "conflict", reason: "Native model preset configuration is not a writable mapping" };
++	}
++	await settings.flush();
++	await settings.reloadFromDisk();
++	const actual = getModelPreset(settings, name);
++	if (actual.kind !== "found") {
++		return { kind: "conflict", reason: actual.kind === "invalid" ? actual.reason : "Preset is hidden or absent after native readback" };
++	}
++	if (outcome === "created" && !Bun.deepEquals(actual.preset, parsed)) {
++		return { kind: "conflict", reason: "Preset changed or was shadowed before native readback" };
++	}
++	return { kind: outcome, preset: actual.preset };
++}
++
+ export type ModelPresetDeleteResult = "deleted" | "missing" | "project";
+ 
+ /**
+@@ -331,6 +371,48 @@ export async function applyModelPreset(
+ 	}
+ }
+ 
++export interface SessionModelPresetResult {
++	name: string;
++	preset: ModelPreset;
++	model: Model;
++	thinkingLevel: ConfiguredThinkingLevel | undefined;
++	settingsScope: "session";
++}
++
++/** Apply a named native preset, optionally from a frozen snapshot, without permitting config-file writes. */
++export async function applySessionModelPreset(
++	settings: Settings,
++	session: ModelPresetSession,
++	name: string,
++	snapshot?: unknown,
++): Promise<SessionModelPresetResult> {
++	if (settings.settingsScope !== "session") throw new Error("Model preset selection requires session settings");
++	if (typeof name !== "string" || !isValidModelPresetName(name)) throw new Error(`Invalid preset name "${name}"`);
++	const release = await acquireModelRoleMutation();
++	try {
++		if (snapshot !== undefined) {
++			const parsed = parseModelPreset(snapshot);
++			if (typeof parsed === "string") throw new Error(`Invalid model preset "${name}": ${parsed}`);
++			cfgModelPresets.override(settings, { ...cfgModelPresets.get(settings), [name]: parsed });
++		}
++		// The same native application path as applyModelPreset, with snapshot install and readback
++		// inside its role-mutation lock so concurrent clients cannot apply one another's snapshot.
++		const result = await applyModelPresetLocked(settings, session, name);
++		if (result.kind !== "switched" || !isCleanModelPresetSwitch(result)) {
++			throw new Error(formatModelPresetSwitch(name, result));
++		}
++		return {
++			name,
++			preset: captureModelPreset(settings),
++			model: result.model,
++			thinkingLevel: result.thinkingLevel,
++			settingsScope: "session",
++		};
++	} finally {
++		release();
++	}
++}
++
+ async function applyModelPresetLocked(
+ 	settings: Settings,
+ 	session: ModelPresetSession,
+diff --git a/packages/coding-agent/src/config/settings.ts b/packages/coding-agent/src/config/settings.ts
+index 38d5f37..adb2c4c 100644
+--- a/packages/coding-agent/src/config/settings.ts
++++ b/packages/coding-agent/src/config/settings.ts
+@@ -55,7 +55,7 @@ import {
+ } from "./registry";
+ // Registers every setting before any instance is read (definitions live next to their domains).
+ import "./all-settings";
+-import { cfgDisabledProviders, cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
++import { cfgDisabledProviders, cfgModelPresets, cfgModelRoles, cfgModelRoleStorage, type ModelPreset } from "./model-settings";
+ import { cfgShellPath } from "../exec/settings";
+ 
+ // ═══════════════════════════════════════════════════════════════════════════
+@@ -327,6 +327,7 @@ export type OverlayLayers = Readonly<Pick<OwnLayers, "global" | "overrides"> & {
+ export interface SettingsMirrorState {
+ 	/** Bumped on every own-layer change of the source; a mirror ignores states not newer than its last. */
+ 	readonly generation: number;
++	readonly settingsScope: "session" | "persistent";
+ 	readonly cwd: string;
+ 	readonly agentDir: string;
+ 	readonly configFiles: readonly string[];
+@@ -737,6 +738,7 @@ export class Settings {
+ 	#mirror: SettingsMirrorSource | undefined;
+ 	/** {@link SettingsMirrorState.generation} this mirror last adopted; `-1` before the first. */
+ 	#mirrorGeneration = -1;
++	#mirrorSettingsScope: "session" | "persistent" = "persistent";
+ 	/** Bumped by every own-layer or scope rebuild; reported as {@link SettingsMirrorState.generation}. */
+ 	#layerGeneration = 0;
+ 	/** Observers of own-layer and scope changes ({@link onLayersChange}). */
+@@ -998,6 +1000,7 @@ export class Settings {
+ 	mirrorState(): SettingsMirrorState {
+ 		return {
+ 			generation: this.#layerGeneration,
++			settingsScope: this.settingsScope,
+ 			cwd: this.#cwd,
+ 			agentDir: this.#agentDir,
+ 			configFiles: [...this.#configFiles],
+@@ -1023,6 +1026,7 @@ export class Settings {
+ 		if (state.generation <= this.#mirrorGeneration) return;
+ 		const previous = this.#mirrorGeneration < 0 ? undefined : this.#snapshot();
+ 		this.#mirrorGeneration = state.generation;
++		this.#mirrorSettingsScope = state.settingsScope;
+ 		this.#cwd = state.cwd;
+ 		this.#agentDir = state.agentDir;
+ 		this.#configFiles = [...state.configFiles];
+@@ -1190,6 +1194,41 @@ export class Settings {
+ 		this.#fireIfChanged(setting, prev);
+ 	}
+ 
++	/** Native bootstrap-only conditional create; own-key presence under the existing YAML lock always wins. */
++	async createModelPresetIfMissing(name: string, preset: ModelPreset): Promise<"created" | "preserved" | "conflict"> {
++		if (this.#mirror || !this.#persist || !this.#configPath) {
++			throw new Error("Preset creation requires a direct persisted native Settings instance");
++		}
++		cfgModelPresets.assertWritable({ [name]: preset });
++		await this.flush();
++		const configPath = this.#configPath;
++		return this.#withYamlWriteLock(configPath, async writePath => {
++			// Do not quarantine/repair malformed user YAML as a side effect of optional bootstrap creation.
++			const loaded = await this.#loadYamlIfPresent(writePath, false);
++			if (loaded.kind === "invalid") return "conflict";
++			if (loaded.kind === "unreadable") throw loaded.error;
++			const current = loaded.kind === "loaded" ? loaded.settings : {};
++			const entries = getByPath(current, ["modelPresets"]);
++			if (entries !== undefined && !isRecord(entries)) return "conflict";
++			if (isRecord(entries) && Object.hasOwn(entries, name)) {
++				this.#adoptSavedGlobal(current, configPath);
++				return "preserved";
++			}
++			for (const layer of [this.#overrides, this.#configOverlay, this.#project]) {
++				const higherEntries = getByPath(layer, ["modelPresets"]);
++				if (isRecord(higherEntries) && Object.hasOwn(higherEntries, name)) {
++					this.#adoptSavedGlobal(current, configPath);
++					return "preserved";
++				}
++			}
++			setByPath(current, ["modelPresets", name], preset);
++			await this.#writeYamlAtomically(writePath, stringifyYamlConfig(current));
++			this.#quarantinedYamlTargets.delete(configPath);
++			this.#adoptSavedGlobal(current, configPath);
++			return "created";
++		});
++	}
++
+ 	/**
+ 	 * Registry plumbing behind `Setting.setMember`: adds (`member`) or removes `item` in list `setting`
+ 	 * of the global layer, seeded from the default when that layer has no list, so the persisted list
+@@ -1818,6 +1857,11 @@ export class Settings {
+ 		return this.#storage;
+ 	}
+ 
++	/** Whether writes from this instance reach native config files, including through a worker mirror. */
++	get settingsScope(): "session" | "persistent" {
++		return this.#mirror ? this.#mirrorSettingsScope : this.#persist ? "persistent" : "session";
++	}
++
+ 	getCwd(): string {
+ 		return this.#cwd;
+ 	}
+diff --git a/packages/coding-agent/src/discovery/omp-extension-roots.ts b/packages/coding-agent/src/discovery/omp-extension-roots.ts
+index a9300b6..92a085c 100644
+--- a/packages/coding-agent/src/discovery/omp-extension-roots.ts
++++ b/packages/coding-agent/src/discovery/omp-extension-roots.ts
+@@ -253,6 +253,79 @@ async function isDirectory(p: string): Promise<boolean> {
+ 	}
+ }
+ 
++/** Process-local managed Host selection; absent for ordinary OMP invocations. */
++export interface ManagedExtensionSelection {
++	root: string;
++	classify(candidate: string): Promise<"managed" | "shadowed" | "other">;
++}
++
++/**
++ * Resolve the internally selected package, never a package-name registry. The
++ * marker is not a discovery source: its exact directory must also be selected
++ * by the invocation. Invalid context fails closed rather than loading both
++ * managed and ambient revisions (or silently running without the managed one).
++ */
++export async function managedExtensionSelection(
++	selectedPaths: readonly string[],
++	cwd: string,
++): Promise<ManagedExtensionSelection | undefined> {
++	const marker = process.env.OMP_SUPERAGENT_MANAGED_ULW_PATH;
++	if (marker === undefined) return undefined;
++	const invalid = (reason: string): Error => new Error(`Invalid managed extension selection: ${reason}`);
++	if (!path.isAbsolute(marker)) throw invalid("package root must be absolute");
++	let root: string;
++	let name: string;
++	try {
++		root = await fs.realpath(marker);
++		if (!(await fs.stat(root)).isDirectory()) throw new Error("package root is not a directory");
++		const manifest: unknown = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
++		if (
++			!manifest || typeof manifest !== "object" || !("name" in manifest) ||
++			typeof manifest.name !== "string" || !manifest.name.trim() || manifest.name !== manifest.name.trim()
++		) throw new Error("package.json must declare a non-empty package name");
++		name = manifest.name;
++	} catch (error) {
++		throw invalid(String(error));
++	}
++	let selected = false;
++	for (const candidate of selectedPaths) {
++		const resolved = path.resolve(cwd, expandTilde(candidate));
++		try {
++			if (await fs.realpath(resolved) === root) selected = true;
++		} catch (error) {
++			if (!isEnoent(error)) throw error;
++		}
++	}
++	if (!selected) throw invalid("package root must be explicitly selected by this invocation");
++	return {
++		root,
++		async classify(candidate) {
++			let current: string;
++			try {
++				const real = await fs.realpath(candidate);
++				current = (await fs.stat(real)).isDirectory() ? real : path.dirname(real);
++			} catch (error) {
++				if (isEnoent(error)) return "other";
++				throw error;
++			}
++			// A configured file or symlink is owned by its actual nearest package,
++			// not by the filename or the spelling of its discovery directory.
++			for (;;) {
++				if (current === root) return "managed";
++				try {
++					const manifest = tryParseJson<{ name?: unknown }>(await fs.readFile(path.join(current, "package.json"), "utf8"));
++					return manifest?.name === name ? "shadowed" : "other";
++				} catch (error) {
++					if (!isEnoent(error)) throw error;
++				}
++				const parent = path.dirname(current);
++				if (parent === current) return "other";
++				current = parent;
++			}
++		},
++	};
++}
++
+ /**
+  * Resolve every configured extension package directory for the given context.
+  *
+@@ -291,6 +364,7 @@ export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtens
+ 			: injectedCliRoots.map(root =>
+ 					root.relativePath ? { ...root, path: path.resolve(ctx.cwd, root.relativePath) } : root,
+ 				);
++	const managed = await managedExtensionSelection(explicitSeed.map(root => root.path), ctx.cwd);
+ 	const rootMode: OmpExtensionRootMode = ctx.extensionRoots?.mode ?? scopedRoots?.mode ?? injectedCliRootMode;
+ 	let candidates: InjectedRoot[] = explicitSeed;
+ 	if (rootMode === "merge") {
+@@ -334,6 +408,18 @@ export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtens
+ 	for (let i = 0; i < unique.length; i++) {
+ 		if (!directoryFlags[i]) continue;
+ 		const { path: p, level } = unique[i];
++		if (managed) {
++			const ownership = await managed.classify(p);
++			if (ownership === "shadowed") continue;
++			if (ownership === "managed") {
++				// Package resources deduplicate first-seen keys, so the selected
++				// package must precede other explicit roots as well as settings.
++				if (!roots.some(root => root.path === managed.root)) {
++					roots.unshift({ path: managed.root, level, name: path.basename(managed.root) });
++				}
++				continue;
++			}
++		}
+ 		roots.push({ path: p, level, name: path.basename(p) });
+ 	}
+ 	return roots;
+diff --git a/packages/coding-agent/src/extensibility/extensions/loader.ts b/packages/coding-agent/src/extensibility/extensions/loader.ts
+index 525ccaf..f31e08b 100644
+--- a/packages/coding-agent/src/extensibility/extensions/loader.ts
++++ b/packages/coding-agent/src/extensibility/extensions/loader.ts
+@@ -23,6 +23,7 @@ import { type Hook, hookCapability } from "../../capability/hook";
+ import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
+ import { loadCapability } from "../../discovery";
+ import { getExtensionNameFromPath } from "../../discovery/helpers";
++import { managedExtensionSelection } from "../../discovery/omp-extension-roots";
+ import type { ExecOptions } from "../../exec/exec";
+ import { execCommand } from "../../exec/exec";
+ import { getCodingAgentApi } from "../host-api";
+@@ -720,6 +721,8 @@ export interface DiscoverExtensionPathOptions {
+ 	ambient?: boolean;
+ 	/** Include ambient hook factories. Disable for read-only catalog commands. */
+ 	includeAmbientHooks?: boolean;
++	/** Explicit invocation roots, separate from settings, when supplied by the SDK. */
++	explicitPaths?: readonly string[];
+ }
+ 
+ export async function discoverExtensionPaths(
+@@ -728,6 +731,7 @@ export async function discoverExtensionPaths(
+ 	disabledExtensionIds?: string[],
+ 	options: DiscoverExtensionPathOptions = {},
+ ): Promise<string[]> {
++	const managed = await managedExtensionSelection(options.explicitPaths ?? configuredPaths, cwd);
+ 	const allPaths: string[] = [];
+ 	const seen = new Set<string>();
+ 	const disabled = new Set(disabledExtensionIds ?? []);
+@@ -738,7 +742,12 @@ export async function discoverExtensionPaths(
+ 	// Key on the real file so a symlink and its target load once, e.g. an
+ 	// extensions/ symlink plus the same file passed with --extension. Missing
+ 	// paths keep their lexical key so the loader still reports them.
+-	const addPath = async (extPath: string): Promise<void> => {
++	let managedModuleFound = false;
++	const addPath = async (extPath: string, toggleable = false): Promise<void> => {
++		const ownership = managed ? await managed.classify(extPath) : undefined;
++		if (ownership === "shadowed") return;
++		if (ownership === "managed") managedModuleFound = true;
++		else if (toggleable && isDisabledName(getExtensionNameFromPath(extPath))) return;
+ 		const resolved = path.resolve(extPath);
+ 		const key = await fs.realpath(resolved).catch(() => resolved);
+ 		if (!seen.has(key)) {
+@@ -749,8 +758,7 @@ export async function discoverExtensionPaths(
+ 
+ 	const addPaths = async (paths: string[]): Promise<void> => {
+ 		for (const extPath of paths) {
+-			if (isDisabledName(getExtensionNameFromPath(extPath))) continue;
+-			await addPath(extPath);
++			await addPath(extPath, true);
+ 		}
+ 	};
+ 
+@@ -793,10 +801,12 @@ export async function discoverExtensionPaths(
+ 	// 3–4. Installed-plugin entries (ambient only), then explicitly configured
+ 	// paths. Configured file paths bypass the disabled-name filter.
+ 	for (const module of await listPackageExtensionModules(configuredPaths, cwd, { plugins: ambient })) {
+-		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
+-		await addPath(module.path);
++		await addPath(module.path, module.toggleable);
+ 	}
+ 
++	if (managed && !managedModuleFound) {
++		throw new Error(`Invalid managed extension selection: no extension modules in ${managed.root}`);
++	}
+ 	return allPaths;
+ }
+ 
+diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
+index db7e94f..92e080d 100644
+--- a/packages/coding-agent/src/main.ts
++++ b/packages/coding-agent/src/main.ts
+@@ -6,6 +6,7 @@
+  */
+ import * as fsSync from "node:fs";
+ import * as os from "node:os";
++import * as path from "node:path";
+ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
+ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+ import { getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
+@@ -26,6 +27,8 @@ import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
+ import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
+ import chalk from "@oh-my-pi/pi-utils/chalk";
+ import { reset as resetCapabilities } from "./capability";
++import { CollabGuestLink } from "./collab/guest";
++import { RpcSocketHost, validateRpcSocketPath } from "./modes/rpc/rpc-socket-host";
+ import {
+ 	type Args,
+ 	reportInvalidFlagValues,
+@@ -47,6 +50,7 @@ import { runAutoUpdate } from "./cli/auto-update";
+ import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
+ import { findConfigFile } from "./config";
+ import { ModelRegistry } from "./config/model-registry";
++import { applySessionModelPreset } from "./config/model-presets";
+ import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
+ import {
+ 	disabledProviderIds,
+@@ -129,6 +133,7 @@ import {
+ 	type SessionInfo,
+ } from "./session/session-listing";
+ import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
++import { FileSessionStorage } from "./session/session-storage";
+ import { forkIfMovedAway } from "./session/session-transfer";
+ import { shouldShowStartupSplash } from "./startup-splash";
+ import {
+@@ -661,7 +666,7 @@ async function runInteractiveMode(
+ 	subagentEventBus?: EventBus,
+ 	initialMessage?: string,
+ 	initialImages?: ImageContent[],
+-	joinLink?: string,
++	joinLink?: string | { socket: string; readOnly: boolean },
+ 	startDeferredStartupWork?: (mode: InteractiveMode) => void,
+ 	startupLease?: ComposerLease,
+ 	startupGoal?: string,
+@@ -697,7 +702,7 @@ async function runInteractiveMode(
+ 		// setting needs the shared setup splash renderer.
+ 		const storedSetupVersion = cfgSetupVersion.get(settings);
+ 		setupWizard =
+-			forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
++			typeof joinLink !== "object" && (forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash)
+ 				? await import("./modes/setup")
+ 				: undefined;
+ 		const setupOptions = {
+@@ -799,11 +804,15 @@ async function runInteractiveMode(
+ 		// `omp join <link>`: dispatch through the same builtin path as a typed
+ 		// `/join` so collab guards and error rendering stay in one place.
+ 		if (joinLink !== undefined) {
+-			const executeBuiltinSlashCommand = await loadBuiltinSlashCommandExecutor();
+-			await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
++			if (typeof joinLink === "object") {
++				await new CollabGuestLink(mode).joinLocal(joinLink.socket, joinLink.readOnly, () => mode.requestShutdown());
++			} else {
++				const executeBuiltinSlashCommand = await loadBuiltinSlashCommandExecutor();
++				await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
++			}
+ 			// Join failure returns to the local session; success still needs the
+ 			// controller observing its eventual restoration without hosting replicas.
+-			mode.collabController.autoStart();
++			if (typeof joinLink === "string") mode.collabController.autoStart();
+ 		}
+ 		// Keep guest mutations gated through setup dialogs and transcript replay,
+ 		// not just init. Only a successful outer startup opens the room for input.
+@@ -1315,12 +1324,23 @@ export async function createSessionManager(
+ 		if (options.nativeFlagOwnership !== "preliminary") {
+ 			validateSessionPersistenceArgs(parsed);
+ 		}
+-		return SessionManager.inMemory();
++		// Attach starts without a writable local conversation, but Collab adopts
++		// its disk-backed replica through switchSession. MemorySessionStorage
++		// cannot read that file and would silently activate an empty replica.
++		return parsed.attach ? SessionManager.inMemory(cwd, new FileSessionStorage()) : SessionManager.inMemory();
+ 	}
+ 	normalizeContinueSessionArgs(parsed);
+ 
+ 	if (typeof parsed.resume === "string") {
+ 		const sessionArg = parsed.resume;
++		if (parsed.rpcSocket) {
++			const manager = await SessionManager.open(sessionArg, parsed.sessionDir, undefined, { initialCwd: cwd });
++			if (path.resolve(manager.getCwd()) !== path.resolve(cwd)) {
++				await manager.close();
++				throw new SessionResolutionError("Socket host --cwd must match the explicit session's recorded cwd");
++			}
++			return manager;
++		}
+ 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+ 			// The conversation may have gone on in a sibling file while another process held this one.
+ 			const continuation = await findSessionContinuation(sessionArg);
+@@ -1892,8 +1912,20 @@ export async function runRootCommand(
+ 			rejectNoUiWithoutRpc(parsedArgs);
+ 		}
+ 		const mode = parsedArgs.mode || "text";
++		if (parsedArgs.modelPreset && (!parsedArgs.sessionSettings || mode === "acp")) {
++			throw new CliUsageError("--model-preset requires --session-settings and a single-session host (not ACP)");
++		}
++		if (parsedArgs.rpcSocket) {
++			if ((mode !== "rpc" && mode !== "rpc-ui") || !parsedArgs.cwd || !path.isAbsolute(parsedArgs.cwd) ||
++				typeof parsedArgs.resume !== "string" || !path.isAbsolute(parsedArgs.resume) || parsedArgs.noSession ||
++				parsedArgs.continue || parsedArgs.fork || parsedArgs.restore || parsedArgs.fromClaude || parsedArgs.fromCodex) {
++				throw new CliUsageError("--rpc-socket requires --mode rpc[-ui], an absolute --cwd and --session file, without other session selectors");
++			}
++			validateRpcSocketPath(parsedArgs.rpcSocket);
++			process.env.OMP_RPC_SOCKET = parsedArgs.rpcSocket;
++		}
+ 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
+-		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
++		const rpcInput = !parsedArgs.rpcSocket && (mode === "rpc" || mode === "rpc-ui") ? claimRpcInput() : undefined;
+ 
+ 		// Kick off plugin-root preload in parallel with the remaining startup work.
+ 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
+@@ -1969,9 +2001,11 @@ export async function runRootCommand(
+ 		// Account routing must use the effective settings, including `--config` and
+ 		// `PI_CONFIG_FILES` overlays, rather than independently re-reading only the
+ 		// main config file during auth discovery.
+-		const settingsPromise = deps.settings
+-			? Promise.resolve(deps.settings)
+-			: logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config });
++		const settingsPromise = (
++			deps.settings
++				? Promise.resolve(deps.settings)
++				: logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config })
++		).then(nativeSettings => (parsedArgs.sessionSettings ? nativeSettings.overlay() : nativeSettings));
+ 		settingsPromise.catch(() => {});
+ 		const authStoragePromise = logger.time("discoverAuthStorage", async () =>
+ 			(deps.discoverAuthStorage ?? discoverAuthStorage)(undefined, { settings: await settingsPromise }),
+@@ -2675,6 +2709,14 @@ export async function runRootCommand(
+ 				mcpManager,
+ 				startBackgroundModelDiscovery,
+ 			} = createdSession;
++			if (parsedArgs.modelPreset) {
++				try {
++					await applySessionModelPreset(settingsInstance, session, parsedArgs.modelPreset);
++				} catch (error) {
++					await session.dispose();
++					throw error;
++				}
++			}
+ 			if (!isInteractive) session.validateRetryFallbackChains();
+ 
+ 			const sessionToolNames = session.getAllToolNames();
+@@ -2850,12 +2892,17 @@ export async function runRootCommand(
+ 				const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
+ 				stopStartupWatchdog();
+ 				logger.endTiming();
++				const transport = parsedArgs.rpcSocket
++					? new RpcSocketHost(parsedArgs.rpcSocket, session, subagentEventBus)
++					: undefined;
++				await transport?.listen();
+ 				await runRpcMode(session, {
+ 					setToolUIContext: mode === "rpc-ui" ? setToolUIContext : undefined,
+ 					headless: parsedArgs.noUi === true,
+ 					subagentEventBus,
+ 					mcpManager,
+ 					input: rpcInput,
++					transport,
+ 				});
+ 			} else if (isInteractive) {
+ 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+@@ -2902,7 +2949,7 @@ export async function runRootCommand(
+ 						subagentEventBus,
+ 						initialMessage,
+ 						initialImages,
+-						parsedArgs.join,
++						parsedArgs.attach ?? parsedArgs.join,
+ 						startDeferredStartupWork,
+ 						startupLease,
+ 						initialArgs.goal,
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-client.ts b/packages/coding-agent/src/modes/rpc/rpc-client.ts
+index cfcbbde..e8d51e1 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-client.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-client.ts
+@@ -62,7 +62,7 @@ import type {
+ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
+ 
+ /** RpcCommand without the id field (for internal send) */
+-type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
++export type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
+ 
+ /** Process transport consumed by {@link RpcClient}. */
+ export interface RpcAgentProcess {
+@@ -370,6 +370,25 @@ export class RpcClient {
+ 		this.#customTools = [...(options.customTools ?? [])];
+ 	}
+ 
++	/** Send with an optional caller-persisted identity; no retry or replay is performed. */
++	request(command: RpcCommandBody, options?: { id?: string; timeoutMs?: number }): Promise<RpcResponse> {
++		return this.#send(command, options?.timeoutMs, options?.id);
++	}
++
++	onExtensionUIRequest(listener: (request: RpcExtensionUIRequest) => void): () => void {
++		this.#extensionUiListeners.add(listener);
++		return () => this.#extensionUiListeners.delete(listener);
++	}
++
++	respondToUI(response: RpcExtensionUIResponse): void {
++		this.#writeFrame(response);
++	}
++
++	/** Persist and stop an idle socket host; stopping this client only disconnects its transport. */
++	async shutdownHost(): Promise<void> {
++		this.#getData(await this.#send({ type: "shutdown_host" }));
++	}
++
+ 	/**
+ 	 * Start the RPC agent process.
+ 	 *
+@@ -1676,6 +1695,9 @@ export class RpcClient {
+ 		if (!this.#process?.stdin) {
+ 			throw new Error("Client not started");
+ 		}
++		if (!id || this.#pendingRequests.has(id)) {
++			throw new Error(`Request id is empty or already outstanding: ${id}`);
++		}
+ 		const fullCommand = { ...command, id } as RpcCommand;
+ 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
+ 		let settled = false;
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-mode.ts b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+index 4408b13..2c8cfe7 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-mode.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+@@ -20,6 +20,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
+ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+ import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+ import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
++import { applySessionModelPreset, captureModelPreset } from "../../config/model-presets";
+ import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
+ import {
+ 	type ExtensionAskDialogQuestion,
+@@ -95,6 +96,7 @@ import { RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-sessio
+ import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
+ import type {
+ 	RpcAbortAndRestoreQueueResult,
++	RpcAgentSessionEventFrame,
+ 	RpcCommand,
+ 	RpcExtensionUIRequest,
+ 	RpcExtensionUIResponse,
+@@ -1372,6 +1374,14 @@ export function registerRpcPersistenceSurface(
+ 
+ /** Startup options for {@link runRpcMode}. */
+ export interface RpcModeOptions {
++	/** Process-owned local transport. Unlike stdio, a peer leaving never closes input. */
++	transport?: {
++		input: ReadableStream<Uint8Array>;
++		output(frame: object): void;
++		sessionEvent(frame: RpcAgentSessionEventFrame): void;
++		isBusy(): boolean;
++		close(): Promise<void>;
++	};
+ 	/** `--mode rpc-ui`: route tool UI (e.g. ask) over the protocol, independently of headless extensions. */
+ 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+ 	/** `--no-ui`: extensions run with `hasUI=false` and no UI frames; tool UI and host-issued login are unaffected. */
+@@ -1395,7 +1405,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 		setToolUIContext,
+ 		headless = false,
+ 		subagentEventBus,
+-		input = claimRpcInput(),
++		input = options.transport?.input ?? claimRpcInput(),
+ 		createLiveSession,
+ 		createDictationController,
+ 	} = options;
+@@ -1407,6 +1417,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 	process.env.PI_NOTIFICATIONS = "off";
+ 
+ 	const frameEncoder = new RpcFrameEncoder();
++	// The socket host frames each connection independently. Keep its canonical
++	// logical responses lossless; each peer's writer applies its negotiated cap.
++	if (options.transport) frameEncoder.setProtocolVersion(2);
+ 	// Bun on Windows writes a piped process.stdout with a blocking WriteFile on the
+ 	// JS thread and never reports backpressure, so a client that stops reading
+ 	// stdout froze the whole worker, stdin reader included. An fd write stream
+@@ -1414,23 +1427,25 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 	const stdout = process.platform === "win32" ? fs.createWriteStream("", { fd: 1, autoClose: false }) : process.stdout;
+ 	// The writer can fail before the bridge is constructed.
+ 	let dictationBridge: RpcDictationBridge | undefined = undefined;
+-	const outputWriter = new RpcOutputWriter(stdout, failure => {
++	const outputWriter = options.transport ? undefined : new RpcOutputWriter(stdout, failure => {
+ 		logger.error("RPC output delivery failed", { error: String(failure) });
+ 		dictationBridge?.dispose();
+ 		void session.dispose().finally(() => process.exit(1));
+ 	});
+-	outputWriter.write(
+-		frameEncoder.encodeFrames({
++	const writeOutput = (obj: object): void => {
++		if (options.transport) options.transport.output(obj);
++		else outputWriter!.write(frameEncoder.encodeFrames(obj));
++	};
++	writeOutput({
+ 			type: "ready",
+ 			protocolVersion: 1,
+ 			supportedProtocolVersions: [1, 2],
+ 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
+ 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+ 			supportsBashExcludeFromContext: true,
+-		}),
+-	);
++		});
+ 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+-		outputWriter.write(frameEncoder.encodeFrames(obj));
++		writeOutput(obj);
+ 		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
+ 			frameEncoder.setProtocolVersion(2);
+ 	};
+@@ -1467,7 +1482,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 		costCapRefusal: () => session.costCapRefusal,
+ 		settledWithoutRun: () => void settleWatcher.check(),
+ 	});
+-	const sessionEvents = new RpcSessionEventForwarder(output);
++	const sessionEvents = new RpcSessionEventForwarder(frame => {
++		// Socket transports intercept set_event_filter per peer, so this canonical
++		// forwarder always retains full snapshots; only peer projectors emit deltas.
++		if (options.transport) options.transport.sessionEvent(frame as RpcAgentSessionEventFrame);
++		else output(frame);
++	});
+ 
+ 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
+ 	const hostToolBridge = new RpcHostToolBridge(output);
+@@ -1846,7 +1866,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 			if (!persistenceFailure || error !== persistenceFailure) throw error;
+ 			// The notice frame this failure queued must reach the client before the
+ 			// process ends (review 3983906393).
+-			await outputWriter.close();
++			await outputWriter?.close();
++			await options.transport?.close();
+ 			try {
+ 				if (!process.stderr.write(`${formatPersistenceDurabilityFailure(persistenceFailure.message)}\n`)) {
+ 					const { promise, resolve } = Promise.withResolvers<void>();
+@@ -1870,7 +1891,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 		}
+ 		// A failure that already reported and then recovered still leaves its notice
+ 		// queued here, so the success path drains the same queue before it exits.
+-		await outputWriter.close();
++		await outputWriter?.close();
++		await options.transport?.close();
+ 		process.exit(0);
+ 	};
+ 
+@@ -2024,6 +2046,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 		const id = command.id;
+ 
+ 		switch (command.type) {
++			case "shutdown_host": {
++				if (!options.transport) return error(id, command.type, "shutdown_host requires --rpc-socket");
++				if (session.isBusyForSnapshot || !isSessionSettled(session, goalTurnScheduled) || pendingExtensionRequests.size > 0 ||
++					options.transport.isBusy() || liveBridge.active || dictationBridge.active ||
++					(session.getAsyncJobTree({ recentLimit: 0 })?.running.length ?? 0) > 0) {
++					return error(id, command.type, "Host has running, queued, or pending work", "session_busy");
++				}
++				shutdownState.requested = true;
++				return success(id, command.type);
++			}
+ 			case "negotiate_protocol": {
+ 				if (command.protocolVersion !== 2)
+ 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
+@@ -2262,6 +2294,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 				await goalController.settled();
+ 				const queuedMessages = session.getQueuedMessages();
+ 				const state: RpcSessionState = {
++					...(options.transport ? { hostPid: process.pid, hasOwnedRunningWork: (session.getAsyncJobTree({ recentLimit: 0 })?.running.length ?? 0) > 0 } : {}),
++					settingsScope: session.settings.settingsScope,
++					modelSettings: captureModelPreset(session.settings),
+ 					model: session.model,
+ 					thinkingLevel: session.thinkingLevel,
+ 					isStreaming: session.isStreaming,
+@@ -2533,6 +2568,21 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 				return success(id, "set_model", model);
+ 			}
+ 
++			case "set_model_preset": {
++				if (session.settings.settingsScope !== "session") {
++					return error(id, "set_model_preset", "Model preset selection requires --session-settings");
++				}
++				if (command.preset === undefined) {
++					return error(id, "set_model_preset", "A frozen native preset snapshot is required");
++				}
++				if (!isSessionSettled(session, goalTurnScheduled) || session.isCompacting || session.isSessionTransitioning ||
++					(session.getAsyncJobTree({ recentLimit: 0 })?.running.length ?? 0) > 0) {
++					return error(id, "set_model_preset", "Model preset selection requires an idle session", "session_busy");
++				}
++				const result = await applySessionModelPreset(session.settings, session, command.name, command.preset);
++				return success(id, "set_model_preset", result);
++			}
++
+ 			case "cycle_model": {
+ 				const result = await session.cycleModel();
+ 				if (!result) {
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-session-events.ts b/packages/coding-agent/src/modes/rpc/rpc-session-events.ts
+index 71fbce6..c33aeff 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-session-events.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-session-events.ts
+@@ -99,7 +99,11 @@ export class RpcSessionEventForwarder {
+ 	}
+ 
+ 	forward(event: AgentSessionEvent): void {
+-		const frame = this.#stamp(event);
++		this.forwardStamped(this.#stamp(event));
++	}
++
++	/** Per-client projection of an already stamped authoritative host event. */
++	forwardStamped(frame: RpcAgentSessionEventFrame): void {
+ 		if (this.#filter && !this.#filter.has(frame.type)) return;
+ 		if (frame.type === "message_update" && this.#messageUpdates === "delta") {
+ 			this.#output({
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-types.ts b/packages/coding-agent/src/modes/rpc/rpc-types.ts
+index 6d7b4f8..8046194 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-types.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-types.ts
+@@ -17,6 +17,8 @@ import type {
+ 	ToolExample,
+ } from "@oh-my-pi/pi-ai";
+ import type { BashResult } from "../../exec/bash-executor";
++import type { ModelPreset } from "../../config/model-settings";
++import type { SessionModelPresetResult } from "../../config/model-presets";
+ import type { ContextUsage } from "../../extensibility/extensions/types";
+ import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+ import type { SessionLeaseReport } from "../../session/session-storage";
+@@ -48,6 +50,7 @@ export type RpcMessageUpdates = "full" | "delta";
+ export type RpcCommand =
+ 	// Protocol
+ 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
++	| { id?: string; type: "shutdown_host" }
+ 
+ 	// Prompting
+ 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+@@ -97,6 +100,7 @@ export type RpcCommand =
+ 
+ 	// Model
+ 	| { id?: string; type: "set_model"; provider: string; modelId: string }
++	| { id?: string; type: "set_model_preset"; name: string; preset: ModelPreset }
+ 	| { id?: string; type: "cycle_model" }
+ 	| { id?: string; type: "get_available_models" }
+ 
+@@ -171,6 +175,16 @@ export type RpcCommand =
+ // ============================================================================
+ 
+ export interface RpcSessionState {
++	/** Actual settings write boundary; older hosts without this field are not safe preset targets. */
++	settingsScope: "session" | "persistent";
++	/** Effective native role/thinking settings, independent of the active session model/effort. */
++	modelSettings: ModelPreset;
++	/** Authoritative OS process identity, present for a socket host. */
++	hostPid?: number;
++	/** Authoritative unresolved dialogs, present for a socket host. */
++	pendingUiRequests?: RpcExtensionUIRequest[];
++	/** Running jobs in this host's ownership tree, including delivery-suppressed services. */
++	hasOwnedRunningWork?: boolean;
+ 	model?: Model;
+ 	thinkingLevel: ThinkingLevel | undefined;
+ 	isStreaming: boolean;
+@@ -428,6 +442,7 @@ export interface RpcSubagentMessagesResult {
+ 
+ // Success responses with data
+ export type RpcResponse =
++	| { id?: string; type: "response"; command: "shutdown_host"; success: true }
+ 	// Protocol
+ 	| {
+ 			id?: string;
+@@ -542,6 +557,7 @@ export type RpcResponse =
+ 			success: true;
+ 			data: Model;
+ 	  }
++	| { id?: string; type: "response"; command: "set_model_preset"; success: true; data: SessionModelPresetResult }
+ 	| {
+ 			id?: string;
+ 			type: "response";
+diff --git a/packages/coding-agent/src/modes/rpc/wire/commands.ts b/packages/coding-agent/src/modes/rpc/wire/commands.ts
+index 3469547..02fee91 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/commands.ts
++++ b/packages/coding-agent/src/modes/rpc/wire/commands.ts
+@@ -32,6 +32,7 @@ export interface RpcCommandSpec {
+ const IMAGES = doc("ImageContent[]", "Images attached to the message.");
+ 
+ export const rpcCommands: readonly RpcCommandSpec[] = [
++	{ name: "shutdown_host", doc: "Persist and stop an idle socket host; refuses running or pending work." },
+ 	{
+ 		name: "negotiate_protocol",
+ 		doc: "Switch the connection to a protocol version advertised by `ready`.",
+@@ -225,6 +226,12 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
+ 		params: { provider: "string", modelId: "string" },
+ 		result: "ModelInfo",
+ 	},
++	{
++		name: "set_model_preset",
++		doc: "Apply a frozen native model preset to an idle session-settings host; return effective native readback.",
++		params: { name: "string", preset: "ModelPresetSnapshot" },
++		result: "ModelPresetResult",
++	},
+ 	{ name: "cycle_model", doc: "Cycle to the next model.", result: "ModelCycleResult", nullable: true },
+ 	{
+ 		name: "get_available_models",
+diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
+index a114a6b..408121f 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
++++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
+@@ -488,8 +488,22 @@ export interface UsageLimitWrapUp {
+ /** Provider-neutral state of an account past its usage limit, discriminated by `stage`. */
+ export type UsageLimitState = UsageLimitLowPriority | UsageLimitWrapUp;
+ 
++export type SettingsScope = "session" | "persistent";
++
++export type ModelPresetThinkingLevel = "auto" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
++
+ export interface SessionState {
+ 	sessionId: string;
++	/** Actual native settings write boundary; older hosts default to persistent. */
++	settingsScope?: SettingsScope;
++	/** Actual effective native role assignments and default thinking policy; absent on older hosts, never inferred from preset identity. */
++	modelSettings?: ModelPresetSnapshot;
++	/** Authoritative OS process identity of a socket host. */
++	hostPid?: number;
++	/** Authoritative unresolved dialogs of a socket host, retaining original request identities. */
++	pendingUiRequests?: ExtensionUiRequest[];
++	/** Running jobs in the socket host ownership tree, including delivery-suppressed services. */
++	hasOwnedRunningWork?: boolean;
+ 	model?: ModelInfo;
+ 	thinkingLevel?: ThinkingLevel;
+ 	isStreaming?: boolean;
+@@ -527,6 +541,19 @@ export interface SessionState {
+ 	goal?: GoalModeState | null;
+ }
+ 
++export interface ModelPresetSnapshot {
++	modelRoles: Record<string, string>;
++	defaultThinkingLevel?: ModelPresetThinkingLevel;
++}
++
++export interface ModelPresetResult {
++	name: string;
++	preset: ModelPresetSnapshot;
++	model: ModelInfo;
++	settingsScope: "session";
++	thinkingLevel?: ConfiguredThinkingLevel;
++}
++
+ export interface BashResult {
+ 	output: string;
+ 	cancelled: boolean;
+@@ -1742,6 +1769,11 @@ export interface SetModelParams {
+ 	modelId: string;
+ }
+ 
++export interface SetModelPresetParams {
++	name: string;
++	preset: ModelPresetSnapshot;
++}
++
+ export interface GetAvailableModelsResult {
+ 	models: ModelInfo[];
+ }
+@@ -1928,6 +1960,7 @@ export interface GetBtwHistoryResult {
+ 
+ /** Every RPC command's parameters and successful response `data`. */
+ export interface RpcWireCommands {
++	shutdown_host: { params: undefined; result: undefined };
+ 	negotiate_protocol: { params: NegotiateProtocolParams; result: NegotiateProtocolResult };
+ 	prompt: { params: PromptParams; result: PromptAck };
+ 	steer: { params: SteerParams; result: undefined };
+@@ -1963,6 +1996,7 @@ export interface RpcWireCommands {
+ 	dictation_start: { params: DictationStartParams; result: undefined };
+ 	dictation_stop: { params: undefined; result: DictationStopResult };
+ 	set_model: { params: SetModelParams; result: ModelInfo };
++	set_model_preset: { params: SetModelPresetParams; result: ModelPresetResult };
+ 	cycle_model: { params: undefined; result: ModelCycleResult | null };
+ 	get_available_models: { params: undefined; result: GetAvailableModelsResult };
+ 	set_thinking_level: { params: SetThinkingLevelParams; result: undefined };
+diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
+index ad23664..14bd9de 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
++++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
+@@ -9,6 +9,17 @@
+ 		"serverFrame": "RpcServerFrame",
+ 		"inbound": "RpcInbound",
+ 		"commands": [
++			{
++				"name": "shutdown_host",
++				"doc": "Persist and stop an idle socket host; refuses running or pending work.",
++				"params": null,
++				"result": null,
++				"nullable": false,
++				"unwrap": null,
++				"timeoutMs": null,
++				"completion": null,
++				"clientOmit": []
++			},
+ 			{
+ 				"name": "negotiate_protocol",
+ 				"doc": "Switch the connection to a protocol version advertised by `ready`.",
+@@ -396,6 +407,17 @@
+ 				"completion": null,
+ 				"clientOmit": []
+ 			},
++			{
++				"name": "set_model_preset",
++				"doc": "Apply a frozen native model preset to an idle session-settings host; return effective native readback.",
++				"params": "SetModelPresetParams",
++				"result": "ModelPresetResult",
++				"nullable": false,
++				"unwrap": null,
++				"timeoutMs": null,
++				"completion": null,
++				"clientOmit": []
++			},
+ 			{
+ 				"name": "cycle_model",
+ 				"doc": "Cycle to the next model.",
+@@ -2623,12 +2645,55 @@
+ 			],
+ 			"description": "Provider-neutral state of an account past its usage limit, discriminated by `stage`."
+ 		},
++		"SettingsScope": {
++			"enum": [
++				"session",
++				"persistent"
++			],
++			"type": "string"
++		},
++		"ModelPresetThinkingLevel": {
++			"enum": [
++				"auto",
++				"minimal",
++				"low",
++				"medium",
++				"high",
++				"xhigh",
++				"max"
++			],
++			"type": "string"
++		},
+ 		"SessionState": {
+ 			"type": "object",
+ 			"properties": {
+ 				"sessionId": {
+ 					"type": "string"
+ 				},
++				"settingsScope": {
++					"$ref": "#/$defs/SettingsScope",
++					"description": "Actual native settings write boundary; older hosts default to persistent.",
++					"default": "persistent"
++				},
++				"modelSettings": {
++					"$ref": "#/$defs/ModelPresetSnapshot",
++					"description": "Actual effective native role assignments and default thinking policy; absent on older hosts, never inferred from preset identity."
++				},
++				"hostPid": {
++					"type": "integer",
++					"description": "Authoritative OS process identity of a socket host."
++				},
++				"pendingUiRequests": {
++					"type": "array",
++					"items": {
++						"$ref": "#/$defs/ExtensionUiRequest"
++					},
++					"description": "Authoritative unresolved dialogs of a socket host, retaining original request identities."
++				},
++				"hasOwnedRunningWork": {
++					"type": "boolean",
++					"description": "Running jobs in the socket host ownership tree, including delivery-suppressed services."
++				},
+ 				"model": {
+ 					"$ref": "#/$defs/ModelInfo"
+ 				},
+@@ -2771,6 +2836,50 @@
+ 				"sessionId"
+ 			]
+ 		},
++		"ModelPresetSnapshot": {
++			"type": "object",
++			"properties": {
++				"modelRoles": {
++					"type": "object",
++					"properties": {},
++					"additionalProperties": {
++						"type": "string"
++					}
++				},
++				"defaultThinkingLevel": {
++					"$ref": "#/$defs/ModelPresetThinkingLevel"
++				}
++			},
++			"required": [
++				"modelRoles"
++			]
++		},
++		"ModelPresetResult": {
++			"type": "object",
++			"properties": {
++				"name": {
++					"type": "string"
++				},
++				"preset": {
++					"$ref": "#/$defs/ModelPresetSnapshot"
++				},
++				"model": {
++					"$ref": "#/$defs/ModelInfo"
++				},
++				"settingsScope": {
++					"const": "session"
++				},
++				"thinkingLevel": {
++					"$ref": "#/$defs/ConfiguredThinkingLevel"
++				}
++			},
++			"required": [
++				"name",
++				"preset",
++				"model",
++				"settingsScope"
++			]
++		},
+ 		"BashResult": {
+ 			"type": "object",
+ 			"properties": {
+@@ -6709,6 +6818,21 @@
+ 				"modelId"
+ 			]
+ 		},
++		"SetModelPresetParams": {
++			"type": "object",
++			"properties": {
++				"name": {
++					"type": "string"
++				},
++				"preset": {
++					"$ref": "#/$defs/ModelPresetSnapshot"
++				}
++			},
++			"required": [
++				"name",
++				"preset"
++			]
++		},
+ 		"GetAvailableModelsResult": {
+ 			"type": "object",
+ 			"properties": {
+diff --git a/packages/coding-agent/src/modes/rpc/wire/state.ts b/packages/coding-agent/src/modes/rpc/wire/state.ts
+index fda4d55..29208e4 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/state.ts
++++ b/packages/coding-agent/src/modes/rpc/wire/state.ts
+@@ -101,7 +101,14 @@ export const stateDefs = {
+ 		"UsageLimitLowPriority | UsageLimitWrapUp",
+ 		"Provider-neutral state of an account past its usage limit, discriminated by `stage`.",
+ 	),
++	SettingsScope: "'session' | 'persistent'",
++	ModelPresetThinkingLevel: "'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'",
+ 	SessionState: {
++		settingsScope: absentAs(doc("SettingsScope", "Actual native settings write boundary; older hosts default to persistent."), "persistent"),
++		"modelSettings?": doc("ModelPresetSnapshot", "Actual effective native role assignments and default thinking policy; absent on older hosts, never inferred from preset identity."),
++		"hostPid?": doc("number.integer", "Authoritative OS process identity of a socket host."),
++		"pendingUiRequests?": doc("ExtensionUiRequest[]", "Authoritative unresolved dialogs of a socket host, retaining original request identities."),
++		"hasOwnedRunningWork?": doc("boolean", "Running jobs in the socket host ownership tree, including delivery-suppressed services."),
+ 		"model?": "ModelInfo",
+ 		"thinkingLevel?": "ThinkingLevel",
+ 		isStreaming: absentAs("boolean", false),
+@@ -143,6 +150,17 @@ export const stateDefs = {
+ 		"contextUsage?": "ContextUsage",
+ 		goal: absentAs(doc("GoalModeState | null", "Current goal mode; null when the session has no goal."), null),
+ 	},
++	ModelPresetSnapshot: {
++		modelRoles: "Record<string, string>",
++		"defaultThinkingLevel?": "ModelPresetThinkingLevel",
++	},
++	ModelPresetResult: {
++		name: "string",
++		preset: "ModelPresetSnapshot",
++		model: "ModelInfo",
++		"thinkingLevel?": "ConfiguredThinkingLevel",
++		settingsScope: "'session'",
++	},
+ 
+ 	BashResult: {
+ 		output: "string",
+diff --git a/packages/coding-agent/src/sdk.ts b/packages/coding-agent/src/sdk.ts
+index ad253ff..ca592fc 100644
+--- a/packages/coding-agent/src/sdk.ts
++++ b/packages/coding-agent/src/sdk.ts
+@@ -1202,6 +1202,7 @@ export async function discoverSessionExtensionPaths(
+ 	return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, {
+ 		ambient: !explicitOnly,
+ 		includeAmbientHooks: options.includeAmbientHooks,
++		explicitPaths: explicit,
+ 	});
+ }
+ 
+diff --git a/packages/coding-agent/test/collab/chunked-welcome.test.ts b/packages/coding-agent/test/collab/chunked-welcome.test.ts
+index 3d798f2..8157dd2 100644
+--- a/packages/coding-agent/test/collab/chunked-welcome.test.ts
++++ b/packages/coding-agent/test/collab/chunked-welcome.test.ts
+@@ -62,6 +62,7 @@ function makeHostContext(snapshot: SizedSnapshot): InteractiveModeContext {
+ 			getSessionId: () => snapshot.header.id,
+ 			getCwd: () => snapshot.header.cwd,
+ 			snapshotForReplication: () => snapshot,
++			getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
+ 			onEntryAppended: undefined,
+ 		},
+ 		session: {
+diff --git a/packages/coding-agent/test/collab/helpers/throttled-host.ts b/packages/coding-agent/test/collab/helpers/throttled-host.ts
+index 003bf08..a49fc54 100644
+--- a/packages/coding-agent/test/collab/helpers/throttled-host.ts
++++ b/packages/coding-agent/test/collab/helpers/throttled-host.ts
+@@ -58,6 +58,7 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
+ 			// (image stripping) and retains it behind a lazy batch. Sharing one object
+ 			// would hide both.
+ 			snapshotForReplication: () => structuredClone(snapshot),
++			getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
+ 			onEntryAppended: undefined,
+ 		},
+ 		session: {
+diff --git a/packages/coding-agent/test/collab/replication-shrink.test.ts b/packages/coding-agent/test/collab/replication-shrink.test.ts
+index 60675b1..7e56a55 100644
+--- a/packages/coding-agent/test/collab/replication-shrink.test.ts
++++ b/packages/coding-agent/test/collab/replication-shrink.test.ts
+@@ -196,6 +196,7 @@ interface HostHarness {
+ interface HostReplicationSource {
+ 	getSessionId(): string;
+ 	getCwd(): string;
++	getEntry(id: string): SessionEntry | undefined;
+ 	snapshotForReplication(): { header: HostSnapshot["header"]; entries: readonly SessionEntry[] };
+ 	onEntryAppended?: ((entry: SessionEntry) => void) | undefined;
+ }
+@@ -205,6 +206,7 @@ function makeHostContext(snapshot: HostSnapshot): HostHarness {
+ 		getSessionId: () => snapshot.header.id,
+ 		getCwd: () => snapshot.header.cwd,
+ 		snapshotForReplication: () => snapshot,
++		getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
+ 		onEntryAppended: undefined,
+ 	});
+ }
+diff --git a/packages/coding-agent/test/fixtures/fork-rpc-agent.ts b/packages/coding-agent/test/fixtures/fork-rpc-agent.ts
+index e247f67..7cf1057 100644
+--- a/packages/coding-agent/test/fixtures/fork-rpc-agent.ts
++++ b/packages/coding-agent/test/fixtures/fork-rpc-agent.ts
+@@ -5,6 +5,8 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+ import { runRpcMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
++import { RpcSocketHost } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-socket-host";
++import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+@@ -15,6 +17,8 @@ const root = process.argv[2];
+ if (!root || root.startsWith("-")) throw new Error("fork-rpc-agent: expected the temp root as the first argument");
+ process.chdir(root);
+ const cwd = process.cwd();
++const socketPath = process.argv[3];
++let toolUI: ExtensionUIContext | undefined;
+ const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+ authStorage.keys.setRuntime("anthropic", "test-key");
+ const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+@@ -25,8 +29,16 @@ const mock = createMockModel({
+ 	// streams until the test aborts it.
+ 	// "seed-ask" calls `ask` (not registered here, so it records an error result) with a form
+ 	// the UI could reopen; "seed-bad-ask" calls it with arguments carrying no form.
+-	handler: context => {
++	handler: async context => {
+ 		const last = JSON.stringify(context.messages.at(-1)?.content);
++		if (socketPath) session.sessionManager.appendCustomEntry("socket-test-private", { marker: "not-replicated" });
++		if (socketPath && last.includes("approval")) {
++			const approved = await toolUI!.confirm("Deploy?", "Approve the test deployment");
++			return { content: [approved ? "Approved" : "Denied"] };
++		}
++		if (socketPath && last.includes("invoke-owned")) {
++			return { content: [{ type: "toolCall", id: crypto.randomUUID(), name: "owned", arguments: {} }] };
++		}
+ 		if (last.includes("seed-ask") || last.includes("seed-bad-ask")) {
+ 			const args = last.includes("seed-ask") ? { html: askHtml } : {};
+ 			return { content: [{ type: "toolCall", id: "ask-1", name: "ask", arguments: args }] };
+@@ -69,7 +81,9 @@ const agent = new Agent({
+ });
+ const session = new AgentSession({
+ 	agent,
+-	sessionManager: SessionManager.create(cwd, path.join(cwd, "sessions")),
++	sessionManager: socketPath
++		? await SessionManager.open(path.join(cwd, "socket-session.jsonl"), undefined, undefined, { initialCwd: cwd })
++		: SessionManager.create(cwd, path.join(cwd, "sessions")),
+ 	settings: Settings.isolated({ "compaction.enabled": false, "goal.continuationModes": ["rpc"] }),
+ 	modelRegistry,
+ 	sideStreamFn: side.stream,
+@@ -88,4 +102,6 @@ session.waitForIdle = async () => {
+ 	heldGoalIdle = true;
+ 	await summaryStarted.promise;
+ };
+-await runRpcMode(session);
++const transport = socketPath ? new RpcSocketHost(socketPath, session) : undefined;
++await transport?.listen();
++await runRpcMode(session, { transport, setToolUIContext: ui => { toolUI = ui; } });
+diff --git a/packages/coding-agent/test/model-presets.test.ts b/packages/coding-agent/test/model-presets.test.ts
+index 79e04bf..f9ce992 100644
+--- a/packages/coding-agent/test/model-presets.test.ts
++++ b/packages/coding-agent/test/model-presets.test.ts
+@@ -7,6 +7,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+ import {
+ 	acquireModelRoleMutation,
+ 	applyModelPreset,
++	createModelPresetIfMissing,
+ 	deleteModelPreset,
+ 	getModelPreset,
+ 	getModelPresetNames,
+@@ -70,11 +71,12 @@ describe("model presets", () => {
+ 	}
+ 
+ 	/** Settings with a real project layer and an optional `--config` overlay. */
+-	async function projectSettings(options: { project?: string; overlay?: string; storage?: "global" | "project" }) {
++	async function projectSettings(options: { global?: string; project?: string; overlay?: string; storage?: "global" | "project"; persist?: boolean }) {
+ 		const dir = TempDir.createSync("@pi-model-presets-project-");
+ 		tempDirs.push(dir);
+ 		const projectDir = path.join(dir.path(), "project");
+ 		fs.mkdirSync(path.join(projectDir, ".omp"), { recursive: true });
++		if (options.global) fs.writeFileSync(path.join(dir.path(), "config.yml"), options.global);
+ 		if (options.project) fs.writeFileSync(path.join(projectDir, ".omp", "config.yml"), options.project);
+ 		const configFiles: string[] = [];
+ 		if (options.overlay) {
+@@ -85,7 +87,7 @@ describe("model presets", () => {
+ 		return Settings.loadIsolated({
+ 			cwd: projectDir,
+ 			agentDir: dir.path(),
+-			inMemory: true,
++			inMemory: options.persist !== true,
+ 			configFiles,
+ 			overrides: options.storage ? { modelRoleStorage: options.storage } : {},
+ 		});
+@@ -226,6 +228,77 @@ describe("model presets", () => {
+ 		expect(result).toMatchObject({ kind: "failed", reason: "metadata refresh failed" });
+ 	});
+ 
++	it("conditionally creates without clobbering an external same-name insert after its last read", async () => {
++		const settings = await projectSettings({
++			global: JSON.stringify({ modelRoles: { default: SONNET, judge: OPUS } }),
++			persist: true,
++		});
++		const operator = await Settings.loadIsolated({ cwd: settings.getCwd(), agentDir: settings.getAgentDir() });
++		const configPath = path.join(settings.getAgentDir(), "config.yml");
++		expect(getModelPreset(settings, "high")).toEqual({ kind: "missing" });
++		const operatorPreset = { modelRoles: { default: OPUS }, defaultThinkingLevel: Effort.High };
++		cfgModelPresets.setEntry(operator, "high", operatorPreset);
++		cfgModelPresets.setEntry(operator, "operator", { modelRoles: { default: SONNET } });
++		await operator.flush();
++		const before = fs.readFileSync(configPath);
++		const candidate = { modelRoles: { default: SONNET_46 }, defaultThinkingLevel: Effort.Low };
++
++		// This instance still believes high is absent. A generation captured only now would
++		// incorrectly authorize overwriting the operator's entry; own-key presence must win.
++		const preserved = await createModelPresetIfMissing(settings, "high", candidate);
++		expect(preserved).toEqual({ kind: "preserved", preset: operatorPreset });
++		expect(fs.readFileSync(configPath)).toEqual(before);
++		expect(getModelPreset(settings, "operator")).toMatchObject({ kind: "found" });
++		expect(settings.getModelRoles()).toEqual({ default: SONNET, judge: OPUS });
++
++		expect(await createModelPresetIfMissing(settings, "middle", candidate)).toEqual({ kind: "created", preset: candidate });
++		await operator.reloadFromDisk();
++		expect(getModelPreset(operator, "high")).toEqual({ kind: "found", preset: operatorPreset });
++		expect(getModelPreset(operator, "middle")).toEqual({ kind: "found", preset: candidate });
++		expect(getModelPreset(operator, "operator")).toMatchObject({ kind: "found" });
++		expect(operator.getModelRoles()).toEqual({ default: SONNET, judge: OPUS });
++	});
++
++	it.each([null, { modelRoles: { default: 42 } }])("preserves hidden raw same-name entries instead of replacing them (%j)", async raw => {
++		const settings = await projectSettings({
++			global: JSON.stringify({ modelPresets: { high: raw } }),
++			overlay: JSON.stringify({ modelPresets: { high: null } }),
++			persist: true,
++		});
++		const configPath = path.join(settings.getAgentDir(), "config.yml");
++		const before = fs.readFileSync(configPath);
++		expect(getModelPreset(settings, "high")).toEqual({ kind: "missing" });
++		const result = await createModelPresetIfMissing(settings, "high", { modelRoles: { default: SONNET } });
++		expect(result.kind).toBe("conflict");
++		expect(fs.readFileSync(configPath)).toEqual(before);
++	});
++
++	it.each(["project", "overlay"] as const)("preserves an existing %s preset without copying it globally", async source => {
++		const preset = { modelRoles: { default: OPUS }, defaultThinkingLevel: Effort.High };
++		const settings = await projectSettings({
++			global: "{}\n",
++			[source]: JSON.stringify({ modelPresets: { high: preset } }),
++			persist: true,
++		});
++		const configPath = path.join(settings.getAgentDir(), "config.yml");
++		const before = fs.readFileSync(configPath);
++		expect(await createModelPresetIfMissing(settings, "high", { modelRoles: { default: SONNET } }))
++			.toEqual({ kind: "preserved", preset });
++		expect(settings.getGlobalSettings().modelPresets).toBeUndefined();
++		expect(fs.readFileSync(configPath)).toEqual(before);
++	});
++
++	it("refuses malformed external YAML without moving or repairing it during bootstrap", async () => {
++		const settings = await projectSettings({ global: "{}\n", persist: true });
++		const configPath = path.join(settings.getAgentDir(), "config.yml");
++		fs.writeFileSync(configPath, "{\n");
++		expect((await createModelPresetIfMissing(settings, "high", { modelRoles: { default: SONNET } })).kind).toBe("conflict");
++		expect(fs.readFileSync(configPath, "utf8")).toBe("{\n");
++		expect(fs.readdirSync(settings.getAgentDir()).filter(name => name.startsWith("config.yml.broken-"))).toEqual([]);
++		await expect(createModelPresetIfMissing(Settings.isolated(), "high", { modelRoles: { default: SONNET } }))
++			.rejects.toThrow("direct persisted native Settings");
++	});
++
+ 	it("saves only the named entry globally and never copies project presets", async () => {
+ 		const settings = await projectSettings({
+ 			project: `modelPresets:\n  team:\n    modelRoles:\n      default: ${SONNET}\n`,
+diff --git a/sdk/go/omp-rpc/wire.go b/sdk/go/omp-rpc/wire.go
+index 8acbe4c..faa085a 100644
+--- a/sdk/go/omp-rpc/wire.go
++++ b/sdk/go/omp-rpc/wire.go
+@@ -2530,8 +2530,63 @@ func (v *UsageLimitState) decodeFrom(raw map[string]json.RawMessage) error {
+ 	return nil
+ }
+ 
++type SettingsScope string
++
++const (
++	SettingsScopeSession    SettingsScope = "session"
++	SettingsScopePersistent SettingsScope = "persistent"
++)
++
++func (v *SettingsScope) UnmarshalJSON(data []byte) error {
++	s, err := decodeString(data, "SettingsScope")
++	if err != nil {
++		return err
++	}
++	switch value := SettingsScope(s); value {
++	case SettingsScopeSession, SettingsScopePersistent:
++		*v = value
++		return nil
++	}
++	return unknownValue("SettingsScope", s)
++}
++
++type ModelPresetThinkingLevel string
++
++const (
++	ModelPresetThinkingLevelAuto    ModelPresetThinkingLevel = "auto"
++	ModelPresetThinkingLevelMinimal ModelPresetThinkingLevel = "minimal"
++	ModelPresetThinkingLevelLow     ModelPresetThinkingLevel = "low"
++	ModelPresetThinkingLevelMedium  ModelPresetThinkingLevel = "medium"
++	ModelPresetThinkingLevelHigh    ModelPresetThinkingLevel = "high"
++	ModelPresetThinkingLevelXhigh   ModelPresetThinkingLevel = "xhigh"
++	ModelPresetThinkingLevelMax     ModelPresetThinkingLevel = "max"
++)
++
++func (v *ModelPresetThinkingLevel) UnmarshalJSON(data []byte) error {
++	s, err := decodeString(data, "ModelPresetThinkingLevel")
++	if err != nil {
++		return err
++	}
++	switch value := ModelPresetThinkingLevel(s); value {
++	case ModelPresetThinkingLevelAuto, ModelPresetThinkingLevelMinimal, ModelPresetThinkingLevelLow, ModelPresetThinkingLevelMedium, ModelPresetThinkingLevelHigh, ModelPresetThinkingLevelXhigh, ModelPresetThinkingLevelMax:
++		*v = value
++		return nil
++	}
++	return unknownValue("ModelPresetThinkingLevel", s)
++}
++
+ type SessionState struct {
+-	SessionID             string         `json:"sessionId"`
++	SessionID string `json:"sessionId"`
++	// Actual native settings write boundary; older hosts default to persistent.
++	SettingsScope SettingsScope `json:"settingsScope"`
++	// Actual effective native role assignments and default thinking policy; absent on older hosts, never inferred from preset identity.
++	ModelSettings *ModelPresetSnapshot `json:"modelSettings,omitempty"`
++	// Authoritative OS process identity of a socket host.
++	HostPid *int64 `json:"hostPid,omitempty"`
++	// Authoritative unresolved dialogs of a socket host, retaining original request identities.
++	PendingUIRequests []ExtensionUiRequest `json:"pendingUiRequests,omitempty"`
++	// Running jobs in the socket host ownership tree, including delivery-suppressed services.
++	HasOwnedRunningWork   *bool          `json:"hasOwnedRunningWork,omitempty"`
+ 	Model                 *ModelInfo     `json:"model,omitempty"`
+ 	ThinkingLevel         *ThinkingLevel `json:"thinkingLevel,omitempty"`
+ 	IsStreaming           bool           `json:"isStreaming"`
+@@ -2577,6 +2632,11 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
+ 	var out SessionState
+ 	d := fieldDecoder{raw: raw, owner: "SessionState"}
+ 	d.required("sessionId", &out.SessionID)
++	d.defaulted("settingsScope", &out.SettingsScope, `"persistent"`)
++	d.optional("modelSettings", &out.ModelSettings)
++	d.optional("hostPid", &out.HostPid)
++	d.optional("pendingUiRequests", &out.PendingUIRequests)
++	d.optional("hasOwnedRunningWork", &out.HasOwnedRunningWork)
+ 	d.optional("model", &out.Model)
+ 	d.optional("thinkingLevel", &out.ThinkingLevel)
+ 	d.defaulted("isStreaming", &out.IsStreaming, `false`)
+@@ -2612,6 +2672,58 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
+ 	return nil
+ }
+ 
++type ModelPresetSnapshot struct {
++	ModelRoles           map[string]string         `json:"modelRoles"`
++	DefaultThinkingLevel *ModelPresetThinkingLevel `json:"defaultThinkingLevel,omitempty"`
++}
++
++func (v *ModelPresetSnapshot) UnmarshalJSON(data []byte) error {
++	return decodeWith(data, "ModelPresetSnapshot", v.decodeFrom)
++}
++
++func (v *ModelPresetSnapshot) decodeFrom(raw map[string]json.RawMessage) error {
++	var out ModelPresetSnapshot
++	d := fieldDecoder{raw: raw, owner: "ModelPresetSnapshot"}
++	d.required("modelRoles", &out.ModelRoles)
++	d.optional("defaultThinkingLevel", &out.DefaultThinkingLevel)
++	if d.err != nil {
++		return d.err
++	}
++	*v = out
++	return nil
++}
++
++type ModelPresetResult struct {
++	Name          string                   `json:"name"`
++	Preset        ModelPresetSnapshot      `json:"preset"`
++	Model         ModelInfo                `json:"model"`
++	ThinkingLevel *ConfiguredThinkingLevel `json:"thinkingLevel,omitempty"`
++}
++
++func (v *ModelPresetResult) UnmarshalJSON(data []byte) error {
++	return decodeWith(data, "ModelPresetResult", v.decodeFrom)
++}
++
++func (v *ModelPresetResult) decodeFrom(raw map[string]json.RawMessage) error {
++	var out ModelPresetResult
++	d := fieldDecoder{raw: raw, owner: "ModelPresetResult"}
++	d.required("name", &out.Name)
++	d.required("preset", &out.Preset)
++	d.required("model", &out.Model)
++	d.constant("settingsScope", "session")
++	d.optional("thinkingLevel", &out.ThinkingLevel)
++	if d.err != nil {
++		return d.err
++	}
++	*v = out
++	return nil
++}
++
++func (v ModelPresetResult) MarshalJSON() ([]byte, error) {
++	type plain ModelPresetResult
++	return encodeObject(plain(v), `"settingsScope":"session"`, nil)
++}
++
+ type BashResult struct {
+ 	Output              string  `json:"output"`
+ 	Cancelled           bool    `json:"cancelled"`
+@@ -7781,6 +7893,11 @@ func (v *GetBtwHistoryResult) decodeFrom(raw map[string]json.RawMessage) error {
+ 	return nil
+ }
+ 
++// ShutdownHost sends "shutdown_host": Persist and stop an idle socket host; refuses running or pending work.
++func (c Commands) ShutdownHost(ctx context.Context) error {
++	return c.call(ctx, "shutdown_host", nil, 0, nil)
++}
++
+ // NegotiateProtocolCommand holds the parameters of "negotiate_protocol".
+ type NegotiateProtocolCommand struct {
+ 	ProtocolVersion int64 `json:"protocolVersion"`
+@@ -8170,6 +8287,19 @@ func (c Commands) SetModel(ctx context.Context, p SetModelCommand) (ModelInfo, e
+ 	return out, err
+ }
+ 
++// SetModelPresetCommand holds the parameters of "set_model_preset".
++type SetModelPresetCommand struct {
++	Name   string              `json:"name"`
++	Preset ModelPresetSnapshot `json:"preset"`
++}
++
++// SetModelPreset sends "set_model_preset": Apply a frozen native model preset to an idle session-settings host; return effective native readback.
++func (c Commands) SetModelPreset(ctx context.Context, p SetModelPresetCommand) (ModelPresetResult, error) {
++	var out ModelPresetResult
++	err := c.call(ctx, "set_model_preset", p, 0, &out)
++	return out, err
++}
++
+ // CycleModel sends "cycle_model": Cycle to the next model.
+ func (c Commands) CycleModel(ctx context.Context) (*ModelCycleResult, error) {
+ 	var out *ModelCycleResult
+diff --git a/sdk/python/omp-rpc/src/omp_rpc/_wire.py b/sdk/python/omp-rpc/src/omp_rpc/_wire.py
+index 2cfb0c1..5dec73e 100644
+--- a/sdk/python/omp-rpc/src/omp_rpc/_wire.py
++++ b/sdk/python/omp-rpc/src/omp_rpc/_wire.py
+@@ -135,6 +135,16 @@ _SLOW_MODE_SCOPE_VALUES: Final[frozenset[str]] = frozenset({"session", "global"}
+ _decode_slow_mode_scope = cast("Decoder[SlowModeScope]", literal(_SLOW_MODE_SCOPE_VALUES))
+ 
+ 
++SettingsScope: TypeAlias = Literal["session", "persistent"]
++_SETTINGS_SCOPE_VALUES: Final[frozenset[str]] = frozenset({"session", "persistent"})
++_decode_settings_scope = cast("Decoder[SettingsScope]", literal(_SETTINGS_SCOPE_VALUES))
++
++
++ModelPresetThinkingLevel: TypeAlias = Literal["auto", "minimal", "low", "medium", "high", "xhigh", "max"]
++_MODEL_PRESET_THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset({"auto", "minimal", "low", "medium", "high", "xhigh", "max"})
++_decode_model_preset_thinking_level = cast("Decoder[ModelPresetThinkingLevel]", literal(_MODEL_PRESET_THINKING_LEVEL_VALUES))
++
++
+ BtwStatus: TypeAlias = Literal["running", "complete", "cancelled", "error", "interrupted"]
+ """Side-question turn lifecycle; `interrupted` marks a turn whose process died while it ran."""
+ _BTW_STATUS_VALUES: Final[frozenset[str]] = frozenset({"running", "complete", "cancelled", "error", "interrupted"})
+@@ -643,6 +653,16 @@ class UsageLimitWrapUp:
+ @dataclass(slots=True, frozen=True, kw_only=True)
+ class SessionState:
+     session_id: str
++    settings_scope: SettingsScope = "persistent"
++    """Actual native settings write boundary; older hosts default to persistent."""
++    model_settings: ModelPresetSnapshot | None = None
++    """Actual effective native role assignments and default thinking policy; absent on older hosts, never inferred from preset identity."""
++    host_pid: int | None = None
++    """Authoritative OS process identity of a socket host."""
++    pending_ui_requests: tuple[ExtensionUiRequest, ...] | None = None
++    """Authoritative unresolved dialogs of a socket host, retaining original request identities."""
++    has_owned_running_work: bool | None = None
++    """Running jobs in the socket host ownership tree, including delivery-suppressed services."""
+     model: ModelInfo | None = None
+     thinking_level: ThinkingLevel | None = None
+     is_streaming: bool = False
+@@ -680,6 +700,21 @@ class SessionState:
+     """Current goal mode; null when the session has no goal."""
+ 
+ 
++@dataclass(slots=True, frozen=True, kw_only=True)
++class ModelPresetSnapshot:
++    model_roles: dict[str, str]
++    default_thinking_level: ModelPresetThinkingLevel | None = None
++
++
++@dataclass(slots=True, frozen=True, kw_only=True)
++class ModelPresetResult:
++    name: str
++    preset: ModelPresetSnapshot
++    model: ModelInfo
++    settings_scope: Literal["session"] = "session"
++    thinking_level: ConfiguredThinkingLevel | None = None
++
++
+ @dataclass(slots=True, frozen=True, kw_only=True)
+ class BashResult:
+     output: str
+@@ -2046,6 +2081,11 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
+     payload = expect_object(value, path)
+     return SessionState(
+         session_id=required(payload, "sessionId", decode_str, path),
++        settings_scope=defaulted(payload, "settingsScope", _decode_settings_scope, path, "persistent"),
++        model_settings=optional(payload, "modelSettings", parse_model_preset_snapshot, path),
++        host_pid=optional(payload, "hostPid", decode_int, path),
++        pending_ui_requests=optional(payload, "pendingUiRequests", array(parse_extension_ui_request), path),
++        has_owned_running_work=optional(payload, "hasOwnedRunningWork", decode_bool, path),
+         model=optional(payload, "model", parse_model_info, path),
+         thinking_level=optional(payload, "thinkingLevel", _decode_thinking_level, path),
+         is_streaming=defaulted(payload, "isStreaming", decode_bool, path, False),
+@@ -2076,6 +2116,25 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
+     )
+ 
+ 
++def parse_model_preset_snapshot(value: object, path: str = "ModelPresetSnapshot") -> ModelPresetSnapshot:
++    payload = expect_object(value, path)
++    return ModelPresetSnapshot(
++        model_roles=required(payload, "modelRoles", record(decode_str), path),
++        default_thinking_level=optional(payload, "defaultThinkingLevel", _decode_model_preset_thinking_level, path),
++    )
++
++
++def parse_model_preset_result(value: object, path: str = "ModelPresetResult") -> ModelPresetResult:
++    payload = expect_object(value, path)
++    required(payload, "settingsScope", cast('Decoder[Literal["session"]]', literal(frozenset({"session"}))), path)
++    return ModelPresetResult(
++        name=required(payload, "name", decode_str, path),
++        preset=required(payload, "preset", parse_model_preset_snapshot, path),
++        model=required(payload, "model", parse_model_info, path),
++        thinking_level=optional(payload, "thinkingLevel", _decode_configured_thinking_level, path),
++    )
++
++
+ def parse_bash_result(value: object, path: str = "BashResult") -> BashResult:
+     payload = expect_object(value, path)
+     return BashResult(
+@@ -3357,6 +3416,11 @@ class WireClient:
+     def _listen(self, frame_type: str, listener: Callable[..., None]) -> Callable[[], None]:
+         raise NotImplementedError
+ 
++    def shutdown_host(self) -> None:
++        """Persist and stop an idle socket host; refuses running or pending work."""
++        params: dict[str, object] = {}
++        self._command("shutdown_host", params)
++
+     def steer(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+         """Queue a steering message."""
+         params: dict[str, object] = {}
+@@ -4135,6 +4199,9 @@ __all__ = [
+     "ModelCost",
+     "ModelCycleResult",
+     "ModelInfo",
++    "ModelPresetResult",
++    "ModelPresetSnapshot",
++    "ModelPresetThinkingLevel",
+     "NavigateTreeResult",
+     "NegotiateProtocolResult",
+     "NoticeEvent",
+@@ -4175,6 +4242,7 @@ __all__ = [
+     "SetStatusUiRequest",
+     "SetTitleUiRequest",
+     "SetWidgetUiRequest",
++    "SettingsScope",
+     "SlashCommandInput",
+     "SlashCommandSource",
+     "SlashSubcommand",
+@@ -4319,6 +4387,8 @@ __all__ = [
+     "parse_model_cost",
+     "parse_model_cycle_result",
+     "parse_model_info",
++    "parse_model_preset_result",
++    "parse_model_preset_snapshot",
+     "parse_navigate_tree_result",
+     "parse_negotiate_protocol_result",
+     "parse_notice_event",
+diff --git a/sdk/python/omp-rpc/src/omp_rpc/client.py b/sdk/python/omp-rpc/src/omp_rpc/client.py
+index 26cac7b..eca5e87 100644
+--- a/sdk/python/omp-rpc/src/omp_rpc/client.py
++++ b/sdk/python/omp-rpc/src/omp_rpc/client.py
+@@ -23,6 +23,8 @@ from ._wire import (
+     ExtensionUiRequest,
+     ImageContent,
+     MessageEndEvent,
++    ModelPresetResult,
++    ModelPresetSnapshot,
+     PromptResultEvent,
+     ReadyEvent,
+     RpcAgentEvent,
+@@ -36,6 +38,7 @@ from ._wire import (
+     WireClient,
+     parse_agent_message,
+     parse_notification,
++    parse_model_preset_result,
+     parse_todo_phase,
+ )
+ from ._wire_runtime import (
+@@ -978,6 +981,18 @@ class RpcClient(WireClient):
+     def clear_todos(self) -> tuple[TodoPhase, ...]:
+         return self.set_todos(())
+ 
++    def set_model_preset(
++        self, name: str, preset: ModelPresetSnapshot
++    ) -> ModelPresetResult:
++        """Apply a frozen native preset to an idle session-settings host."""
++        snapshot: JsonObject = {
++            "modelRoles": cast(JsonValue, dict(preset.model_roles))
++        }
++        if preset.default_thinking_level is not None:
++            snapshot["defaultThinkingLevel"] = preset.default_thinking_level
++        data = self._command("set_model_preset", {"name": name, "preset": snapshot})
++        return parse_model_preset_result(data, "set_model_preset")
++
+     def get_messages(self) -> tuple[AgentMessage, ...]:
+         if self._protocol_version == 2:
+             try:
+diff --git a/sdk/rust/omp-rpc/src/wire.rs b/sdk/rust/omp-rpc/src/wire.rs
+index c3b281b..e0138ed 100644
+--- a/sdk/rust/omp-rpc/src/wire.rs
++++ b/sdk/rust/omp-rpc/src/wire.rs
+@@ -3090,10 +3090,76 @@ impl<'de> Deserialize<'de> for UsageLimitState {
+ 	}
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum SettingsScope {
++	#[serde(rename = "session")]
++	Session,
++	#[serde(rename = "persistent")]
++	Persistent,
++}
++
++impl SettingsScope {
++	/// Wire value.
++	pub fn as_str(self) -> &'static str {
++		match self {
++			Self::Session => "session",
++			Self::Persistent => "persistent",
++		}
++	}
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum ModelPresetThinkingLevel {
++	#[serde(rename = "auto")]
++	Auto,
++	#[serde(rename = "minimal")]
++	Minimal,
++	#[serde(rename = "low")]
++	Low,
++	#[serde(rename = "medium")]
++	Medium,
++	#[serde(rename = "high")]
++	High,
++	#[serde(rename = "xhigh")]
++	Xhigh,
++	#[serde(rename = "max")]
++	Max,
++}
++
++impl ModelPresetThinkingLevel {
++	/// Wire value.
++	pub fn as_str(self) -> &'static str {
++		match self {
++			Self::Auto => "auto",
++			Self::Minimal => "minimal",
++			Self::Low => "low",
++			Self::Medium => "medium",
++			Self::High => "high",
++			Self::Xhigh => "xhigh",
++			Self::Max => "max",
++		}
++	}
++}
++
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct SessionState {
+ 	#[serde(rename = "sessionId")]
+ 	pub session_id: String,
++	/// Actual native settings write boundary; older hosts default to persistent.
++	#[serde(rename = "settingsScope", default = "default_session_state_settings_scope")]
++	pub settings_scope: SettingsScope,
++	/// Actual effective native role assignments and default thinking policy; absent on older hosts, never inferred from preset identity.
++	#[serde(rename = "modelSettings", default, skip_serializing_if = "Option::is_none")]
++	pub model_settings: Option<ModelPresetSnapshot>,
++	/// Authoritative OS process identity of a socket host.
++	#[serde(rename = "hostPid", default, skip_serializing_if = "Option::is_none")]
++	pub host_pid: Option<i64>,
++	/// Authoritative unresolved dialogs of a socket host, retaining original request identities.
++	#[serde(rename = "pendingUiRequests", default, skip_serializing_if = "Option::is_none")]
++	pub pending_ui_requests: Option<Vec<ExtensionUiRequest>>,
++	/// Running jobs in the socket host ownership tree, including delivery-suppressed services.
++	#[serde(rename = "hasOwnedRunningWork", default, skip_serializing_if = "Option::is_none")]
++	pub has_owned_running_work: Option<bool>,
+ 	#[serde(default, skip_serializing_if = "Option::is_none")]
+ 	pub model: Option<ModelInfo>,
+ 	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
+@@ -3158,6 +3224,25 @@ pub struct SessionState {
+ 	pub goal: Option<GoalModeState>,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct ModelPresetSnapshot {
++	#[serde(rename = "modelRoles")]
++	pub model_roles: BTreeMap<String, String>,
++	#[serde(rename = "defaultThinkingLevel", default, skip_serializing_if = "Option::is_none")]
++	pub default_thinking_level: Option<ModelPresetThinkingLevel>,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct ModelPresetResult {
++	pub name: String,
++	pub preset: ModelPresetSnapshot,
++	pub model: ModelInfo,
++	#[serde(rename = "settingsScope")]
++	pub settings_scope: LitSession,
++	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
++	pub thinking_level: Option<ConfiguredThinkingLevel>,
++}
++
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct BashResult {
+ 	pub output: String,
+@@ -5488,6 +5573,12 @@ pub struct SetModelParams {
+ 	pub model_id: String,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct SetModelPresetParams {
++	pub name: String,
++	pub preset: ModelPresetSnapshot,
++}
++
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct GetAvailableModelsResult {
+ 	pub models: Vec<ModelInfo>,
+@@ -5966,6 +6057,27 @@ impl<'de> Deserialize<'de> for LitCompleted {
+ 	}
+ }
+ 
++/// The constant `"session"`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
++pub struct LitSession;
++
++impl Serialize for LitSession {
++	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++		serializer.serialize_str("session")
++	}
++}
++
++impl<'de> Deserialize<'de> for LitSession {
++	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++		let value = Value::deserialize(deserializer)?;
++		if value.as_str() == Some("session") {
++			Ok(Self)
++		} else {
++			Err(D::Error::custom(format!("expected \"session\", got {value}")))
++		}
++	}
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub enum LogoutAccountType {
+ 	#[serde(rename = "api_key")]
+@@ -6090,6 +6202,10 @@ fn default_queued_messages_state_live_steered() -> i64 {
+ 	serde_json::from_str("0").expect("valid wire default")
+ }
+ 
++fn default_session_state_settings_scope() -> SettingsScope {
++	serde_json::from_str("\"persistent\"").expect("valid wire default")
++}
++
+ fn default_session_state_is_streaming() -> bool {
+ 	serde_json::from_str("false").expect("valid wire default")
+ }
+@@ -6186,6 +6302,21 @@ fn default_ask_question_multi() -> bool {
+ 	serde_json::from_str("false").expect("valid wire default")
+ }
+ 
++/// Persist and stop an idle socket host; refuses running or pending work.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++pub struct ShutdownHostCommand {}
++
++impl Command for ShutdownHostCommand {
++	const NAME: &'static str = "shutdown_host";
++	const TIMEOUT_MS: Option<u64> = None;
++	type Output = ();
++
++	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
++		let _ = data;
++		Ok(())
++	}
++}
++
+ /// Switch the connection to a protocol version advertised by `ready`.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct NegotiateProtocolCommand {
+@@ -6791,6 +6922,23 @@ impl Command for SetModelCommand {
+ 	}
+ }
+ 
++/// Apply a frozen native model preset to an idle session-settings host; return effective native readback.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct SetModelPresetCommand {
++	pub name: String,
++	pub preset: ModelPresetSnapshot,
++}
++
++impl Command for SetModelPresetCommand {
++	const NAME: &'static str = "set_model_preset";
++	const TIMEOUT_MS: Option<u64> = None;
++	type Output = ModelPresetResult;
++
++	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
++		serde_json::from_value::<ModelPresetResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
++	}
++}
++
+ /// Cycle to the next model.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+ pub struct CycleModelCommand {}
+diff --git a/packages/coding-agent/src/collab/local-client.ts b/packages/coding-agent/src/collab/local-client.ts
+new file mode 100644
+index 0000000..15e107e
+--- /dev/null
++++ b/packages/coding-agent/src/collab/local-client.ts
+@@ -0,0 +1,65 @@
++import * as net from "node:net";
++import { StringDecoder } from "node:string_decoder";
++import { RpcFrameDecoder, RpcFrameEncoder, MAX_RPC_FRAME_BYTES } from "../modes/rpc/rpc-frame";
++import { validateRpcSocketPath } from "../modes/rpc/rpc-socket-host";
++import type { CollabFrame, EncodedFrame } from "./protocol";
++import type { CollabSocket } from "./relay-client";
++
++export type CollabGuestTransport = Pick<CollabSocket, "send" | "connect" | "close" | "onOpen" | "onFrame" | "onClose">;
++
++/** Existing Collab application frames, carried by the host's native RPC framing. */
++export class LocalCollabSocket implements CollabGuestTransport {
++	onOpen?: CollabGuestTransport["onOpen"];
++	onFrame?: CollabGuestTransport["onFrame"];
++	onClose?: CollabGuestTransport["onClose"];
++	#socket: net.Socket | undefined;
++	#closed = false;
++	#encoder = new RpcFrameEncoder();
++
++	constructor(readonly socketPath: string) {}
++
++	connect(): void {
++		validateRpcSocketPath(this.socketPath, true);
++		const socket = net.createConnection(this.socketPath);
++		this.#socket = socket;
++		const decoder = new StringDecoder("utf8");
++		const frames = new RpcFrameDecoder();
++		let pending = "";
++		let reason = "Host disconnected";
++		socket.on("data", data => {
++			pending += decoder.write(data);
++			let newline: number;
++			while ((newline = pending.indexOf("\n")) >= 0) {
++				const line = pending.slice(0, newline);
++				pending = pending.slice(newline + 1);
++				if (Buffer.byteLength(line) > MAX_RPC_FRAME_BYTES) { socket.destroy(); return; }
++				try {
++					const frame = frames.push(JSON.parse(line)) as Record<string, unknown> | undefined;
++					if (!frame) continue;
++					if (frame.type === "ready") {
++						socket.write(`${JSON.stringify({ type: "negotiate_protocol", protocolVersion: 2, id: "attach:protocol" })}\n`);
++					} else if (frame.type === "response" && frame.id === "attach:protocol") {
++						if (frame.success !== true) { reason = "Host refused protocol negotiation"; socket.destroy(); return; }
++						this.#encoder.setProtocolVersion(2);
++						this.onOpen?.();
++					} else if (typeof frame.t === "string") this.onFrame?.(frame as unknown as CollabFrame, 0);
++				} catch (error) { reason = `Invalid host frame: ${String(error)}`; socket.destroy(); return; }
++			}
++			if (Buffer.byteLength(pending) > MAX_RPC_FRAME_BYTES) socket.destroy();
++		});
++		socket.on("error", error => { reason = error.message; socket.destroy(); });
++		socket.on("close", () => { if (!this.#closed) this.onClose?.(reason, false); });
++	}
++
++	send(frame: CollabFrame | EncodedFrame): boolean {
++		if (!this.#socket || this.#closed || this.#socket.destroyed) return false;
++		const value = typeof frame === "string" ? JSON.parse(frame) as object : frame;
++		for (const line of this.#encoder.encodeFrames(value)) this.#socket.write(line);
++		return true;
++	}
++
++	close(): void {
++		this.#closed = true;
++		this.#socket?.destroy();
++	}
++}
+diff --git a/packages/coding-agent/src/commands/attach.ts b/packages/coding-agent/src/commands/attach.ts
+new file mode 100644
+index 0000000..8e71e5b
+--- /dev/null
++++ b/packages/coding-agent/src/commands/attach.ts
+@@ -0,0 +1,27 @@
++import * as path from "node:path";
++import { Args, CliUsageError, Command, Flags } from "@oh-my-pi/pi-utils/cli";
++import { parseArgs } from "../cli/args";
++import { runRootCommand } from "../main";
++import { validateRpcSocketPath } from "../modes/rpc/rpc-socket-host";
++
++export default class Attach extends Command {
++	static description = "Attach the native TUI to a running local OMP host";
++	static args = { socket: Args.string({ description: "Absolute private RPC socket", required: true }) };
++	static flags = { "read-only": Flags.boolean({ description: "View only; cannot prompt, abort, or answer approvals", default: false }) };
++
++	async run(): Promise<void> {
++		const { args, flags } = await this.parse(Attach);
++		if (!process.stdin.isTTY || !process.stdout.isTTY) throw new CliUsageError("omp attach requires an interactive terminal");
++		if (!args.socket || !path.isAbsolute(args.socket)) throw new CliUsageError("omp attach requires an absolute socket path");
++		validateRpcSocketPath(args.socket, true);
++		const parsed = parseArgs([]);
++		parsed.noSession = true;
++		// A replica can edit its local UI but must never change the operator's native settings.
++		parsed.sessionSettings = true;
++		parsed.noExtensions = true;
++		parsed.noLsp = true;
++		parsed.noContextFiles = true;
++		parsed.attach = { socket: args.socket, readOnly: flags["read-only"] };
++		await runRootCommand(parsed, []);
++	}
++}
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts b/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
+new file mode 100644
+index 0000000..ca9656c
+--- /dev/null
++++ b/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
+@@ -0,0 +1,449 @@
++import * as fs from "node:fs";
++import * as net from "node:net";
++import * as path from "node:path";
++import { StringDecoder } from "node:string_decoder";
++import { isRecord } from "@oh-my-pi/pi-utils";
++import type { CollabUiRequestDraft } from "@oh-my-pi/pi-wire";
++import { CollabHost, type CollabHostTransport } from "../../collab/host";
++import type { CollabFrame, EncodedFrame } from "../../collab/protocol";
++import type { AgentSession } from "../../session/agent-session";
++import type { EventBus } from "../../utils/event-bus";
++import { MAX_RPC_FRAME_BYTES, RpcFrameDecoder, RpcFrameEncoder } from "./rpc-frame";
++import { RpcSessionEventForwarder } from "./rpc-session-events";
++import { RpcOutputWriter } from "./rpc-output";
++import type { RpcAgentSessionEventFrame, RpcExtensionUIRequest, RpcExtensionUIResponse, RpcSubagentSubscriptionLevel } from "./rpc-types";
++
++const MAX_OUTSTANDING_REQUESTS = 4096;
++const COMPLETION_COMMANDS = new Set(["prompt", "abort_and_prompt"]);
++const FIXED_SESSION_COMMANDS = new Set(["new_session", "open_session", "switch_session", "fork", "branch", "navigate_tree"]);
++
++/** No unlink-on-start: even an owned stale socket requires explicit operator cleanup. */
++export function validateRpcSocketPath(socketPath: string, existing = false): void {
++	if (!path.isAbsolute(socketPath) || Buffer.byteLength(socketPath) > 100) {
++		throw new Error("RPC socket must be an absolute Unix socket path of at most 100 bytes");
++	}
++	const directory = path.dirname(socketPath);
++	const stat = fs.lstatSync(directory);
++	if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o700) {
++		throw new Error("RPC socket directory must be owned by this user with mode 0700 (no symlink)");
++	}
++	if (existing) {
++		const socket = fs.lstatSync(socketPath);
++		if (!socket.isSocket() || socket.uid !== stat.uid || (socket.mode & 0o077) !== 0) {
++			throw new Error("RPC socket must be an owner-only socket owned by this user");
++		}
++	} else {
++		try {
++			fs.lstatSync(socketPath);
++		} catch (error) {
++			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
++			throw error;
++		}
++		throw new Error(`RPC socket path already exists; refusing to overwrite: ${socketPath}`);
++	}
++}
++
++interface Peer {
++	id: number;
++	socket: net.Socket;
++	encoder: RpcFrameEncoder;
++	writer: RpcOutputWriter;
++	kind: "rpc" | "collab" | undefined;
++	projector: RpcSessionEventForwarder;
++	subscription: RpcSubagentSubscriptionLevel;
++	requests: number;
++}
++
++interface RequestOwner {
++	peer: Peer;
++	id: unknown;
++	completion: boolean;
++	responseSeen?: boolean;
++	completionSeen?: boolean;
++	subscription?: RpcSubagentSubscriptionLevel;
++}
++
++/** One RPC runtime, many independently framed/correlated connections. */
++export class RpcSocketHost {
++	readonly input: ReadableStream<Uint8Array>;
++	readonly #session: AgentSession;
++	readonly #socketPath: string;
++	readonly #peers = new Map<number, Peer>();
++	readonly #requests = new Map<string, RequestOwner>();
++	readonly #calls = new Map<string, { peer: Peer; uri: boolean }>();
++	readonly #dialogs = new Map<string, { request: RpcExtensionUIRequest; abort: AbortController }>();
++	#controller!: ReadableStreamDefaultController<Uint8Array>;
++	#server: net.Server | undefined;
++	#socketIdentity: fs.Stats | undefined;
++	#ready: object | undefined;
++	#sequence = 0;
++	#requestSequence = 0;
++	#toolOwner: Peer | undefined;
++	#uriOwner: Peer | undefined;
++	#collab: CollabHost | undefined;
++	#closed = false;
++	#stopping = false;
++	#collabTransport: CollabHostTransport;
++
++	constructor(socketPath: string, session: AgentSession, subagentEventBus?: EventBus) {
++		this.#socketPath = socketPath;
++		this.#session = session;
++		this.input = new ReadableStream({ start: controller => { this.#controller = controller; } });
++		this.#collabTransport = {
++			send: (frame, target = 0) => this.#sendCollab(frame, target),
++			sendLatest: (_key, frame) => this.#sendCollab(frame),
++			broadcastAdvisory: frame => this.#sendCollab(frame),
++			sendBatch: (frames, target) => {
++				for (const frame of frames) if (!this.#sendCollab(frame, target)) return false;
++				return true;
++			},
++			isServing: id => this.#peers.get(id)?.kind === "collab",
++			isAdmitting: id => this.#peers.get(id)?.kind === "collab",
++			discardPendingSends: () => {
++				// net.Socket writes cannot be revoked. Close backed-up peers rather than
++				// allowing a goodbye to overtake their accepted snapshot or entries.
++				for (const peer of this.#peers.values()) if (peer.kind === "collab" && peer.socket.writableLength) peer.socket.destroy();
++			},
++			flush: () => this.#flush("collab"),
++			close: () => {
++				for (const peer of this.#peers.values()) if (peer.kind === "collab") peer.socket.end();
++			},
++		};
++		this.#collab = new CollabHost({ session, sessionManager: session.sessionManager, settings: session.settings, subagentEventBus });
++	}
++
++	async listen(): Promise<void> {
++		validateRpcSocketPath(this.#socketPath);
++		await this.#collab!.startLocal(this.#collabTransport);
++		this.#server = net.createServer(socket => this.#connect(socket));
++		const { promise, resolve, reject } = Promise.withResolvers<void>();
++		this.#server.once("error", reject);
++		this.#server.listen(this.#socketPath, () => {
++				try {
++					fs.chmodSync(this.#socketPath, 0o600);
++					this.#socketIdentity = fs.lstatSync(this.#socketPath);
++					this.#server!.off("error", reject);
++					resolve();
++				} catch (error) { reject(error); }
++		});
++		await promise.catch(async error => { await this.close(); throw error; });
++		this.#server.on("error", error => {
++			process.stderr.write(`RPC socket listener failed: ${error.message}\n`);
++			this.#controller.error(error);
++		});
++	}
++
++	#connect(socket: net.Socket): void {
++		const peer: Peer = { id: ++this.#sequence, socket, encoder: new RpcFrameEncoder(), kind: undefined, requests: 0,
++			writer: new RpcOutputWriter(socket, () => socket.destroy()),
++			projector: new RpcSessionEventForwarder(frame => this.#send(peer, frame)), subscription: "off" };
++		this.#peers.set(peer.id, peer);
++		if (this.#ready) this.#send(peer, this.#ready);
++		for (const dialog of this.#dialogs.values()) this.#send(peer, dialog.request);
++		const decoder = new StringDecoder("utf8");
++		const frames = new RpcFrameDecoder();
++		let pending = "";
++		socket.on("data", data => {
++			pending += decoder.write(data);
++			let newline: number;
++			while ((newline = pending.indexOf("\n")) >= 0) {
++				const line = pending.slice(0, newline);
++				pending = pending.slice(newline + 1);
++				if (Buffer.byteLength(line) > MAX_RPC_FRAME_BYTES) { socket.destroy(); return; }
++				if (!line.trim()) continue;
++				try {
++					const frame = frames.push(JSON.parse(line));
++					if (frame) this.#receive(peer, frame);
++				} catch (error) { this.#error(peer, undefined, "parse", String(error)); }
++			}
++			if (Buffer.byteLength(pending) > MAX_RPC_FRAME_BYTES) socket.destroy();
++		});
++		socket.on("error", () => socket.destroy());
++		socket.on("close", () => {
++			this.#peers.delete(peer.id);
++			this.#collabTransport.onControl?.({ t: "peer-left", peer: peer.id });
++			for (const [id, owner] of this.#calls) {
++				if (owner.peer !== peer) continue;
++				this.#calls.delete(id);
++				this.#failHostCall(id, owner.uri);
++			}
++			// Accepted work stays tracked until it settles, even without a return route.
++		});
++	}
++
++	#enqueue(frame: object): void {
++		if (!this.#closed) this.#controller.enqueue(new TextEncoder().encode(`${JSON.stringify(frame)}\n`));
++	}
++
++	#receive(peer: Peer, frame: unknown): void {
++		if (!isRecord(frame)) { this.#error(peer, undefined, "parse", "Expected an object"); return; }
++		if (this.#stopping) { this.#error(peer, frame.id, String(frame.type ?? frame.t), "Host is shutting down"); return; }
++		if (typeof frame.t === "string") {
++			if (peer.kind === "rpc") { peer.socket.destroy(); return; }
++			peer.kind = "collab";
++			this.#collabTransport.onFrame?.(frame as unknown as CollabFrame, peer.id);
++			return;
++		}
++		if (peer.kind === "collab") { peer.socket.destroy(); return; }
++		const type = frame.type;
++		if (typeof type !== "string") { this.#error(peer, frame.id, "parse", "Expected a command type"); return; }
++		if (type === "negotiate_protocol") {
++			if (frame.protocolVersion !== 2) this.#error(peer, frame.id, type, "Unsupported protocol version");
++			else {
++				this.#send(peer, { type: "response", id: frame.id, command: type, success: true, data: { protocolVersion: 2 } });
++				peer.encoder.setProtocolVersion(2);
++			}
++			return;
++		}
++		peer.kind = "rpc";
++		if (type === "set_event_filter") {
++			if (frame.events !== null && (!Array.isArray(frame.events) || !frame.events.every(event => typeof event === "string" && event.length > 0))) {
++				this.#error(peer, frame.id, type, "events must be null or an array of strings"); return;
++			}
++			const messageUpdates = frame.messageUpdates ?? "full";
++			if (messageUpdates !== "full" && messageUpdates !== "delta") {
++				this.#error(peer, frame.id, type, 'messageUpdates must be "full" or "delta"'); return;
++			}
++			const events = peer.projector.setFilter(frame.events as string[] | null, messageUpdates);
++			this.#send(peer, { type: "response", id: frame.id, command: type, success: true, data: { events, messageUpdates } });
++			return;
++		}
++		if (type === "extension_ui_response") { this.#answerUi(frame as unknown as RpcExtensionUIResponse); return; }
++		if (type === "host_tool_result" || type === "host_tool_update" || type === "host_uri_result") {
++			const owner = this.#calls.get(String(frame.id));
++			if (owner?.peer !== peer) return;
++			if (type !== "host_tool_update") this.#calls.delete(String(frame.id));
++			this.#enqueue(frame);
++			return;
++		}
++		if (FIXED_SESSION_COMMANDS.has(type)) {
++			this.#error(peer, frame.id, type, "A socket host owns one explicit session; start another host process for another session"); return;
++		}
++		if (type === "set_host_tools" || type === "set_host_uri_schemes") {
++			const owner = type === "set_host_tools" ? this.#toolOwner : this.#uriOwner;
++			const definitions = type === "set_host_tools" ? frame.tools : frame.schemes;
++			if (owner && owner !== peer && (this.#peers.has(owner.id) || !Array.isArray(definitions) || definitions.length === 0)) {
++				this.#error(peer, frame.id, type, "Another connected client owns this host capability"); return;
++			}
++			if (type === "set_host_tools") this.#toolOwner = peer;
++			else this.#uriOwner = peer;
++		}
++		if (peer.requests >= 256 || this.#requests.size >= MAX_OUTSTANDING_REQUESTS) {
++			this.#error(peer, frame.id, type, "Too many outstanding requests"); return;
++		}
++		const subscription = type === "set_subagent_subscription" ? frame.level : undefined;
++		if (subscription !== undefined && subscription !== "off" && subscription !== "progress" && subscription !== "events") {
++			this.#error(peer, frame.id, type, "Invalid subagent subscription level"); return;
++		}
++		const id = `socket:${++this.#requestSequence}`;
++		peer.requests++;
++		this.#requests.set(id, { peer, id: frame.id, completion: COMPLETION_COMMANDS.has(type), subscription });
++		this.#enqueue({ ...frame, id, ...(subscription !== undefined ? { level: "events" } : {}) });
++	}
++
++	#error(peer: Peer, id: unknown, command: string, error: string): void {
++		this.#send(peer, { type: "response", id, command, success: false, error });
++	}
++
++	#send(peer: Peer, frame: object): boolean {
++		if (peer.socket.destroyed) return false;
++		try {
++			peer.writer.write(peer.encoder.encodeFrames(frame));
++			return !peer.socket.destroyed;
++		} catch { peer.socket.destroy(); return false; }
++	}
++
++	#sendCollab(frame: CollabFrame | EncodedFrame, target = 0): boolean {
++		const value = typeof frame === "string" ? JSON.parse(frame) as object : frame;
++		if (target) {
++			const peer = this.#peers.get(target);
++			return peer?.kind === "collab" ? this.#send(peer, value) : false;
++		}
++		let sent = false;
++		for (const peer of this.#peers.values()) if (peer.kind === "collab") sent = this.#send(peer, value) || sent;
++		return sent;
++	}
++
++	output(frame: object): void {
++		if (!isRecord(frame)) return;
++		if (frame.type === "ready") this.#ready = frame;
++		if (frame.type === "response" || frame.type === "prompt_result") {
++			const owner = this.#requests.get(String(frame.id));
++			if (!owner) return;
++			if (frame.type === "response" && frame.command === "shutdown_host" && frame.success === true) this.#stopping = true;
++			if (owner.subscription !== undefined && frame.success === true) owner.peer.subscription = owner.subscription;
++			const data = frame.command === "get_state" && frame.success === true && isRecord(frame.data)
++				? { data: { ...frame.data, pendingUiRequests: [...this.#dialogs.values()].map(dialog => dialog.request) } }
++				: owner.subscription !== undefined && frame.success === true ? { data: { level: owner.subscription } } : {};
++			this.#send(owner.peer, { ...frame, id: owner.id, ...data });
++			let done = !owner.completion;
++			if (frame.type === "prompt_result") {
++				owner.completionSeen = true;
++				done = owner.responseSeen === true;
++			} else if (!owner.responseSeen) {
++				owner.responseSeen = true;
++				done ||= owner.completionSeen === true || frame.success === false || isRecord(frame.data) && frame.data.agentInvoked === false;
++			}
++			if (done) {
++				this.#requests.delete(String(frame.id));
++				owner.peer.requests--;
++			}
++			return;
++		}
++		if (frame.type === "host_tool_call" || frame.type === "host_uri_request") {
++			const uri = frame.type === "host_uri_request";
++			const peer = uri ? this.#uriOwner : this.#toolOwner;
++			if (peer && this.#peers.has(peer.id) && this.#send(peer, frame)) this.#calls.set(String(frame.id), { peer, uri });
++			else this.#failHostCall(String(frame.id), uri);
++			return;
++		}
++		if (frame.type === "host_tool_cancel" || frame.type === "host_uri_cancel") {
++			const owner = this.#calls.get(String(frame.targetId));
++			if (owner) { this.#send(owner.peer, frame); this.#calls.delete(String(frame.targetId)); }
++			return;
++		}
++		if (frame.type === "extension_ui_request") this.#mirrorUi(frame as RpcExtensionUIRequest);
++		for (const peer of this.#peers.values()) {
++			if (peer.kind === "collab") continue;
++			if ((frame.type === "subagent_lifecycle" || frame.type === "subagent_progress") && peer.subscription === "off") continue;
++			if (frame.type === "subagent_event" && peer.subscription !== "events") continue;
++			this.#send(peer, frame);
++		}
++	}
++
++	sessionEvent(frame: RpcAgentSessionEventFrame): void {
++		for (const peer of this.#peers.values()) if (peer.kind !== "collab") peer.projector.forwardStamped(frame);
++	}
++
++	isBusy(): boolean {
++		return this.#requests.size > 1 || this.#calls.size > 0 || this.#dialogs.size > 0;
++	}
++
++	#failHostCall(id: string, uri: boolean): void {
++		const error = "Owning RPC client disconnected; host capability is unavailable until its owner reconnects and registers";
++		this.#enqueue(uri ? { type: "host_uri_result", id, isError: true, error } : {
++			type: "host_tool_result", id, isError: true, result: { content: [{ type: "text", text: error }] },
++		});
++	}
++
++	#answerUi(response: RpcExtensionUIResponse): void {
++		const pending = this.#dialogs.get(response.id);
++		if (!pending) return;
++		const request = pending.request;
++		const valid = "cancelled" in response && response.cancelled === true ||
++			request.method === "confirm" && "confirmed" in response && typeof response.confirmed === "boolean" ||
++			(request.method === "editor" || request.method === "input") && "value" in response && typeof response.value === "string" ||
++			request.method === "select" && "value" in response && request.options.includes(response.value) ||
++			request.method === "ask" && "answers" in response && Array.isArray(response.answers) &&
++			response.answers.length === request.questions.length && request.questions.every((question, index) => {
++				const answer = response.answers[index];
++				return answer?.id === question.id && Array.isArray(answer.selectedOptions) &&
++					answer.selectedOptions.every(option => question.options.some(candidate => candidate.label === option)) &&
++					(question.multi || answer.selectedOptions.length <= 1) &&
++					(answer.customInput === undefined || typeof answer.customInput === "string");
++			});
++		if (!valid) return;
++		this.#dialogs.delete(response.id);
++		pending.abort.abort();
++		this.#enqueue(response);
++		for (const peer of this.#peers.values()) if (peer.kind !== "collab") this.#send(peer, {
++			type: "extension_ui_request", id: `settled:${response.id}`, method: "cancel", targetId: response.id,
++		});
++	}
++
++	#mirrorUi(request: RpcExtensionUIRequest): void {
++		if (request.method === "cancel") {
++			this.#dialogs.get(request.targetId)?.abort.abort();
++			this.#dialogs.delete(request.targetId);
++			return;
++		}
++		if (!["select", "confirm", "input", "editor", "ask"].includes(request.method)) return;
++		const abort = new AbortController();
++		this.#dialogs.set(request.id, { request, abort });
++		void this.#presentUi(request, abort.signal).then(response => {
++			if (response) this.#answerUi(response);
++		}).catch(error => this.#session.emitNotice("warning", `Native attach dialog failed: ${String(error)}`, "rpc-attach"));
++	}
++
++	async #presentUi(request: RpcExtensionUIRequest, signal: AbortSignal): Promise<RpcExtensionUIResponse | undefined> {
++		const ask = async (draft: CollabUiRequestDraft) => {
++			const result = await this.#collab?.requestGuestUi(draft, signal, { retainOnReconnect: true });
++			return result?.kind === "answered" ? result : undefined;
++		};
++		const id = request.id;
++		if (request.method === "ask") {
++			const answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }> = [];
++			for (const question of request.questions) {
++				const selectedOptions: string[] = [];
++				let customInput: string | undefined;
++				const labels = question.options.map(option => option.label);
++				const other = "Other (enter text)…";
++				const done = "Submit selections";
++				while (!signal.aborted) {
++					const result = await ask({ kind: "select", title: question.question, options: [...labels, other, ...(question.multi ? [done] : [])], initialIndex: question.recommended,
++						selectionMarker: question.multi ? "checkbox" : undefined, markableCount: labels.length,
++						checkedIndices: selectedOptions.map(label => labels.indexOf(label)) });
++					if (!result) return;
++					if (result.value === undefined) return { type: "extension_ui_response", id, cancelled: true };
++					if (result.value === done) break;
++					if (result.value === other) {
++						const input = await ask({ kind: "editor", title: question.question });
++						if (!input) return;
++						if (input.value === undefined) continue;
++						customInput = input.value;
++						break;
++					}
++					if (!labels.includes(result.value)) continue;
++					const index = selectedOptions.indexOf(result.value);
++					if (index >= 0) selectedOptions.splice(index, 1);
++					else selectedOptions.push(result.value);
++					if (!question.multi) break;
++				}
++				if (signal.aborted) return;
++				answers.push({ id: question.id, selectedOptions, customInput });
++			}
++			return { type: "extension_ui_response", id, answers };
++		}
++		let draft: CollabUiRequestDraft;
++		if (request.method === "select") draft = { kind: "select", title: request.title, options: request.options.map((label, index) => ({ label, description: request.optionDetails?.[index]?.description })), initialIndex: request.initialIndex,
++			selectionMarker: request.selectionMarker, checkedIndices: request.checkedIndices, markableCount: request.markableCount };
++		else if (request.method === "confirm") draft = { kind: "select", title: request.title, helpText: request.message, options: ["Yes", "No"], approval: true };
++		else if (request.method === "editor") draft = { kind: "editor", title: request.title, prefill: request.prefill };
++		else if (request.method === "input") draft = { kind: "editor", title: request.title };
++		else return;
++		const result = await ask(draft);
++		if (!result || signal.aborted) return;
++		if (result.value === undefined) return { type: "extension_ui_response", id, cancelled: true };
++		return request.method === "confirm" ? { type: "extension_ui_response", id, confirmed: result.value === "Yes" } : { type: "extension_ui_response", id, value: result.value };
++	}
++
++	async #flush(kind?: Peer["kind"]): Promise<void> {
++		await Promise.all([...this.#peers.values()].filter(peer => !kind || peer.kind === kind).map(async peer => {
++			// A stalled viewer must not hold the host's persisted shutdown hostage.
++			const timeout = setTimeout(() => peer.socket.destroy(), 1000);
++			try { await peer.writer.close(); } catch { peer.socket.destroy(); }
++			finally { clearTimeout(timeout); }
++		}));
++	}
++
++	async close(): Promise<void> {
++		if (this.#closed) return;
++		this.#closed = true;
++		for (const pending of this.#dialogs.values()) pending.abort.abort();
++		this.#dialogs.clear();
++		await this.#collab?.stop("Host shut down");
++		await this.#flush();
++		for (const peer of this.#peers.values()) peer.socket.destroy();
++		if (this.#server?.listening) {
++			const { promise, resolve } = Promise.withResolvers<void>();
++			this.#server.close(() => resolve());
++			await promise;
++		}
++		if (this.#socketIdentity) {
++			try {
++				const stat = fs.lstatSync(this.#socketPath);
++				if (stat.ino === this.#socketIdentity.ino && stat.dev === this.#socketIdentity.dev) fs.unlinkSync(this.#socketPath);
++			} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
++		}
++	}
++}
+diff --git a/packages/coding-agent/test/cli-session-settings.test.ts b/packages/coding-agent/test/cli-session-settings.test.ts
+new file mode 100644
+index 0000000..d6891c4
+--- /dev/null
++++ b/packages/coding-agent/test/cli-session-settings.test.ts
+@@ -0,0 +1,202 @@
++import { afterEach, describe, expect, it } from "bun:test";
++import * as path from "node:path";
++import { Agent } from "@oh-my-pi/pi-agent-core";
++import { Effort } from "@oh-my-pi/pi-ai";
++import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
++import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
++import { isUnknownLongValueCandidate, VALUELESS_FLAGS } from "@oh-my-pi/pi-coding-agent/cli/flag-tables";
++import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
++import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
++import { applySessionModelPreset } from "@oh-my-pi/pi-coding-agent/config/model-presets";
++import { cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
++import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { clearOmpExtensionCliRoots } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
++import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
++import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
++import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
++import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
++import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
++import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
++import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
++import { ModelHubComponent } from "@oh-my-pi/pi-tui/overlays/model-hub";
++import { initTheme } from "@oh-my-pi/pi-tui/theme";
++import { TempDir } from "@oh-my-pi/pi-utils";
++import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
++import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
++
++afterEach(() => {
++	clearOmpExtensionCliRoots();
++});
++
++describe("--session-settings", () => {
++	it("is a value-less launch flag without disabling session persistence", () => {
++		const parsed = parseArgs(["--session-settings", "--model", "anthropic/claude-sonnet-4-6", "hello"]);
++		expect(parsed.sessionSettings).toBe(true);
++		expect(parsed.noSession).toBeUndefined();
++		expect(parsed.model).toBe("anthropic/claude-sonnet-4-6");
++		expect(parsed.messages).toEqual(["hello"]);
++		expect(parsed.unrecognizedFlags).toEqual([]);
++		expect(VALUELESS_FLAGS.has("--session-settings")).toBe(true);
++		expect(isUnknownLongValueCandidate("--session-settings")).toBe(false);
++		expect(parseArgs([]).sessionSettings).toBeUndefined();
++		expect(parseArgs(["--session-settings", "--model-preset", "high"]).modelPreset).toBe("high");
++		expect(parseArgs(["--session-settings", "--model-preset=middle"]).modelPreset).toBe("middle");
++	});
++
++	it("rejects startup preset application without an isolated single-session host", async () => {
++		for (const args of [["--mode", "rpc", "--model-preset", "high"], ["--mode", "acp", "--session-settings", "--model-preset", "high"]]) {
++			await expect(runRootCommand(parseArgs(args), [])).rejects.toThrow("--model-preset requires --session-settings");
++		}
++	});
++
++	it.each([false, true])("selects the native settings boundary before auth discovery (enabled=%s)", async enabled => {
++		const nativeSettings = Settings.isolated({
++			modelRoles: { default: "anthropic/claude-sonnet-4-5", judge: "native-judge/decisions" },
++			"retry.fallbackChains": { judge: ["backup-judge/decisions"] },
++		});
++		const stop = new Error("session-settings auth boundary observed");
++		let observed: Settings | undefined;
++		await expect(
++			runRootCommand(
++				parseArgs(["--mode", "rpc", "--no-extensions", ...(enabled ? ["--session-settings"] : [])]),
++				[],
++				{
++					settings: nativeSettings,
++					discoverAuthStorage: async (_agentDir, options) => {
++						observed = options?.settings;
++						throw stop;
++					},
++				},
++			),
++		).rejects.toBe(stop);
++		expect(observed).toBeDefined();
++		if (!observed) throw new Error("Expected auth discovery to receive settings");
++		expect(observed === nativeSettings).toBe(!enabled);
++		expect(observed.getStorage()).toBe(nativeSettings.getStorage());
++		expect(observed.getModelRole("judge")).toBe("native-judge/decisions");
++		expect(cfgRetryFallbackChains.get(observed).judge).toEqual(["backup-judge/decisions"]);
++		if (enabled) {
++			observed.setModelRole("default", "anthropic/claude-sonnet-4-6");
++			expect(nativeSettings.getModelRole("default")).toBe("anthropic/claude-sonnet-4-5");
++		}
++	});
++
++	it("keeps real TUI /model hub assignments local while recording a restorable session model", async () => {
++		using dir = TempDir.createSync("@omp-model-hub-session-settings-");
++		const initialModel = getBundledModel("anthropic", "claude-sonnet-4-5");
++		const targetModel = getBundledModel("anthropic", "claude-sonnet-4-6");
++		if (!initialModel || !targetModel) throw new Error("Expected bundled Anthropic test models");
++		const agentDir = dir.join("agent");
++		const configPath = path.join(agentDir, "config.yml");
++		const modelsPath = path.join(agentDir, "models.yml");
++		const initialSelector = `${initialModel.provider}/${initialModel.id}`;
++		const targetSelector = `${targetModel.provider}/${targetModel.id}`;
++		await Bun.write(configPath, JSON.stringify({
++			modelRoles: { default: initialSelector, judge: initialSelector },
++			retry: { fallbackChains: { judge: [targetSelector] } },
++		}));
++		await Bun.write(modelsPath, "{\"providers\":{}}\n");
++		const nativeSettings = await Settings.loadIsolated({ cwd: dir.path(), agentDir });
++		const settings = nativeSettings.overlay();
++		const configBefore = await Bun.file(configPath).bytes();
++		const modelsBefore = await Bun.file(modelsPath).bytes();
++		const authStorage = createInMemoryAuthStorage();
++		authStorage.keys.setRuntime("anthropic", "session-settings-test-key");
++		const modelRegistry = new ModelRegistry(authStorage, modelsPath, { settings });
++		const sessionManager = SessionManager.create(dir.path(), dir.join("sessions"));
++		const session = new AgentSession({
++			agent: new Agent({ initialState: { model: initialModel, systemPrompt: ["Test"], tools: [], messages: [] } }),
++			sessionManager,
++			settings,
++			modelRegistry,
++		});
++		let mounted: Component | undefined;
++		const assigned = Promise.withResolvers<void>();
++		const ctx = createInteractiveModeContext({
++			settings,
++			session,
++			sessionManager,
++			statusLine: { invalidate: () => assigned.resolve() },
++			ui: {
++				showOverlay: component => {
++					mounted = component;
++					return { hide() {}, setHidden() {}, isHidden: () => false } satisfies OverlayHandle;
++				},
++			},
++		});
++		try {
++			await initTheme(false);
++			await sessionManager.ensureOnDisk();
++			expect(nativeSettings.settingsScope).toBe("persistent");
++			expect(settings.settingsScope).toBe("session");
++			expect(settings.mirrorState().settingsScope).toBe("session");
++			const mirror = Settings.mirror({
++				write: () => settings.mirrorState(),
++				refresh: async () => settings.mirrorState(),
++				cloneForCwd: cwd => settings.cloneForCwd(cwd),
++			}, settings.mirrorState());
++			expect(mirror.settingsScope).toBe("session");
++			await expect(applySessionModelPreset(nativeSettings, session, "low")).rejects.toThrow("requires session settings");
++			await expect(applySessionModelPreset(settings, session, "low", { modelRoles: { default: 42 } })).rejects.toThrow("Invalid model preset");
++			const frozen = {
++				modelRoles: { default: initialSelector, judge: initialSelector, smol: targetSelector },
++				defaultThinkingLevel: Effort.Low,
++			};
++			cfgModelPresets.override(settings, { low: frozen });
++			const applied = await applySessionModelPreset(settings, session, "low");
++			expect(applied.settingsScope).toBe("session");
++			expect(applied.preset).toEqual(frozen);
++			expect(applied.model.id).toBe(initialModel.id);
++			expect(session.thinkingLevel).toBe(Effort.Low);
++			const liveSnapshot = { ...frozen, defaultThinkingLevel: Effort.High };
++			const liveApplied = await applySessionModelPreset(settings, session, "high", liveSnapshot);
++			expect(liveApplied.preset).toEqual(liveSnapshot);
++			expect(session.thinkingLevel).toBe(Effort.High);
++			expect(Object.keys(cfgModelPresets.get(settings)).sort()).toEqual(["high", "low"]);
++			expect(cfgModelPresets.get(nativeSettings)).toEqual({});
++			expect(nativeSettings.getModelRole("smol")).toBeUndefined();
++			expect(await Bun.file(configPath).bytes()).toEqual(configBefore);
++			expect(await Bun.file(modelsPath).bytes()).toEqual(modelsBefore);
++			new SelectorController(ctx).showModelSelector();
++			expect(mounted).toBeInstanceOf(ModelHubComponent);
++			if (!(mounted instanceof ModelHubComponent)) throw new Error("Expected the native /model role hub");
++			for (const char of targetModel.id) mounted.handleInput(char);
++			mounted.handleInput("\n"); // Matching model -> native role assignment strip.
++			mounted.handleInput("\n"); // Assign the default role through SelectorController.
++			await assigned.promise;
++			await settings.flush();
++			await sessionManager.flush();
++			expect(ctx.showError).not.toHaveBeenCalled();
++			expect(session.model?.id).toBe(targetModel.id);
++			const selectedRole = settings.getModelRole("default");
++			if (!selectedRole) throw new Error("Expected a configured native default-role selector");
++			const resolvedRole = resolveModelRoleValue(selectedRole, [targetModel], { settings });
++			expect(resolvedRole.model?.provider).toBe(targetModel.provider);
++			expect(resolvedRole.model?.id).toBe(targetModel.id);
++			expect(resolvedRole.explicitThinkingLevel).toBe(true);
++			expect(resolvedRole.thinkingLevel).toBe(Effort.High);
++			expect(session.thinkingLevel).toBe(Effort.High);
++			expect(nativeSettings.getModelRole("default")).toBe(initialSelector);
++			expect(settings.getModelRole("judge")).toBe(initialSelector);
++			expect(cfgRetryFallbackChains.get(settings).judge).toEqual([targetSelector]);
++			expect(settings.getStorage()).toBe(nativeSettings.getStorage());
++			expect(await Bun.file(configPath).bytes()).toEqual(configBefore);
++			expect(await Bun.file(modelsPath).bytes()).toEqual(modelsBefore);
++			const sessionFile = sessionManager.getSessionFile();
++			if (!sessionFile) throw new Error("Expected persisted session file");
++			await session.dispose();
++			const resumed = await SessionManager.open(sessionFile);
++			try {
++				const restored = resumed.buildSessionContext();
++				expect(getRestorableSessionModels(restored.models, resumed.getLastModelChangeRole())[0]).toBe(targetSelector);
++			} finally {
++				await resumed.close();
++			}
++		} finally {
++			if (mounted instanceof ModelHubComponent) mounted.dispose();
++			await session.dispose();
++			nativeSettings.cancelPendingSaves();
++			authStorage.close();
++		}
++	});
++});
+diff --git a/packages/coding-agent/test/fixtures/socket-host-smoke-extension.ts b/packages/coding-agent/test/fixtures/socket-host-smoke-extension.ts
+new file mode 100644
+index 0000000..3ce9d9d
+--- /dev/null
++++ b/packages/coding-agent/test/fixtures/socket-host-smoke-extension.ts
+@@ -0,0 +1,32 @@
++/** Actual CLI/PTY smoke provider: every response is local; no model API is contacted. */
++import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
++import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
++
++export default function socketHostSmoke(pi: ExtensionAPI): void {
++	let ui: ExtensionUIContext | undefined;
++	const mock = createMockModel({
++		id: "local",
++		provider: "socket-host-smoke",
++		handler: async context => {
++			const input = JSON.stringify(context.messages.at(-1)?.content);
++			if (input.includes("NATIVE_TUI_EDITABLE_LOCAL_PROMPT")) return { content: ["Socket host editable response"] };
++			if (input.includes("approval")) {
++				const allowed = await ui!.confirm("Smoke approval", "Allow the local smoke action?");
++				return { content: [allowed ? "Smoke approved" : "Smoke denied"] };
++			}
++			if (input.includes("slow")) return { content: ["Slow smoke completed"], delayMs: 600_000 };
++			return { content: ["Socket host smoke response"] };
++		},
++	});
++	pi.registerProvider("socket-host-smoke", {
++		baseUrl: "mock://socket-host-smoke",
++		api: "socket-host-smoke",
++		apiKey: "local-smoke-key",
++		streamSimple: mock.stream,
++		models: [{
++			id: "local", name: "Local socket host smoke", reasoning: false, input: ["text"],
++			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32_768, maxTokens: 4096,
++		}],
++	});
++	pi.on("session_start", (_event, ctx) => { ui = ctx.ui; });
++}
+diff --git a/packages/coding-agent/test/rpc-socket-host.test.ts b/packages/coding-agent/test/rpc-socket-host.test.ts
+new file mode 100644
+index 0000000..5451f8d
+--- /dev/null
++++ b/packages/coding-agent/test/rpc-socket-host.test.ts
+@@ -0,0 +1,225 @@
++import { afterEach, beforeEach, describe, expect, test } from "bun:test";
++import * as fs from "node:fs/promises";
++import * as net from "node:net";
++import * as os from "node:os";
++import * as path from "node:path";
++import { Readable } from "node:stream";
++import { RpcClient, type RpcAgentProcess } from "../src/modes/rpc/rpc-client";
++import { validateRpcSocketPath } from "../src/modes/rpc/rpc-socket-host";
++import { LocalCollabSocket } from "../src/collab/local-client";
++import { COLLAB_PROTO, type CollabFrame } from "../src/collab/protocol";
++import { mintSessionId } from "../src/session/session-manager";
++import type { SessionEntry } from "../src/session/session-entries";
++import { createSessionManager } from "../src/main";
++import { parseArgs } from "../src/cli/args";
++import { Settings } from "../src/config/settings";
++
++function socketProcess(socketPath: string): RpcAgentProcess {
++	const socket = net.createConnection(socketPath);
++	const exited = Promise.withResolvers<number>();
++	socket.on("error", () => socket.destroy());
++	socket.once("close", () => exited.resolve(0));
++	return {
++		stdin: { write: data => socket.write(data) },
++		stdout: Readable.toWeb(socket) as ReadableStream<Uint8Array>,
++		peekStderr: () => "",
++		kill: () => socket.destroy(),
++		exited: exited.promise,
++	};
++}
++
++function nextFrame(socket: LocalCollabSocket, predicate: (frame: CollabFrame) => boolean): Promise<CollabFrame> {
++	const { promise, resolve, reject } = Promise.withResolvers<CollabFrame>();
++	const previous = socket.onFrame;
++	const timeout = setTimeout(() => { socket.onFrame = previous; reject(new Error("Timed out waiting for native Collab frame")); }, 10_000);
++	socket.onFrame = (frame, peer) => {
++		previous?.(frame, peer);
++		if (!predicate(frame)) return;
++		clearTimeout(timeout);
++		socket.onFrame = previous;
++		resolve(frame);
++	};
++	return promise;
++}
++
++describe("process-owned local RPC host", () => {
++	let root: string;
++	let socketPath: string;
++	let child: ReturnType<typeof Bun.spawn>;
++	let stderr: Promise<string>;
++	const clients: RpcClient[] = [];
++	const views: LocalCollabSocket[] = [];
++
++	async function connect(): Promise<RpcClient> {
++		const client = new RpcClient({ spawn: () => socketProcess(socketPath) });
++		clients.push(client);
++		await client.start();
++		return client;
++	}
++
++	beforeEach(async () => {
++		// Short private path fits macOS sockaddr_un even when TMPDIR is long.
++		root = await fs.mkdtemp(path.join(process.platform === "darwin" ? "/private/tmp" : os.tmpdir(), "omp-host-test-"));
++		await fs.chmod(root, 0o700);
++		socketPath = path.join(root, "host.sock");
++		child = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures/fork-rpc-agent.ts"), root, socketPath], {
++			cwd: root, stdin: "ignore", stdout: "ignore", stderr: "pipe",
++			env: { ...Bun.env, PI_CODING_AGENT_DIR: path.join(root, "config"), PI_NO_TITLE: "1", PI_NOTIFICATIONS: "off" },
++		});
++		stderr = new Response(child.stderr as ReadableStream<Uint8Array>).text();
++		const deadline = Date.now() + 20_000;
++		while (true) {
++			try { await fs.lstat(socketPath); break; } catch (error) {
++				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
++			}
++			if (child.exitCode !== null) throw new Error(`Host exited: ${await stderr}`);
++			if (Date.now() > deadline) throw new Error("Host did not listen");
++			await Bun.sleep(10);
++		}
++	});
++
++	afterEach(async () => {
++		for (const view of views.splice(0)) view.close();
++		await Promise.all(clients.splice(0).map(client => client.stop()));
++		child?.kill();
++		await child?.exited;
++		await fs.rm(root, { recursive: true, force: true });
++	});
++
++	test("isolates same request ids and event filters, and persists after every client disconnects", async () => {
++		const a = await connect();
++		const b = await connect();
++		const [state, messages] = await Promise.all([
++			a.request({ type: "get_state" }, { id: "same" }),
++			b.request({ type: "get_messages" }, { id: "same" }),
++		]);
++		expect(state).toMatchObject({ id: "same", command: "get_state", success: true, data: { hostPid: child.pid, pendingUiRequests: [] } });
++		expect(messages).toMatchObject({ id: "same", command: "get_messages", success: true, data: { messages: [] } });
++		await a.setEventFilter([]);
++		await b.promptAndWait("first");
++		await Promise.all([a.stop(), b.stop()]);
++		const reconnected = await connect();
++		expect((await reconnected.getMessages()).some(message => message.role === "assistant")).toBe(true);
++		await reconnected.shutdownHost();
++		expect(await child.exited).toBe(0);
++		expect((await fs.readFile(path.join(root, "socket-session.jsonl"), "utf8"))).toContain("Done");
++	}, 30_000);
++
++	test("a running turn survives controller loss and prevents shutdown until settled", async () => {
++		const owner = await connect();
++		const started = Promise.withResolvers<void>();
++		owner.onSessionEvent(event => { if (event.type === "notice" && event.message === "slow turn streaming") started.resolve(); });
++		await owner.request({ type: "prompt", message: "slow" }, { id: "durable-turn" });
++		await started.promise;
++		await owner.stop();
++		const next = await connect();
++		expect((await next.getState()).isStreaming).toBe(true);
++		await expect(next.shutdownHost()).rejects.toMatchObject({ code: "session_busy" });
++		await next.abort();
++		await next.waitForSettled();
++		await next.shutdownHost();
++		expect(await child.exited).toBe(0);
++	}, 30_000);
++
++	test("native Collab snapshots are read-only and viewer disconnect never stops the worker", async () => {
++		const client = await connect();
++		await client.promptAndWait("first");
++		const view = new LocalCollabSocket(socketPath);
++		views.push(view);
++		const replicated: SessionEntry[] = [];
++		view.onFrame = frame => { if (frame.t === "snapshot-chunk") replicated.push(...frame.entries as SessionEntry[]); };
++		const synchronized = nextFrame(view, frame => frame.t === "snapshot-chunk" && frame.final);
++		const welcome = nextFrame(view, frame => frame.t === "welcome");
++		view.onOpen = () => { view.send({ t: "hello", proto: COLLAB_PROTO, name: "viewer" }); };
++		view.connect();
++		const snapshot = await welcome;
++		expect(snapshot).toMatchObject({ t: "welcome", readOnly: true, entryCount: expect.any(Number) });
++		await synchronized;
++		expect(JSON.stringify(replicated)).not.toContain("not-replicated");
++		if (snapshot.t !== "welcome") throw new Error("Expected native snapshot header");
++		const replicaPath = path.join(root, "replica-probe.jsonl");
++		await fs.writeFile(replicaPath, [{ ...snapshot.header, id: mintSessionId() }, ...replicated].map(entry => JSON.stringify(entry)).join("\n") + "\n");
++		const attachArgs = parseArgs([]);
++		attachArgs.noSession = true;
++		attachArgs.attach = { socket: socketPath, readOnly: true };
++		const replica = await createSessionManager(attachArgs, root, Settings.isolated());
++		if (!replica) throw new Error("Expected attach's native session manager");
++		try {
++			await replica.setSessionFile(replicaPath);
++			const branch = replica.getBranch();
++			expect(branch.filter(entry => entry.type === "message").map(entry => entry.message.role)).toEqual(["user", "assistant"]);
++			expect(JSON.stringify(branch)).toContain("Done");
++			const ids = new Set(branch.map(entry => entry.id));
++			expect(branch.every(entry => entry.parentId === null || ids.has(entry.parentId))).toBe(true);
++		} finally { await replica.close(); }
++		const denied = nextFrame(view, frame => frame.t === "error");
++		view.send({ t: "prompt", text: "must not run" });
++		expect(await denied).toMatchObject({ t: "error", message: expect.stringMatching(/read.only/i) });
++		view.close();
++		expect((await client.getState()).isStreaming).toBe(false);
++		await client.shutdownHost();
++		expect(await child.exited).toBe(0);
++	}, 30_000);
++
++	test("replays original approval identities, and the first RPC or native answer cancels every other surface", async () => {
++		const owner = await connect();
++		const asked = Promise.withResolvers<string>();
++		owner.onExtensionUIRequest(request => { if (request.method === "confirm") asked.resolve(request.id); });
++		await owner.prompt("approval");
++		const originalId = await asked.promise;
++		await owner.stop();
++		const responder = await connect();
++		const state = await responder.getState();
++		expect(state.pendingUiRequests).toMatchObject([{ id: originalId, method: "confirm" }]);
++		const native = new LocalCollabSocket(socketPath);
++		views.push(native);
++		const shown = nextFrame(native, frame => frame.t === "ui-request");
++		native.onOpen = () => { native.send({ t: "hello", proto: COLLAB_PROTO, name: "controller", writeToken: Buffer.from("local").toString("base64url") }); };
++		native.connect();
++		const request = await shown;
++		if (request.t !== "ui-request") throw new Error("Expected native dialog");
++		const ended = nextFrame(native, frame => frame.t === "ui-request-end" && frame.reqId === request.request.reqId);
++		responder.respondToUI({ type: "extension_ui_response", id: originalId, confirmed: true });
++		await ended;
++		native.send({ t: "ui-response", reqId: request.request.reqId, value: "No" });
++		await responder.waitForSettled();
++		expect((await responder.getState()).pendingUiRequests).toEqual([]);
++		expect(await responder.getLastAssistantText()).toBe("Approved");
++		native.close();
++		await responder.shutdownHost();
++		expect(await child.exited).toBe(0);
++	}, 30_000);
++
++	test("spectators cannot steal or clear host tools, and explicit reconnect registration restores the owner", async () => {
++		const owner = await connect();
++		const spectator = await connect();
++		let calls = 0;
++		const tool = { name: "owned", description: "Owned test capability", parameters: { type: "object", properties: {} }, execute: () => { calls++; return "Owner result"; } };
++		await owner.setCustomTools([tool]);
++		expect(await spectator.request({ type: "set_host_tools", tools: [] })).toMatchObject({ success: false });
++		await spectator.promptAndWait("invoke-owned");
++		expect(calls).toBe(1);
++		await owner.stop();
++		expect(await spectator.request({ type: "set_host_tools", tools: [] })).toMatchObject({ success: false });
++		const replacement = await connect();
++		await replacement.setCustomTools([tool]);
++		await spectator.promptAndWait("invoke-owned");
++		expect(calls).toBe(2);
++		await spectator.shutdownHost();
++		expect(await child.exited).toBe(0);
++	}, 30_000);
++
++	test("refuses unsafe directories, symlinks and any occupied endpoint", async () => {
++		expect(() => validateRpcSocketPath(socketPath)).toThrow(/already exists/);
++		const unsafe = path.join(root, "unsafe");
++		await fs.mkdir(unsafe, { mode: 0o755 });
++		expect(() => validateRpcSocketPath(path.join(unsafe, "host.sock"))).toThrow(/0700/);
++		const alias = path.join(root, "alias");
++		await fs.symlink(root, alias);
++		expect(() => validateRpcSocketPath(path.join(alias, "other.sock"))).toThrow(/symlink/);
++		const occupied = path.join(root, "occupied");
++		await fs.writeFile(occupied, "foreign");
++		expect(() => validateRpcSocketPath(occupied)).toThrow(/already exists/);
++		expect(await fs.readFile(occupied, "utf8")).toBe("foreign");
++	}, 30_000);
++});
+diff --git a/packages/coding-agent/test/managed-extension-precedence.test.ts b/packages/coding-agent/test/managed-extension-precedence.test.ts
+new file mode 100644
+index 0000000..fe2c556
+--- /dev/null
++++ b/packages/coding-agent/test/managed-extension-precedence.test.ts
+@@ -0,0 +1,187 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
++import type { Skill } from "@oh-my-pi/pi-coding-agent/capability/skill";
++import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { initializeWithSettings, loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
++import {
++	clearOmpExtensionCliRoots,
++	listOmpExtensionRoots,
++	setInvocationConfiguredExtensions,
++	withOmpExtensionRootScope,
++} from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
++import { discoverExtensionPaths, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
++import { __closeExtensionParseCacheForTests } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
++import { discoverSessionExtensionPaths } from "@oh-my-pi/pi-coding-agent/sdk";
++import { getAgentDir, getPluginsDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
++
++const marker = "OMP_SUPERAGENT_MANAGED_ULW_PATH";
++const packageName = "@managed-regression/workflow";
++const envKeys = [marker, "HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
++
++describe("managed extension package precedence", () => {
++	let root: string;
++	let home: string;
++	let cwd: string;
++	let originalAgentDir: string;
++	const originalEnv = new Map<string, string | undefined>();
++
++	beforeEach(async () => {
++		originalAgentDir = getAgentDir();
++		for (const key of envKeys) originalEnv.set(key, process.env[key]);
++		root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-managed-extension-"));
++		home = path.join(root, "home");
++		cwd = path.join(root, "project");
++		await fs.mkdir(home, { recursive: true });
++		await fs.mkdir(cwd, { recursive: true });
++		process.env.HOME = home;
++		process.env.USERPROFILE = home;
++		delete process.env[marker];
++		for (const key of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) delete process.env[key];
++		vi.spyOn(os, "homedir").mockReturnValue(home);
++		setAgentDir(path.join(home, ".omp", "agent"));
++		resetSettingsForTest();
++		clearOmpExtensionCliRoots();
++		clearFsCache();
++	});
++
++	afterEach(async () => {
++		resetSettingsForTest();
++		clearOmpExtensionCliRoots();
++		clearFsCache();
++		vi.restoreAllMocks();
++		for (const [key, value] of originalEnv) {
++			if (value === undefined) delete process.env[key];
++			else process.env[key] = value;
++		}
++		originalEnv.clear();
++		setAgentDir(originalAgentDir);
++		__closeExtensionParseCacheForTests();
++		await removeWithRetries(root);
++	});
++
++	async function writePackage(dir: string, revision: string, name = packageName): Promise<string> {
++		await fs.mkdir(dir, { recursive: true });
++		await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name, version: revision, omp: { extensions: ["./index.ts"] } }));
++		await fs.writeFile(path.join(dir, "index.ts"), `
++			export default function(pi) {
++				pi.on("before_agent_start", async () => ({ systemPrompt: ${JSON.stringify(revision)} }));
++				pi.registerTool({
++					name: ${JSON.stringify(revision)}, label: ${JSON.stringify(revision)}, description: "revision proof",
++					parameters: pi.typebox.Type.Object({}),
++					execute: async () => ({ content: [{ type: "text", text: ${JSON.stringify(revision)} }] }),
++				});
++			}
++		`);
++		const skillDir = path.join(dir, "skills", "workflow-proof");
++		await fs.mkdir(skillDir, { recursive: true });
++		await fs.writeFile(path.join(skillDir, "SKILL.md"), `---\nname: workflow-proof\ndescription: ${revision}\n---\n${revision}\n`);
++		return dir;
++	}
++
++	for (const configuredKind of ["directory", "file", "symlink"] as const) {
++		it(`loads only the selected factory over ambient, plugin and configured ${configuredKind} revisions`, async () => {
++			const managed = await writePackage(path.join(root, "revisions", "selected", "package"), "managed-revision");
++			const global = await writePackage(path.join(getAgentDir(), "extensions", "old-global"), "global-revision");
++			const configured = await writePackage(path.join(root, "configured-release"), "configured-revision");
++			const linked = await writePackage(path.join(root, "linked-release"), "linked-revision");
++			await fs.symlink(path.join(linked, "index.ts"), path.join(getAgentDir(), "extensions", "old-linked.ts"));
++			const unrelated = await writePackage(path.join(root, "unrelated"), "unrelated-revision", "unrelated-extension");
++			await fs.writeFile(path.join(getAgentDir(), "extensions", "excluded.ts"), `export default pi => pi.registerCommand("must-stay-disabled", { handler: async () => {} });`);
++			const pluginsDir = getPluginsDir();
++			expect(pluginsDir.startsWith(home + path.sep)).toBe(true);
++			await writePackage(path.join(pluginsDir, "node_modules", "old-installed"), "plugin-revision");
++			await fs.writeFile(path.join(pluginsDir, "package.json"), JSON.stringify({ private: true, dependencies: { "old-installed": "1.0.0" } }));
++			let configuredPath = configured;
++			if (configuredKind === "file") configuredPath = path.join(configured, "index.ts");
++			if (configuredKind === "symlink") {
++				configuredPath = path.join(root, "configured-entry.ts");
++				await fs.symlink(path.join(configured, "index.ts"), configuredPath);
++			}
++			const configuredPaths = [configuredPath, global];
++			const settings = Settings.isolated({
++				extensions: configuredPaths,
++				disabledExtensions: ["extension-module:package", "extension-module:excluded"],
++			});
++			initializeWithSettings(settings);
++			process.env[marker] = await fs.realpath(managed);
++			const explicit = [unrelated, managed];
++			await withOmpExtensionRootScope(explicit, "merge", async () => {
++				setInvocationConfiguredExtensions(configuredPaths);
++				const paths = await discoverSessionExtensionPaths({ additionalExtensionPaths: explicit }, cwd, settings);
++				const loaded = await loadExtensions(paths, cwd);
++				expect(loaded.errors).toEqual([]);
++				expect(loaded.extensions.flatMap(extension => [...extension.tools.keys()]).sort()).toEqual(["managed-revision", "unrelated-revision"]);
++				expect(loaded.extensions.some(extension => extension.commands.has("must-stay-disabled"))).toBe(false);
++				const managedExtension = loaded.extensions.find(extension => extension.tools.has("managed-revision"));
++				expect(managedExtension?.handlers.get("before_agent_start")).toHaveLength(1);
++				const handler = managedExtension!.handlers.get("before_agent_start")![0];
++				expect(await handler({ type: "before_agent_start", prompt: "proof", systemPrompt: "" }, {} as never)).toEqual({ systemPrompt: "managed-revision" });
++				const skills = await loadCapability<Skill>("skills", { cwd, providers: ["omp-plugins"] });
++				expect(skills.warnings).toEqual([]);
++				expect(skills.items.find(skill => skill.name === "workflow-proof")?.path).toBe(path.join(await fs.realpath(managed), "skills", "workflow-proof", "SKILL.md"));
++				const roots = await listOmpExtensionRoots({ cwd, home, repoRoot: null });
++				expect(roots.map(root => root.path)).toEqual([await fs.realpath(managed), unrelated]);
++			});
++		});
++	}
++
++	it("leaves ordinary OMP package loading, exclusions and explicit root resource order unchanged", async () => {
++		const first = await writePackage(path.join(root, "first"), "first-revision");
++		const second = await writePackage(path.join(root, "second"), "second-revision");
++		const disabled = await writePackage(path.join(root, "package"), "disabled-revision", "unrelated-disabled");
++		const settings = Settings.isolated({ disabledExtensions: ["extension-module:package"] });
++		initializeWithSettings(settings);
++		await withOmpExtensionRootScope([first, second, disabled], "merge", async () => {
++			const paths = await discoverSessionExtensionPaths({ additionalExtensionPaths: [first, second, disabled] }, cwd, settings);
++			const loaded = await loadExtensions(paths, cwd);
++			expect(loaded.errors).toEqual([]);
++			expect(loaded.extensions.flatMap(extension => [...extension.tools.keys()]).sort()).toEqual(["first-revision", "second-revision"]);
++			const skills = await loadCapability<Skill>("skills", { cwd, providers: ["omp-plugins"] });
++			expect(skills.items.find(skill => skill.name === "workflow-proof")?.path).toBe(path.join(first, "skills", "workflow-proof", "SKILL.md"));
++		});
++	});
++
++	it("accepts a symlink spelling of the selected root without double binding", async () => {
++		const managed = await writePackage(path.join(root, "revision", "package"), "managed-revision");
++		const alias = path.join(root, "selected-alias");
++		await fs.symlink(managed, alias, "dir");
++		process.env[marker] = await fs.realpath(managed);
++		await withOmpExtensionRootScope([alias, managed], "merge", async () => {
++			const paths = await discoverExtensionPaths([alias, managed], cwd);
++			const loaded = await loadExtensions(paths, cwd);
++			expect(loaded.errors).toEqual([]);
++			expect(loaded.extensions.flatMap(extension => [...extension.tools.keys()])).toEqual(["managed-revision"]);
++			const roots = await listOmpExtensionRoots({ cwd, home, repoRoot: null });
++			expect(roots.map(root => root.path)).toEqual([await fs.realpath(managed)]);
++		});
++	});
++
++	it("rejects a valid marker when the SDK selects it only through settings", async () => {
++		const managed = await writePackage(path.join(root, "package"), "managed-revision");
++		process.env[marker] = await fs.realpath(managed);
++		const settings = Settings.isolated({ extensions: [managed] });
++		await expect(discoverSessionExtensionPaths({}, cwd, settings)).rejects.toThrow("must be explicitly selected");
++		await expect(listOmpExtensionRoots({ cwd, home, repoRoot: null })).rejects.toThrow("must be explicitly selected");
++	});
++
++	for (const invalid of ["relative", "missing", "file", "malformed", "unnamed", "empty"] as const) {
++		it(`rejects an invalid ${invalid} managed package instead of falling back`, async () => {
++			const managed = path.join(root, "package");
++			await fs.mkdir(managed);
++			let selected = managed;
++			if (invalid === "relative") selected = "package";
++			else if (invalid === "missing") selected = path.join(root, "missing");
++			else if (invalid === "file") {
++				selected = path.join(managed, "index.ts");
++				await fs.writeFile(selected, "export default () => {};");
++			} else {
++				await fs.writeFile(path.join(managed, "package.json"), invalid === "malformed" ? "{" : JSON.stringify(invalid === "unnamed" ? {} : { name: packageName }));
++			}
++			process.env[marker] = selected;
++			await expect(discoverExtensionPaths([selected], cwd, undefined, { ambient: false })).rejects.toThrow("Invalid managed extension selection");
++		});
++	}
++});

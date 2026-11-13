@@ -1,0 +1,10 @@
+node_modules/
+.upstream/
+coverage/
+dist/
+.env
+.env.*
+!.env.example
+config.local.json
+.state/
+*.tsbuildinfo

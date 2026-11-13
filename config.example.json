@@ -1,0 +1,29 @@
+{
+  "command": [
+    "/absolute/path/to/bun",
+    "/absolute/path/to/omp-superagent/.upstream/omp/packages/coding-agent/src/cli.ts"
+  ],
+  "stateDir": "/Users/REPLACE_ME/.omp-sa",
+  "headCwd": "/absolute/path/to/workspace",
+  "maxHosts": 4,
+  "maxSubagents": 8,
+  "idleMs": 300000,
+  "discord": {
+    "tokenEnv": "DISCORD_BOT_TOKEN",
+    "ownerId": "REPLACE_WITH_OWNER_USER_ID",
+    "allowedGuildIds": ["REPLACE_WITH_GUILD_ID"],
+    "allowedChannelIds": ["REPLACE_WITH_PARENT_CHANNEL_ID"]
+  },
+  "telegram": {
+    "tokenEnv": "TELEGRAM_BOT_TOKEN",
+    "ownerId": "REPLACE_WITH_POSITIVE_TELEGRAM_OWNER_ID",
+    "allowedChatIds": ["-REPLACE_WITH_GROUP_CHAT_ID"]
+  },
+  "slack": {
+    "botTokenEnv": "SLACK_BOT_TOKEN",
+    "appTokenEnv": "SLACK_APP_TOKEN",
+    "ownerId": "REPLACE_WITH_SLACK_OWNER_ID",
+    "teamId": "REPLACE_WITH_SLACK_TEAM_ID",
+    "allowedChannelIds": ["REPLACE_WITH_SLACK_CHANNEL_ID"]
+  }
+}

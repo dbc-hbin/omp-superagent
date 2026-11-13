@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/dbc-hbin/omp-ulw.git",
+  "ref": "HEAD",
+  "directory": ".upstream/ulw",
+  "checkIntervalMs": 3600000,
+  "commandTimeoutMs": 180000,
+  "probeTimeoutMs": 30000,
+  "materialize": "upstream/materialize-frontend-refs.mjs"
+}

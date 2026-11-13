@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="410" viewBox="0 0 960 410" role="img" aria-labelledby="architecture-title architecture-desc">
+  <title id="architecture-title">One always-on service, one OMP head, independent lane sessions</title>
+  <desc id="architecture-desc">Discord, Telegram, and Slack connect to the always-on Gateway service. All input passes to the OMP Head agent session, which decides and works directly or controls independent repository or topic sessions in Lane A and Lane B. Only the head controls lanes. Lane results return through the head and Gateway to the messengers. The head and lanes share an informational board; dashed connections are not a command bus.</desc>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --ink: #222b3d;
+      --muted: #536176;
+      --surface: #ffffff;
+      --border: #9aa6b8;
+      --edge: #66758c;
+      --board: #f3f5f9;
+      --info: #8490a3;
+      --head-surface: #faf5ff;
+      --head-border: #9742c5;
+      --head-ink: #752ba0;
+      --magenta: #ce3f9f;
+      --violet: #9350d0;
+      --cyan: #1596ad;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #edf1fa;
+        --muted: #bac5d7;
+        --surface: #171d29;
+        --border: #63718a;
+        --edge: #a5b2c9;
+        --board: #202838;
+        --info: #8797b1;
+        --head-surface: #2b1e3b;
+        --head-border: #cd8bf0;
+        --head-ink: #e3b4ff;
+        --magenta: #f077c7;
+        --violet: #bb8cf3;
+        --cyan: #5ccfdf;
+      }
+    }
+    text { fill: var(--ink); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .heading { font-size: 24px; font-weight: 650; }
+    .node { fill: var(--surface); stroke: var(--border); stroke-width: 1.5; }
+    .node-title { font-size: 22px; font-weight: 650; text-anchor: middle; }
+    .detail { fill: var(--muted); font-size: 16px; text-anchor: middle; }
+    .flow { fill: none; stroke: var(--edge); stroke-width: 1.8; stroke-linejoin: round; marker-end: url(#flow-arrow); }
+    .control { stroke: var(--head-border); marker-end: url(#control-arrow); }
+    .information { fill: none; stroke: var(--info); stroke-width: 1.6; stroke-dasharray: 5 5; stroke-linecap: round; stroke-linejoin: round; }
+    .head { fill: var(--head-surface); stroke: var(--head-border); stroke-width: 2; }
+    .head-label { fill: var(--head-ink); }
+    .caption { fill: var(--muted); font-size: 16px; }
+    .board { fill: var(--board); stroke: var(--info); stroke-width: 1.2; }
+  </style>
+  <defs>
+    <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 10 5 0 10Z" fill="var(--edge)"/>
+    </marker>
+    <marker id="control-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 10 5 0 10Z" fill="var(--head-border)"/>
+    </marker>
+  </defs>
+
+  <text class="heading" x="24" y="34">One service. One head. Independent lanes.</text>
+
+  <!-- Connections precede nodes so every arrow terminates at a clean border. -->
+  <g aria-hidden="true">
+    <path class="flow" d="M184 150H224"/>
+    <path class="flow" d="M398 150H446"/>
+    <path class="flow" d="M446 222H398"/>
+    <path class="flow" d="M224 222H184"/>
+    <path class="flow control" d="M638 144H684V102H754"/>
+    <path class="flow" d="M754 142H714V180H638"/>
+    <path class="flow control" d="M638 214H714V246H754"/>
+    <path class="flow" d="M754 286H684V238H638"/>
+    <path class="information" d="M542 254V350"/>
+    <path class="information" d="M936 102H950V372H936"/>
+    <path class="information" d="M846 318V350"/>
+  </g>
+
+  <g>
+    <rect class="node" x="24" y="112" width="160" height="142" rx="14"/>
+    <text class="node-title" x="104" y="145">Messengers</text>
+    <text class="detail" x="104" y="177">Discord</text>
+    <text class="detail" x="104" y="201">Telegram</text>
+    <text class="detail" x="104" y="225">Slack</text>
+  </g>
+
+  <g>
+    <rect class="node" x="224" y="112" width="174" height="142" rx="14"/>
+    <text class="node-title" x="311" y="151">Gateway</text>
+    <text class="detail" x="311" y="181">always-on service</text>
+    <text class="detail" x="311" y="211">admit · route · reply</text>
+  </g>
+
+  <g>
+    <rect class="head" x="446" y="112" width="192" height="142" rx="14"/>
+    <path d="M470 113H514" stroke="var(--magenta)" stroke-width="3"/>
+    <path d="M520 113H564" stroke="var(--violet)" stroke-width="3"/>
+    <path d="M570 113H614" stroke="var(--cyan)" stroke-width="3"/>
+    <text class="node-title head-label" x="542" y="147">OMP Head</text>
+    <text class="detail" x="542" y="175">agent session</text>
+    <text class="detail" x="542" y="202">decides · works</text>
+    <text class="detail head-label" x="542" y="230">Head-only lane control</text>
+  </g>
+
+  <g>
+    <rect class="node" x="754" y="60" width="182" height="108" rx="14"/>
+    <text class="node-title" x="845" y="91">Lane A</text>
+    <text class="detail" x="845" y="118">independent session</text>
+    <text class="detail" x="845" y="145">repo / topic A</text>
+  </g>
+  <g>
+    <rect class="node" x="754" y="210" width="182" height="108" rx="14"/>
+    <text class="node-title" x="845" y="241">Lane B</text>
+    <text class="detail" x="845" y="268">independent session</text>
+    <text class="detail" x="845" y="295">repo / topic B</text>
+  </g>
+
+  <text class="caption" x="249" y="284">Replies via head</text>
+  <text class="caption" x="654" y="199">results</text>
+  <text class="caption" x="695" y="275">results</text>
+  <text class="caption" x="553" y="305">status / context</text>
+
+  <g>
+    <rect class="board" x="446" y="350" width="490" height="44" rx="12"/>
+    <text x="466" y="378" font-size="18" font-weight="650">Shared board</text>
+    <text class="caption" x="609" y="378">information only · not control</text>
+  </g>
+</svg>

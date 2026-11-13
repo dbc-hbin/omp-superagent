@@ -1,0 +1,24 @@
+flowchart LR
+    M["Messengers<br/>Discord · Telegram · Slack"]
+    G["Gateway<br/>Always-on service<br/>Admit · route · reply"]
+    H["OMP Head<br/>Agent session<br/>Decides · works<br/>Head-only lane control"]
+    A["Lane A<br/>Independent session<br/>repo / topic A"]
+    B["Lane B<br/>Independent session<br/>repo / topic B"]
+    S["Shared board<br/>Information only · not control"]
+
+    M --> G
+    G --> H
+    H -->|Head-only control| A
+    H -->|Head-only control| B
+    A -->|Results| H
+    B -->|Results| H
+    H --> G
+    G --> M
+    H -.- S
+    A -.- S
+    B -.- S
+
+    classDef head fill:#faf5ff,stroke:#9742c5,color:#752ba0,stroke-width:2px
+    classDef board fill:#f3f5f9,stroke:#8490a3,color:#222b3d
+    class H head
+    class S board

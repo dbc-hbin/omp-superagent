@@ -1,0 +1,29 @@
+{
+  "name": "omp-superagent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "omp-superagent": "src/cli.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test test",
+    "start": "bun src/cli.ts start",
+    "prepare:omp": "bun scripts/prepare-omp.ts",
+    "prepare:ulw": "bun scripts/prepare-ulw.ts",
+    "postinstall": "bun scripts/prepare-ulw.ts"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "link:.upstream/omp/packages/coding-agent",
+    "@slack/socket-mode": "^3.2.0",
+    "@slack/web-api": "^8.3.0",
+    "@sinclair/typebox": "^0.34.41",
+    "discord.js": "^14.25.1",
+    "grammy": "^1.46.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^7.0.2"
+  }
+}

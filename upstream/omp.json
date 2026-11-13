@@ -1,0 +1,57 @@
+{
+  "repository": "https://github.com/can1357/oh-my-pi.git",
+  "tag": "v18.20.0",
+  "revision": "c308970263ae13744ea15ab67302e3dac840e266",
+  "checkout": ".upstream/omp",
+  "patches": [
+    "patches/omp/0001-process-owned-local-rpc-and-native-attach.patch"
+  ],
+  "patchSha256": "07ab9f779e93e0344fc5fc3d2428a43051bd130f0853bb3ad8cc6d6b9201f245",
+  "runtime": {
+    "bun": "1.4.4",
+    "entry": "packages/coding-agent/src/cli.ts",
+    "packageDependency": "link:.upstream/omp/packages/coding-agent",
+    "hostArguments": ["--mode", "rpc-ui", "--rpc-socket", "<absolute-private-socket>", "--session", "<absolute-session-file>", "--cwd", "<absolute-project-dir>", "--session-settings"],
+    "attachArguments": ["attach", "<absolute-private-socket>", "[--read-only]"],
+    "attachSettings": "always process-local native Settings.overlay()",
+    "presetArguments": ["--config", "<private-frozen-native-preset-overlay>", "--model-preset", "<native-preset-name>"],
+    "extensionEnvironment": "OMP_RPC_SOCKET",
+    "managedExtensionEnvironment": "OMP_SUPERAGENT_MANAGED_ULW_PATH=<canonical immutable package root>; the same root must be explicitly selected by this invocation",
+    "shutdownCommand": "shutdown_host"
+  },
+  "verification": {
+    "status": "verified-local-rpc-and-native-tui",
+    "managedExtensionPrecedence": {
+      "status": "implemented-not-run-by-worker",
+      "targetedTests": "bun test packages/coding-agent/test/managed-extension-precedence.test.ts packages/coding-agent/test/extensions-discovery.test.ts packages/coding-agent/test/plugin-extensions-discovery.test.ts packages/coding-agent/test/discovery/disabled-extensions.test.ts packages/coding-agent/test/task/discovery.test.ts",
+      "coverage": "actual loaded factory tools and before_agent_start handler; ambient/global directory and file symlink, installed plugin, configured directory/file/symlink revisions of the manifest-derived identity excluded; unrelated extensions and exclusions retained; mandatory managed package ignores inherited module-name disable; selected sibling skills precede other roots; ordinary unmarked OMP unchanged; invalid/unselected/empty managed roots rejected",
+      "scope": "process-local internal marker only; native package/module resolution reused; no global mutation, blanket extension disable, new provider, or duplicate registry"
+    },
+    "sessionSettings": {
+      "status": "implemented-not-run-by-worker",
+      "targetedTests": "bun test packages/coding-agent/test/cli-session-settings.test.ts",
+      "coverage": "value-less CLI flag, pre-auth settings overlay boundary, native TUI model-hub assignment, frozen native preset application/readback, scope/mirror metadata, config/models byte stability, judge inheritance, transcript restoration",
+      "presetStartupFlag": "--model-preset <name> (requires --session-settings; excludes ACP)",
+      "presetRpcCommand": "set_model_preset {name, preset: {modelRoles, defaultThinkingLevel?}}",
+      "codeGeneration": "bun run gen:rpc completed; regenerated TypeScript/schema/Python/Rust/Go artifacts",
+      "modelSettingsField": "get_state.modelSettings: actual effective {modelRoles, defaultThinkingLevel}, separate from active model/effort",
+      "conditionalCreate": "createModelPresetIfMissing(settings,name,preset): native locked raw own-key no-clobber; flush/reload created/preserved/conflict readback; no recursive role-mutation lock",
+      "conditionalCreateTests": "bun test packages/coding-agent/test/model-presets.test.ts (same-entry external race, hidden/null/invalid entries, higher layers, malformed YAML preservation; not run by worker)",
+      "parentVerificationCorrections": "Defined-role native captureModelPreset readback; native isSessionSettled plus compaction/transition/owned-jobs guards; TUI role assertion resolves native model/effort suffix semantics; Effort enum literals. Parent rerun required; no worker checks."
+    },
+    "results": {
+      "rpcRegression": "57 passed",
+      "generatedWire": "1 passed",
+      "collabAndSocketRegression": "29 passed; overlaps RPC suite",
+      "finalAttachReplicaStorageRegression": "1 passed, 8 assertions",
+      "actualHostLifecycle": "1 passed, 28 assertions",
+      "actualTuiPty": "1 passed, 19 assertions; read-only and editable attach, detach survival",
+      "liveDiscord": "not activated",
+      "realModelProvider": "not exercised; deterministic local provider used",
+      "herdr": "not exercised; HERDR_ENV absent"
+    },
+    "codeGeneration": "bun run gen:rpc",
+    "targetedTests": "bun test packages/coding-agent/test/rpc-socket-host.test.ts packages/coding-agent/test/collab/chunked-welcome.test.ts packages/coding-agent/test/collab/replication-shrink.test.ts packages/coding-agent/test/rpc-client.start.test.ts packages/coding-agent/test/rpc-client.restart.test.ts packages/coding-agent/test/rpc-session-events.test.ts packages/coding-agent/test/rpc-extension-ui.test.ts packages/coding-agent/test/rpc-wire/generated.test.ts",
+    "actualCliProviderFixture": "packages/coding-agent/test/fixtures/socket-host-smoke-extension.ts"
+  }
+}

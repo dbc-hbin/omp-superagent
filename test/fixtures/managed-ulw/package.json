@@ -1,0 +1,6 @@
+{
+  "name": "omp-ulw",
+  "version": "0.0.0-fixture",
+  "type": "module",
+  "omp": { "extensions": ["./index.ts"], "skills": ["./skills"] }
+}
