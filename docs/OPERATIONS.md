@@ -22,7 +22,8 @@ WebSocket·heartbeat로 검증했다. 실제 운영 봇 로그인과 herdr 제�
 잘못된 generator 호출로 보조 OMP가 실행되어 파일 설명 응답을 받은 일이 있다. 실행 파일·PID·
 세션·제공자 사용량을 확보하지 못해 실제 제공자 호출·비용 등 부작용은 미확인이다. 이는 결정적인
 로컬 테스트 증거와 별개이며, 테스트는 실제 메신저 운영의 증거가 아니다.
-아래 start 명령은 운영자가 명시적으로 실행할 절차이며 메신저 봇 자동 활성화는 없다.
+아래 start 명령은 운영자가 명시적으로 실행할 절차다. 선택적으로 macOS `install`을 실행한
+경우에만 다음 로그인 시 같은 start를 자동 호출하며, 설치·준비·doctor 자체는 봇을 켜지 않는다.
 **기존 runtime 통합의 검증 상태:** Gateway → head 기동·복구, 모든 후속의 head 경유, head-only manager /
 lane-only 역할 확장 / 공통 board 확장과 게시판 알림은 아래에 기록한 로컬 회귀와 실제 native
 runtime·model-selection·board·Gateway E2E 검증을 수행했다. 이는 기존 통합의 기록이다.
@@ -772,8 +773,9 @@ bun --no-env-file src/cli.ts status --config config.local.json
 최초 admission barrier를 통과한 Gateway는 이후 head 부재에도 durable admission을 유지한다.
 `head.ready`/`head.connected`가 내려갔다고 이미 열린 수신을 잃거나 모델을 폴링하지 않는다.
 
-**다음 start만 설정한 모든 어댑터의 활성화를 명시적으로 요청한다.** 설치·prepare·doctor는
-start를 대신하지 않는다. 실제 자격 증명으로 실행하면 설정된 Discord·Telegram·Slack 모두에 연결한다.
+**다음 start가 설정한 모든 어댑터의 활성화를 요청한다.** prepare·doctor는 start를
+대신하지 않는다. 별도 macOS `install`은 다음 로그인에 이 start를 실행하도록 허가한다.
+실제 자격 증명으로 실행하면 설정된 Discord·Telegram·Slack 모두에 연결한다.
 
 ```sh
 bun --no-env-file src/cli.ts start --config config.local.json
@@ -1000,8 +1002,47 @@ native shutdown 전에 supervisor의 재기동을 억제해 의도한 종료를 
 shutdown ACK는 프로세스 종료나 슬롯 반환이 아니다. native 프로세스의 실제 종료를 확인한 뒤에만
 소유권·Host 예산을 해제한다. RPC disconnect·기존 PID 종료·socket 부재를 대조하며 하나라도
 관측 불가면 보류한다.
-head의 Gateway client detach나 TUI 종료는 transport stop이 아니다. launchd/systemd 서비스
-설치·자동 시작 등록·배포는 이 절차에 포함하지 않는다.
+head의 Gateway client detach나 TUI 종료는 transport stop이 아니다.
+
+### macOS 로그인 자동 시작 등록
+
+Hermes의 `gateway install`·`uninstall` UX를 기존 단일 Gateway 구조에 맞게 적용했다.
+이 프로젝트의 CLI는 `gateway` 하위 명령 없이 다음처럼 사용한다.
+
+```sh
+bun --no-env-file src/cli.ts install --config config.local.json
+bun --no-env-file src/cli.ts status --config config.local.json
+bun --no-env-file src/cli.ts uninstall --config config.local.json
+```
+
+- `install`: 현재 계정의 LaunchAgents에 인스턴스별 등록을 준비하고 다음 로그인의 실행을
+  허가한다. 즉시 bootstrap하거나 Gateway·모델·메신저를 시작하지 않는다.
+- 로그인 시 절대 경로로 기존 CLI `start`를 한 번 호출한다. macOS의 **로그인 후** 동작이며
+  로그인 전 부팅 데몬은 아니다. `KeepAlive`로 별도 감독·재시도하지 않으므로 명시적 중지와
+  메신저 `/restart`의 일회성 successor가 OS 재기동과 경쟁하지 않는다.
+- `status`의 `autostart`에서 등록·launchd 실행 상태를 확인한다. 설치된 plist나 launcher의
+  종료는 Gateway/head ready 또는 실제 메시지 응답 성공을 뜻하지 않는다.
+- `uninstall`은 정확히 소유한 자동 시작 등록만 제거한다. 시작 launcher가 실행 중이면 강제로
+  끊지 않는다. 기존 Gateway·HEAD·레인·세션·비밀 파일은 유지하며 중지는 `stop main`으로
+  별도 요청한다. `stop main`만 실행하면 등록은 남아 다음 로그인에 다시 시작한다.
+- 자동 시작에는 구성한 모든 메신저 credential 이름을 owner-only `FILE.env`에 준비해야 한다.
+  현재 셸의 credential만으로 설치 성공을 주장하지 않는다. plist에는 토큰이나 임의 환경변수를
+  복사하지 않으며 native 모델 인증은 해당 계정의 기존 OMP 설정을 사용한다.
+- Bun·저장소·설정 경로를 옮겼다면 다시 설치한다. 서비스 관리자 오류·타인 소유/변조 등록은
+  성공으로 숨기거나 `--force`로 인계받지 않는다.
+- native `command[0]`도 실행 가능한 절대 경로여야 한다. 로그인 환경은 대화형 셸 초기화 파일을
+  읽지 않으며 셸 전용 모델 인증·설정 환경변수를 복사하지 않는다.
+- 비정상 종료·전원 손실 뒤의 stale socket, 재사용된 PID, 미확정 재시작 기록은 기존 Gateway
+  소유권 검사에서 시작을 보류할 수 있다. 로그인 launcher는 이를 지우거나 우회하지 않으며
+  실패한 시작을 자동 반복하지 않는다. 등록 성공은 모든 crash 복구의 보장이 아니다.
+- Linux/systemd·Windows 서비스 설치와 Gateway crash 자동 재시작은 이 명령의 범위가 아니다.
+
+검증: Bun 1.4.4에서 autostart·Gateway lifecycle 회귀 35개와 타입 검사를 통과했다.
+격리된 실제 CLI install/status/uninstall·`plutil`·macOS GUI `launchctl bootstrap` 시험도
+통과했다. 시험은 생성된 argv·일회성 정책을 유지하고 HOME/PI/XDG만 격리한 plist 복사본으로,
+이미 실행 중인 시험용 Gateway에 동일 PID로 연결했다. 실제 로그인·재부팅·cold 계정 기동·
+cold detached process-group 생존·운영 메신저 왕복은 검증하지 않았다. 운영 자동 시작은
+이 검증으로 등록되지 않는다.
 
 ## 5. 운영 범위와 복구 제약
 

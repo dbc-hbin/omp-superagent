@@ -14,6 +14,8 @@ const HELP = `omp-superagent — messenger-connected OMP head and independent to
 Usage:
   omp-superagent setup --config FILE
   omp-superagent start --config FILE
+  omp-superagent install --config FILE
+  omp-superagent uninstall --config FILE
   omp-superagent status --config FILE
   omp-superagent attach [main|LANE_ID] --config FILE [--read-only]
   omp-superagent stop [main|LANE_ID] --config FILE
@@ -24,6 +26,8 @@ Usage:
 
 setup interactively prepares configuration and a private FILE.env; it never activates accounts or starts services.
 start explicitly launches a detached Gateway and its native head, activating configured messenger connections. No install/autostart is performed.
+install enables macOS per-user startup at future login only; requires configured messenger credentials in private FILE.env and native settings/authentication under the OS account home. No immediate start or shell environment capture.
+uninstall removes only the owned login launcher; it does not stop an existing Gateway/head or remove credentials/state.
 stop main stops the supervised Gateway/head service; busy native hosts refuse without being killed or resurrected.
 attach uses the same host, not another --resume writer. Run it in a herdr pane if desired.
 discord-commands uses Discord REST only: dry-run by default, with no Gateway or native runtime activation.
@@ -47,9 +51,17 @@ function laneRows(stateDir: string): Lane[] {
 export async function main(args = process.argv.slice(2)): Promise<void> {
   if (!args.length || args.includes("--help") || args[0] === "help") { console.log(HELP); return; }
   const [command] = args;
-  if (!["setup", "start", "status", "attach", "stop", "doctor", "discord-commands", "telegram-commands", "slack-commands"].includes(command!)) throw new Error(`Unknown command: ${command}`);
+  if (!["setup", "start", "install", "uninstall", "status", "attach", "stop", "doctor", "discord-commands", "telegram-commands", "slack-commands"].includes(command!)) throw new Error(`Unknown command: ${command}`);
   const configAt = args.indexOf("--config");
   if (configAt < 0 || !args[configAt + 1]) throw new Error("--config FILE is required");
+  if (command === "install" || command === "uninstall") {
+    if (args.length !== 3 || configAt !== 1 || args[2]!.startsWith("-"))
+      throw new Error(`Usage: ${command} --config FILE`);
+    const config = await loadConfig(args[2]!);
+    const { installAutostart, uninstallAutostart } = await import("./autostart");
+    console.log(JSON.stringify(await (command === "install" ? installAutostart(config) : uninstallAutostart(config)), null, 2));
+    return;
+  }
   if (command === "setup") { await setup(args[configAt + 1]!); return; }
   if (command === "discord-commands" || command === "telegram-commands" || command === "slack-commands") {
     const extra = command === "telegram-commands" ? " [--language CODE]"
@@ -110,9 +122,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (command === "status") {
-    const { gatewayStatus } = await import("./gateway");
+    const { gatewayStatus } = await import("./gateway-protocol");
+    const { autostartStatus } = await import("./autostart");
     console.log(JSON.stringify({
       gateway: await gatewayStatus(config),
+      autostart: await autostartStatus(config),
       main: { socketPath: hostPaths(config, "main").socketPath },
       lanes: laneRows(config.stateDir).map(l => ({
         id: l.id, title: l.title, cwd: l.cwd, workState: l.workState,

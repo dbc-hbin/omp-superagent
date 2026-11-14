@@ -106,6 +106,22 @@ bun --no-env-file src/cli.ts start --config config.local.json
 bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
 ```
 
+### 선택: macOS 로그인 후 자동 시작
+
+```sh
+bun --no-env-file src/cli.ts install --config config.local.json
+bun --no-env-file src/cli.ts status --config config.local.json
+bun --no-env-file src/cli.ts uninstall --config config.local.json
+```
+
+`install`은 인스턴스별 LaunchAgent를 등록해 **재부팅 후 다음 로그인**에 기존 `start`를
+한 번 실행합니다. 설치 즉시 봇을 켜지 않습니다. 메신저 자격 증명은 셸 환경에만 두지 말고
+비공개 `config.local.json.env`에 준비해야 합니다. plist에는 토큰을 저장하지 않습니다.
+`status`는 자동 시작 등록과 실제 Gateway·HEAD 준비 상태를 구분합니다.
+`uninstall`은 이후 자동 시작만 해제하고 현재 작업은 유지합니다. 현재 실행 중지는 별도
+`stop main`입니다. 로그인 전 부팅·Linux/Windows 서비스 설치·Gateway crash 자동 재시작은
+지원하지 않습니다.
+
 ## 사용 방법
 
 - **상태 반응:** 접수하면 👀, native 처리 중이면 Discord·Slack에 💭를 표시합니다.

@@ -9,7 +9,7 @@ import { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-l
 import { credentialEnvNames, hostPaths, loadConfig, privateDirectory, requireMessengerCredentials, type Config } from "./config";
 import type { GatewayRestartRecord, GatewayRestartRequest, LanePresetSnapshot, Messenger } from "./contracts";
 import { DeliveryError } from "./delivery";
-import { gatewayCall, gatewayPaths } from "./gateway-protocol";
+import { gatewayCall, gatewayPaths, gatewayStatus } from "./gateway-protocol";
 import { GatewayServer, type GatewayStatus } from "./gateway-server";
 import { GatewayStore } from "./gateway-store";
 import { readRestartPlan, restartConfigHash, validateRestartPlan, type RestartPlan } from "./gateway-restart";
@@ -526,11 +526,6 @@ export async function startGateway(config: Config, options: GatewayOptions = {})
   return service;
 }
 
-export async function gatewayStatus(config: Config): Promise<GatewayStatus | null> {
-  const path = gatewayPaths(config).socketPath;
-  if (!existsSync(path)) return null;
-  return gatewayCall<GatewayStatus>(path, "/status");
-}
 export async function stopGateway(config: Config): Promise<void> {
   try { await gatewayCall(gatewayPaths(config).socketPath, "/stop", {}, { timeoutMs: 25_000 }); }
   catch (error) {

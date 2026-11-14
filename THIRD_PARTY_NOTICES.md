@@ -194,8 +194,25 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 - 적용: `scripts/setup.sh`와 CLI setup/credential 로딩의 UX를 이 저장소의 OMP·Gateway 계약에
   맞춰 독립 작성했다. 해당 Python·설치기 코드는 복사하지 않았다.
 - Bash builtin·Node 표준 `readline`/dotenv parser와 기존 config 검증을 사용한다.
-  Hermes의 자동 봇 생성·로그인·Gateway 서비스 설치/재시작·allow-all 정책은 가져오지 않는다.
+  셋업에 Hermes의 자동 봇 생성·로그인·Gateway 서비스 설치/재시작·allow-all 정책을 넣지 않는다.
   정확한 호환 범위는 Unix terminal과 이 저장소가 준비한 Bun/패치 OMP이며 Hermes 실행 의존성은 없다.
+
+## Hermes Gateway — 로그인 자동 시작 UX 참고, 독립 구현
+
+- 참고 revision: [`NousResearch/hermes-agent` `fa1aab3187fa9951fa7c3620e0aa6f922d6636f6`](https://github.com/NousResearch/hermes-agent/tree/fa1aab3187fa9951fa7c3620e0aa6f922d6636f6).
+- 확인한 구현: [`hermes_cli/gateway.py`](https://github.com/NousResearch/hermes-agent/blob/fa1aab3187fa9951fa7c3620e0aa6f922d6636f6/hermes_cli/gateway.py)의
+  install/uninstall 명령 dispatch와
+  [`hermes_cli/gateway_launchd.py`](https://github.com/NousResearch/hermes-agent/blob/fa1aab3187fa9951fa7c3620e0aa6f922d6636f6/hermes_cli/gateway_launchd.py)의
+  인스턴스별 LaunchAgent, `ProgramArguments`, `RunAtLoad`, no-start 설치 및 소유권 확인 흐름.
+- 원본 라이선스: [MIT, Copyright (c) 2025 Nous Research](https://github.com/NousResearch/hermes-agent/blob/fa1aab3187fa9951fa7c3620e0aa6f922d6636f6/LICENSE).
+  Python 구현을 복사하지 않고 Node/Bun 표준 API와 macOS `launchctl`·`plutil`을 사용해
+  `src/autostart.ts` 및 CLI install/uninstall/status를 독립 구현했다.
+- 의도적인 차이: macOS 로그인 시 기존 `start`만 실행하는 일회성 등록이며 Hermes의
+  KeepAlive 감독자·프로세스 강제 교체·detached fallback·sudo/system 서비스·Windows backend는
+  가져오지 않는다. 설치 즉시 봇을 켜지 않고 준비·doctor·setup에서 자동 등록하지 않는다.
+- 호환 가정: 현재 계정의 macOS GUI 로그인, 접근 가능한 절대 Bun·저장소·config 경로,
+  비공개 sibling credential 파일, 프로젝트가 준비한 patched OMP. 등록 상태와 실제 Gateway
+  준비 상태는 구분하며, 등록만으로 재부팅·운영 계정 왕복 검증을 주장하지 않는다.
 
 ## OMP — 상위 소스와 코어 패치
 

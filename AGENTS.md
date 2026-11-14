@@ -30,9 +30,13 @@ Read README verification limits before claiming production compatibility.
 ## Architecture invariants
 
 - One messenger-facing main OMP head, supervised by one detached ordinary-code
-  Gateway launched by explicit start. Gateway owns adapters, credentials, durable
+  Gateway launched by explicit start or an explicitly installed one-shot login
+  launcher invoking that same start. Gateway owns adapters, credentials, durable
   ingress, and that designated head's lifecycle; it never connects to lane RPC or
   decides lane dispatch/retry. No additional AI supervisor or execution backend.
+- macOS `install` authorizes next-login startup, not immediate bot activation.
+  Keep the LaunchAgent one-shot, without KeepAlive or a second resident supervisor.
+  `uninstall` removes future startup, not the running Gateway or its session data.
 - At least one optional `discord`, `telegram`, or `slack` config block is required;
   all configured transports run together through `src/messengers.ts`. Existing
   Discord-only configs remain valid. Never activate accounts during preparation

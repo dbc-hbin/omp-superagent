@@ -39,6 +39,8 @@ Host 15개·58 assertion과 최종 tsc를 확인했으며 그 뒤 전체 root �
 - 자체 대시보드, 새로운 모델·인증·컴팩션·서브에이전트 엔진은 만들지 않는다.
 - 명시적 `start`가 하나의 detached **Gateway**를 기동하고 Gateway가 정확히 하나의 지정 헤드를
   시작·재연결·감독한다. Gateway는 일반 코드 데몬이지 AI 감독자나 새 실행 백엔드가 아니다.
+  macOS에서 명시적으로 `install`한 경우 다음 로그인에 일회성 LaunchAgent가 같은 `start`를
+  호출한다. 설치 자체는 봇을 시작하지 않으며 상시 OS 감독자를 추가하지 않는다.
 - 실제 메신저 자격 증명·어댑터는 Gateway가 소유한다. 헤드는 로컬 Messenger client로 연결하고,
   **레인 RPC·배정·재시도·결과 판단은 오직 헤드 runtime**이 소유한다. Gateway는 레인 소켓에 연결하지 않는다.
 - 최초 입력과 연결된 주제의 모든 후속 입력도 헤드를 거친다. 주제 연결은 맥락 정보이지 자동 dispatch 허가가 아니다.
@@ -107,6 +109,7 @@ Gateway를 모든 lane 실행을 소유하는 별도 manager로 확장하지 않
 | 소스 | 구현 책임 |
 | --- | --- |
 | `src/cli.ts`, `src/config.ts` | `--config` 필수 CLI, 명시적 start, 설정·소유 경로 검증, doctor/status/attach/stop |
+| `src/autostart.ts` | macOS의 인스턴스별 일회성 LaunchAgent install/uninstall·등록 상태 조회. 기존 start를 다음 로그인에 호출하며 별도 Gateway 실행·복구 엔진 없음 |
 | `scripts/setup.sh`, `src/setup.ts`, `src/credentials.ts` | controlling-terminal 셋업·토큰 숨김 입력, 기존 config 검증 재사용, owner-only sibling 환경 파일과 start/doctor의 제한된 로딩. 봇 활성화 없음 |
 | `src/gateway*.ts` | detached Gateway 기동·소유권·영속 수신/receipt·헤드 감독·로컬 transport 효과 proxy |
 | `src/gateway-client.ts` | `createGatewayMessenger(config): Messenger`. 헤드 runtime에 기존 Messenger 계약을 제공하며 stop은 client만 detach |
@@ -223,8 +226,28 @@ sequenceDiagram
 별도 단계다. 준비 실패/중지 중에는 polling·offset·ACK를 앞당기지 않는다. 헤드의 client stop은
 연결 해제일 뿐 실제 어댑터 종료가 아니다. `stop main`은 감독 대상 헤드와 Gateway를 함께
 중지하며 즉시 부활시키지 않는다. busy-host 거부, 알 수 없는 socket 보존, 살아 있는 레인의
-재연결·보존을 유지한다. launchd/systemd 설치·자동 로그인·배포는 이번 범위가 아니다.
+재연결·보존을 유지한다. macOS 로그인 자동 시작은 아래의 별도 명시적 설치로만 등록한다.
 연동 제어 연결과 native TUI는 같은 Host/session을 보고 viewer 종료는 Host 종료가 아니다.
+
+### macOS 로그인 자동 시작
+
+`install --config FILE`은 현재 계정의 `~/Library/LaunchAgents`에 canonical stateDir별
+고유 등록을 준비한다. 셸의 임의 `HOME`으로 다른 계정의 서비스 위치를 선택하지 않는다.
+등록은 절대 Bun·CLI·config 경로와 argv를 사용하고, 셸 명령 문자열로 해석하지 않는다.
+자격 증명은 기존 비공개 `FILE.env`에서 시작 시 읽으며 plist에 토큰·임의 환경을 복사하지 않는다.
+설치 시 파일에 필요한 credential 이름이 준비됐는지만 확인하며 계정 인증은 하지 않는다.
+
+`RunAtLoad`로 로그인 시 기존 `start`를 한 번 호출한다. `KeepAlive`는 끄고 launcher 종료가
+detached Gateway를 정리하지 않게 한다. Gateway의 HEAD 감독·수명 소유권·메신저 `/restart`
+successor 경로는 바꾸지 않는다. 설치 중 즉시 bootstrap·봇 로그인하지 않으며 준비·setup·doctor가
+자동으로 설치하지 않는다. macOS 로그인 전 부팅 서비스, Linux/systemd·Windows 서비스,
+Gateway crash 자동 재시작은 제공하지 않는다.
+
+`status`의 `autostart`는 파일 등록·launchd 상태를 실제 Gateway/head ready와 구분한다.
+`uninstall`은 정확히 소유한 등록만 제거하며 실행 중인 시작 launcher는 강제로 끊지 않는다.
+Gateway/head·레인·자격 증명·세션 기록은 보존한다. `stop main`은 현재 실행을 중지하고
+즉시 부활하지 않지만 등록을 유지하면 다음 로그인에 다시 시작한다. 영구 해제는 `uninstall`이다.
+셸 환경에만 있던 credential은 다음 로그인에 상속되지 않으며 이동한 설치 경로는 재등록해야 한다.
 
 Gateway endpoint는 `stateDir/run/gateway.sock`, 로그는 `stateDir/logs/gateway.log`다. 같은
 `coordination.sqlite`의 `gateway_events`/`gateway_effects`와 metadata를 사용하고 별도 SQLite

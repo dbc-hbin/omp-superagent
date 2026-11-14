@@ -122,6 +122,23 @@ Attach a read-only native TUI to the same head:
 bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
 ```
 
+### Optional: start automatically after macOS login
+
+```sh
+bun --no-env-file src/cli.ts install --config config.local.json
+bun --no-env-file src/cli.ts status --config config.local.json
+bun --no-env-file src/cli.ts uninstall --config config.local.json
+```
+
+`install` registers a per-instance LaunchAgent for the **next login after reboot**;
+it does not start a bot now. Required messenger credentials must be in the private
+`config.local.json.env`, not only your shell environment. The one-shot launcher uses
+the existing `start`; it does not supervise or automatically respawn the Gateway.
+`status` separates autostart registration from live Gateway/head readiness.
+`uninstall` disables future login startup without stopping existing work. Use
+`stop main` separately to stop the current Gateway/head. Pre-login boot, Linux and
+Windows service installation are not supported.
+
 ## Working from chat
 
 - Received messages get an eyes reaction. Native processing adds a temporary thought

@@ -1,8 +1,10 @@
 import { request, type IncomingMessage } from "node:http";
+import { existsSync } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Config } from "./config";
 import { DeliveryError } from "./delivery";
+import type { GatewayStatus } from "./gateway-server";
 
 export const MAX_GATEWAY_FRAME = 16 * 1024 * 1024;
 export const MAX_GATEWAY_ATTACHMENT = 20 * 1024 * 1024;
@@ -12,6 +14,12 @@ export function gatewayPaths(config: Pick<Config, "stateDir">) {
   const socketPath = join(config.stateDir, "run", "gateway.sock");
   if (Buffer.byteLength(socketPath) > 100) throw new Error("stateDir is too long for the Gateway socket");
   return { socketPath, logPath: join(config.stateDir, "logs", "gateway.log") };
+}
+
+export async function gatewayStatus(config: Config): Promise<GatewayStatus | null> {
+  const path = gatewayPaths(config).socketPath;
+  if (!existsSync(path)) return null;
+  return gatewayCall<GatewayStatus>(path, "/status");
 }
 
 export async function trustedGatewaySocket(socketPath: string): Promise<{ dev: number; ino: number }> {
