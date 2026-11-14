@@ -371,7 +371,8 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       expect(laneModel).not.toEqual(mainModel); // Advisory choice is intentionally not binding.
     }
 
-    const created = await runtime.startLane({ sourceId: topic.id, title: "Native independent topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: laneCwd,
+    const kickoffText = "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.";
+    const created = await runtime.startLane({ sourceId: topic.id, title: "Native independent topic", kickoff: kickoffText, cwd: laneCwd,
       ...(modelSelection ? { preset: "middle" as const } : { model: laneModel }),
       modelReason, acceptance: ["Reply only inside the original topic thread"] });
     expect(created.route).toEqual(threadRoute);
@@ -434,11 +435,11 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       const editedPreset = await presetManager!.resolve("middle");
       expect(editedPreset).toMatchObject({ model: mainModel, preset: "middle" });
       expect(editedPreset.snapshot).not.toEqual(middlePreset);
-      await runtime.resume(created.id);
     }
 
     await messenger.deliver(followup);
     await until(() => store.input(followup.id)?.state === "done", "bound follow-up reaches head before explicit delegation");
+    if (modelSelection) await runtime.resume(created.id, followup.id);
     expect(store.input(followup.id)).toMatchObject({ target: "main", state: "done", route: threadRoute, generation: 0 });
     expect(requestIds(parseSessionEntries(await fs.readFile(firstLane.sessionFile, "utf8")))).toEqual([firstHandoff]);
     const followupHandoff = `handoff:${followup.id}:${created.id}`;
@@ -460,6 +461,9 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       });
       expect(await laneRoles(created.id, "resumed-middle")).toMatchObject({ model: laneModel, smol: mainModel, judge: modelFixtureModels.judge });
       await unchangedNativeSettings();
+      console.log(JSON.stringify({ nativeResumeReopen: "passed", sourceId: followup.id, route: threadRoute,
+        sessionId: finalLane.sessionId, generation: finalLane.generation, model: finalLane.model,
+        preset: finalLane.modelPreset, transcriptPreserved: true }));
 
       // The authorization source is a real received request, never a generated event ID.
       await messenger.deliver(modelChangeSource);
@@ -506,12 +510,16 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     expect(store.inputs()).toEqual([]);
     expect(store.outputs()).toEqual([]);
     expect(store.approvals()).toEqual([]);
-    expect(messenger.sent.map(output => ({ sourceId: output.sourceId, route: output.route, text: output.text }))).toEqual(
-      expectedDelivered.map(input => ({ sourceId: input.id, route: input.route, text: reply })));
-    expect(outbox()).toEqual(expectedDelivered.map(input => ({
+    const expectedSent = expectedDelivered.map(input => ({ sourceId: input.id, route: input.route, text: reply }));
+    const expectedOutbox = expectedDelivered.map(input => ({
       id: `${input.id}:answer`, source_id: input.id, route: JSON.stringify(input.route), text: reply,
       state: "sent", remote_id: `native-receipt:${input.id}:answer`, error: null,
-    })));
+    }));
+    expectedSent.splice(1, 0, { sourceId: firstHandoff, route: threadRoute, text: kickoffText });
+    expectedOutbox.splice(1, 0, { id: `${topic.id}:kickoff`, source_id: firstHandoff, route: JSON.stringify(threadRoute),
+      text: kickoffText, state: "sent", remote_id: `native-receipt:${topic.id}:kickoff`, error: null });
+    expect(messenger.sent.map(output => ({ sourceId: output.sourceId, route: output.route, text: output.text }))).toEqual(expectedSent);
+    expect(outbox()).toEqual(expectedOutbox);
     expect(errors).toEqual([]);
 
     if (modelSelection) {

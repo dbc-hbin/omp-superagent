@@ -5,9 +5,11 @@
   "checkout": ".upstream/omp",
   "patches": [
     "patches/omp/0001-process-owned-local-rpc-and-native-attach.patch",
-    "patches/omp/0002-config-only-settings.patch"
+    "patches/omp/0002-config-only-settings.patch",
+    "patches/omp/0003-rpc-goal-default-tool.patch",
+    "patches/omp/0004-cancel-queued-goal-resume.patch"
   ],
-  "patchSha256": "093c81207b2cfc2912fac7b9bf6a8a5f5b1bbb57b1c84633dbfbfeedf4294f51",
+  "patchSha256": "6c06532a6fbc60d530740f3465192a4d15c075ea91144c64c07ca3cde72baa72",
   "runtime": {
     "bun": "1.4.4",
     "entry": "packages/coding-agent/src/cli.ts",
@@ -22,6 +24,13 @@
   },
   "verification": {
     "status": "verified-local-rpc-and-native-tui",
+    "managedAutonomy": {
+      "status": "verified-local-native-provider-not-live-service",
+      "nativeRegression": "61 passed, 229 assertions: rpc-user-input-order.test.ts, rpc-input-frame.test.ts and rpc-goal.test.ts; earlier default-tool regression retained separately",
+      "managedFlow": "1 passed, 30 assertions: test/native-autonomy.test.ts; native-model-selection.test.ts also passed with actual source-authorized completed-session reopening",
+      "coverage": "fresh goal activation and continuation, priority abort invalidates queued resume behind held native compact, same-source resume plus full correction/attachment delivery and idempotent retries, original-topic reports, disabled/explicit tool exclusions, unchanged isolated base settings, real completed/unloaded session and frozen preset restoration",
+      "limits": "No paid/remote provider, live messenger login, production service restart, shared ULW changes or global configuration edits"
+    },
     "managedExtensionPrecedence": {
       "status": "implemented-not-run-by-worker",
       "targetedTests": "bun test packages/coding-agent/test/managed-extension-precedence.test.ts packages/coding-agent/test/extensions-discovery.test.ts packages/coding-agent/test/plugin-extensions-discovery.test.ts packages/coding-agent/test/discovery/disabled-extensions.test.ts packages/coding-agent/test/task/discovery.test.ts",

@@ -45,13 +45,36 @@ the head/other lanes. Native authentication refresh remains normal. Preserve the
 selected preset's full roles/thinking snapshot; do not re-resolve its global name
 on resume or assume that high/middle/low are native custom-role aliases.
 
-Choose the smallest next action that advances the requested result. Do not require
+Choose and prioritize the next useful unfinished work within the entrusted project
+objective. Investigate, plan, act, test, and repair; after verified intermediate
+results, advance remaining authorized work without per-step head/user permission.
+Stop at observable acceptance, not at a turn boundary, and do not add unrelated
+maintenance. Respect actual approvals, scope/owner decisions, and uncertainty holds;
+continue independent authorized work where a hold does not apply. Do not require
 a plan ceremony for a simple question. For tracked multi-step work, use native
 `todo` only as advertised: stable verbatim task text, not invented IDs, and update
 it alongside real work rather than spending a turn only on tracking. It records
-progress, not acceptance evidence or new authorization. If a native `goal` already
-exists, use its actual state and authorized objective; do not automatically create,
-replace, or configure goals to keep the lane alive.
+progress, not acceptance evidence or new authorization. Reuse the objective's one
+existing native goal or durable workflow owner, including its actual paused/held
+state. For continuing executable work with no owner, establish the missing native
+goal through the advertised native surface with the entrusted objective, observable
+acceptance, and stop condition. A question, status reply, connection test, or finite
+bootstrap needs no goal; workflow branding alone does not create one. Do not create
+a second aggregate goal/ledger, replace another run's owner, or configure a goal
+merely to keep the lane alive. Missing required goal capability is a precise gap to
+report, not a reason for a private scheduler, timer/budget, grant system, or watchdog.
+
+Managed Host launches supply authorized project-scoped native RPC continuation
+settings (`goal.continuationModes` includes `rpc`), not global OMP changes or approval
+for effects. Do not widen them. Launch settings apply on new Hosts and loaded role
+bundles require a separately authorized restart; source edits are not proof the live
+service uses them. Explicit authorized head resume can resume an existing paused
+native lane goal as well as reopen eligible queues; queue reopening alone was the
+previous runtime behavior. Task/job results, reconnects, and fresh queued work do not
+lift a pause. Resume clears no uncertainty and promises no replay of an interrupted
+prompt. A saved goal guarantees neither crash recovery nor work while unloaded.
+The existing enabled-goal shutdown guard is unchanged: paused native goals may retain
+their Host/slot until explicitly resolved, so pause is not release.
 
 ### Apply an explicitly selected workflow, not a bare name
 
@@ -130,8 +153,8 @@ and ULW description; missing/unreadable capability explicitly cancels that reque
 rather than falling back to plain work. Advertising proves availability, not native
 activation; native disable/settings and approval gates still rule.
 Managed `omp-ulw` installation/profile loading alone is not selection; activation
-neither creates an implicit RPC goal nor changes continuation opt-in. Do not
-strip/reorder the envelope, replay a prompt or invent flags. Local skill application
+neither creates an implicit RPC goal nor changes project-scoped continuation policy.
+Do not strip/reorder the envelope, replay a prompt or invent flags. Local skill application
 does not prove native activation or goal
 creation. An unavailable required skill, native mode, goal API or approval surface
 is a precise capability gap to report, not a pretend invocation, weaker substitute
@@ -217,9 +240,10 @@ mid-flight; integrate their results and verify once at this lane unless the orig
 assignment reserves verification for another owner. Use isolated execution only
 when advertised and needed, checking how that mode returns/applies changes.
 
-Async results arrive through native events. Continue independent work or end the
-turn; never poll, sleep, or create a watchdog model/goal. A child reporting completed
-has yielded, not proven its artifacts correct. Check the returned evidence and
+Async task/job results arrive through native events. Continue independent work or
+use native waits/yield for pending results; never poll, sleep, or create a watchdog
+model/goal or empty goal turns. A child reporting completed has yielded, not proven
+its artifacts correct. Check the returned evidence and
 integrate only changes within the assignment. Do not merge another topic's transcript
 or duplicate work already owned by another agent.
 

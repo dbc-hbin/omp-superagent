@@ -349,7 +349,7 @@ process.on("SIGTERM", () => server.close(() => process.exit(0)));
   expect(observed.managedUlwPath).toBe(launch.managedUlwPath);
   expect(observed.fixtureUlwPath).toBe(launch.managedUlwPath);
   expect(observed.args.filter((arg: string) => arg === launch.managedUlwPath)).toHaveLength(1);
-  expect(observed.config).toEqual({ task: { maxConcurrency: 2 } });
+  expect(observed.config).toEqual({ task: { maxConcurrency: 2 }, goal: { continuationModes: ["rpc"] } });
   expect(observed.cwd).toBe(root);
   expect(observed.args).toContain("rpc-ui");
   expect(observed.args).not.toContain("--auto-approve");

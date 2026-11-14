@@ -6,11 +6,15 @@ Revision: c308970263ae13744ea15ab67302e3dac840e266
 Patches, in order:
   0001-process-owned-local-rpc-and-native-attach.patch
   0002-config-only-settings.patch
+  0003-rpc-goal-default-tool.patch
+  0004-cancel-queued-goal-resume.patch
 upstream/omp.json patchSha256 hashes their concatenated contents in this order.
 
 Apply from a clean checkout of the exact base revision:
   git apply /absolute/omp-superagent/patches/omp/0001-process-owned-local-rpc-and-native-attach.patch
   git apply /absolute/omp-superagent/patches/omp/0002-config-only-settings.patch
+  git apply /absolute/omp-superagent/patches/omp/0003-rpc-goal-default-tool.patch
+  git apply /absolute/omp-superagent/patches/omp/0004-cancel-queued-goal-resume.patch
   bun install --frozen-lockfile
 
 Use Bun 1.4.4 or a compatible newer version. The outer project links the local
@@ -28,6 +32,18 @@ Its sibling resources precede other explicit/configured/installed package roots.
 Invalid or unselected roots, missing package identity, and roots with no modules
 fail instead of silently falling back. Without the marker OMP is unchanged.
 This never edits global settings/packages or uses --no-extensions.
+
+When goal.continuationModes includes rpc, an unrestricted root session's default
+tool set exposes the native goal tool before a goal exists. Explicit --tools,
+--no-tools, restricted child selections, and goal.enabled=false remain binding.
+Interactive-only defaults are unchanged. This permits a managed agent to create
+the one native goal for entrusted executable work without an extension widening
+the operator's selected tool list. Native goal mutation approvals still apply.
+
+Goal resume participates in RpcUserInputGate's existing accepted-frame ordering.
+A later abort or committed session change invalidates an older queued resume before
+it reaches the goal controller. Priority abort/read commands still overtake blocked
+serial work; an invalidated resume cannot clear the controller's native stop fence.
 
 Launch one OS process for each authoritative session:
   mkdir -m 700 /private/tmp/omp-host-$UID

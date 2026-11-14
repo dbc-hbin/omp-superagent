@@ -20,6 +20,9 @@ the results back to your conversation.
 
 - **A head that works, not just delegates.** Keep straightforward work in the main session.
   Open lanes when separate context or independent execution helps.
+- **Autonomy inside the entrusted objective.** Choose and prioritize useful next work,
+  plan, act, test, and repair. Verified intermediate results lead to remaining authorized
+  work without per-step permission, not to unrelated scope or automatic external effects.
 - **Separate repositories and topics.** Lanes are real OMP work sessions, not another
   supervisor layered over a worker.
 - **Models chosen per lane.** The head consults OMP's judge and chooses a native model or
@@ -133,6 +136,11 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
   lane work, and returns the result. Separate repository work keeps its own lane context.
   Ordinary same-topic follow-ups steer active work by default; no `/steer` is needed.
   Different conversations, controls, and workflow selections remain separate.
+- Work continues within the entrusted project objective until acceptance or a real
+  approval, scope, uncertainty, or owner-decision boundary. `/stop` pauses the bound lane;
+  `/resume` explicitly authorizes its continuation, including an existing paused native
+  goal. Previously resume only reopened eligible queues; it never clears uncertain effects
+  or promises replay of an interrupted prompt. Slack uses `!stop` and `!resume`.
 - Inspect the shared head with `/model` or `/effort`; use `/model list`, then
   `/model <provider/model>` or `/effort <level>` to change its idle session.
   Slack uses `!model` and `!effort`. Global defaults and existing lanes stay unchanged.
@@ -161,6 +169,16 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
   default roles and effort too. The change reply reports the actual model/effort and scope.
 
 [Commands, approvals, and everyday use](docs/OPERATIONS.md#4-명령과-일상-사용)
+
+Managed Host launches use project-scoped native goal settings with `rpc` in
+`goal.continuationModes`, without changing global OMP settings. Continuing executable
+work reuses one native goal/workflow owner; questions, status, and preset bootstrap do
+not each create goals. The head yields for durable lane reports rather than running a
+waiting goal; workers use native tasks/jobs. Pause/cancel, approvals, and tool exclusions
+still bind. Saved goals do not guarantee crash replay or continuation while unloaded.
+An enabled goal still blocks shutdown, even when paused, until explicitly resolved.
+New launches pick launch settings; existing role bundles need a separately authorized
+Host restart. Editing this repository does not mean the live service has applied it.
 
 ## ULW included
 

@@ -35,8 +35,12 @@ tool.
   to a lane; do not assume its binding already forwarded it. Other routes, internal
   reports, workflow selections, and controls do not join that execution.
 - Identify the requested outcome, allowed effects, constraints, and observable
-  acceptance. Resolve facts from tools first. If a material repository or authority
-  decision remains unavailable, use native `ask` in the source conversation; provide
+  acceptance. Entrusting a project objective authorizes choosing and prioritizing
+  its next useful work, not a permission question for every plan/act/test/repair
+  step. State that objective and its limits in the handoff so the lane can continue
+  after verified intermediate results; do not narrow it to a single turn or expand
+  it into unrelated maintenance. Resolve facts from tools first. If a material
+  repository or authority decision remains unavailable, use native `ask` in the source conversation; provide
   a short supported form under its advertised schema, not a fabricated questions API.
   Do not ask for information already discoverable from project evidence.
 
@@ -81,6 +85,15 @@ Children start without the head transcript. Require evidence and remaining risks
 ask editing subtasks to skip mid-flight build/test/lint/format runs so their owner
 can verify the integrated result. Async task results arrive as native events; do
 other work or end the turn, never poll for them.
+
+Continuation is separate from workflow branding. For executable work that must
+continue across native turns, reuse the objective's native goal or durable workflow
+owner; the working session creates a missing native goal through its advertised
+surface only when no owner already exists. Do not require ULW just to use native
+goals, create goals for questions/status/bootstrap, or create an aggregate head goal
+to wait for managed lanes. Use their durable report events and preserve the original
+authorized source/route. Native goal availability and project-scoped RPC continuation
+settings do not approve effects or lift pauses, uncertainty, or native tool gates.
 
 ### Select an ULW method only when it earns its state
 
@@ -214,11 +227,12 @@ or quotations where needed. The head's external answer remains in the user's
 language. Use this compact brief, omitting empty fields rather than copying the transcript:
 
 ```text
-Goal: requested observable outcome
+Goal: entrusted project objective and requested observable outcome
 Workspace: existing absolute cwd; repo/worktree evidence
 Scope: allowed changes and explicit non-goals; relevant user changes to preserve
 Evidence: original request facts; relevant paths/results; unresolved assumptions
-Acceptance: observable criteria and intended verification surface
+Acceptance: observable criteria, intended verification surface, and stop condition
+Continuation: next useful authorized work after verified results; existing native goal/workflow owner if any
 Handoff: completed/partial work, checks already run, decisions or approvals still needed
 Method: chosen workflow name; selectedBy: user|head; actual selection provenance
 Necessity: concrete evidence; lighter alternative and deficiency; benefit over overhead

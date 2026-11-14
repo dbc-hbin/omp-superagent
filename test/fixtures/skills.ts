@@ -305,7 +305,9 @@ try {
       check("lane_start", { sourceId: "source", title: "title", cwd: workspace, kickoff, ...modelChoice, workflow }, false);
       check("lane_message", { id: "lane", text: "instruction", sourceId: "source", workflow }, false);
     }
-    for (const name of ["lane_pause", "lane_resume"]) check(name, { id: "lane" }, true);
+    check("lane_pause", { id: "lane" }, true);
+    check("lane_resume", { id: "lane", sourceId: "source" }, true);
+    check("lane_resume", { id: "lane" }, false);
     check("lane_close", { id: "lane", outcome: "completed", evidence: "checked" }, true);
     check("lane_close", { id: "lane", outcome: "cancelled", evidence: "authorized" }, true);
     check("lane_close", { id: "lane", outcome: "completed" }, false);

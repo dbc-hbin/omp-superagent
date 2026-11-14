@@ -16,6 +16,7 @@ import type {
   RpcSessionState,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { isValidModelPresetName } from "@oh-my-pi/pi-coding-agent/config/model-presets";
+import { RPC_GOAL_CONTINUATION_MODE } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
 import type { DialogResponse, LanePresetSnapshot } from "./contracts";
 import { activeManagedUlw, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
 
@@ -300,6 +301,7 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
   try {
     await fs.writeFile(configPath, JSON.stringify({
       task: { maxConcurrency: options.subagentConcurrency },
+      goal: { continuationModes: [RPC_GOAL_CONTINUATION_MODE] },
       ...(options.modelPreset ? { modelPresets: { [options.modelPreset.name]: options.modelPreset.preset } } : {}),
       ...(options.modelSettings ? {
         modelRoles: {

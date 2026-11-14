@@ -36,7 +36,7 @@ export interface RuntimeState {
   hasPendingAsyncWork?: boolean;
   hasOwnedRunningWork?: boolean;
   pendingUiRequests?: Record<string, unknown>[];
-  goal?: { enabled?: boolean; mode?: string } | null;
+  goal?: { enabled?: boolean; mode?: string; goal?: { status?: string } } | null;
 }
 /** The production adapter is HostConnection; tests inject only its transport boundary. */
 export interface RuntimeHost {
@@ -66,7 +66,7 @@ interface Live {
   sessionId: string;
   connection: RuntimeHost;
   input?: InputRecord;
-  result?: { status: string; agentInvoked: boolean };
+  result?: { status: string; agentInvoked: boolean; goalResume?: true };
   admitted: Map<string, { input: InputRecord; result?: { status: string; agentInvoked: boolean } }>;
   running: boolean;
   preparing: number;
@@ -163,6 +163,7 @@ export class Superagent {
   private readonly callbacks = new Set<string>();
   private readonly controls = new Set<string>();
   private readonly operations = new Map<string, Promise<Lane>>();
+  private readonly pauseRevisions = new Map<string, number>();
   private readonly modelChanges = new Map<string, Promise<unknown>>();
   private readonly tasks = new Set<Promise<unknown>>();
   private readonly activeReactions = new Map<string, string>();
@@ -890,7 +891,7 @@ export class Superagent {
       this.controls.add(input.id);
       this.background((async () => {
         try {
-          await this.resume(bound.id);
+          await this.resume(bound.id, input.id);
           this.store.settle(input.id, "done", {
             id: `${input.id}:control`, text: "레인의 실행 대기를 해제했습니다.",
           });
@@ -1383,6 +1384,7 @@ export class Superagent {
 
   async pause(id: string): Promise<void> {
     this.assertRestartOpen();
+    this.pauseRevisions.set(id, (this.pauseRevisions.get(id) ?? 0) + 1);
     this.laneMutations++;
     try {
       const lane = this.requireLane(id);
@@ -1429,12 +1431,18 @@ export class Superagent {
     } finally { this.laneMutations--; }
   }
 
-  async resume(id: string): Promise<void> {
+  async resume(id: string, sourceId?: string): Promise<void> {
     this.assertRestartOpen();
+    const pauseRevision = this.pauseRevisions.get(id) ?? 0;
     this.laneMutations++;
     try {
       const lane = this.requireLane(id);
       if (lane.workState === "cancelled") throw new Error("Cancelled work requires an explicit new/reopened request");
+      this.authorized(lane.route);
+      const source = sourceId ? this.store.input(sourceId) : null;
+      if (sourceId && (!source || source.state === "cancelled")) throw new Error("Resume requires a received uncancelled sourceId");
+      if (source) this.authorized(source.route);
+      if (source && this.store.input(`resume:${source.id}:${id}`)) return;
       if (this.blocked.has(id)) {
         if (this.residentHosts().size > this.config.maxHosts) throw new Error("Existing native ownership exceeds the host budget; reconcile it before resuming");
         if (this.live.has(id) || lane.pid !== null || existsSync(lane.socketPath)) {
@@ -1442,19 +1450,73 @@ export class Superagent {
           await this.reconcileUi(live);
         }
       }
-      const live = this.live.get(id);
+      let live = this.live.get(id);
+      if (!live && source && existsSync(lane.sessionFile)) {
+        if (source.state === "cancelled" || this.kickoffHeld(id)
+          || this.store.inputs(id).some(input => input.state === "submitted" || input.state === "uncertain")) {
+          throw new Error("Resolve kickoff delivery and uncertain submissions before restoring the goal");
+        }
+        live = await this.ensureLane(lane, undefined, pauseRevision) ?? undefined;
+        if (!live) throw new Error("The native session could not be restored within existing ownership and host limits");
+      }
       if (live) await this.checkLaneModel(live);
       else if (this.modelIntent(id)) await this.requireAvailableModel(this.modelIntent(id)!.model);
       else if (lane.model !== null) await this.requireAvailableModel(lane.model);
+      const state = live ? await this.state(live) : null;
+      if ((this.pauseRevisions.get(id) ?? 0) !== pauseRevision) throw new Error("A later pause superseded this resume");
+      if (source && this.store.input(source.id)?.state === "cancelled") throw new Error("The resume source was cancelled");
+      if (state?.goal?.goal?.status === "paused") {
+        if (!source || source.state === "cancelled") throw new Error("Resuming a native goal requires a received uncancelled sourceId");
+        this.authorized(source.route);
+        this.authorized(lane.route);
+        if (live?.input || !state.isSettled || state.pendingUiRequests?.length || this.store.approvals(id).length
+          || this.store.inputs(id).some(input => input.state === "submitted" || input.state === "uncertain")
+          || this.kickoffHeld(id)) throw new Error("Resolve native work, approvals, kickoff delivery and uncertain submissions before resuming the goal");
+      }
       this.assertRestartOpen();
       this.blocked.delete(id);
       this.modelHolds.delete(id);
-      this.store.updateLane(id, lane.generation, { workState: "open" });
+      this.store.updateLane(id, this.requireLane(id).generation, { workState: "open" });
       const intent = this.modelIntent(id);
       if (!live && intent?.native === false) this.commitModelChange(this.requireLane(id), intent);
       if (!live && this.modelIntent(id)) {
         const restored = await this.ensureLane(this.requireLane(id));
         if (!restored || this.modelIntent(id)) throw new Error(`Lane ${id} model-change intent remains held; inspect native state and retry its exact source`);
+      }
+      if (live && source && state?.goal?.goal?.status === "paused") {
+        const inputId = `resume:${source.id}:${id}`;
+        this.store.receive({
+          ...source, id: inputId, route: lane.route,
+          text: "Resume the existing native goal within its entrusted objective.", attachments: [],
+        }, id, { [`handoff-source:${inputId}`]: source.id });
+        const requestId = `sg-${key(inputId)}-${live.generation}`;
+        if (!this.store.submit(inputId, requestId, live.generation)) throw new Error("Native goal resume was not admitted");
+        const input = this.store.input(inputId);
+        if (!input) throw new Error("Admitted native goal resume is missing");
+        live.input = input;
+        live.result = undefined;
+        live.admitted.set(requestId, { input });
+        live.ownedRuns = 0;
+        live.running = false;
+        live.assistantOutcome = undefined;
+        live.text = "";
+        live.busy = true;
+        live.preparing++;
+        this.store.updateLane(id, live.generation, { runtimeState: "running", lastActivityAt: Date.now() });
+        try {
+          successful(await live.connection.request({ type: "goal", op: "resume" }, requestId), "resume native goal");
+          if (live.input === input && live.admitted.has(requestId) && this.requireLane(id).workState === "open") {
+            const result: Live["result"] = { status: "accepted", agentInvoked: false, goalResume: true };
+            live.result = result;
+            live.admitted.set(requestId, { input, result });
+          }
+        } catch (error) {
+          if (this.store.input(inputId)?.state === "submitted") this.store.settle(inputId, "uncertain", {
+            id: `${inputId}:admission`, text: "Native goal resume outcome is uncertain; it was not replayed.",
+          });
+          throw error;
+        } finally { live.preparing--; }
+        await this.finish(live);
       }
       await this.kick();
     } finally { this.laneMutations--; }
@@ -1499,12 +1561,12 @@ export class Superagent {
     };
   }
 
-  private async ensureLane(lane: Lane, explicitRetry?: ModelChangeIntent): Promise<Live | null> {
+  private async ensureLane(lane: Lane, explicitRetry?: ModelChangeIntent, authorizedResume?: number): Promise<Live | null> {
     if (this.restartFence()) return null;
     if (this.modelChanges.has(lane.id) && !explicitRetry) return null;
     const existing = this.live.get(lane.id);
     if (existing) return existing.releasing ? null : existing;
-    if ((this.blocked.has(lane.id) && !explicitRetry) || this.connecting.has(lane.id)) return null;
+    if ((this.blocked.has(lane.id) && !explicitRetry && authorizedResume === undefined) || this.connecting.has(lane.id)) return null;
     if (!this.residentHosts().has(lane.id) && this.residentHosts().size >= this.config.maxHosts) {
       const candidates = [...this.live.values()].filter(host => host.id !== "main" && !host.input && !host.busy)
         .sort((left, right) => left.lastActivity - right.lastActivity);
@@ -1514,6 +1576,8 @@ export class Superagent {
       if (this.residentHosts().size >= this.config.maxHosts) return null;
     }
     this.connecting.add(lane.id);
+    const restoringResumed = (workState: Lane["workState"]) => (workState === "paused" || workState === "completed")
+      && authorizedResume !== undefined && (this.pauseRevisions.get(lane.id) ?? 0) === authorizedResume;
     try {
       if (existsSync(lane.socketPath)) {
         const live = await this.attach(lane.id, lane.generation, lane.socketPath);
@@ -1549,14 +1613,15 @@ export class Superagent {
       }
       const current = this.requireLane(lane.id);
       if (current.generation !== lane.generation) throw new Error(`Lane ${lane.id} generation changed before launch`);
-      if (current.workState !== "open" && !explicitRetry) return null;
+      if (current.workState !== "open" && !explicitRetry && !restoringResumed(current.workState)) return null;
       lane = current;
       const restoring = lane.sessionId !== null || existsSync(lane.sessionFile);
       if (restoring && !existsSync(lane.sessionFile)) throw new Error(`Lane ${lane.id} has a recorded session but no transcript; restore it before resuming`);
       lane = this.store.nextGeneration(lane.id);
       await mkdir(dirname(lane.sessionFile), { recursive: true, mode: 0o700 });
       const beforeLaunch = this.requireLane(lane.id);
-      if (this.stopped || this.restartFence() || beforeLaunch.generation !== lane.generation || (beforeLaunch.workState !== "open" && !explicitRetry)) return null;
+      if (this.stopped || this.restartFence() || beforeLaunch.generation !== lane.generation
+        || (beforeLaunch.workState !== "open" && !explicitRetry && !restoringResumed(beforeLaunch.workState))) return null;
       const presetLaunch = explicitRetry?.preset && explicitRetry.snapshot
         ? { model: explicitRetry.model, name: explicitRetry.preset, snapshot: explicitRetry.snapshot }
         : !pendingModelChange && lane.model && lane.modelPreset && lane.modelPresetSnapshot
@@ -2673,11 +2738,13 @@ export class Superagent {
       // The originating command's result includes failures outside assistant
       // generation (for example admission/cost limits). Only an authoritative
       // later owned run can supersede it, including a successful native retry.
-      const outcome = live.assistantOutcome && live.assistantOutcome.run > 1
-        ? live.assistantOutcome.status : result.status;
+      // Goal resume only acknowledges activation: even its first run needs an
+      // observed assistant outcome; a zero-run refusal is not completion.
+      const outcome = result.goalResume ? live.assistantOutcome?.status ?? "error"
+        : live.assistantOutcome && live.assistantOutcome.run > 1 ? live.assistantOutcome.status : result.status;
       const completed = outcome === "completed";
       const state = completed ? "done" : outcome === "aborted" ? "cancelled" : "uncertain";
-      const text = completed ? (result.agentInvoked ? live.text : "") : outcome === "aborted"
+      const text = completed ? (result.agentInvoked || result.goalResume && live.ownedRuns > 0 ? live.text : "") : outcome === "aborted"
         ? "실행이 중단되었습니다. 작업 완료로 처리하지 않았습니다."
         : "실행이 실패했습니다. 작업 완료로 처리하지 않았습니다.";
       for (const admitted of admissions) {

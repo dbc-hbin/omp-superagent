@@ -48,6 +48,8 @@ class HostTransport implements RuntimeHost {
   beforeSetEffort?: () => Promise<void> | void;
   beforeCompact?: () => Promise<void> | void;
   beforeAbort?: () => Promise<void> | void;
+  beforeGoalResume?: () => Promise<void> | void;
+  goalResumeRuns = true;
   compactResult: "success" | "rejected" | "throw-after" = "success";
   compactAbort?: () => void;
   abortCount = 0;
@@ -158,7 +160,20 @@ class HostTransport implements RuntimeHost {
       }
       return { success: true, data: { agentInvoked: !this.local } };
     }
-    if (command.type === "goal") { this.state.goal = null; return { success: true, data: {} }; }
+    if (command.type === "goal") {
+      if (this.state.goal?.goal && command.op === "pause") {
+        this.state.goal = { enabled: false, mode: "active", goal: { status: "paused" } };
+      } else if (this.state.goal?.goal && command.op === "resume") {
+        this.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+        if (this.goalResumeRuns) {
+          this.state.isSettled = false;
+          this.state.isStreaming = true;
+          this.emit({ type: "agent_start" });
+        }
+        await this.beforeGoalResume?.();
+      } else this.state.goal = null;
+      return { success: true, data: {} };
+    }
     if (command.type === "shutdown_host") {
       if (this.shutdownAllowed && this.shutdownDisconnect) this.exit();
       return { success: this.shutdownAllowed, error: this.shutdownAllowed ? undefined : "services still owned" };
@@ -326,7 +341,7 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], pre
   const main = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
   const hosts = new Map<string, HostTransport>([[hostPaths(config, "main").socketPath, main]]);
   const launched: HostOptions[] = [];
-  const launchBehavior: { model?: LaneModel | null; pid?: number } = {};
+  const launchBehavior: { model?: LaneModel | null; pid?: number; goal?: RuntimeState["goal"] } = {};
   const nativePresets = new Map<string, ResolvedLanePreset>([
     ["high", { model: executionModel, preset: "high", snapshot: { modelRoles: { default: "fixture/capable", smol: "fixture/efficient" }, defaultThinkingLevel: Effort.High } }],
     ["middle", { model: executionModel, preset: "middle", snapshot: { modelRoles: { default: "fixture/capable" } } }],
@@ -366,6 +381,7 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], pre
       const host = new HostTransport(options.sessionFile, `session-${id}`,
         launchBehavior.model !== undefined ? launchBehavior.model : selected ?? restored ?? executionModel);
       host.state.hostPid = launchBehavior.pid ?? process.pid;
+      if (launchBehavior.goal !== undefined) host.state.goal = structuredClone(launchBehavior.goal);
       if (options.modelPreset) host.state.modelSettings = structuredClone(options.modelPreset.preset);
       hosts.set(options.socketPath, host);
       if (!existsSync(options.sessionFile)) writeFileSync(options.sessionFile, JSON.stringify({ type: "session", version: 3, id: host.state.sessionId, cwd: options.cwd }) + "\n");
@@ -3653,6 +3669,227 @@ describe("real Store runtime coordination", () => {
     expect(store.input("135")?.state).toBe("done");
     expect(hosts.get(lane.socketPath)?.prompts ?? []).toEqual([]);
     expect(messenger.sent).toHaveLength(1);
+  });
+
+  test("explicit resume owns a paused native goal's result without replaying the cancelled prompt", async () => {
+    const { runtime, store, config, hosts, main, messenger } = fixture();
+    const lane = savedLane(store, config, "goal-resume", route("11"));
+    await runtime.start();
+    await delegate(runtime, message("goal-original", lane.route));
+    const host = hosts.get(lane.socketPath);
+    if (!host) throw new Error("Expected the executing native lane");
+    host.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+    await runtime.pause(lane.id);
+    const source = message("goal-resume-source", lane.route, "/resume");
+    await admit(runtime, source);
+    expect(host.state.goal).toMatchObject({ enabled: true, goal: { status: "active" } });
+    expect(host.prompts).toHaveLength(1);
+    expect(store.input(`resume:${source.id}:${lane.id}`)?.state).toBe("submitted");
+    expect(store.input(`handoff:goal-original:${lane.id}`)?.state).toBe("cancelled");
+    host.state.goal = null;
+    host.state.isStreaming = false;
+    host.state.isSettled = true;
+    host.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Resumed native objective verified" }], stopReason: "stop" } });
+    host.emit({ type: "session_settled" });
+    await main.whenPrompts(1);
+    expect(store.input(`resume:${source.id}:${lane.id}`)?.state).toBe("done");
+    expect(store.input(`report:resume:${source.id}:${lane.id}`)?.text).toContain("Resumed native objective verified");
+    expect(store.input(`report:handoff:goal-original:${lane.id}`)).toBeNull();
+    await messenger.whenSent(1);
+    expect(messenger.sent.filter(output => output.id === `${source.id}:control`)).toHaveLength(1);
+  });
+
+  test("native goal resume cannot bypass an uncertain earlier submission or an unconfirmed kickoff", async () => {
+    for (const hold of ["uncertain", "kickoff"] as const) {
+      const { runtime, store, config, hosts } = fixture();
+      const lane = savedLane(store, config, `resume-${hold}`, route("11"));
+      await runtime.start();
+      await delegate(runtime, message(`original-${hold}`, lane.route));
+      const host = hosts.get(lane.socketPath);
+      if (!host) throw new Error("Expected the executing native lane");
+      host.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+      await runtime.pause(lane.id);
+      const held = message(`held-${hold}`, lane.route);
+      store.receive(held, lane.id);
+      if (hold === "uncertain") store.settle(held.id, "uncertain");
+      else store.setMeta(`kickoff-output:${held.id}`, "unconfirmed-output");
+      const source = message(`resume-${hold}`, lane.route);
+      store.receive(source, "main");
+      store.settle(source.id, "done");
+      await expect(runtime.resume(lane.id, source.id)).rejects.toThrow("Resolve native work");
+      expect(store.lane(lane.id)?.workState).toBe("paused");
+      expect(host.state.goal?.goal?.status).toBe("paused");
+      expect(host.commands.filter(command => command.type === "goal" && command.op === "resume")).toEqual([]);
+    }
+  });
+
+  test("explicit resume restores an unloaded native goal without replaying an old input", async () => {
+    const { runtime, store, config, hosts, launchBehavior, main } = fixture();
+    const lane = savedLane(store, config, "unloaded-goal", route("11"));
+    store.updateLane(lane.id, lane.generation, { workState: "paused" });
+    mkdirSync(dirname(lane.sessionFile), { recursive: true });
+    writeFileSync(lane.sessionFile, JSON.stringify({ type: "session", version: 3, id: "session-unloaded-goal", cwd: lane.cwd }) + "\n");
+    launchBehavior.goal = { enabled: false, mode: "active", goal: { status: "paused" } };
+    await runtime.start();
+    const source = message("resume-unloaded-goal", lane.route);
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    await runtime.resume(lane.id, source.id);
+    const host = hosts.get(lane.socketPath);
+    if (!host) throw new Error("Expected the restored native lane");
+    expect(host.prompts).toEqual([]);
+    expect(host.state.goal?.goal?.status).toBe("active");
+    expect(store.lane(lane.id)?.workState).toBe("open");
+    host.state.goal = null;
+    host.state.isStreaming = false;
+    host.state.isSettled = true;
+    host.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Restored objective verified" }] } });
+    host.emit({ type: "session_settled" });
+    await main.whenPrompts(1);
+    expect(store.input(`report:resume:${source.id}:${lane.id}`)?.text).toContain("Restored objective verified");
+  });
+
+  test("one source can resume a goal and deliver its full correction and attachment idempotently", async () => {
+    const downloads: Route[] = [];
+    const { runtime, store, config, hosts, main } = fixture(3, async route => {
+      downloads.push(route);
+      return new Response("owner correction");
+    });
+    const lane = savedLane(store, config, "resume-correction", route("11"));
+    await runtime.start();
+    await delegate(runtime, message("original-correction", lane.route));
+    const host = hosts.get(lane.socketPath);
+    if (!host) throw new Error("Expected the executing native lane");
+    host.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+    await runtime.pause(lane.id);
+    const source: Inbound = { ...message("resume-correction-source", lane.route, "Resume, but apply this exact correction."),
+      attachments: [{ id: "correction", name: "correction.txt", url: "adapter-file:correction", size: 16 }] };
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    await runtime.resume(lane.id, source.id);
+    await runtime.resume(lane.id, source.id);
+    host.state.goal = null;
+    host.state.isStreaming = false;
+    host.state.isSettled = true;
+    host.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Resumed objective" }] } });
+    host.emit({ type: "session_settled" });
+    await main.whenPrompts(1);
+    main.complete("Resume milestone received");
+    await runtime.messageLane(lane.id, source.text, source.id);
+    await runtime.messageLane(lane.id, source.text, source.id);
+    expect(host.prompts).toHaveLength(2);
+    expect(host.prompts[1]?.command.message).toContain(source.text);
+    expect(store.input(`handoff:${source.id}:${lane.id}`)?.attachments).toEqual(source.attachments);
+    expect(downloads).toEqual([source.route]);
+    expect(host.commands.filter(command => command.type === "goal" && command.op === "resume")).toHaveLength(1);
+    host.complete("Correction applied");
+    await main.whenPrompts(2);
+    expect(store.input(`resume:${source.id}:${lane.id}`)?.state).toBe("done");
+    expect(store.input(`handoff:${source.id}:${lane.id}`)?.state).toBe("done");
+  });
+
+  test("a source-authorized resume reopens a completed unloaded conversation before forwarding work", async () => {
+    const { runtime, store, config, hosts } = fixture();
+    const lane = savedLane(store, config, "completed-unloaded", route("11"));
+    store.updateLane(lane.id, lane.generation, { workState: "completed" });
+    mkdirSync(dirname(lane.sessionFile), { recursive: true });
+    writeFileSync(lane.sessionFile, JSON.stringify({ type: "session", version: 3, id: "session-completed-unloaded", cwd: lane.cwd }) + "\n");
+    await runtime.start();
+    const source = message("reopen-completed-source", lane.route, "Continue the existing conversation.");
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    await runtime.resume(lane.id, source.id);
+    expect(store.lane(lane.id)).toMatchObject({ workState: "open", model: lane.model, sessionFile: lane.sessionFile });
+    await runtime.messageLane(lane.id, source.text, source.id);
+    const host = hosts.get(lane.socketPath);
+    if (!host) throw new Error("Expected the restored native conversation");
+    expect(host.prompts).toHaveLength(1);
+    expect(host.prompts[0]?.command.message).toContain(source.text);
+    expect(host.commands.filter(command => command.type === "goal" && command.op === "resume")).toEqual([]);
+  });
+
+  for (const outcome of ["error", "aborted", "no-run"] as const) {
+    test(`native resume ${outcome} is not a completed objective`, async () => {
+      const { runtime, store, config, hosts, main } = fixture();
+      const lane = savedLane(store, config, `goal-${outcome}`, route("11"));
+      await runtime.start();
+      await delegate(runtime, message(`original-${outcome}`, lane.route));
+      const host = hosts.get(lane.socketPath);
+      if (!host) throw new Error("Expected the executing native lane");
+      host.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+      await runtime.pause(lane.id);
+      const source = message(`resume-${outcome}`, lane.route);
+      store.receive(source, "main");
+      store.settle(source.id, "done");
+      host.goalResumeRuns = outcome !== "no-run";
+      await runtime.resume(lane.id, source.id);
+      if (outcome !== "no-run") {
+        host.state.isSettled = true;
+        host.state.isStreaming = false;
+        host.emit({ type: "agent_end", messages: [{
+          role: "assistant", stopReason: outcome, content: [{ type: "text", text: "Unverified success" }],
+        }] });
+        host.emit({ type: "session_settled" });
+      }
+      await main.whenPrompts(1);
+      expect(store.input(`resume:${source.id}:${lane.id}`)?.state).toBe(outcome === "aborted" ? "cancelled" : "uncertain");
+      expect(store.input(`report:resume:${source.id}:${lane.id}`)?.text).not.toContain("Unverified success");
+      expect(host.prompts).toHaveLength(1);
+    });
+  }
+
+  test("a later pause supersedes a resume waiting for native model readiness", async () => {
+    const { runtime, store, config, hosts, main } = fixture();
+    const lane = savedLane(store, config, "resume-readiness-race", route("11"));
+    await runtime.start();
+    await delegate(runtime, message("original-readiness-race", lane.route));
+    const host = hosts.get(lane.socketPath);
+    if (!host) throw new Error("Expected the executing native lane");
+    host.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+    await runtime.pause(lane.id);
+    const source = message("resume-readiness-race", lane.route);
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    const checking = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    main.beforeCatalog = async () => { checking.resolve(); await release.promise; };
+    const resumed = runtime.resume(lane.id, source.id).then(() => null, (error: unknown) => error);
+    await checking.promise;
+    await runtime.pause(lane.id);
+    release.resolve();
+    expect(await resumed).toMatchObject({ message: "A later pause superseded this resume" });
+    expect(store.lane(lane.id)?.workState).toBe("paused");
+    expect(host.commands.filter(command => command.type === "goal" && command.op === "resume")).toEqual([]);
+    expect(store.input(`resume:${source.id}:${lane.id}`)).toBeNull();
+  });
+
+  test("a late native resume acknowledgement cannot restore an admission cancelled by a newer pause", async () => {
+    const { runtime, store, config, hosts, main } = fixture();
+    const lane = savedLane(store, config, "resume-ack-race", route("11"));
+    await runtime.start();
+    await delegate(runtime, message("original-ack-race", lane.route));
+    const host = hosts.get(lane.socketPath);
+    if (!host) throw new Error("Expected the executing native lane");
+    host.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+    await runtime.pause(lane.id);
+    const source = message("resume-ack-race", lane.route);
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    const accepted = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    host.beforeGoalResume = async () => { accepted.resolve(); await release.promise; };
+    const resumed = runtime.resume(lane.id, source.id);
+    await accepted.promise;
+    await runtime.pause(lane.id);
+    release.resolve();
+    await resumed;
+    host.emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Late output" }] }] });
+    host.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(store.input(`resume:${source.id}:${lane.id}`)?.state).toBe("cancelled");
+    expect(store.input(`report:resume:${source.id}:${lane.id}`)).toBeNull();
+    expect(store.lane(lane.id)?.workState).toBe("paused");
+    expect(main.prompts).toEqual([]);
   });
 
   test("restart enforces persisted pause without reopening cancelled work", async () => {

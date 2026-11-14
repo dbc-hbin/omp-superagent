@@ -29,6 +29,9 @@ Host 15개·58 assertion과 최종 tsc를 확인했으며 그 뒤 전체 root �
   플랫폼별 ID를 검증하며 표시 이름으로 교차 플랫폼 신원이나 권한을 추정하지 않는다.
 - 스레드·주제별 맥락과 무관한 저장소의 작업 맥락을 분리한다.
 - 레인은 그 대화에서 직접 일하는 OMP 세션이다. 레인마다 감독자와 작업자를 둘씩 만들지 않는다.
+- 맡긴 프로젝트 목표 안에서는 헤드·레인이 다음 유용한 일을 선택·우선순위화하고 계획·실행·검증·
+  수정을 이어간다. 검증한 중간 결과 뒤에도 남은 허가 작업을 단계별 허락 없이 진행한다.
+  완료 기준에 도달하면 멈추며 새 범위·외부 효과·불확실성·승인 경계는 그대로 지킨다.
 - 모든 요청을 위임하지 않는다. 메인 헤드와 레인 모두 일반 OMP 작업 능력을 유지한다.
 - 저장된 세션 수와 상주 실행 수를 분리한다.
 - 실행은 herdr 없이도 가능하다. herdr는 동일한 실행에 접속하는 선택적 화면이다.
@@ -97,7 +100,7 @@ flowchart TB
 Gateway 수신 연결은 헤드/레인의 모델 턴과 프로세스 상주 여부에 귀속되지 않는다. 헤드가
 없어도 Gateway는 허가된 수신을 먼저 영속화하고 지정 헤드 복구 뒤 순서대로 전달한다.
 Gateway를 모든 lane 실행을 소유하는 별도 manager로 확장하지 않는다.
-이벤트가 없을 때 LLM을 반복 호출하거나 상시 대기 goal을 돌리지 않는다.
+실행할 허가 작업 없이 이벤트를 기다리기 위해 LLM을 반복 호출하거나 상시 대기 goal을 돌리지 않는다.
 
 ### 구현 위치와 시작 경로
 
@@ -599,7 +602,7 @@ bash·eval 상태, 대기 입력, 승인, 비동기 결과가 다른 세션으�
 | 독립 레인 | 맥락 분리, 독립 수명, 병렬 진행, 변경 격리에 실질적인 이점이 있음 |
 
 헤드의 실행·수정 도구를 일괄 제거하지 않는다.
-위임 정책은 운영 스킬로 조율하고, 위험한 행동의 권한은 별도 정책으로 집행한다.
+위임 정책은 운영 스킬로 조율하고, 행동 권한은 기존 native 승인·도구 제외·원래 배정의 경계로 집행한다.
 파일 수·줄 수·예상 시간 같은 임의 임계값으로 위임을 강제하지 않는다.
 직접 시작한 작업이 커지면 원본 요구와 진행·검증 상태를 정리해 레인으로 넘길 수 있다.
 
@@ -617,7 +620,7 @@ bash·eval 상태, 대기 입력, 승인, 비동기 결과가 다른 세션으�
 | `lane_set_model` | `id`, 실제 허가 입력 `sourceId`, 정확히 하나의 model/preset, 필수 modelReason으로 명시적 유휴 레인 변경. active input/UI/goal/소유 서비스/불확실성 없이 durable intent/receipt·native readback으로 확인. 자동 interrupt·승격·전역 설정 변경 없음 |
 | `lane_inspect` | ID 생략 시 관리 레인 목록, 지정 시 기록·실제 실행 상태 조회 |
 | `lane_message` | `id`, `text`, 실제 허가 입력 `sourceId`, 선택적 `workflow: {name,reason}`으로 지정 레인에 명시적 지시·후속 맥락 전달 |
-| `lane_pause`, `lane_resume` | 실행과 자동 재개 정책을 함께 제어하고 상태 확인 |
+| `lane_pause`, `lane_resume` | 실행과 자동 재개 정책을 함께 제어하고 상태 확인. `lane_resume`는 실제 재개 지시의 `sourceId`로 기존 paused native goal의 결과를 원래 route에 연결 |
 | `lane_close` | 확인한 evidence와 completed/cancelled 결과를 기록. merge·게시·worktree 삭제 권한을 부여하지 않음 |
 
 `lane_start`는 실행 완료나 빈 슬롯을 기다리지 않고 레인 ID와 접수 상태를 반환한다.
@@ -631,6 +634,8 @@ root head의 manager 확장은 Host 시작 시 `skills/head/SKILL.md`와
 transcript로 삽입하는 방식이 아니며, 적용 전에 별도 `read`나 스킬 조회를 할 필요가 없다.
 파일 수정은 Host 재시작 후 반영된다. 같은 소스의 native URI는 기존 OMP 패키지 discovery로
 계속 제공하며 별도 스킬 레지스트리는 만들지 않는다.
+소스 편집은 현재 운영 서비스의 적용 증거가 아니며, 기존 Host의 역할 번들을 바꾸려면 별도로
+허가된 재시작이 필요하다. 이번 역할 변경만으로 live 서비스를 재시작하거나 적용했다고 하지 않는다.
 
 전체 로드는 번들된 헤드 운영 절차에만 적용하며 관련 없는 사용자·프로젝트 스킬을 모두
 로드하지 않는다. 헤드 번들은 레인이나 native 자식에 주입하지 않는다. 레인은 기존의 별도
@@ -650,6 +655,39 @@ native 위임과 manager/board 권한 경계는 그대로 유지한다.
 - 레인 스킬: 범위 내 직접 작업, 전문 스킬 활용, 진행·막힘·완료 근거 보고.
 - Dori harness의 “모든 요청을 레인으로” 지침은 채택하지 않는다.
 - 별도의 duty LLM이나 레인별 감독 루프를 기본 구성으로 추가하지 않는다.
+
+### 맡긴 목표의 자율 실행과 native continuation
+
+자율성은 맡긴 프로젝트 목표의 다음 유용한 작업을 고르고 계획·실행·테스트·수정한 뒤,
+검증된 결과에서 남은 허가 작업으로 이어가는 것이다. 단계별 진행 허락을 반복해서 묻지 않는다.
+완료 기준을 충족하면 끝내고, 실제 범위·권한·운영자 결정이나 불확실성이 막는 행동만 보류한다.
+미배정 유지보수나 새 외부 효과를 목표에 추가하지 않는다. 작업 topic 생성·확인된 간결한 착수
+보고를 먼저 보내는 기존 fence, 원래 source/route와 pause/cancel·native 승인·도구 제외는 유지한다.
+
+목표의 기존 native goal 또는 durable workflow owner 하나를 재사용한다. 이어갈 실행 작업에
+소유자가 없으면 실제 광고된 native goal 도구로 목표·관측 가능한 완료/중단 기준을 설정한다.
+질문·상태·연결 테스트·프리셋 bootstrap마다 goal을 만들지 않으며 ULW 선택은 필수 조건이 아니다.
+기존 workflow와 경쟁하는 두 번째 aggregate goal·장부도 만들지 않는다. 헤드는 실제 durable
+lane report event에서 근거를 확인해 다음 허가 작업을 명시적으로 지시한다. 레인을 기다리기만
+하려고 head goal을 돌리지 않고 턴을 끝낸다. 부분 작업·명령은 native task/job·대기 이벤트를
+사용하며 Duty AI·새 scheduler·shadow registry·요청별 grant 체계·임의 타이머/예산을 추가하지 않는다.
+
+새 관리 Host launch는 프로젝트 범위의 native goal 설정과 `goal.continuationModes`의 `rpc`를
+사용한다. 일반 OMP 전역 설정·공유 ULW 소스는 바꾸지 않고 native 승인·도구 제외도 우회하지
+않는다. pinned core patch `0003`은 이 opt-in이 있는 root의 기본 도구에만 native `goal`을
+노출한다. 명시적 `--tools`·`--no-tools`, child 제한, `goal.enabled=false`는 유지한다.
+이 launch 설정과 이미 로드한 역할 번들의 적용 시점을 구분한다. 저장된 goal은 실제
+계속 실행·완료나 crash prompt 자동 replay, unloaded 상태의 실행을 보장하지 않는다.
+기존 `lane_resume`는 runtime queue만 다시 열었지만, 이제 명시적으로 허가된 재개에서만 기존
+paused native lane goal도 재개한다. 자동 report·재연결·새 queued 입력은 재개 허가가 아니며,
+재개는 없는 goal 생성·불확실성 해제·이전 외부 효과 취소가 아니다.
+unloaded 세션은 기존 소유권·모델·Host 한도 안에서 먼저 복원한다. native resume ACK는 실행
+완료가 아니며 첫 재개 run의 실패·중단과 zero-run 거부도 별도로 판정한다. 더 늦은 pause가
+앞선 resume의 준비·ACK를 추월해도 취소된 입력이나 실행을 되살리지 않는다.
+native serial tail에 대기 중인 resume도 기존 `RpcUserInputGate`의 접수 순서로 취소한다.
+별도 `resume:<sourceId>:<laneId>` receipt는 같은 원본 지시·첨부를 전달하는 일반 handoff
+신원을 소비하지 않으며 동일 재개 source 재시도는 새 실행을 만들지 않는다. 완료된 unloaded
+대화도 명시적 source가 있으면 모델·세션 소유권과 최신 pause 경계를 지키며 다시 연다.
 
 ### 일반 모델 프로필과 역할 특화의 범위
 
@@ -949,6 +987,8 @@ DSH의 활성 슬롯 개념을 참고하되, 슬롯 반환과 메모리 회수�
 2. 뒤늦게 돌아올 비동기 결과나 처리 대기 입력이 없다.
 3. 미해결 승인·질문이나 프로세스에 귀속된 서비스가 없다.
 4. OMP 세션 기록의 저장 완료를 확인했다.
+5. enabled native goal이 없다. 기존 shutdown guard를 유지하므로 paused goal도 enabled이면
+   Host·슬롯을 유지할 수 있다. 명시적으로 해결하기 전에는 pause를 unload·종료로 취급하지 않는다.
 
 `agent_end`는 회수 근거로 충분하지 않다. `session_settled`/실제 실행 상태와
 미해결 요청·소유 자원을 함께 확인한다. 유휴 실행을 종료해도 세션 기록은 보존한다.

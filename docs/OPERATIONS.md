@@ -95,6 +95,9 @@ Dori의 운영 개념을 현재 도구 계약에 맞게 독립 작성했으며 S
 않았다. 강제 위임, herdr 실행 의존, 별도 duty 모델·상태 레지스트리, 시간 경과 자동 종료,
 자동 push·배포·worktree 삭제는 포함하지 않는다. `lane_resume`는 불확실한 제출 기록을
 해제하지 않으며, 현재 도구에 없는 복구 동작을 스킬이 있다고 가정하지 않는다.
+맡긴 프로젝트 목표 안에서는 다음 유용한 작업을 선택·우선순위화하고 계획·실행·테스트·수정을
+이어간다. 검증한 중간 결과 뒤의 남은 허가 작업은 단계별 허락을 다시 받지 않는다. 실제 승인·
+범위·운영자 결정·불확실성 경계는 보존하며, 완료 기준을 충족하면 새 일을 만들어 연장하지 않는다.
 
 ### 일반 모델 프로필과 역할 특화
 
@@ -141,7 +144,10 @@ substantive 계약을 따른다. `lane_start`와 `lane_message`는 선택적인 
 source/handoff에 영속 결합되어 변경·생략하는 충돌 재시도로 바꿀 수 없다.
 plain ULW는 ULW를 arm하지만 전문 native mode를 선택하거나 암묵적 RPC goal을 만들지 않는다. 필요한
 native goal은 레인/클라이언트의 실제 광고된 API와 기존 허가 안에서만 생성한다. head manager에
-lane goal 생성 도구가 있다고 가정하지 않으며 unattended RPC continuation의 기존 opt-in도 유지한다.
+lane goal 생성 도구가 있다고 가정하지 않는다. 이어갈 실행 작업은 기존 native goal 또는 durable
+workflow owner 하나를 재사용하고 없을 때만 실제 native goal로 설정한다. 질문·상태·연결 테스트·
+bootstrap마다 생성하지 않으며 ULW는 native goal 사용의 필수 조건이 아니다. 관리 Host의
+프로젝트 범위 RPC continuation 설정은 아래 운영 범위와 복구 제약을 따른다.
 
 공식 `omp-ulw`는 관리형 설치/업데이트 대상으로 포함하지만 설치·프로필 로드만으로 workflow가
 선택되지는 않는다. 별도 공용 프롬프트 레지스트리 없이 기존 필수 head 번들·lane SKILL 경로를
@@ -845,6 +851,9 @@ LLM 분류나 lane 실행을 하지 않는다.
 그룹·workspace 채널 대화에서 `/new`(Slack `!new`)는 새 스레드/topic 사용 안내를 보내며
 OMP 자체 `/new`로 전달하지 않는다. 연결된 레인 대화의 `/stop`, `/resume`
 (Slack `!stop`, `!resume`)은 각각 일시정지·명시적 재개 제어다.
+종전 재개는 runtime queue를 다시 여는 동작이었으며 이제는 명시적으로 허가된 재개에서만 기존
+paused native lane goal도 재개한다. 자동 report·재연결·새 queued 입력은 재개 권한이 아니며,
+재개는 없는 goal 생성·불확실성 해제·중단 prompt 자동 replay를 뜻하지 않는다.
 이미 접수된 `/new`·`/main` 제어 메시지를 수정해도 기존 경계·작업·현재 주제는 바뀌지 않으며,
 기록과 고정 안내만 남기고 새 메시지로 제어하도록 요청한다. Slack의 `!` 제어도 같은 정책이다.
 일반 작업 메시지 수정은 새 입력 revision이며 이미 실행된 외부 효과를 취소하지 않는다.
@@ -985,10 +994,18 @@ head의 Gateway client detach나 TUI 종료는 transport stop이 아니다. laun
 
 ## 5. 운영 범위와 복구 제약
 
-- 자율 작업은 기존 OMP의 task·goal을 재사용한다. RPC에서 goal을 자동으로 이어가려면
-  운영자의 기존 `goal.continuationModes` 설정에 `rpc`가 포함되어 있어야 한다.
-  이 확장이 설정을 몰래 활성화하거나 별도 LLM 감독 루프를 만들지는 않는다.
-  저장된 goal의 존재와 실제 연속 실행·완료는 구분한다.
+- 자율 작업은 기존 OMP task/job·goal·workflow owner를 재사용한다. 새 관리 Host launch는
+  허가된 프로젝트 범위 native goal 설정과 `goal.continuationModes`의 `rpc`를 사용한다.
+  OMP 전역 설정·공유 ULW 소스는 바꾸지 않으며 native 승인·도구 제외·pause/cancel·원래 source/
+  route·불확실성 보류를 유지한다. 작업 topic과 확인된 간결한 착수 보고도 계속 실행의 선행 조건이다.
+  헤드는 실제 durable lane report event에서 근거를 확인해 다음 허가 작업을 지시한다. 레인 대기만을
+  위해 head goal을 계속 돌리지 않고 턴을 끝내며 작업자는 native task/job 결과·대기를 사용한다.
+  별도 Duty AI·scheduler·shadow registry·요청별 grant 체계·임의 타이머/예산은 추가하지 않는다.
+  저장 goal의 존재는 실제 연속 실행·완료, crash prompt 자동 replay나 unloaded 실행을 보장하지 않는다.
+- launch 설정은 새 Host 기동에 적용된다. 이미 로드한 역할 번들은 별도로 허가된 Host 재시작이
+  필요하며 소스 편집이나 설치 성공만으로 현재 운영 서비스에 적용됐다고 하지 않는다.
+  기존 native enabled-goal shutdown guard는 유지한다. paused goal도 enabled이면 명시적으로
+  해결하기 전까지 Host·슬롯을 유지할 수 있으며 pause를 unload·종료로 간주하거나 강제 회수하지 않는다.
 
 - 코어 패치의 `--rpc-socket`, 동일 Host attach, 제어 연결 해제 후 Host 수명 유지가 필요하다.
   stock `--mode rpc`와 `omp join`의 조합이나 로그 tail로 대체하지 않는다.
@@ -1062,6 +1079,7 @@ head/lane·root/child 조합, 첫 턴·후속 턴과 OpenAI Responses 요청 훅
 ```sh
 export OMP_TEST_COMMAND="$(bun -e 'const c = await Bun.file("config.local.json").json(); console.log(JSON.stringify(c.command));')"
 OMP_SUPERAGENT_NATIVE_TEST=1 bun test test/native-host.test.ts test/native-tui.test.ts test/native-runtime.test.ts test/native-model-selection.test.ts test/native-board.test.ts test/native-gateway.test.ts
+OMP_SUPERAGENT_NATIVE_TEST=1 bun test test/native-autonomy.test.ts
 ```
 
 필요하면 `OMP_TEST_NATIVES_DIR`에 준비된 native addon 디렉터리의 절대 경로를 지정한다.
@@ -1086,6 +1104,8 @@ managed extension 중복/disabled 처리, 비차단 updater startup과 native bi
 
 | 검증 항목 | 현재 결과 |
 | --- | --- |
+| 2026-11-14 자율 재개 회귀 3건 수정 | `0004`는 기존 native `RpcUserInputGate`에서 serial 대기 중인 goal resume을 뒤늦은 abort로 무효화한다. 별도 resume receipt가 일반 source handoff/첨부와 충돌하지 않으며, source가 있는 completed/unloaded 재개도 기존 세션·middle preset을 보존한다. runtime/store 257개·2,299 assertion, native input-order/input-frame/goal 61개·229 assertion 통과. 의도적 원인 복원에서 correction identity 충돌·completed 복원 거절 2개와 실제 native queued resume 재활성화 1개가 각각 실패했고, 소스를 바이트 단위로 복원한 뒤 해당 2개·11 assertion과 native autonomy 1개·30 assertion이 통과했다. 최종 typecheck 통과. native model-selection도 source `103`·같은 세션·preset을 유지한 실제 완료/unload/reopen 흐름으로 통과했다. 최초 native barrier는 작은 transcript 기본 compaction 정책 때문에 미진입했고, 다음 시도는 held compaction 정리를 기다리는 abort ACK를 먼저 기다려 timeout됐다. fixture만 수정했다. 기존 model fixture의 kickoff 누락 기대값도 실제 durable kickoff receipt를 정확히 포함하도록 고쳤다. 실패 진단은 보존했고 남은 격리 fixture Host 1개는 신원 확인 후 barrier 해제·native 정상 종료했다. 운영 서비스·메신저 계정·전역 설정 변경이나 재시작은 하지 않음 |
+| 2026-11-14 목표 기반 자율 실행 | Bun 1.4.4에서 `tsc --noEmit` 통과. Host/runtime/store/default-steering/skills 5파일 294개·2,575 assertion 통과·10.62초. native RPC goal/default tool 2파일 31개·122 assertion 통과·8.11초(관리 세션의 marker를 물려받지 않는 격리 환경). 실제 managed Host·production lane role·native goal·결정적 로컬 제공자·기록용 Messenger에서 1개·19 assertion 통과·5.14초: 목표 생성→첫 yield→native continuation→완료, 실제 `/stop` 후 paused 상태·추가 실행 없음, `/resume`의 동일 topic/source-bound durable report, `goal.enabled=false`와 명시적 `--tools read` 제외·전역 설정 무변경 확인. resume ACK만으로 성공 처리하지 않는 첫 run 실패/중단·zero-run 및 뒤늦은 pause·ACK 경합·unloaded 복원은 runtime 회귀로 확인했다. 첫 native 활성 도구 누락은 SDK 초기 선택에서 수정했으며 fixture ID·리소스·중복 관측 오류를 고친 뒤 위 결과를 얻었다. 실제 모델의 자율 판단 품질·실계정·운영 재시작 검증은 아니며 실행 중인 Gateway/head는 변경하지 않음 |
 | 2026-11-14 `/restart` 리뷰·회귀·실계정 | 요청 UUID 규약 불일치, 확정 거절 뒤 fence 유지, 과거 receipt 갱신의 최신 상태 덮어쓰기를 수정했다. runtime/Gateway/lifecycle/default-steering 전체 4파일 286개·2,415 assertion 통과·11.28초. 마지막 fixture receipt 타입 수정 뒤 `tsc --noEmit` 및 lifecycle 전체 10개·78 assertion 통과·5.83초. Discord에 restart 포함 12개 명령을 적용·GET 검증하고 실제 자동완성에서 `/restart` 실행: Gateway 72353→72522, HEAD 72371→72526, 세션 `01a1d829-0eca-7323-8e3d-400f15811a55` 유지. 실제 접수 응답 `1571084170149757019`·준비 완료 응답 `1571084188050919425`의 UI 표시와 durable `sent`를 확인했다. 최종 두 프로세스 ready, 초기화 complete, 대기/미해결 이벤트 0, restart fence 해제. Telegram/Slack은 같은 경로의 회귀·SDK 검증 범위이며 실계정은 미설정 |
 | 2026-11-14 Discord 명령 실계정·UI | 유휴·미처리 입력/출력 없음 확인 후 정상 stop/start로 Gateway 64050·HEAD 64055 기동, 같은 세션 `01a1d829-0eca-7323-8e3d-400f15811a55` 보존. 당시 11개 명령의 이름·Superagent 설명·옵션·범위를 실제 API에 적용하고 GET readback 일치 확인. Discord 브라우저 자동완성에서 `/status`를 선택·실행해 비공개 접수 확인과 실제 상태 답변을 확인했다. 입력 `1571074536387121294`는 `messageId:null`인 interaction으로 `done`, 응답 `1571074537733230604`는 `sent`; native 초기화 complete·유휴 상태 확인. 이후 추가한 `/restart` 자체의 검증과 Telegram/Slack 실계정 검증은 이 행의 범위가 아님 |
 | 2026-11-14 세 메신저 명령 메뉴·실행 | 관련 14파일 전체 480개·4,981 assertion 통과·12.94초. 실제 Slack SocketModeClient의 로컬 WebSocket ACK·재전달, 명령 신원·비밀 비저장·토픽 경계·busy 상태 조회·기존 플랫폼 경로를 포함한다. 이후 SDK 타입 수정 뒤 `tsc --noEmit` 통과 및 Telegram/Slack 등록 2파일 전체 32개·843 assertion 통과·67ms. Discord·Telegram·Slack 등록 경계와 새 ingress에 대한 독립 정적 리뷰에서 추가 결함 없음. 실제 Discord 등록 dry-run은 bot/app 신원과 기존 Hermes 목록·guild 충돌 없음까지 확인했다. 운영 등록·재시작·실제 명령 UI 결과는 별도 기록하며 Telegram/Slack은 현재 운영 config에 없어 실계정 검증하지 않음 |

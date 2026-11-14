@@ -16,6 +16,8 @@ Discord·Telegram·Slack을 [oh-my-pi](https://github.com/can1357/oh-my-pi)의 �
 ## 차별점
 
 - **직접 실행하는 헤드:** 조사·구현을 직접 처리하거나, 분리할 작업의 범위와 인계를 정해 위임합니다.
+- **맡긴 목표 안의 자율 실행:** 다음 유용한 일을 선택·우선순위화하고 계획·실행·검증·수정합니다.
+  검증한 중간 결과 뒤에도 남은 허가 작업을 단계별 허락 없이 이어가되 새 범위·외부 효과를 임의로 추가하지 않습니다.
 - **저장소·주제별 독립 레인:** 별도 OMP Host와 세션으로 작업 디렉터리와 맥락을 나눕니다.
 - **레인별 native 모델·프리셋:** 헤드가 native judge의 자문을 받아 선택하며, 다른 레인이나 전역 설정을 바꾸지 않습니다.
 - **연결과 세션 수명의 분리:** 지속 실행되는 Gateway가 메신저 연결과 수신·조율 장부를 맡고, OMP 세션이 대화 맥락을 맡습니다.
@@ -113,6 +115,10 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
   같은 작업의 후속 지시는 기존 주제를 유지합니다. 질문·상태 조회·계산·연결 테스트는 기존 대화에서 바로 답합니다.
 - **독립 주제:** 일반 메시지로 새 작업을 요청하면 헤드가 범위를 판단해 지원되는 실제 스레드·topic을 만들고 독립 세션을 연결합니다. native topic이 없는 DM은 논리 주제로 분리합니다. `/new`(Slack `!new`)도 명시적 DM 주제 제어로 유지합니다.
 - **후속 요청:** 같은 주제의 일반 후속 입력은 실행 중인 작업에 기본 steer로 전달합니다. `/steer`는 필요 없습니다. 헤드가 먼저 받고 필요한 레인 지시를 명시적으로 전달하며, 다른 대화·제어 명령·workflow 선택은 섞지 않습니다.
+- **목표 계속 실행·중지:** 맡긴 프로젝트 목표의 완료 기준이나 실제 승인·범위·불확실성·운영자 결정
+  경계까지 진행합니다. `/stop`은 연결 레인을 일시정지하고 `/resume`은 기존 paused native goal을
+  포함한 명시적 재개입니다. 종전 재개는 queue만 다시 열었으며, 이제도 불확실성을 해제하거나
+  중단 prompt의 replay를 보장하지 않습니다. Slack은 `!stop`·`!resume`입니다.
 - **헤드 모델·effort:** `/model`·`/effort`로 조회하고, `/model list`의 정확한 모델을
   `/model <provider/model>`로 선택하거나 `/effort <level>`로 변경합니다. Slack은 `!model`·`!effort`입니다.
   유휴 헤드 세션에만 적용하며 전역 기본값과 기존 레인은 유지합니다.
@@ -138,6 +144,15 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
   등록 결과에 재설치·재승인이 필요하다고 나오면 그 절차까지 완료해야 합니다.
 - **명시적 전역 저장:** `/model preset <name> --global`만 native 기본 역할·effort도 저장합니다.
   옵션이 없으면 이번 헤드 세션 전용이며, 변경 알림에 실제 모델·effort와 적용 범위를 표시합니다.
+
+새 관리 Host launch는 프로젝트 범위의 native goal 설정과 `goal.continuationModes`의 `rpc`를
+사용하며 OMP 전역 설정은 바꾸지 않습니다. 이어갈 실행 작업은 native goal/workflow owner 하나를
+재사용하고 질문·상태·프리셋 bootstrap마다 goal을 만들지 않습니다. 헤드는 레인을 기다리는 goal
+대신 durable report event로 후속 작업을 판단하며, 작업자는 native task/job을 사용합니다.
+pause/cancel·승인·도구 제외는 유지하며 저장 goal은 crash replay나 unloaded 실행을 보장하지 않습니다.
+enabled goal은 paused 상태여도 명시적으로 해결할 때까지 기존 shutdown guard로 Host를 유지할 수 있습니다.
+launch 설정은 새 Host에, 기존 역할 번들은 별도로 허가된 Host 재시작 후에 적용됩니다.
+저장소 편집만으로 현재 운영 서비스에 반영됐다는 뜻은 아닙니다.
 
 ## ULW
 

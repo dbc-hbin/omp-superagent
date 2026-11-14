@@ -185,9 +185,9 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "lane_resume", label: "Resume independent work", approval: "exec",
-    description: "Explicitly resume a paused lane after user authorization; resumes queued inputs, not an uncertain external action.",
-    parameters: Type.Object({ id: Type.String() }),
-    async execute(_id, params, _signal, _onUpdate, ctx) { await requireRuntime(ctx).resume(params.id); return result(await requireRuntime(ctx).inspect(params.id)); },
+    description: "Explicitly resume a paused lane and its native goal under a received sourceId. Preserves the model, budgets and original objective; never clears uncertain submissions or retries an uncertain external action.",
+    parameters: Type.Object({ id: Type.String(), sourceId: Type.String() }),
+    async execute(_id, params, _signal, _onUpdate, ctx) { await requireRuntime(ctx).resume(params.id, params.sourceId); return result(await requireRuntime(ctx).inspect(params.id)); },
   });
   pi.registerTool({
     name: "lane_close", label: "Close independent work", approval: "write",

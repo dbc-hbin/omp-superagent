@@ -1,0 +1,62 @@
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-mode.ts b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+--- a/packages/coding-agent/src/modes/rpc/rpc-mode.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+@@ -559,6 +559,7 @@
+ 		if (
+ 			!isAbort &&
+ 			command.type !== "compact" &&
++			!(command.type === "goal" && command.op === "resume") &&
+ 			!Object.hasOwn(USER_INPUT_TYPES, command.type) &&
+ 			!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)
+ 		) {
+@@ -2381,6 +2382,9 @@
+ 
+ 			case "goal": {
+ 				try {
++					if (command.op === "resume" && !inputGate.isCurrent(command)) {
++						return error(id, "goal", "Goal resume cancelled before admission");
++					}
+ 					return success(id, "goal", await goalController.handle(command));
+ 				} catch (goalError) {
+ 					return error(id, "goal", goalError instanceof Error ? goalError.message : String(goalError));
+diff --git a/packages/coding-agent/test/rpc-user-input-order.test.ts b/packages/coding-agent/test/rpc-user-input-order.test.ts
+--- a/packages/coding-agent/test/rpc-user-input-order.test.ts
++++ b/packages/coding-agent/test/rpc-user-input-order.test.ts
+@@ -56,7 +56,7 @@
+ 	expect(gate.isCurrent(after)).toBe(true);
+ });
+ 
+-test.each(["abort", "abort_and_restore_queue"] as const)("%s cancels a compact queued before admission", async type => {
++test.each(["abort", "abort_and_restore_queue"] as const)("%s cancels compact and goal resume queued before admission", async type => {
+ 	const gate = new RpcUserInputGate();
+ 	const modelStarted = Promise.withResolvers<void>();
+ 	const releaseModel = Promise.withResolvers<void>();
+@@ -67,8 +67,8 @@
+ 			if (command.type === "set_model") {
+ 				modelStarted.resolve();
+ 				await releaseModel.promise;
+-			} else if (command.type === "compact") {
+-				if (gate.isCurrent(command)) started.push("compact");
++			} else if (command.type === "compact" || command.type === "goal") {
++				if (gate.isCurrent(command)) started.push(command.type);
+ 			} else if (command.type === type) {
+ 				interrupted.resolve();
+ 			} else throw new Error(`unexpected command ${command.type}`);
+@@ -79,6 +79,7 @@
+ 	dispatcher.dispatch({ type: "set_model", provider: "mock", modelId: "mock" });
+ 	await modelStarted.promise;
+ 	dispatcher.dispatch({ type: "compact" });
++	dispatcher.dispatch({ type: "goal", op: "resume" });
+ 	dispatcher.dispatch({ type });
+ 	await interrupted.promise;
+ 	expect(started).toEqual([]);
+@@ -88,6 +89,9 @@
+ 	const later = { type: "compact" } as const;
+ 	gate.accept(later);
+ 	expect(gate.isCurrent(later)).toBe(true);
++	const resume = { type: "goal", op: "resume" } as const;
++	gate.accept(resume);
++	expect(gate.isCurrent(resume)).toBe(true);
+ });
+ 
+ test("later input does not start until the earlier submission's work settles", async () => {

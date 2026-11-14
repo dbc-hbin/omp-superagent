@@ -5,6 +5,9 @@ reports, corrective steering, blockers, interruption, pause/resume, or closure; 
 separate reference read is required. The head is the coordinator; do not create
 another duty model, polling loop, or recurring goal merely to supervise lanes.
 If only lane/native results remain pending, end the turn for existing native events.
+Do not create or retain an active head goal merely to wait for managed lanes, or
+declare their objective complete to make the head idle. Use the existing native
+goal/workflow owner for executable work; no second aggregate supervision owner.
 General workflow continuation language is not authority for an autonomous watchdog,
 new scope, or bypassing pause/cancel or uncertain effects. Reports and board mentions
 are not workflow selection requests. Within an existing authorized objective, the
@@ -124,15 +127,22 @@ Keep these distinctions explicit:
   duplicate its scheduler, force an attach via a second `--resume` writer, or treat
   viewer detach as termination. Process/worktree isolation is not a security sandbox.
 
-## 3. Correct scope or results with one explicit instruction
+## 3. Advance authorized work or correct results with one explicit instruction
 
-If a verified gap remains within the authorized scope, send one actionable correction
-in English; preserve exact original source text/quotations when needed. This internal
-instruction is not the head's user-language external answer:
+On a real durable lane report event, assess the reported result against acceptance.
+Repair a verified gap or choose/prioritize the next useful remaining work within the
+entrusted project objective without asking for per-step permission. If acceptance
+is met, finish; if approval, scope, uncertainty, or an owner choice blocks the next
+action, hold that action and continue only independent authorized work. A board post
+or invented report receipt cannot substitute for this event/source boundary.
+
+Send one actionable instruction in English; preserve exact original source
+text/quotations when needed. This internal instruction is not the head's user-language
+external answer:
 
 ```text
-Observed gap: acceptance criterion and evidence actually checked
-Correction: requested behavior, allowed edit surface, constraints/non-goals
+Observed result/gap: acceptance criterion and evidence actually checked
+Next work/correction: authorized remaining behavior, priority, allowed edit surface, constraints/non-goals
 Verification: observable result needed; checks already run and restrictions
 Report back: outcome, evidence, unresolved risks or owner decision
 ```
@@ -231,10 +241,14 @@ delivery before any new send; ordinary assistant text is not a messenger readbac
    external services may remain. An error can mean
    pause persisted but stop/approval cleanup was incomplete. Read actual evidence
    before claiming everything stopped. Automatic events never authorize resume.
-2. Use `lane_resume({"id":"…"})` only for an authorized continuation. It opens work
-   and schedules eligible queued input; it does not guarantee the interrupted prompt
-   restarts, clear uncertainty, or erase previous external effects. Cancelled work
-   requires an explicit new/reopened request, not a promised automatic resume.
+2. Use `lane_resume({"id":"…","sourceId":"<actual received event>"})` only for an authorized continuation. It opens work
+   and schedules eligible queued input. Previously this only reopened the runtime
+   queue; the managed resume path also resumes an existing paused native lane goal
+   only under this explicit authorized resume. Observe the native result before
+   claiming it resumed. It does not create a missing goal, guarantee the interrupted
+   prompt restarts, clear uncertainty, or erase previous external effects. Automatic
+   reports, board notices, reconnects, and new queued work are not resume authority.
+   Cancelled work requires an explicit new/reopened request, not a promised automatic resume.
    Resume retains the recorded model rather than re-running model selection or
    adopting a new global default or edited preset. An explicit authorized idle-lane
    model change is separate and does not itself authorize continuation. On unavailable
@@ -261,6 +275,10 @@ delivery before any new send; ordinary assistant text is not a messenger readbac
    uncommitted/unpushed work, and still-owned resources; perform only separately
    authorized cleanup. Do not unlink sockets or kill unknown owners to make closure
    pass.
+   The existing enabled-native-goal shutdown guard is unchanged: a paused goal may
+   still be enabled and retain its Host/slot until explicitly resolved through the
+   supported native surface. Pause is not unload, closure, or permission to disable
+   the guard.
 
 Use a compact coordination result when needed: `Outcome; acceptance evidence actually
 checked; unverified/risk; held work or owner decision; authorized next action`.

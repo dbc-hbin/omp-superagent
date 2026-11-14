@@ -1,0 +1,110 @@
+diff --git a/packages/coding-agent/src/sdk.ts b/packages/coding-agent/src/sdk.ts
+--- a/packages/coding-agent/src/sdk.ts
++++ b/packages/coding-agent/src/sdk.ts
+@@ -4524,7 +4524,12 @@
+ 				return tool?.defaultInactive === true || tool?.hidden === true;
+ 			}),
+ 		);
+-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
++		// Only the native default plan may expose an unstarted RPC goal. The
++		// registry also holds a lazily activatable goal for explicitly limited
++		// sessions, so registry membership alone must not widen their selection.
++		const requestedActiveToolNames = normalizedRequested.filter(
++			name => name !== "goal" || (options.toolNames === undefined && builtInToolNames.includes("goal")),
++		);
+ 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
+ 			? new Set(explicitlyRequestedToolNames)
+ 			: undefined;
+diff --git a/packages/coding-agent/src/tools/index.ts b/packages/coding-agent/src/tools/index.ts
+index 1ec9360..351fd94 100644
+--- a/packages/coding-agent/src/tools/index.ts
++++ b/packages/coding-agent/src/tools/index.ts
+@@ -103,7 +103,7 @@ import { cfgEditMode } from "../edit/settings";
+ import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
+ import { cfgPythonInterpreter } from "../eval/settings";
+ import { cfgExternalThinking } from "../session/settings";
+-import { cfgGoalEnabled } from "../goals/settings";
++import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
+ import { cfgLspEnabled } from "../lsp/settings";
+ import { cfgMemoryBackend } from "../memory-backend/settings";
+ import { cfgTaskMaxRecursionDepth } from "../task/settings";
+@@ -671,6 +671,11 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
+ 			: undefined;
+ 	const goalEnabled = cfgGoalEnabled.get(session.settings);
+ 	const goalModeActive = !restrictToolNames && goalEnabled && session.getGoalModeState?.()?.enabled === true;
++	const rpcGoalTool =
++		!restrictToolNames &&
++		goalEnabled &&
++		(session.taskDepth ?? 0) === 0 &&
++		cfgGoalContinuationModes.get(session.settings).includes("rpc");
+ 	const externalThinkingActive =
+ 		cfgExternalThinking.get(session.settings) && supportsExternalThinking(session.getActiveModel?.());
+ 	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
+@@ -774,7 +779,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
+ 	}
+ 	const editDisabled = cfgEditMode.get(session.settings) === "none";
+ 	const isToolAllowed = (name: string) => {
+-		// Never in the default set. Explicitly activatable while goal.enabled and
++		// RPC continuation opt-in exposes it in the unrestricted root default set.
++		// Explicitly activatable while goal.enabled and
+ 		// no goal record exists yet — /guided-goal enables it so the agent can
+ 		// finish the interview with `goal create`, which turns goal mode on. Once
+ 		// a goal record exists, only an enabled goal keeps the tool: a completed
+@@ -848,7 +854,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
+ 		...Object.keys(BUILTIN_TOOLS).filter(isToolAllowed),
+ 		...(externalThinkingActive ? ["think"] : []),
+ 		...(includeYield ? ["yield"] : []),
+-		...(goalModeActive ? ["goal"] : []),
++		...(goalModeActive || (rpcGoalTool && isToolAllowed("goal")) ? ["goal"] : []),
+ 	];
+ 	return { requestedTools, names, isAllowed: isToolAllowed };
+ }
+diff --git a/packages/coding-agent/test/rpc-goal.test.ts b/packages/coding-agent/test/rpc-goal.test.ts
+index fda2554..55bf937 100644
+--- a/packages/coding-agent/test/rpc-goal.test.ts
++++ b/packages/coding-agent/test/rpc-goal.test.ts
+@@ -158,7 +158,7 @@ describe("RPC goal command", () => {
+ 		const state = await rpc.getState();
+ 		expect(state.goal).toBeNull();
+ 		expect(state.isSettled).toBe(true);
+-		expect(state.dumpTools?.map(tool => tool.name)).not.toContain("goal");
++		expect(state.dumpTools?.map(tool => tool.name)).toContain("goal");
+ 		const messages = await rpc.getMessages();
+ 		const continuations = messages.filter(
+ 			message => message.role === "custom" && message.customType === "goal-continuation",
+diff --git a/packages/coding-agent/test/tools/builtin-defaults.test.ts b/packages/coding-agent/test/tools/builtin-defaults.test.ts
+index 1c46ede..f3aea9d 100644
+--- a/packages/coding-agent/test/tools/builtin-defaults.test.ts
++++ b/packages/coding-agent/test/tools/builtin-defaults.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, test } from "bun:test";
+ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { cfgGoalContinuationModes, cfgGoalEnabled } from "@oh-my-pi/pi-coding-agent/goals/settings";
+ import { resolveBuiltinToolPlan, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+ import { BUILTIN_TOOL_HELP, BUILTIN_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/builtin-names";
+ 
+@@ -21,4 +22,24 @@ describe("BUILTIN_TOOL_HELP", () => {
+ 		const declared = Object.fromEntries(settled.map(name => [name, BUILTIN_TOOL_HELP[name].defaultState]));
+ 		expect(actual).toEqual(declared);
+ 	});
++
++	test("RPC goal opt-in exposes the root default tool without widening explicit or child selections", async () => {
++		const settings = Settings.isolated();
++		cfgGoalContinuationModes.set(settings, ["rpc"]);
++		const session: ToolSession = {
++			cwd: "/tmp",
++			hasUI: false,
++			getSessionFile: () => null,
++			getSessionSpawns: () => "*",
++			settings,
++			skipPythonPreflight: true,
++		};
++		expect((await resolveBuiltinToolPlan(session)).names).toContain("goal");
++		expect((await resolveBuiltinToolPlan(session, ["read"])).names).not.toContain("goal");
++		expect((await resolveBuiltinToolPlan(session, [])).names).not.toContain("goal");
++		expect((await resolveBuiltinToolPlan({ ...session, restrictToolNames: true })).names).not.toContain("goal");
++		expect((await resolveBuiltinToolPlan({ ...session, taskDepth: 1 })).names).not.toContain("goal");
++		cfgGoalEnabled.set(settings, false);
++		expect((await resolveBuiltinToolPlan(session)).names).not.toContain("goal");
++	});
+ });
