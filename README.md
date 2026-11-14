@@ -148,8 +148,10 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
   compacts the idle head. `/model preset` lists native presets and `/model preset <name>`
   applies one to the head session. `/stop head` interrupts head work without stopping the Gateway.
   Slack uses the same commands with `!`.
-- `/restart` replaces both the Gateway and HEAD when idle, preserving the native session
-  and durable coordination state. Active work or approvals cause refusal, not a forced kill.
+- `/restart` checkpoints busy HEAD work, then replaces Gateway and HEAD after a confirmed
+  original-route ACK and safe native shutdown. It restores the same session/model and
+  resumes eligible active goals without replaying prompts. Independent lanes stay running;
+  uncertain effects and unreconciled owned resources remain held, never force-killed.
   Slack supports `!restart` and the registered `/superagent-restart`.
 - Discord also supports the registered slash-command picker. Preview registration with
   `bun --no-env-file src/cli.ts discord-commands --config config.local.json`; add `--apply`

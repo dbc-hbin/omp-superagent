@@ -76,10 +76,13 @@ Read README verification limits before claiming production compatibility.
   Idle means no model polling loop, not loss of the messenger connection. Client
   detach is not transport stop; explicit stop main stops Gateway/head without revival.
 - `/restart` is an explicit owner control for replacing both Gateway and HEAD,
-  not a model turn or permission to kill active work. Require idle native/controller
-  state, a durably sent original-route acknowledgement, exact process ownership,
-  and one durable lifecycle request. Preserve the native session and refuse ambiguous
-  retries. An explicit operator stop must prevent a pending successor from reviving.
+  not a model turn or permission for force-kill or prompt replay. Busy admission
+  durably fences intake, confirms the original-route acknowledgement, checkpoints
+  and interrupts HEAD through native APIs, then requires actual safe quiescence,
+  exact ownership and one durable lifecycle request before replacement. Preserve
+  native session/model, independent lane Hosts and original approval identities.
+  Resume only eligible formerly active goals through source-bound native resume;
+  uncertain effects remain held. Explicit operator stop prevents successor revival.
 - Herdr is optional observation/control of the same authoritative OMP host.
   Viewer detach must not terminate work. Never simulate attach by opening a
   second writer with `--resume`.

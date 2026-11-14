@@ -23,7 +23,7 @@ export interface GatewayStatus {
   ulw?: ManagedUlwStatus;
   restart?: Omit<GatewayRestartRecord, "sessionFile">;
 }
-interface HeadClient { id: string; pid: number; ready: boolean; resumed: boolean; events?: ServerResponse; sequence?: number; reconciliation?: string }
+interface HeadClient { id: string; pid: number; ready: boolean; resumed: boolean; reconciled: boolean; events?: ServerResponse; sequence?: number; reconciliation?: string }
 interface ServerOptions {
   socketPath: string;
   store: GatewayStore;
@@ -147,7 +147,8 @@ export class GatewayServer {
       await this.options.authorizeHead(Number(data.pid));
       if (this.client && this.client.id !== id && this.connected) throw new DeliveryError("A head client is already attached", "rejected");
       if (this.client?.id === id) this.client.events?.destroy();
-      this.client = { id, pid: Number(data.pid), ready: false, resumed: data.resumed === true };
+      const reconciled = this.client?.id === id && this.client.pid === data.pid && this.client.reconciled;
+      this.client = { id, pid: Number(data.pid), ready: false, resumed: data.resumed === true, reconciled };
       json(response, { ok: true });
       return;
     }
@@ -171,7 +172,11 @@ export class GatewayServer {
       // Recheck supervised process authority before reading any caller body.
       try { await this.options.authorizeHead(client.pid); }
       catch { throw new DeliveryError("Gateway head authorization rejected", "rejected"); }
-      if (!this.headReady) throw new DeliveryError("Gateway head is not ready for restart", "rejected");
+      // Native approval reconciliation belongs to this authenticated controller,
+      // not to one SSE connection. Quarantine may close that stream after
+      // receive durably admits a priority restart but before its async handoff.
+      if (!this.admissionReady || !client.reconciled || client.reconciliation)
+        throw new DeliveryError("Gateway head is not ready for restart", "rejected");
       await this.restart(record(await readGatewayJson(request)), response);
       return;
     }
@@ -189,12 +194,13 @@ export class GatewayServer {
         // A new controller reconciled native approvals before calling /ready.
         this.openAdmission();
       }
+      if (!client.reconciliation) client.reconciled = true;
       json(response, { ok: true });
       this.deliver();
     } else if (endpoint === "/receipt") {
       if (!Number.isSafeInteger(data.sequence) || data.sequence !== client.sequence)
         throw new DeliveryError("Gateway receipt is not the outstanding event", "rejected");
-      const outstanding = this.options.store.next()?.event;
+      const outstanding = this.options.store.next(client.sequence)?.event;
       const barrier = outstanding?.kind === "reconnect" ? outstanding.barrier : undefined;
       if (data.outcome !== "accepted" && data.outcome !== "rejected" && data.outcome !== "unresolved")
         throw new DeliveryError("Invalid Gateway admission receipt", "rejected");
@@ -211,6 +217,7 @@ export class GatewayServer {
       client.sequence = undefined;
       if (barrier && barrier === client.reconciliation && outcome === "accepted") {
         client.reconciliation = undefined;
+        client.reconciled = true;
         this.openAdmission();
       }
       json(response, { ok: true });

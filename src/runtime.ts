@@ -36,7 +36,7 @@ export interface RuntimeState {
   hasPendingAsyncWork?: boolean;
   hasOwnedRunningWork?: boolean;
   pendingUiRequests?: Record<string, unknown>[];
-  goal?: { enabled?: boolean; mode?: string; goal?: { status?: string } } | null;
+  goal?: { enabled?: boolean; mode?: string; goal?: { id?: string; status?: string } } | null;
 }
 /** The production adapter is HostConnection; tests inject only its transport boundary. */
 export interface RuntimeHost {
@@ -71,6 +71,7 @@ interface Live {
   running: boolean;
   preparing: number;
   ownedRuns: number;
+  nativeVersion: number;
   assistantOutcome?: { status: "completed" | "error" | "aborted"; run: number };
   text: string;
   busy: boolean;
@@ -79,6 +80,8 @@ interface Live {
   finishAgain?: boolean;
   releasing?: boolean;
   lostDuringRelease?: boolean;
+  recovery?: NonNullable<HeadRestart["checkpoint"]>["residents"][number];
+  goalId?: string;
   unsubscribe: () => void;
 }
 interface AttachmentData {
@@ -106,7 +109,23 @@ interface HeadRestart extends GatewayRestartRequest {
   ownerPid: number;
   sessionId: string;
   sessionFile: string;
+  stopBoundary?: string | null;
   state: "checking" | "acknowledging" | "handoff" | "accepted" | "refused" | "uncertain" | "failed" | "ready";
+  checkpoint?: {
+    goalSourceId?: string;
+    goalId?: string;
+    goalActive: boolean;
+    model: LaneModel | null;
+    thinkingLevel?: string;
+    residents: Array<{
+      id: string; generation: number; pid: number; sessionId: string;
+      inputId?: string; requestIds: string[];
+      result?: Live["result"];
+      ownedRuns: number;
+      assistantOutcome?: Live["assistantOutcome"];
+      entryId?: string;
+    }>;
+  };
 }
 export interface LaneStart extends LaneModelChoice {
   sourceId: string;
@@ -149,8 +168,9 @@ function successful(value: unknown, operation: string): Record<string, unknown> 
 function assistantText(value: unknown): string | null {
   const message = record(value);
   if (message.role !== "assistant" || !Array.isArray(message.content)) return null;
-  return message.content.filter(part => record(part).type === "text")
+  const text = message.content.filter(part => record(part).type === "text")
     .map(part => String(record(part).text ?? "")).join("");
+  return text.trim() ? text : null;
 }
 
 /** One controller for durable coordination; OMP remains the execution/transcript owner. */
@@ -247,14 +267,16 @@ export class Superagent {
           this.report(error);
         }
       }
-      // There is no native prompt-result journal. Never infer acceptance/completion
-      // from a live PID, an idle session, or the session's last assistant message.
+      const recovered = await this.restoreRestartAdmissions();
+      // Only exact checkpoint ownership plus native receipts restores admissions.
+      // A live PID or an idle session alone never proves prompt completion.
       const stopBoundary = this.store.getMeta("head:stop-boundary");
       if (stopBoundary) {
         const boundary = JSON.parse(stopBoundary) as { cancelledInputIds: string[] };
         for (const id of boundary.cancelledInputIds) this.store.settle(id, "cancelled");
       }
       for (const input of this.store.inputs().filter(input => input.state === "submitted")) {
+        if (recovered.has(input.id)) continue;
         const owner = this.store.getMeta(`steering-owner:${input.id}`);
         this.store.settle(input.id, "uncertain", !owner || owner === input.id ? {
           id: `${input.id}:interrupted`,
@@ -284,6 +306,7 @@ export class Superagent {
       if (this.stopped) return;
       if (this.adapters.inspectPresets) await this.initializeHead(previousInitialization);
       await this.reconcileRestart();
+      for (const live of this.live.values()) if (live.input) await this.finish(live);
       this.timer = setInterval(() => void this.kick().catch(this.report), 1000);
       this.timer.unref?.();
       await this.kick();
@@ -721,8 +744,28 @@ export class Superagent {
       this.verify({ id, generation, sessionId: "" }, state);
       live = {
         id, generation, sessionId: state.sessionId, connection, busy: !state.isSettled,
-        lastActivity: Date.now(), text: "", ownedRuns: 0, admitted: new Map(), running: false, preparing: 0, unsubscribe,
+        lastActivity: Date.now(), text: "", ownedRuns: 0, nativeVersion: 0, admitted: new Map(), running: false, preparing: 0, unsubscribe,
+        goalId: state.goal?.goal?.id,
       };
+      const recovery = id === "main" ? undefined : this.restartFence()?.checkpoint?.residents.find(saved =>
+        saved.id === id && saved.generation === generation && saved.sessionId === state.sessionId && saved.pid === state.hostPid);
+      if (recovery) {
+        // Publish exact owned admissions before observing buffered events, UI, or
+        // any further state/journal await. Completion still requires native proof.
+        for (const requestId of recovery.requestIds) {
+          const input = this.store.inputs(id).find(input => input.requestId === requestId && input.state === "submitted");
+          if (!input) continue;
+          const result = input.id === recovery.inputId ? recovery.result : undefined;
+          live.admitted.set(requestId, { input, result });
+          if (input.id === recovery.inputId) {
+            live.input = input;
+            live.result = result;
+            live.ownedRuns = recovery.ownedRuns;
+            live.assistantOutcome = recovery.assistantOutcome;
+          }
+        }
+        if (live.admitted.size) live.recovery = recovery;
+      }
       this.live.set(id, live);
       if (id === "main") this.store.setMeta("main:sessionId", state.sessionId);
       else this.store.updateLane(id, generation, {
@@ -871,7 +914,16 @@ export class Superagent {
         return;
       }
       this.controls.add(input.id);
-      if (control.name === "stop" && !this.restartFence()) this.admitStop(this.store.input(input.id)!, control);
+      if (control.name === "stop") {
+        const restart = this.restartFence();
+        if (restart && this.stopTarget(this.store.input(input.id)!, control) === "main"
+          && !["handoff", "accepted", "uncertain"].includes(restart.state)) {
+          this.store.settle(restart.inputId, "cancelled");
+          this.saveRestart({ ...restart, state: "refused" }, false);
+          this.restartResult(restart, "Explicit HEAD stop superseded restart before lifecycle handoff. No successor was authorized.");
+        }
+        if (!this.restartFence()) this.admitStop(this.store.input(input.id)!, control);
+      }
       // Read-only controls must not queue behind an unrelated slow catalog read.
       // Mutations still use pump's existing serialized path; stops own their tail.
       const operation = Promise.resolve().then(async () => {
@@ -1484,42 +1536,49 @@ export class Superagent {
         if (!restored || this.modelIntent(id)) throw new Error(`Lane ${id} model-change intent remains held; inspect native state and retry its exact source`);
       }
       if (live && source && state?.goal?.goal?.status === "paused") {
-        const inputId = `resume:${source.id}:${id}`;
-        this.store.receive({
-          ...source, id: inputId, route: lane.route,
-          text: "Resume the existing native goal within its entrusted objective.", attachments: [],
-        }, id, { [`handoff-source:${inputId}`]: source.id });
-        const requestId = `sg-${key(inputId)}-${live.generation}`;
-        if (!this.store.submit(inputId, requestId, live.generation)) throw new Error("Native goal resume was not admitted");
-        const input = this.store.input(inputId);
-        if (!input) throw new Error("Admitted native goal resume is missing");
-        live.input = input;
-        live.result = undefined;
-        live.admitted.set(requestId, { input });
-        live.ownedRuns = 0;
-        live.running = false;
-        live.assistantOutcome = undefined;
-        live.text = "";
-        live.busy = true;
-        live.preparing++;
-        this.store.updateLane(id, live.generation, { runtimeState: "running", lastActivityAt: Date.now() });
-        try {
-          successful(await live.connection.request({ type: "goal", op: "resume" }, requestId), "resume native goal");
-          if (live.input === input && live.admitted.has(requestId) && this.requireLane(id).workState === "open") {
-            const result: Live["result"] = { status: "accepted", agentInvoked: false, goalResume: true };
-            live.result = result;
-            live.admitted.set(requestId, { input, result });
-          }
-        } catch (error) {
-          if (this.store.input(inputId)?.state === "submitted") this.store.settle(inputId, "uncertain", {
-            id: `${inputId}:admission`, text: "Native goal resume outcome is uncertain; it was not replayed.",
-          });
-          throw error;
-        } finally { live.preparing--; }
-        await this.finish(live);
+        await this.resumeNativeGoal(live, source, lane.route, `resume:${source.id}:${id}`);
       }
       await this.kick();
     } finally { this.laneMutations--; }
+  }
+
+  private async resumeNativeGoal(live: Live, source: InputRecord, route: Route, inputId: string): Promise<void> {
+    this.assertRestartOpen();
+    if (this.store.input(inputId)) return; // A submitted or uncertain resume is never repeated.
+    this.store.receive({
+      ...source, id: inputId, route,
+      text: "Resume the existing native goal within its entrusted objective.", attachments: [],
+    }, live.id, { [`handoff-source:${inputId}`]: source.id });
+    const requestId = `sg-${key(inputId)}-${live.generation}`;
+    if (!this.store.submit(inputId, requestId, live.generation)) throw new Error("Native goal resume was not admitted");
+    const input = this.store.input(inputId);
+    if (!input) throw new Error("Admitted native goal resume is missing");
+    live.input = input;
+    live.result = undefined;
+    live.admitted.set(requestId, { input });
+    live.recovery = undefined;
+    live.ownedRuns = 0;
+    live.running = false;
+    live.assistantOutcome = undefined;
+    live.text = "";
+    live.busy = true;
+    live.preparing++;
+    if (live.id !== "main") this.store.updateLane(live.id, live.generation, { runtimeState: "running", lastActivityAt: Date.now() });
+    try {
+      successful(await live.connection.request({ type: "goal", op: "resume" }, requestId), "resume native goal");
+      if (live.input === input && live.admitted.has(requestId)
+        && (live.id === "main" || this.requireLane(live.id).workState === "open")) {
+        const result: Live["result"] = { status: "accepted", agentInvoked: false, goalResume: true };
+        live.result = result;
+        live.admitted.set(requestId, { input, result });
+      }
+    } catch (error) {
+      if (this.store.input(inputId)?.state === "submitted") this.store.settle(inputId, "uncertain", {
+        id: `${inputId}:admission`, text: "Native goal resume outcome is uncertain; it was not replayed.",
+      });
+      throw error;
+    } finally { live.preparing--; }
+    await this.finish(live);
   }
 
   async closeLane(id: string, outcome: "completed" | "cancelled", evidence: string): Promise<void> {
@@ -1719,10 +1778,25 @@ export class Superagent {
   }
 
   private saveRestart(restart: HeadRestart, hold = true): void {
-    this.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(restart));
     const fence = this.restartFence();
-    if (hold && (!fence || fence.requestId === restart.requestId)) this.store.setMeta("head:restart-fence", JSON.stringify(restart));
-    else if (!hold && fence?.requestId === restart.requestId) this.store.setMeta("head:restart-fence", "");
+    // Only admission acquires authority. An async checkpoint may update its
+    // still-owned fence, never recreate one cleared by a newer stop.
+    if (!fence || fence.requestId !== restart.requestId || fence.inputId !== restart.inputId
+      || hold && this.store.getMeta("gateway:operator-stop") !== (restart.stopBoundary ?? null)) return;
+    this.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(restart));
+    this.store.setMeta("head:restart-fence", hold ? JSON.stringify(restart) : "");
+  }
+
+  private assertRestartCurrent(restart: HeadRestart): void {
+    const fence = this.restartFence();
+    if (this.stopped || !fence || fence.requestId !== restart.requestId || fence.inputId !== restart.inputId
+      || fence.ownerPid !== restart.ownerPid || fence.sessionId !== restart.sessionId
+      || fence.sessionFile !== restart.sessionFile || ["refused", "ready"].includes(fence.state))
+      throw new DeliveryError("Restart authority was superseded; no checkpoint continuation is authorized", "rejected");
+    if (this.store.getMeta("gateway:operator-stop") !== (restart.stopBoundary ?? null)) {
+      this.refuseRestart(restart, "An explicit operator stop superseded this request; no successor is authorized.");
+      throw new DeliveryError("Operator stop superseded restart", "rejected");
+    }
   }
 
   private assertRestartOpen(): void {
@@ -1741,64 +1815,165 @@ export class Superagent {
 
   private refuseRestart(restart: HeadRestart, text: string): void {
     this.store.settle(restart.inputId, "cancelled");
-    this.restartResult(restart, `Gateway AND HEAD restart refused. ${text} No process was stopped. /stop head is a separate, deliberate interruption, not part of /restart.`);
+    this.restartResult(restart, `Gateway AND HEAD restart refused. ${text} No process was stopped; any confirmed checkpoint remains in the original native session.`);
     this.saveRestart({ ...restart, state: "refused" }, false);
   }
 
-  private restartControllerBusy(inputId: string): boolean {
-    return this.initializationHoldsHead() || !!this.bootstrapActive || this.headStopping > 0 || !!this.headCompaction
-      || !!this.store.getMeta("head:stop-boundary") || this.connecting.size > 0 || this.operations.size > 0
-      || this.laneMutations > 0 || this.modelChanges.size > 0 || this.blocked.size > 0 || this.modelHolds.size > 0 || this.callbacks.size > 0
-      || this.store.approvals().length > 0 || this.store.inputs().some(input => input.id !== inputId)
-      || this.store.lanes().some(lane => !!this.modelIntent(lane.id) || !!this.modelIntent(lane.id, "apply"))
-      || [...this.live.values()].some(live => !!live.input || live.admitted.size > 0 || live.running || live.busy
-        || live.preparing > 0 || !!live.releasing || !!live.finishing);
+  private restartControllerBusy(): boolean {
+    // Pending/uncertain inputs and resident lane execution are durable state to
+    // recover, not reasons to refuse a service lifecycle operation.
+    return this.connecting.size > 0 || this.operations.size > 0 || this.laneMutations > 0
+      || this.modelChanges.size > 0 || this.callbacks.size > 0
+      || [...this.live.values()].some(live => live.preparing > 0 || !!live.releasing);
   }
 
   private admitRestart(input: InputRecord, command: HeadCommand): boolean {
     if (this.store.getMeta(`head:restart:${input.id}`)) return false;
     if (command.argument || !this.adapters.requestRestart || this.restartFence()) {
       this.controlReply(input, `Gateway AND HEAD restart refused. ${command.argument ? "Use /restart with no arguments."
-        : !this.adapters.requestRestart ? "The managed Gateway restart transport is unavailable." : "An earlier restart is still held; it was not retried."} No process was stopped. /stop head is a separate, deliberate interruption.`, "cancelled");
+        : !this.adapters.requestRestart ? "The managed Gateway restart transport is unavailable." : "An earlier restart is still held; inspect its original checkpoint/lifecycle receipt."} No process was stopped.`, "cancelled");
       return false;
     }
     const live = this.live.get("main");
     if (!live || !this.current(live)) {
-      this.controlReply(input, "Gateway AND HEAD restart refused: native HEAD ownership is unavailable. No process was stopped. /stop head is a separate, deliberate interruption.", "cancelled");
+      this.controlReply(input, "Gateway AND HEAD restart held: native HEAD ownership is unavailable. Inspect its native socket/session identity; no process was stopped.", "cancelled");
       return false;
     }
     const restart: HeadRestart = { requestId: crypto.randomUUID(), inputId: input.id,
       ackOutputId: `${input.id}:restart-ack`, ownerPid: process.pid, sessionId: live.sessionId,
       sessionFile: hostPaths(this.config, "main").sessionFile, state: "checking" };
+    restart.stopBoundary = this.store.getMeta("gateway:operator-stop");
     // Reserve the entire service synchronously, before native reads, deliveries,
     // lane dispatch or a second owner command can cross an asynchronous boundary.
-    this.saveRestart(restart);
-    if (this.restartControllerBusy(input.id)) {
-      this.refuseRestart(restart, "Native/controller work, approvals or durable unresolved inputs are still present.");
-      return false;
-    }
+    this.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(restart));
+    this.store.setMeta("head:restart-fence", JSON.stringify(restart));
     this.restartActive = input.id;
     return true;
   }
 
-  private async restartIdle(restart: HeadRestart): Promise<boolean> {
-    if (this.restartFence()?.requestId !== restart.requestId || this.restartControllerBusy(restart.inputId)) return false;
-    const residents = this.residentHosts();
-    for (const id of residents) {
-      const live = this.live.get(id);
-      if (!live || !this.current(live)) return false;
-      const state = await this.state(live);
-      if (!state.isSettled || state.isStreaming || state.isCompacting !== false || state.queuedMessageCount !== 0
-        || state.hasPendingAsyncWork !== false || state.hasOwnedRunningWork !== false
-        || !Array.isArray(state.pendingUiRequests) || state.pendingUiRequests.length
-        || state.goal !== null && state.goal?.enabled !== false
-        || !Number.isSafeInteger(state.hostPid) || state.hostPid! <= 0
-        || id !== "main" && state.hostPid !== this.requireLane(id).pid
-        || id === "main" && (state.hostPid !== restart.ownerPid || state.sessionId !== restart.sessionId
-          || state.sessionFile !== restart.sessionFile)) return false;
+  private async checkpointRestart(restart: HeadRestart): Promise<HeadRestart> {
+    this.assertRestartCurrent(restart);
+    const head = this.live.get("main");
+    if (!head || !this.current(head)) throw new Error("The original HEAD connection is unavailable");
+    const before = await this.state(head);
+    this.assertRestartCurrent(restart);
+    if (before.hostPid !== restart.ownerPid || before.sessionId !== restart.sessionId || before.sessionFile !== restart.sessionFile)
+      throw new Error("The original HEAD identity changed");
+    if (!restart.checkpoint) {
+      const residents: NonNullable<HeadRestart["checkpoint"]>["residents"] = [];
+      for (const live of this.live.values()) {
+        const actual = await this.state(live);
+        this.assertRestartCurrent(restart);
+        if (!Number.isSafeInteger(actual.hostPid) || !actual.hostPid || actual.hostPid <= 0
+          || live.id !== "main" && actual.hostPid !== this.requireLane(live.id).pid)
+          throw new Error(`Native ownership is unavailable for ${live.id}`);
+        const journal = live.input
+          ? successful(await live.connection.request({ type: "get_entries" }), "checkpoint native journal") : null;
+        this.assertRestartCurrent(restart);
+        residents.push({ id: live.id, generation: live.generation, pid: actual.hostPid, sessionId: live.sessionId,
+          inputId: live.input?.id, requestIds: [...live.admitted.keys()], result: live.result,
+          ownedRuns: live.ownedRuns, assistantOutcome: live.assistantOutcome,
+          entryId: typeof journal?.leafId === "string" ? journal.leafId : undefined });
+      }
+      restart = { ...restart, checkpoint: {
+        goalActive: before.goal?.enabled === true && before.goal.goal?.status === "active",
+        goalSourceId: this.headGoalSource(head, before.goal?.goal?.id)?.id, goalId: before.goal?.goal?.id,
+        model: isLaneModel(before.model) ? { provider: before.model.provider, id: before.model.id } : null,
+        thinkingLevel: before.thinkingLevel, residents,
+      } };
+      this.assertRestartCurrent(restart);
+      this.saveRestart(restart);
     }
-    return this.restartFence()?.requestId === restart.requestId && !this.restartControllerBusy(restart.inputId)
-      && isDeepStrictEqual([...residents].sort(), [...this.residentHosts()].sort());
+    // Cancel only this HEAD's original cards. Lane cards and executions remain
+    // owned by their unchanged Hosts and are reconciled on replacement attachment.
+    for (const approval of this.store.approvals("main")) {
+      this.assertRestartCurrent(restart);
+      if (!this.store.resolveApproval(approval.id, approval.generation, "cancelled")) continue;
+      if (approval.generation === head.generation) head.connection.uiResponse(approval.requestId, { cancelled: true });
+      await this.messenger.dismissApproval(approval);
+      this.assertRestartCurrent(restart);
+    }
+    for (const pending of before.pendingUiRequests ?? []) {
+      this.assertRestartCurrent(restart);
+      if (typeof pending.id !== "string") continue;
+      const id = `a-${key(`${head.id}:${head.generation}:${pending.id}`)}`;
+      const approval = this.store.approval(id);
+      if (approval?.state === "answered" && approval.generation === head.generation && approval.requestId === pending.id) {
+        // "answered" is the pre-effect attempt marker, not proof of approval.
+        // Preserve it and archive the exact still-pending generation separately;
+        // cancellation cannot roll back a response already consumed by native.
+        this.store.setMeta(`approval:restart-cancel:${id}`, JSON.stringify({
+          requestId: approval.requestId, generation: approval.generation, target: approval.target,
+        }));
+        await this.messenger.dismissApproval(approval);
+        this.assertRestartCurrent(restart);
+      }
+      head.connection.uiResponse(pending.id, { cancelled: true });
+    }
+    if (this.headCompaction) this.headCompaction.cancelled = true;
+    // The priority native boundary withdraws queued prompts and persists the
+    // interrupted goal as paused. Returned editor text is never resubmitted.
+    if (!before.isSettled || before.isStreaming || before.isCompacting || before.queuedMessageCount
+      || before.pendingUiRequests?.length || before.hasPendingAsyncWork || before.goal?.enabled) {
+      await head.connection.client.abortAndRestoreQueue();
+      this.assertRestartCurrent(restart);
+    }
+    const paused = await this.state(head);
+    this.assertRestartCurrent(restart);
+    if (paused.goal?.enabled) {
+      successful(await head.connection.request({ type: "goal", op: "pause" }), "checkpoint goal");
+      this.assertRestartCurrent(restart);
+    }
+    const children = await head.connection.client.getSubagents();
+    this.assertRestartCurrent(restart);
+    for (const child of children) {
+      await head.connection.client.cancelSubagent(child.id);
+      this.assertRestartCurrent(restart);
+    }
+    await this.finish(head);
+    this.assertRestartCurrent(restart);
+    // A confirmed abort is not a completion receipt. Missing receipts and
+    // historical effects remain quarantined but do not prevent replacement.
+    for (const admitted of head.admitted.values()) {
+      this.activity(admitted.input, false);
+      if (this.store.input(admitted.input.id)?.state === "submitted")
+        this.store.settle(admitted.input.id, "uncertain");
+    }
+    head.admitted.clear();
+    head.input = undefined;
+    head.result = undefined;
+    head.running = false;
+    head.assistantOutcome = undefined;
+    head.text = "";
+    await Promise.all([...this.operations.values(), ...this.modelChanges.values(), this.headStopTail]);
+    this.assertRestartCurrent(restart);
+    const actual = await this.state(head);
+    this.assertRestartCurrent(restart);
+    const checkpoint = restart.checkpoint;
+    if (!checkpoint) throw new Error("Restart checkpoint identity was not recorded");
+    restart = { ...restart, checkpoint: { ...checkpoint,
+      model: isLaneModel(actual.model) ? { provider: actual.model.provider, id: actual.model.id } : null,
+      thinkingLevel: actual.thinkingLevel,
+    } };
+    this.saveRestart(restart);
+    if (actual.modelSettings) {
+      const settingsKey = `head:model-settings:${head.sessionId}`;
+      const previous = JSON.parse(this.store.getMeta(settingsKey) ?? "{\"clearedRoles\":[]}") as { clearedRoles: string[] };
+      this.store.setMeta(settingsKey, JSON.stringify({ settings: actual.modelSettings, clearedRoles: previous.clearedRoles }));
+    }
+    return restart;
+  }
+
+  private async restartIdle(restart: HeadRestart): Promise<boolean> {
+    if (this.restartFence()?.requestId !== restart.requestId || this.restartControllerBusy()) return false;
+    const live = this.live.get("main");
+    if (!live || !this.current(live)) return false;
+    const state = await this.state(live);
+    return state.isSettled && !state.isStreaming && state.isCompacting === false && state.queuedMessageCount === 0
+      && state.hasPendingAsyncWork === false && state.hasOwnedRunningWork === false
+      && Array.isArray(state.pendingUiRequests) && state.pendingUiRequests.length === 0
+      && (state.goal === null || state.goal?.enabled === false)
+      && state.hostPid === restart.ownerPid && state.sessionId === restart.sessionId && state.sessionFile === restart.sessionFile;
   }
 
   private matchingRestart(restart: HeadRestart, receipt: GatewayRestartRecord): boolean {
@@ -1813,10 +1988,7 @@ export class Superagent {
     if (!restart || restart.inputId !== input.id) return;
     let handedOff = false;
     try {
-      if (!await this.restartIdle(restart)) {
-        this.refuseRestart(restart, "HEAD or a resident lane is busy, asynchronous, approval-held, or cannot be verified idle.");
-        return;
-      }
+      this.assertRestartCurrent(restart);
       restart = { ...restart, state: "acknowledging" };
       this.saveRestart(restart);
       this.store.settle(input.id, "done", { id: restart.ackOutputId,
@@ -1826,6 +1998,7 @@ export class Superagent {
       do { await this.flushOutputs(); }
       while (!this.stopped && this.store.output(restart.ackOutputId)?.state === "pending");
       const ack = this.store.output(restart.ackOutputId);
+      this.assertRestartCurrent(restart);
       if (ack?.state !== "sent") {
         if (ack?.state === "failed") this.refuseRestart(restart, "The required ACK was rejected; no restart handoff was attempted.");
         else {
@@ -1835,8 +2008,16 @@ export class Superagent {
         return;
       }
       if (this.stopped) return;
-      if (!await this.restartIdle(restart)) {
-        this.refuseRestart(restart, "Native/controller ownership changed or new unresolved work arrived before handoff.");
+      this.assertRestartCurrent(restart);
+      restart = await this.checkpointRestart(restart);
+      this.assertRestartCurrent(restart);
+      const idle = await this.restartIdle(restart);
+      this.assertRestartCurrent(restart);
+      if (!idle) {
+        this.saveRestart({ ...restart, state: "failed" });
+        const head = this.live.get("main");
+        const actual = head ? this.nativeStatus(await this.state(head)) : "original HEAD is unavailable";
+        this.restartResult(restart, `Restart checkpoint is held: ${actual}. Inspect the original native HEAD's owned jobs/services or in-flight controller mutation. Queued intake and uncertain effects remain preserved; no shutdown or prompt replay was attempted.`);
         return;
       }
       restart = { ...restart, state: "handoff" };
@@ -1865,7 +2046,12 @@ export class Superagent {
             this.restartResult(restart, "Gateway AND HEAD restart acknowledgement was lost or could not be verified. The service remains held; the request was not repeated and completion is not claimed.", true);
           }
         }
-      } else this.refuseRestart(restart, "Native idle state or required ACK delivery could not be verified; no restart handoff was attempted.");
+      } else {
+        if (this.restartFence()?.requestId !== restart.requestId) return;
+        this.saveRestart({ ...restart, state: "failed" });
+        this.restartResult(restart, "Restart checkpoint could not be confirmed. Inspect the original HEAD ownership, native work and cancelled approval receipts. Intake remains durable and held; no shutdown or prompt replay was attempted.");
+        this.report(error);
+      }
     } finally {
       if (this.restartActive === input.id) this.restartActive = undefined;
     }
@@ -1895,6 +2081,87 @@ export class Superagent {
     void this.kick().catch(this.report);
   }
 
+  private async restoreRestartAdmissions(): Promise<Set<string>> {
+    const restored = new Set<string>();
+    const restart = this.restartFence();
+    if (!restart?.checkpoint) return restored;
+    for (const saved of restart.checkpoint.residents) {
+      const live = this.live.get(saved.id);
+      if (!live || live.generation !== saved.generation || live.sessionId !== saved.sessionId) continue;
+      const state = await this.state(live);
+      if (saved.id !== "main" && state.hostPid !== saved.pid) throw new Error("Native recovery owner changed after attachment");
+      const entries = successful(await live.connection.request({ type: "get_entries" }), "read native recovery receipts").entries;
+      if (!Array.isArray(entries)) throw new Error("Native restart recovery entries are unavailable");
+      for (const requestId of saved.requestIds) {
+        const input = this.store.inputs(saved.id).find(input => input.requestId === requestId);
+        if (!input || input.state !== "submitted" && !(saved.id === "main" && input.state === "uncertain")) continue;
+        const result = this.restartPromptReceipt(entries, state, requestId);
+        if (saved.id === "main") {
+          // Only a journaled native outcome can close the interrupted submission.
+          // No receipt means quarantine, even after a confirmed process exit.
+          if (result?.status === "aborted") this.store.settle(input.id, "cancelled");
+          else if (result?.status === "completed") this.store.settle(input.id, "done");
+          continue;
+        }
+        const admitted = live.admitted.get(requestId);
+        if (!admitted) continue;
+        admitted.result ??= result;
+        if (live.input === admitted.input && !live.result?.goalResume) live.result = admitted.result;
+        restored.add(input.id);
+      }
+    }
+    return restored;
+  }
+
+  private recoverNativeOutcome(live: Live, entries: unknown[], state: RuntimeState): void {
+    const saved = live.recovery;
+    if (!saved || !live.input) return;
+    const journal = entries.map(record);
+    const cursor = saved.entryId ? journal.findIndex(entry => entry.id === saved.entryId) : -1;
+    if (cursor < 0) throw new Error("Native recovery checkpoint cursor is unavailable; original work remains held");
+    const isStart = (entry: Record<string, unknown>) => entry.type === "custom" && entry.customType === "rpc_agent_start"
+      && record(entry.data).sessionId === state.sessionId && record(entry.data).sessionFile === state.sessionFile;
+    // Anchor the whole journal to the checkpoint, not to received event counts.
+    // A start after an older assistant must never make that assistant its outcome.
+    let run = saved.ownedRuns - journal.slice(0, cursor + 1).filter(isStart).length;
+    let last: Record<string, unknown> | undefined;
+    let assistantRun = run;
+    let text = "";
+    for (const [index, entry] of journal.entries()) {
+      if (isStart(entry)) run++;
+      const message = record(entry.message);
+      if (entry.type !== "message" || message.role !== "assistant") continue;
+      last = entry;
+      assistantRun = run;
+      // Only the authenticated checkpoint bounds this original request's text.
+      // Older session answers cannot fill an empty detached continuation.
+      if (index > cursor) text = message.stopReason === "error" || message.stopReason === "aborted"
+        ? "" : assistantText(message) ?? text;
+    }
+    live.ownedRuns = run;
+    live.assistantOutcome = saved.assistantOutcome;
+    if (last) this.observeAssistant(live, last.message, assistantRun);
+    live.text = text;
+  }
+
+  private restartPromptReceipt(entries: unknown[], state: RuntimeState, requestId: string): Live["result"] {
+    const receipt = entries.map(record).find(entry => entry.type === "custom" && entry.customType === "rpc_prompt_result"
+      && record(entry.data).sessionId === state.sessionId && record(entry.data).sessionFile === state.sessionFile
+      && record(record(entry.data).frame).id === requestId);
+    const frame = record(record(receipt).data).frame;
+    return frame ? { status: String(record(frame).status), agentInvoked: record(frame).agentInvoked === true } : undefined;
+  }
+
+  private headGoalSource(live: Live, goalId: string | undefined): InputRecord | null {
+    if (!goalId || live.id !== "main") return null;
+    const saved = this.store.getMeta(`head:goal-source:${live.sessionId}:${goalId}`);
+    if (!saved) return null;
+    const owner = record(JSON.parse(saved));
+    const input = typeof owner.inputId === "string" ? this.store.input(owner.inputId) : null;
+    return input && input.target === "main" && input.generation === owner.generation && input.requestId === owner.requestId
+      && owner.sessionFile === hostPaths(this.config, "main").sessionFile ? input : null;
+  }
+
   private async reconcileRestart(): Promise<void> {
     if (this.restartReconciliation) return this.restartReconciliation;
     this.restartReconciliation = (async () => {
@@ -1905,7 +2172,30 @@ export class Superagent {
       if (!original || !isDeepStrictEqual(original, restart)) throw new Error("Restart fence does not match its original durable request");
       const gateway = this.store.getMeta(`gateway:restart:${restart.requestId}`);
       const receipt = gateway ? JSON.parse(gateway) as GatewayRestartRecord : null;
-      if (!receipt || !this.matchingRestart(restart, receipt)) return;
+      if (this.store.getMeta("gateway:operator-stop") !== (restart.stopBoundary ?? null)) {
+        this.store.settle(restart.inputId, "cancelled");
+        this.saveRestart({ ...restart, state: "refused" }, false);
+        this.restartResult(restart, "Explicit operator stop superseded this restart. The original intent was not replayed and no successor was authorized.");
+        return;
+      }
+      if (!receipt) {
+        const live = this.live.get("main");
+        if (!live || this.pidAlive(restart.ownerPid) || !["checking", "acknowledging"].includes(restart.state)) return;
+        const actual = await this.state(live);
+        const owner = JSON.parse(this.store.getMeta("gateway:head") ?? "null") as { pid: number; sessionId: string; sessionFile: string } | null;
+        if (actual.hostPid !== process.pid || actual.hostPid !== owner?.pid || actual.sessionId !== restart.sessionId
+          || actual.sessionFile !== restart.sessionFile || owner?.sessionId !== restart.sessionId || owner.sessionFile !== restart.sessionFile) return;
+        // A pre-handoff crash has no lifecycle effect to replay. Rebind only to
+        // the exact supervised replacement of the same native session. Existing
+        // output IDs keep a sent ACK sent; ambiguous ACKs remain held.
+        const rebound = { ...restart, ownerPid: process.pid };
+        this.saveRestart(rebound);
+        this.restartActive = restart.inputId;
+        const input = this.store.input(restart.inputId);
+        if (input) await this.runHeadRestart(input);
+        return;
+      }
+      if (!this.matchingRestart(restart, receipt)) return;
       if (receipt.state === "refused") {
         await this.restartNotice({ requestId: restart.requestId, outcome: "refused", reason: "Gateway refused restart" });
         return;
@@ -1923,9 +2213,27 @@ export class Superagent {
         && !this.pidAlive(receipt.gatewayPid);
       if (!replacement) return;
       if (receipt.state === "started" && this.initialization?.state === "complete" && this.initialization.sessionId === actual.sessionId) {
+        if (restart.checkpoint && (!sameLaneModel(restart.checkpoint.model, actual.model)
+          || restart.checkpoint.thinkingLevel !== actual.thinkingLevel)) {
+          this.saveRestart({ ...restart, state: "failed" });
+          this.restartResult(restart, "Replacement HEAD model/effort differs from its checkpoint. Intake remains held; inspect session settings. No goal or prompt was replayed.");
+          return;
+        }
         this.store.settle(restart.inputId, "done");
         this.restartResult(restart, "Gateway AND HEAD were replaced and the replacement HEAD is initialized and ready. The same native session, transcript, original conversation route and lane board were restored; no model turn was used for /restart.");
         this.saveRestart({ ...restart, state: "ready" }, false);
+        const source = restart.checkpoint?.goalSourceId ? this.headGoalSource(live, restart.checkpoint.goalId) : null;
+        if (restart.checkpoint?.goalActive && source && actual.goal?.goal?.status === "paused"
+          && actual.goal.goal.id === restart.checkpoint.goalId && source.id === restart.checkpoint.goalSourceId
+          && !this.store.inputs("main").some(input => input.state === "submitted" || input.state === "uncertain")) {
+          await this.resumeNativeGoal(live, source, source.route, `restart-resume:${restart.requestId}:main`);
+        } else if (restart.checkpoint?.goalActive && !source) {
+          const original = this.store.input(restart.inputId);
+          if (!original) throw new Error("Restart result source is unavailable");
+          this.store.queueOutput({ id: `${restart.inputId}:restart-goal-held`, sourceId: restart.inputId,
+            route: original.route,
+            text: "Service replacement is ready, but automatic goal resume is held: its original native source ownership is unavailable. Inspect the existing goal/session; no prompt was replayed or assigned to the restart conversation." });
+        }
       } else if (receipt.state === "failed" || receipt.state === "started" && this.initialization
         && !["checking", "running", "complete"].includes(this.initialization.state)) {
         this.saveRestart({ ...restart, state: "failed" });
@@ -1988,7 +2296,7 @@ export class Superagent {
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
         "/stop [head|lane-id] — head aborts current/admitted ordinary HEAD work and earlier pending changes, not historical uncertain effects or unrelated lanes; an actual managed lane-id pauses that lane. Bare /stop pauses this conversation's bound lane, otherwise HEAD.",
-        "/restart — replace BOTH Gateway AND HEAD only when HEAD, every resident lane, native async work/services/goals/approvals and durable inputs are idle and unambiguous; restore the same native session/transcript/board. Busy restart stops no process. /stop head is a separate deliberate interruption. ACK/acceptance is not completion; no forced kill or automatic retry.",
+        "/restart — durably fence intake, confirm the original-route ACK, checkpoint/interrupt busy HEAD and cancel its original approval cards, then safely replace BOTH Gateway AND HEAD. Restore the same native session/model/effort/board and resume eligible previously active goals without prompt replay. Independent lanes stay running. Uncertain effects or unreconciled owned resources remain held; no forced kill. ACK/acceptance is not completion; explicit stop wins.",
         "/resume — resume this conversation's bound lane only (no head resume mode).",
         "/new [request]; /main — logical DM topic selection; threads/forum topics already supply independent topics. Topic selection does not create a separate HEAD session.",
       ].join("\n")); return true;
@@ -2598,6 +2906,7 @@ export class Superagent {
     if (!steering) {
       live.input = submitted;
       live.result = undefined;
+      live.recovery = undefined;
       live.ownedRuns = 0;
       live.running = false;
       live.assistantOutcome = undefined;
@@ -2649,7 +2958,7 @@ export class Superagent {
     }
   }
 
-  private observeAssistant(live: Live, value: unknown): void {
+  private observeAssistant(live: Live, value: unknown, run = live.ownedRuns): void {
     const message = record(value);
     if (message.role !== "assistant") return;
     if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -2657,14 +2966,14 @@ export class Superagent {
       // originating request. Their authoritative assistant outcome must still
       // supersede that request's earlier successful yield, without leaking text
       // or raw provider diagnostics from a previous/failed turn.
-      live.assistantOutcome = { status: message.stopReason, run: live.ownedRuns };
+      live.assistantOutcome = { status: message.stopReason, run };
       live.text = "";
       return;
     }
     if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") {
       // An explicit later native outcome may recover a provider retry. Missing
       // outcome fields alone never erase an observed failure.
-      live.assistantOutcome = { status: "completed", run: live.ownedRuns };
+      live.assistantOutcome = { status: "completed", run };
     }
     const text = assistantText(message);
     if (text !== null) live.text = text;
@@ -2673,6 +2982,24 @@ export class Superagent {
   private observe(live: Live, frame: Record<string, unknown>): void {
     if (!this.current(live)) return;
     live.lastActivity = Date.now();
+    if (frame.type === "agent_start" || frame.type === "agent_end" || frame.type === "message_end"
+      || frame.type === "prompt_result" || frame.type === "session_settled") {
+      live.nativeVersion++;
+      if (live.finishing) live.finishAgain = true;
+    }
+    if (frame.type === "goal_updated") {
+      const goal = record(record(frame.state).goal);
+      if (typeof goal.id === "string" && goal.id !== live.goalId) {
+        if (live.id === "main" && live.input?.requestId) {
+          const source = live.input;
+          this.store.setMeta(`head:goal-source:${live.sessionId}:${goal.id}`, JSON.stringify({
+            inputId: source.id, requestId: source.requestId, generation: source.generation,
+            sessionFile: hostPaths(this.config, "main").sessionFile,
+          }));
+        }
+        live.goalId = goal.id;
+      }
+    }
     if (frame.type === "agent_start") {
       live.busy = true;
       if (live.input) { live.ownedRuns++; live.running = true; }
@@ -2683,10 +3010,23 @@ export class Superagent {
       this.observeAssistant(live, frame.message);
     }
     if (frame.type === "agent_end" && live.input && frame.isTerminal !== false && Array.isArray(frame.messages)) {
+      // Native terminal payloads contain this run's cumulative messages. Only
+      // the final assistant owns the outcome; a live failure's cleared answer
+      // cannot be revived by replaying older text from that same run.
+      const recoverText = !!live.text || !live.assistantOutcome || live.assistantOutcome.run < live.ownedRuns
+        || frame.messages.some(value => {
+          const message = record(value);
+          return message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted");
+        });
+      let observed = false;
       for (let index = frame.messages.length - 1; index >= 0; index--) {
-        if (record(frame.messages[index]).role !== "assistant") continue;
-        this.observeAssistant(live, frame.messages[index]);
-        break;
+        const message = record(frame.messages[index]);
+        if (message.role !== "assistant") continue;
+        if (!observed) { this.observeAssistant(live, message); observed = true; }
+        if (!recoverText) break;
+        if (message.stopReason === "error" || message.stopReason === "aborted") { live.text = ""; break; }
+        const text = assistantText(message);
+        if (text !== null) { live.text = text; break; }
       }
     }
     if (frame.type === "prompt_result" && typeof frame.id === "string") {
@@ -2722,13 +3062,29 @@ export class Superagent {
   }
 
   private async finishOnce(live: Live): Promise<void> {
-    if (!this.current(live) || live.preparing) return;
+    if (!this.ready || !this.current(live) || live.preparing) return;
     await this.finishBootstrap(live);
     const input = live.input;
     const admissions = [...live.admitted.values()];
+    const nativeVersion = live.nativeVersion;
     const state = await this.state(live);
     if (!this.current(live) || !state.isSettled || live.preparing || live.input !== input
-      || admissions.length !== live.admitted.size) return;
+      || admissions.length !== live.admitted.size || live.nativeVersion !== nativeVersion) return;
+    if (live.recovery) {
+      // Reconcile every recovered settlement, even with an earlier completed
+      // receipt. Reads can overlap a continuation's terminal events; only a
+      // stable lifecycle version and its journal establish the final owned run.
+      const entries = successful(await live.connection.request({ type: "get_entries" }), "recover native lane result").entries;
+      if (!Array.isArray(entries)) throw new Error("Native lane recovery receipts are unavailable");
+      if (!this.current(live) || live.preparing || live.input !== input || admissions.length !== live.admitted.size
+        || live.nativeVersion !== nativeVersion) return;
+      for (const admitted of admissions) {
+        if (admitted.result || !admitted.input.requestId) continue;
+        admitted.result = this.restartPromptReceipt(entries, state, admitted.input.requestId);
+        if (live.input === admitted.input) live.result = admitted.result;
+      }
+      this.recoverNativeOutcome(live, entries, state);
+    }
     live.busy = false;
     live.running = false;
     live.lastActivity = Date.now();
@@ -2759,6 +3115,7 @@ export class Superagent {
         live.admitted.clear();
         live.input = undefined;
         live.result = undefined;
+        live.recovery = undefined;
         live.assistantOutcome = undefined;
         live.text = "";
       }
@@ -2839,6 +3196,10 @@ export class Superagent {
     try {
       const approval = this.store.approval(id);
       if (!approval || routeKey(approval.route) !== routeKey(route) || approval.state === "cancelled") return "rejected";
+      const cancellation = this.store.getMeta(`approval:restart-cancel:${id}`);
+      if (cancellation && isDeepStrictEqual(JSON.parse(cancellation), {
+        requestId: approval.requestId, generation: approval.generation, target: approval.target,
+      })) return "rejected";
       if (id !== `a-${key(`${approval.target}:${approval.generation}:${approval.requestId}`)}`) return "rejected";
       const generation = approval.target === "main" ? Number(this.store.getMeta("main:generation") ?? "0")
         : this.store.lane(approval.target)?.generation;

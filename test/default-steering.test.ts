@@ -26,7 +26,7 @@ class TrackedHost implements RuntimeHost {
   emitStart = true;
   local = false;
   constructor(sessionFile: string, sessionId: string) {
-    this.state = { sessionFile, sessionId, model, settingsScope: "session", isSettled: true, isStreaming: false,
+    this.state = { sessionFile, sessionId, model, hostPid: process.pid, settingsScope: "session", isSettled: true, isStreaming: false,
       isCompacting: false, queuedMessageCount: 0, hasPendingAsyncWork: false, hasOwnedRunningWork: false,
       pendingUiRequests: [], goal: null };
   }
@@ -36,6 +36,7 @@ class TrackedHost implements RuntimeHost {
       this.state.isStreaming = false;
       this.state.isSettled = true;
       this.state.queuedMessageCount = 0;
+      for (const prompt of this.prompts) this.emit({ type: "prompt_result", id: prompt.id, status: "aborted", agentInvoked: true });
       return { steering: [], followUp: [] };
     },
     getSubagents: async () => [],
@@ -44,6 +45,7 @@ class TrackedHost implements RuntimeHost {
   async request(command: Record<string, unknown>, id?: string): Promise<unknown> {
     if (command.type === "get_available_models") return { success: true, data: { models: [model] } };
     if (command.type === "get_available_commands") return { success: true, data: { commands: [] } };
+    if (command.type === "get_entries") return { success: true, data: { entries: [], leafId: null } };
     if (command.type === "goal") { this.state.goal = null; return { success: true }; }
     if (command.type === "shutdown_host") return { success: true };
     if (command.type !== "prompt" || !id) throw new Error(`Unexpected request ${command.type}`);
@@ -154,24 +156,26 @@ async function drain(runtime: Superagent): Promise<void> {
 }
 
 describe("ordinary tracked steering", () => {
-  test("restart is a priority native refusal, never another steering ticket or an implicit stop", async () => {
+  test("restart checkpoints joined native work without creating another steering ticket or replaying either prompt", async () => {
     let restartCalls = 0;
-    const { runtime, main, store, messenger } = fixture(1, async () => {
+    const f = fixture(1, async request => {
       restartCalls++;
-      throw new Error("Busy restart must not reach Gateway");
+      return { ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "main-session",
+        sessionFile: hostPaths(f.config, "main").sessionFile, state: "accepted" };
     });
+    const { runtime, main, store } = f;
     await runtime.start();
     await receive(runtime, inbound("restart-active-owner"));
     await receive(runtime, inbound("restart-active-followup"));
     const commandsBefore = main.prompts.length;
     await receive(runtime, inbound("restart-control", route(), "/restart"));
-    expect(restartCalls).toBe(0);
+    expect(restartCalls).toBe(1);
     expect(main.prompts).toHaveLength(commandsBefore);
-    expect(store.input("restart-active-owner")?.state).toBe("submitted");
-    expect(store.input("restart-active-followup")?.state).toBe("submitted");
-    expect(store.input("restart-control")?.state).toBe("cancelled");
-    expect(messenger.sent.at(-1)?.text).toContain("No process was stopped");
-    expect(messenger.sent.at(-1)?.text).toContain("/stop head is a separate");
+    expect(store.input("restart-active-owner")?.state).toBe("cancelled");
+    expect(store.input("restart-active-followup")?.state).toBe("cancelled");
+    expect(store.input("restart-control")?.state).toBe("done");
+    expect(store.output("restart-control:restart-ack")?.state).toBe("sent");
+    expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("accepted");
   });
 
   test("explicit local handling completes without a prompt_result or stale assistant output", async () => {

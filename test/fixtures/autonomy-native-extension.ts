@@ -12,6 +12,7 @@ export default function autonomyFixture(pi: ExtensionAPI): void {
   let created = false;
   let completed = false;
   let held = false;
+  let headTodoStep = 0;
   pi.on("agent_start", () => { run++; });
   pi.on("session_before_compact", async (_event, ctx) => {
     await ctx.ui.confirm("Autonomy serial barrier", "Release the isolated native compaction command.");
@@ -45,7 +46,47 @@ export default function autonomyFixture(pi: ExtensionAPI): void {
         return parsed ? [{ ...parsed, text }] : [];
       }).at(-1);
       if (!envelope) throw new Error("Native autonomy model requires the production source envelope");
-      if (process.env.OMP_SUPERAGENT_ROLE !== "lane") return { content: [`HEAD ${envelope.requestId}`] };
+      if (process.env.OMP_SUPERAGENT_ROLE !== "lane") {
+        if (envelope.text.includes("[head-todo-empty-tail]")) {
+          const task = `Verify retained head reply ${envelope.sourceId}`;
+          if (headTodoStep === 0) {
+            if (!context.tools?.some(tool => tool.name === "todo")) throw new Error("Head did not expose the native todo tool");
+            headTodoStep = 1;
+            return { content: [{ type: "toolCall", name: "todo", arguments: {
+              op: "init", list: [{ phase: "Head reply retention", items: [task] }],
+            } }] };
+          }
+          if (headTodoStep === 1) {
+            const result = context.messages.at(-1);
+            if (result?.role !== "toolResult" || result.toolName !== "todo" || result.isError)
+              throw new Error("The actual native todo creation did not succeed");
+            headTodoStep = 2;
+            return { content: [`HEAD_TODO_REPLY ${envelope.sourceId}`] };
+          }
+          if (!context.messages.some(message => {
+            if (message.role !== "developer") return false;
+            const text = typeof message.content === "string" ? message.content
+              : message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+            return text.includes("You stopped with 1 incomplete todo item(s):") && text.includes(task);
+          }))
+            throw new Error("Empty head reply requires the actual native incomplete-todo reminder");
+          headTodoStep = 3;
+          return { content: [], stopReason: "stop" };
+        }
+        // The next ordinary head request removes this scenario's native todo
+        // through the actual tool before returning its own, unrelated answer.
+        if (headTodoStep === 3) {
+          headTodoStep = 4;
+          return { content: [{ type: "toolCall", name: "todo", arguments: { op: "rm" } }] };
+        }
+        if (headTodoStep === 4) {
+          const result = context.messages.at(-1);
+          if (result?.role !== "toolResult" || result.toolName !== "todo" || result.isError)
+            throw new Error("The actual native todo cleanup did not succeed");
+          headTodoStep = 5;
+        }
+        return { content: [`HEAD ${envelope.requestId}`] };
+      }
       if (envelope.text.includes("[resume-correction]")) {
         const attachment = /local file ([^;\n]+);/.exec(envelope.text)?.[1];
         if (!attachment || readFileSync(attachment, "utf8") !== "Apply the exact owner correction.\n")

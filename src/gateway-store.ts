@@ -155,9 +155,23 @@ export class GatewayStore {
     }).immediate();
   }
 
-  next(): QueuedEvent | null {
-    const row = this.db.query("SELECT sequence,data,attempted_at FROM gateway_events WHERE delivered_at IS NULL ORDER BY sequence LIMIT 1")
-      .get() as { sequence: number; data: string; attempted_at: number | null } | null;
+  next(sequence?: number): QueuedEvent | null {
+    let row = this.db.query<{ sequence: number; data: string; attempted_at: number | null; delivery_error: string | null }, [number | null]>(
+      `SELECT sequence,data,attempted_at,delivery_error FROM gateway_events
+      WHERE delivered_at IS NULL AND (?1 IS NULL OR sequence=?1) ORDER BY sequence LIMIT 1`)
+      .get(sequence ?? null);
+    if (sequence === undefined && row?.delivery_error === "unresolved") {
+      // Quarantine never grants replay authority, but must not trap the owner
+      // outside recovery controls or the native approval-cache startup barrier.
+      // Ordinary intake keeps its original sequence behind the unresolved event.
+      const control = this.db.query<NonNullable<typeof row>, []>(`SELECT sequence,data,attempted_at,delivery_error FROM gateway_events
+        WHERE delivered_at IS NULL AND (
+          (json_extract(data,'$.kind')='reconnect' AND json_extract(data,'$.barrier') IS NOT NULL)
+          OR (json_extract(data,'$.kind')='message' AND trim(json_extract(data,'$.input.text')) IN ('/restart','/stop','/stop head')))
+        ORDER BY CASE WHEN json_extract(data,'$.kind')='reconnect' THEN 0 ELSE 1 END,sequence LIMIT 1`)
+        .get();
+      if (control) row = control;
+    }
     if (!row) return null;
     const event: GatewayEvent = JSON.parse(row.data);
     return { sequence: row.sequence, event, ...(event.kind === "answer" && row.attempted_at !== null ? { reconciliation: true as const } : {}) };

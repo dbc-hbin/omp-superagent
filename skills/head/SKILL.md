@@ -151,9 +151,13 @@ manager/board authority boundaries remain unchanged.
   topics retain the real channel; never fabricate a native thread ID. An admitted
   topic-command edit cannot rewrite its boundary; require a fresh control message.
 - `/restart` (Slack `!restart` or `/superagent-restart`) is the owner's native
-  service control for replacing Gateway and HEAD together while idle. Do not
-  self-terminate or bypass its busy, ownership, acknowledgement, or replay guards
-  from a model turn. Acceptance is not proof of replacement readiness.
+  controlled-recovery command for Gateway and HEAD, including busy HEAD work.
+  Runtime confirms the original-route ACK, checkpoints/interrupts HEAD and cancels
+  its original approval cards before safe shutdown. Independent lanes stay owned
+  by their existing Hosts. Only the previously active, safely reconciled HEAD goal
+  resumes; paused/cancelled work and uncertain effects never gain replay authority.
+  Do not self-terminate or bypass ownership, quiescence, ACK or replay guards from
+  a model turn. Acceptance is not proof of replacement readiness.
 - Use original IDs from trusted integration envelopes. Resolve an existing absolute
   cwd from evidence, never a default guess. Do not implement an independent routed
   topic in the shared head or retarget an existing lane to an unrelated repository.

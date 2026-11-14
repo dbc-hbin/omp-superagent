@@ -8,6 +8,8 @@ Patches, in order:
   0002-config-only-settings.patch
   0003-rpc-goal-default-tool.patch
   0004-cancel-queued-goal-resume.patch
+  0005-durable-prompt-results.patch
+  0006-durable-run-boundaries.patch
 upstream/omp.json patchSha256 hashes their concatenated contents in this order.
 
 Apply from a clean checkout of the exact base revision:
@@ -15,6 +17,8 @@ Apply from a clean checkout of the exact base revision:
   git apply /absolute/omp-superagent/patches/omp/0002-config-only-settings.patch
   git apply /absolute/omp-superagent/patches/omp/0003-rpc-goal-default-tool.patch
   git apply /absolute/omp-superagent/patches/omp/0004-cancel-queued-goal-resume.patch
+  git apply /absolute/omp-superagent/patches/omp/0005-durable-prompt-results.patch
+  git apply /absolute/omp-superagent/patches/omp/0006-durable-run-boundaries.patch
   bun install --frozen-lockfile
 
 Use Bun 1.4.4 or a compatible newer version. The outer project links the local
@@ -116,8 +120,29 @@ refuses running/queued/background work, owned services (even delivery-suppressed
 pending dialogs/capability calls, and other outstanding commands. isSettled keeps
 native conversation semantics; hasOwnedRunningWork independently prevents idle
 slot/process release. A successful response acknowledges shutdown: wait for host
-exit 0 to confirm persisted disposal. No implicit retry or prompt/result journal
-is added: a disconnected unconfirmed submission is uncertain, not replayable.
+exit 0 to confirm persisted disposal. Socket Hosts now journal exact original-ID
+prompt_result receipts as rpc_prompt_result custom entries before delivery, with
+the native journal session ID/file. get_entries recovers them after controller
+disconnect without resubmitting a prompt. Extension-driven session changes omit
+an old result rather than writing into another session. Missing receipts and
+uncertain effects remain quarantined, never replayable. Named daemon services
+are included in hasOwnedRunningWork and shutdown refusal through the actual
+ToolSession owner, not only the async-job tree.
+Each actual socket-Host agent_start also appends one rpc_agent_start entry before
+per-peer filtering/delivery, with exact journal identity. A detached continuation
+can therefore supersede its first successful yield even when the checkpoint
+predated that first result. No new scheduler, task registry or transcript copy.
+
+Controlled messenger restart uses native priority abort/queue withdrawal and
+goal pause before the existing safe shutdown boundary. It preserves independently
+running lane Hosts. A formerly active, reconciled HEAD goal resumes through
+native goal resume, not duplicated user input; previously paused/cancelled goals
+remain paused. No interrupted non-goal turn restore RPC is available.
+
+Relevant current upstream was inspected at af8e4c142b2bf3a72167ce1178e592988a23cafa:
+https://github.com/can1357/oh-my-pi/blob/af8e4c142b2bf3a72167ce1178e592988a23cafa/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+It retains native goal/abort/get_entries responsibilities; this patch targets the
+pinned v18.20.0 socket-host integration and does not claim newer-version compatibility.
 
 Manual compact remains on the native serial command tail, so later prompts,
 model/settings changes and session mutations cannot overtake its admission or

@@ -1,0 +1,146 @@
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-mode.ts b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+index f2b87d0..4030727 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-mode.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+@@ -2069,7 +2069,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 				if (!options.transport) return error(id, command.type, "shutdown_host requires --rpc-socket");
+ 				if (session.isBusyForSnapshot || !isSessionSettled(session, goalTurnScheduled) || pendingExtensionRequests.size > 0 ||
+ 					options.transport.isBusy() || liveBridge.active || dictationBridge.active ||
+-					(session.getAsyncJobTree({ recentLimit: 0 })?.running.length ?? 0) > 0) {
++					session.hasOwnedRunningWork()) {
+ 					return error(id, command.type, "Host has running, queued, or pending work", "session_busy");
+ 				}
+ 				shutdownState.requested = true;
+@@ -2313,7 +2313,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 				await goalController.settled();
+ 				const queuedMessages = session.getQueuedMessages();
+ 				const state: RpcSessionState = {
+-					...(options.transport ? { hostPid: process.pid, hasOwnedRunningWork: (session.getAsyncJobTree({ recentLimit: 0 })?.running.length ?? 0) > 0 } : {}),
++					...(options.transport ? { hostPid: process.pid, hasOwnedRunningWork: session.hasOwnedRunningWork() } : {}),
+ 					settingsScope: session.settings.settingsScope,
+ 					modelSettings: captureModelPreset(session.settings),
+ 					model: session.model,
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts b/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
+index ca9656c..b10d202 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
+@@ -57,6 +57,8 @@ interface Peer {
+ interface RequestOwner {
+ 	peer: Peer;
+ 	id: unknown;
++	sessionId: string;
++	sessionFile: string | undefined;
+ 	completion: boolean;
+ 	responseSeen?: boolean;
+ 	completionSeen?: boolean;
+@@ -237,7 +239,11 @@ export class RpcSocketHost {
+ 		}
+ 		const id = `socket:${++this.#requestSequence}`;
+ 		peer.requests++;
+-		this.#requests.set(id, { peer, id: frame.id, completion: COMPLETION_COMMANDS.has(type), subscription });
++		this.#requests.set(id, {
++			peer, id: frame.id, completion: COMPLETION_COMMANDS.has(type), subscription,
++			sessionId: this.#session.sessionManager.getSessionId(),
++			sessionFile: this.#session.sessionManager.getSessionFile(),
++		});
+ 		this.#enqueue({ ...frame, id, ...(subscription !== undefined ? { level: "events" } : {}) });
+ 	}
+ 
+@@ -275,7 +281,19 @@ export class RpcSocketHost {
+ 			const data = frame.command === "get_state" && frame.success === true && isRecord(frame.data)
+ 				? { data: { ...frame.data, pendingUiRequests: [...this.#dialogs.values()].map(dialog => dialog.request) } }
+ 				: owner.subscription !== undefined && frame.success === true ? { data: { level: owner.subscription } } : {};
+-			this.#send(owner.peer, { ...frame, id: owner.id, ...data });
++			const mapped = { ...frame, id: owner.id, ...data };
++			if (frame.type === "prompt_result") {
++				const manager = this.#session.sessionManager;
++				// A disconnected controller can recover the exact native outcome with get_entries.
++				// Extension-driven session changes must not put an old result in another journal.
++				if (manager.getSessionId() === owner.sessionId && manager.getSessionFile() === owner.sessionFile) {
++					manager.appendCustomEntry("rpc_prompt_result", {
++						sessionId: owner.sessionId, sessionFile: owner.sessionFile, frame: mapped,
++					});
++					manager.flushSync();
++				}
++			}
++			this.#send(owner.peer, mapped);
+ 			let done = !owner.completion;
+ 			if (frame.type === "prompt_result") {
+ 				owner.completionSeen = true;
+diff --git a/packages/coding-agent/src/session/agent-session.ts b/packages/coding-agent/src/session/agent-session.ts
+index 8fdbac3..357551a 100644
+--- a/packages/coding-agent/src/session/agent-session.ts
++++ b/packages/coding-agent/src/session/agent-session.ts
+@@ -275,6 +275,7 @@ import { currentThreadId, isMainThread } from "../thread/identity";
+ import { registerLocalSession } from "../thread/session-directory";
+ import { prewarmSubagentWorker } from "../thread/subagent-worker";
+ import { SubagentSpawnSignal } from "../thread/subagent-spawn-signal";
++import { hasLiveOwnedService } from "../launch/services";
+ import type { WorkPoolYieldItem } from "../task/workpool-yield";
+ import type { AgentDefinition } from "../task/types";
+ import type { ModelMention } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
+@@ -3583,6 +3584,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
+ 		return manager ? asyncJobTree(manager, this.#agentId, options) : null;
+ 	}
+ 
++	/** Running resources whose ownership would be lost on host disposal, including suppressed jobs and services. */
++	hasOwnedRunningWork(): boolean {
++		return (this.getAsyncJobTree({ recentLimit: 0 })?.running.length ?? 0) > 0 ||
++			(this.#evalToolSession !== undefined && hasLiveOwnedService(this.#evalToolSession));
++	}
++
+ 	/**
+ 	 * Asks for the captions of the running commands in this agent's job tree
+ 	 * (see {@link getAsyncJobTree}), for a listing that prints them (`/jobs full`).
+diff --git a/packages/coding-agent/test/rpc-socket-host.test.ts b/packages/coding-agent/test/rpc-socket-host.test.ts
+index 5451f8d..bed2fc1 100644
+--- a/packages/coding-agent/test/rpc-socket-host.test.ts
++++ b/packages/coding-agent/test/rpc-socket-host.test.ts
+@@ -5,10 +5,12 @@ import * as os from "node:os";
+ import * as path from "node:path";
+ import { Readable } from "node:stream";
+ import { RpcClient, type RpcAgentProcess } from "../src/modes/rpc/rpc-client";
++import type { RpcPromptResultFrame } from "../src/modes/rpc/rpc-types";
+ import { validateRpcSocketPath } from "../src/modes/rpc/rpc-socket-host";
+ import { LocalCollabSocket } from "../src/collab/local-client";
+ import { COLLAB_PROTO, type CollabFrame } from "../src/collab/protocol";
+ import { mintSessionId } from "../src/session/session-manager";
++import { parseSessionEntries } from "../src/session/session-loader";
+ import type { SessionEntry } from "../src/session/session-entries";
+ import { createSessionManager } from "../src/main";
+ import { parseArgs } from "../src/cli/args";
+@@ -105,8 +107,9 @@ describe("process-owned local RPC host", () => {
+ 		expect((await fs.readFile(path.join(root, "socket-session.jsonl"), "utf8"))).toContain("Done");
+ 	}, 30_000);
+ 
+-	test("a running turn survives controller loss and prevents shutdown until settled", async () => {
++	test("a running turn survives controller loss and journals its original-id result in the exact native session", async () => {
+ 		const owner = await connect();
++		const originalState = await owner.getState();
+ 		const started = Promise.withResolvers<void>();
+ 		owner.onSessionEvent(event => { if (event.type === "notice" && event.message === "slow turn streaming") started.resolve(); });
+ 		await owner.request({ type: "prompt", message: "slow" }, { id: "durable-turn" });
+@@ -117,6 +120,23 @@ describe("process-owned local RPC host", () => {
+ 		await expect(next.shutdownHost()).rejects.toMatchObject({ code: "session_busy" });
+ 		await next.abort();
+ 		await next.waitForSettled();
++		const delivered: RpcPromptResultFrame[] = [];
++		next.onPromptResult(frame => delivered.push(frame));
++		await next.promptAndWait("after reconnect");
++		const expected = [
++			{
++				sessionId: originalState.sessionId, sessionFile: originalState.sessionFile,
++				frame: { type: "prompt_result", id: "durable-turn", agentInvoked: true, status: "aborted", sessionSettled: expect.any(Boolean) },
++			},
++			{ sessionId: originalState.sessionId, sessionFile: originalState.sessionFile, frame: delivered[0] },
++		];
++		expect(delivered).toHaveLength(1);
++		const journal = parseSessionEntries(await Bun.file(path.join(root, "socket-session.jsonl")).text());
++		expect(journal.find(entry => entry.type === "session")?.id).toBe(originalState.sessionId);
++		expect(journal.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_prompt_result").map(entry => entry.data)).toEqual(expected);
++		const recovered = await next.getEntries();
++		expect(recovered.entries.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_prompt_result").map(entry => entry.data)).toEqual(expected);
++		expect(recovered.entries.filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(2);
+ 		await next.shutdownHost();
+ 		expect(await child.exited).toBe(0);
+ 	}, 30_000);

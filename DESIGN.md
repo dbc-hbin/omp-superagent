@@ -250,19 +250,51 @@ controller-ready이며 native PID 생존·정확한 identity·Gateway adapter-re
 
 `/restart`(Slack `!restart` 또는 `/superagent-restart`)는 모델 턴이 아닌 우선 제어 명령이다.
 Gateway와 지정 헤드 프로세스를 **모두 교체**하되 동일 native session file·session ID·모델 설정·
-입출력/승인/레인 기록을 보존한다. 실행·비동기 작업·서비스·승인·미해결 입력 및 레인의 활동이
-있으면 거절하며 강제 종료하거나 암묵적으로 취소하지 않는다.
+입출력/승인/레인 기록을 보존한다. 요청 시 바쁘다는 이유로 거절하지 않는다. 원래 route의
+접수 응답이 `sent`인 뒤 헤드 카드만 원래 native ID로 취소하고 우선 abort/queue 회수와 goal
+pause로 체크포인트를 만든다. 실제 native quiescence가 확인된 뒤에만 정상 shutdown한다.
+독립 레인의 Host·작업·승인은 중단하지 않으며 교체 헤드가 정확한 PID/session/generation에
+다시 연결한다. 서비스·소유권·효과가 해소되지 않으면 구체적 보류로 남기며 강제 종료하지 않는다.
 
 헤드는 서비스 전체의 새 dispatch를 막고 원래 명령을 완료 처리한 뒤 기존 outbox로 접수
 응답을 보낸다. 그 출력이 실제 `sent`임을 확인한 경우에만 인증된 Gateway 재시작 요청을 보낸다.
 Gateway는 원래 소유자 입력·정확한 응답·현재 프로세스 신원을 대조하고 요청 ID별 수명 기록을
 영속화한다. 재전달은 같은 기록을 반환하며 두 번째 교체를 시작하지 않는다.
+socket Host는 실제 native session journal에 원래 RPC ID의 `rpc_prompt_result`를 발송 전에
+영속화하고 실제 run 시작도 `rpc_agent_start`로 한 번씩 기록한다. 첫 receipt 전에 체크포인트한
+레인의 후속 run 실패·중단은 이 native 경계와 마지막 outcome으로 복구하며 첫 성공으로 덮지 않는다.
+동일 PID·세션·generation의 admission은 attach에서 buffered 이벤트를 관측하기 전에 복원한다.
+초기 state/journal 읽기 사이의 완료 이벤트도 원래 입력·승인에 귀속한다. 복구한 작업은 정착할 때
+native journal을 다시 대조하며, 두 읽기 사이에 lifecycle이 바뀌면 그 이벤트가 요청한 후속 정착에서
+확인한다. run 수는 체크포인트 cursor에 고정해 재구성하고 assistant는 실제 이전 run 경계에
+귀속하므로 중복 집계나 이전 실패를 새 실행의 outcome으로 옮기지 않는다.
+교체 헤드는 체크포인트의 동일 세션·파일·요청 receipt만 사용해 레인 admission을
+복원한다. receipt가 없는 과거 제출/외부 효과는 uncertain으로 유지하고 원래 prompt를 재제출하지
+않는다. 헤드의 모델·effort readback이 일치하고 초기화가 확인되면 fence를 해제한다. 재시작이
+중단한 활성 헤드 goal만 기존 source/route에 묶인 별도 native `goal resume` receipt로 이어가며,
+이미 paused/cancelled인 goal이나 uncertain 제출은 자동 재개하지 않는다. 미제출 입력은 원래
+장부 순서로 처리한다. goal 없는 중단 턴의 자동 복원 RPC는 없으므로 새 prompt로 위장하지 않는다.
+native goal 생성 이벤트의 실제 owning input을 goal ID·session별로 보존한다. no-progress로
+settled 상태가 되어도 이 원래 source/route를 재사용하며 `/restart` 입력을 대체 owner로 쓰지 않는다.
+소유권을 확인할 수 없는 기존 native goal은 서비스 교체를 막지 않고 자동 재개만 보류한다.
 Gateway가 소유한 정상 shutdown 경로와 일회성 일반 코드 successor가 기존 수명 lock 해제 뒤
 새 Gateway를 시작한다. 헤드는 자신을 종료하지 않으며 새 AI supervisor나 실행 backend를 만들지 않는다.
 
 새 헤드는 원래 세션과 실제 초기화 상태를 확인하고 원래 대화의 outbox에 결과를 알린다.
 접수·프로세스 시작·준비 완료를 구분하고 불확실한 종료/발송/기동을 자동 재시도하지 않는다.
 명시적 운영자 `stop main`이 재시작을 취소한 뒤 successor가 서비스를 되살려서는 안 된다.
+명시적 stop 경계는 영속화한다. handoff 전 헤드 stop도 재시작 intent보다 우선한다.
+체크포인트의 각 비동기 경계·게시와 Gateway의 수명 접수 직전에 동일 request와 캡처한 stop
+경계를 재대조한다. 중지된 fence는 과거 snapshot으로 재취득하지 않는다. native busy로
+`stop main` 종료가 거부되어도 해당 stop 경계는 이전 restart를 무효화한다.
+모호한 승인 답변이 Gateway ingress 앞에서 격리되어도 원래 승인 캐시 복원 barrier와
+소유자 `/restart`·`/stop` 제어는 헤드에 전달할 수 있다. 일반 입력의 순서와 격리 상태는
+그대로 보존하며 Gateway가 승인하거나 레인 배정을 판단하지 않는다. 체크포인트는 아직
+native에 남은 answered-attempt 세대의 취소 신원만 내용 없이 기록한다. 늦은 원래 답변은
+rejected로 조정하며 이미 소비된 승인/외부 효과를 취소했다고 주장하지 않는다.
+완료된 초기 승인 복원 상태는 인증된 동일 controller/PID에 귀속한다. 격리된 답변이 SSE만
+끊어도 진행 중인 비동기 restart 접수를 무효화하지 않으며, 새 controller와 초기 barrier의
+인증·승인 준비 요건은 유지한다.
 
 ### 플랫폼 인증·운영 설정
 
@@ -557,6 +589,11 @@ LLM 추측에 맡기지 않는다. Gateway는 명령의 의미나 lane 대상·�
 레인의 일반 assistant 출력은 헤드용 report 입력이다. 외부 전송은 헤드가 원래 요청 맥락을
 검토한 뒤 내는 답변 또는 명시적으로 헤드가 통제하는 delivery 경로만 사용한다.
 보고의 sourceId·원래 route와 새 report receipt ID를 구분하고 마지막 활동 대화로 보내지 않는다.
+
+같은 요청의 마지막 비어 있지 않은 assistant 답변은 native 정착까지 보존한다. TODO 알림
+등으로 이어진 빈 응답·공백·thinking-only 메시지는 그 답변을 지우지 않으며 새 답변이 있으면
+교체한다. 실패·중단은 이전 답변을 폐기하고, 새 요청에는 이전 요청의 답변을 넘기지 않는다.
+발송은 기존 원본 요청의 outbox·중복 제거 경로를 그대로 사용한다.
 
 메신저 상태 반응은 기존 Messenger 표면의 `setActivity`로 전달한다. Gateway의 영속 접수
 성공 뒤에만 `received`를 비동기로 보내고, 중복 ingress에는 다시 보내지 않는다. native

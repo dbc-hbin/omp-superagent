@@ -7,9 +7,11 @@
     "patches/omp/0001-process-owned-local-rpc-and-native-attach.patch",
     "patches/omp/0002-config-only-settings.patch",
     "patches/omp/0003-rpc-goal-default-tool.patch",
-    "patches/omp/0004-cancel-queued-goal-resume.patch"
+    "patches/omp/0004-cancel-queued-goal-resume.patch",
+    "patches/omp/0005-durable-prompt-results.patch",
+    "patches/omp/0006-durable-run-boundaries.patch"
   ],
-  "patchSha256": "6c06532a6fbc60d530740f3465192a4d15c075ea91144c64c07ca3cde72baa72",
+  "patchSha256": "07b121ccd300b0eefe9123e856b2cee31bd4535e333ff48737c070d8f6021f9a",
   "runtime": {
     "bun": "1.4.4",
     "entry": "packages/coding-agent/src/cli.ts",

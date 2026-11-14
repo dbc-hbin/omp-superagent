@@ -49,6 +49,9 @@ class HostTransport implements RuntimeHost {
   beforeCompact?: () => Promise<void> | void;
   beforeAbort?: () => Promise<void> | void;
   beforeGoalResume?: () => Promise<void> | void;
+  beforeState?: () => Promise<void> | void;
+  beforeEntries?: () => Promise<void> | void;
+  afterEntries?: () => Promise<void> | void;
   goalResumeRuns = true;
   compactResult: "success" | "rejected" | "throw-after" = "success";
   compactAbort?: () => void;
@@ -62,6 +65,7 @@ class HostTransport implements RuntimeHost {
   effortSetResult: "success" | "throw-after" | "model-mismatch" | "missing-effort" | "rejected" = "success";
   levels: unknown[] = ["off", "minimal", "high"];
   levelsSuccess = true;
+  entries: unknown[] = [];
   effortClamp?: string;
   modelEffort?: string | null;
   state: RuntimeState;
@@ -76,7 +80,7 @@ class HostTransport implements RuntimeHost {
     this.exit = () => deferred.resolve();
   }
   client = {
-    getState: async () => structuredClone(this.state),
+    getState: async () => { if (this.beforeState) await this.beforeState(); return structuredClone(this.state); },
     abortAndRestoreQueue: async () => {
       this.abortCount++;
       await this.beforeAbort?.();
@@ -102,6 +106,13 @@ class HostTransport implements RuntimeHost {
       return { success: this.levelsSuccess, data: { levels: structuredClone(this.levels) } };
     }
     if (command.type === "get_session_stats") return { success: true, data: { sessionId: this.state.sessionId, sessionFile: this.state.sessionFile, ...structuredClone(this.stats) } };
+    if (command.type === "get_entries") {
+      if (this.beforeEntries) await this.beforeEntries();
+      const response = { success: true, data: { entries: structuredClone(this.entries), leafId: null } };
+      const after = this.afterEntries?.();
+      if (after) await after;
+      return response;
+    }
     if (command.type === "compact") {
       if (this.compactResult === "rejected") return { success: false, error: "secret rejected compact" };
       this.state.isCompacting = true;
@@ -162,9 +173,9 @@ class HostTransport implements RuntimeHost {
     }
     if (command.type === "goal") {
       if (this.state.goal?.goal && command.op === "pause") {
-        this.state.goal = { enabled: false, mode: "active", goal: { status: "paused" } };
+        this.state.goal = { enabled: false, mode: "active", goal: { ...this.state.goal.goal, status: "paused" } };
       } else if (this.state.goal?.goal && command.op === "resume") {
-        this.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
+        this.state.goal = { enabled: true, mode: "active", goal: { ...this.state.goal.goal, status: "active" } };
         if (this.goalResumeRuns) {
           this.state.isSettled = false;
           this.state.isStreaming = true;
@@ -861,7 +872,7 @@ function savedRestart(instance: Pick<Superagent, "store" | "config">, state: Gat
   return { input, restart, receipt };
 }
 
-describe("idle-only Gateway AND HEAD restart", () => {
+describe("controlled Gateway AND HEAD restart", () => {
   test("the runtime-generated request crosses authenticated Gateway RPC and persists actual acceptance once", async () => {
     let client: GatewayHeadMessenger;
     const { runtime, config, store, messenger, main } = fixture(3, undefined, {
@@ -946,7 +957,7 @@ describe("idle-only Gateway AND HEAD restart", () => {
     expect(main.commands.some(command => command.type === "shutdown_host")).toBe(false);
   });
 
-  test.each(["main", "lane"] as const)("%s native work, async, service, goal, approval and identity guards refuse without stopping processes", async target => {
+  test.each(["main", "lane"] as const)("%s native work is checkpointed or preserved, while unsafe HEAD ownership remains held", async target => {
     const cases: Partial<RuntimeState>[] = [
       { isSettled: false }, { isStreaming: true }, { isCompacting: true }, { queuedMessageCount: 1 },
       { hasPendingAsyncWork: true }, { hasOwnedRunningWork: true }, { goal: { enabled: true } },
@@ -961,19 +972,22 @@ describe("idle-only Gateway AND HEAD restart", () => {
       await runtime.start();
       Object.assign(target === "main" ? main.state : laneHost.state, patch);
       await admit(runtime, message(`restart-guard-owner-${index}`, route(), "/restart"));
-      expect(requests).toEqual([]);
-      expect(store.getMeta("head:restart-fence")).toBe("");
-      expect(messenger.sent.at(-1)?.text).toContain("No process was stopped");
-      expect(messenger.sent.at(-1)?.text).toContain("/stop head is a separate");
-      expect(messenger.sent.at(-1)?.text).not.toContain("secret-native-token");
+      const unsafe = Object.hasOwn(patch, "hostPid") || patch.sessionId !== undefined
+        || target === "main" && (patch.hasPendingAsyncWork !== undefined && patch.hasPendingAsyncWork
+        || patch.hasOwnedRunningWork === true || Object.hasOwn(patch, "hasPendingAsyncWork") && patch.hasPendingAsyncWork === undefined
+        );
+      expect(requests).toHaveLength(unsafe ? 0 : 1);
+      expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe(unsafe ? "failed" : "accepted");
+      expect(store.output(`restart-guard-owner-${index}:restart-ack`)?.state).toBe("sent");
+      expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("secret-native-token");
       expect(main.prompts).toEqual([]);
       expect(laneHost.prompts).toEqual([]);
-      expect(main.abortCount + laneHost.abortCount).toBe(0);
+      expect(laneHost.abortCount).toBe(0);
       expect([...main.commands, ...laneHost.commands].some(command => command.type === "shutdown_host")).toBe(false);
     }
   });
 
-  test.each(["pending", "submitted", "uncertain"] as const)("durable %s work in either HEAD or a lane is not settled by restart refusal", async state => {
+  test.each(["pending", "submitted", "uncertain"] as const)("durable %s work in either HEAD or a lane survives restart admission without replay", async state => {
     for (const target of ["main", "lane"] as const) {
       const { runtime, store, config, requests } = restartFixture();
       const lane = savedLane(store, config, `durable-${state}`, route(`durable-${state}`));
@@ -982,32 +996,197 @@ describe("idle-only Gateway AND HEAD restart", () => {
       store.receive(other, target === "main" ? "main" : lane.id);
       if (state !== "pending") store.submit(other.id, "original-native-ticket", 0);
       if (state === "uncertain") store.settle(other.id, "uncertain");
-      await runtime.receive(message(`restart-durable-${state}-${target}`, route(), "/restart"));
+      await admit(runtime, message(`restart-durable-${state}-${target}`, route(), "/restart"));
       expect(store.input(other.id)?.state).toBe(state);
-      expect(store.input(`restart-durable-${state}-${target}`)?.state).toBe("cancelled");
-      expect(requests).toEqual([]);
+      expect(store.input(`restart-durable-${state}-${target}`)?.state).toBe("done");
+      expect(requests).toHaveLength(1);
     }
   });
 
-  test("durable approvals and active lane runs refuse even when the native HEAD is idle", async () => {
+  test("active lane work and its exact approval remain owned while Gateway and HEAD restart", async () => {
     const { runtime, store, config, hosts, main, requests } = restartFixture();
     const lane = savedLane(store, config, "restart-active-lane", route("restart-active-lane"), process.pid);
     const laneHost = new HostTransport(lane.sessionFile, `session-${lane.id}`);
     hosts.set(lane.socketPath, laneHost);
     await runtime.start();
+    await delegate(runtime, message("active-lane-request", lane.route));
     store.putApproval({ id: "durable-restart-approval", target: lane.id, generation: 0, requestId: "original-ui", route: lane.route,
       request: { method: "confirm" }, state: "pending", remoteId: "original-card" });
     await admit(runtime, message("restart-with-approval", route(), "/restart"));
     expect(store.approval("durable-restart-approval")?.state).toBe("pending");
-    store.resolveApproval("durable-restart-approval", 0, "answered");
-    await delegate(runtime, message("active-lane-request", lane.route));
-    await admit(runtime, message("restart-with-active-lane", route(), "/restart"));
-    expect(requests).toEqual([]);
+    expect(requests).toHaveLength(1);
     expect(laneHost.prompts).toHaveLength(1);
     expect(main.prompts).toEqual([]);
     expect(laneHost.abortCount).toBe(0);
   });
 
+  test.each(["pending", "answered"] as const)("busy HEAD checkpoints its goal and archives the original %s card after confirmed route ACK", async cardState => {
+    const { runtime, main, store, messenger, requests } = restartFixture();
+    await runtime.start();
+    await admit(runtime, message("restart-active-head"));
+    main.state.goal = { enabled: true, mode: "active", goal: { id: "original-head-goal", status: "active" } };
+    main.emit({ type: "goal_updated", state: main.state.goal });
+    main.state.pendingUiRequests = [{ id: "head-question", method: "confirm", title: "Continue?" }];
+    main.emit({ type: "extension_ui_request", ...main.state.pendingUiRequests[0] });
+    await runtime.kick();
+    const card = [...messenger.shown.values()][0]!;
+    if (cardState === "answered") store.resolveApproval(card.id, card.generation, "answered");
+    main.beforeAbort = () => {
+      expect(store.output("restart-busy-head:restart-ack")).toMatchObject({ state: "sent", route: route() });
+      expect(card.requestId).toBe("head-question");
+      expect(store.approval(card.id)?.state).toBe(cardState === "pending" ? "cancelled" : "answered");
+      const ticket = main.prompts[0]!;
+      main.emit({ type: "prompt_result", id: ticket.id, status: "aborted", agentInvoked: true });
+    };
+    const original = message("restart-busy-head", route(), "/restart");
+    await admit(runtime, original);
+    expect(requests).toHaveLength(1);
+    expect(main.abortCount).toBe(1);
+    expect(main.state.goal?.enabled).toBe(false);
+    expect(main.prompts).toHaveLength(1);
+    expect(JSON.parse(store.getMeta("head:restart-fence")!).checkpoint).toMatchObject({
+      goalActive: true, goalSourceId: "restart-active-head", model: executionModel, thinkingLevel: "high",
+    });
+    await messenger.handlers!.answer(card.id, { confirmed: true }, card.route).catch(() => {});
+    expect(main.responses).not.toContainEqual({ id: card.requestId, response: { confirmed: true } });
+    expect(await messenger.handlers!.reconcileAnswer!(card.id, card.route)).toBe("rejected");
+    await admit(runtime, original);
+    expect(main.abortCount).toBe(1);
+    expect(messenger.sent.filter(output => output.id === "restart-busy-head:restart-ack")).toHaveLength(1);
+  });
+
+  test("explicit HEAD stop wins while restart ACK is in flight and never starts a successor", async () => {
+    const { runtime, main, store, messenger, requests } = restartFixture();
+    const sending = Promise.withResolvers<void>();
+    const delivered = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => {
+      if (output.id === "restart-stop-race:restart-ack") { sending.resolve(); await delivered.promise; }
+    };
+    await runtime.start();
+    await runtime.receive(message("restart-stop-race", route(), "/restart"));
+    await sending.promise;
+    await runtime.receive(message("stop-wins-restart", route(), "/stop head"));
+    delivered.resolve();
+    await runtime.kick();
+    expect(requests).toEqual([]);
+    expect(store.getMeta("head:restart-fence")).toBe("");
+    expect(store.input("restart-stop-race")?.state).toBe("done"); // The ACK was already admitted; lifecycle cancellation is separate.
+    expect(JSON.parse(store.getMeta("head:restart:restart-stop-race")!).state).toBe("refused");
+    expect(main.abortCount).toBe(1);
+  });
+
+  test.each(["resident-state", "resident-journal", "final-state"] as const)("a newer HEAD stop cannot be resurrected across the %s checkpoint await", async boundary => {
+    const { runtime, main, store, config, hosts, requests } = restartFixture();
+    const lane = savedLane(store, config, `stop-checkpoint-${boundary}`, route(`stop-${boundary}`), process.pid);
+    const resident = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, resident);
+    await runtime.start();
+    await admit(runtime, message("checkpoint-running-head"));
+    await delegate(runtime, message(`checkpoint-running-lane-${boundary}`, lane.route));
+    const entered = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    const block = async () => { entered.resolve(); await released.promise; };
+    if (boundary === "resident-state") resident.beforeState = async () => { resident.beforeState = undefined; await block(); };
+    if (boundary === "resident-journal") resident.beforeEntries = async () => { resident.beforeEntries = undefined; await block(); };
+    if (boundary === "final-state") main.beforeState = async () => {
+      if (store.input("checkpoint-running-head")?.state !== "uncertain") return;
+      main.beforeState = undefined;
+      await block();
+    };
+    await runtime.receive(message("checkpoint-raced-restart", route(), "/restart"));
+    await entered.promise;
+    expect(store.output("checkpoint-raced-restart:restart-ack")?.state).toBe("sent");
+    await runtime.receive(message("checkpoint-newer-stop", route(), "/stop head"));
+    expect(store.getMeta("head:restart-fence")).toBe("");
+    released.resolve();
+    await runtime.kick();
+    expect(store.getMeta("head:restart-fence")).toBe("");
+    expect(JSON.parse(store.getMeta("head:restart:checkpoint-raced-restart")!).state).toBe("refused");
+    expect(requests).toEqual([]);
+    expect(main.abortCount).toBe(boundary === "final-state" ? 2 : 1);
+    expect(resident.abortCount).toBe(0);
+    expect(resident.prompts).toHaveLength(1);
+  });
+
+  test("an operator-stop boundary superseding a pending ACK prevents native checkpoint and handoff", async () => {
+    const { runtime, main, store, messenger, requests } = restartFixture();
+    const sending = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => {
+      if (output.id === "operator-raced-restart:restart-ack") { sending.resolve(); await released.promise; }
+    };
+    await runtime.start();
+    await admit(runtime, message("operator-running-head"));
+    await runtime.receive(message("operator-raced-restart", route(), "/restart"));
+    await sending.promise;
+    store.setMeta("gateway:operator-stop", "newer-explicit-stop-boundary");
+    released.resolve();
+    await runtime.kick();
+    expect(main.abortCount).toBe(0);
+    expect(main.state.isStreaming).toBe(true);
+    expect(requests).toEqual([]);
+    expect(store.getMeta("head:restart-fence")).toBe("");
+    expect(JSON.parse(store.getMeta("head:restart:operator-raced-restart")!).state).toBe("refused");
+  });
+
+  test("a settled active HEAD goal retains its original source for restart from another conversation", async () => {
+    const instance = restartFixture();
+    const { runtime, main, store, messenger, config } = instance;
+    const original = message("settled-goal-owner", route("goal-route-A"));
+    const control = message("settled-goal-restart", route("restart-route-B"), "/restart");
+    await runtime.start();
+    await admit(runtime, original);
+    main.state.goal = { enabled: true, mode: "active", goal: { id: "settled-native-goal", status: "active" } };
+    main.emit({ type: "goal_updated", state: main.state.goal });
+    main.complete("First yield without finishing the existing native goal");
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("done");
+    await admit(runtime, control);
+    const restart = JSON.parse(store.getMeta(`head:restart:${control.id}`)!);
+    expect(restart.checkpoint).toMatchObject({ goalActive: true, goalId: "settled-native-goal", goalSourceId: original.id });
+    restart.ownerPid = 2_000_000_001;
+    store.setMeta(`head:restart:${control.id}`, JSON.stringify(restart));
+    store.setMeta("head:restart-fence", JSON.stringify(restart));
+    const receipt: GatewayRestartRecord = { requestId: restart.requestId, inputId: control.id, ackOutputId: restart.ackOutputId,
+      gatewayPid: 2_000_000_002, headPid: restart.ownerPid, sessionId: main.state.sessionId,
+      sessionFile: hostPaths(config, "main").sessionFile, state: "started", successorPid: process.pid, replacementPid: process.pid };
+    store.setMeta(`gateway:restart:${restart.requestId}`, JSON.stringify(receipt));
+    store.setMeta("gateway:head", JSON.stringify({ pid: process.pid, sessionId: main.state.sessionId, sessionFile: main.state.sessionFile }));
+    store.setMeta("gateway:socket", JSON.stringify({ pid: process.pid }));
+    main.beforeGoalResume = () => {
+      main.state.pendingUiRequests = [{ id: "resumed-original-card", method: "confirm", title: "Original goal decision" }];
+      main.emit({ type: "extension_ui_request", ...main.state.pendingUiRequests[0] });
+    };
+    await runtime.kick();
+    const resumeId = `restart-resume:${restart.requestId}:main`;
+    expect(store.input(resumeId)).toMatchObject({ route: original.route, state: "submitted" });
+    const card = [...messenger.shown.values()].find(card => card.requestId === "resumed-original-card");
+    expect(card?.route).toEqual(original.route);
+    main.state.pendingUiRequests = [];
+    main.state.goal = null;
+    main.state.isSettled = true;
+    main.state.isStreaming = false;
+    main.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Original goal finished" }] } });
+    main.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(store.output(`${resumeId}:answer`)).toMatchObject({ route: original.route, text: "Original goal finished" });
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test("an unowned native goal holds only automatic resume and never adopts the restart source", async () => {
+    const instance = restartFixture();
+    const { restart } = savedRestart(instance);
+    const checkpoint = { ...restart, checkpoint: { goalActive: true, goalId: "native-only-unowned-goal",
+      model: executionModel, thinkingLevel: "high", residents: [] } };
+    instance.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
+    instance.store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
+    instance.main.state.goal = { enabled: false, mode: "active", goal: { id: "native-only-unowned-goal", status: "paused" } };
+    await instance.runtime.start();
+    expect(instance.store.getMeta("head:restart-fence")).toBe("");
+    expect(instance.main.commands.filter(command => command.type === "goal" && command.op === "resume")).toEqual([]);
+    expect(instance.store.input(`restart-resume:${restart.requestId}:main`)).toBeNull();
+    expect(instance.store.output(`${restart.inputId}:restart-goal-held`)).not.toBeNull();
+  });
   test("a delayed ACK holds handoff and fences direct/lane dispatch and every public lane mutation", async () => {
     const { runtime, store, main, config, hosts, messenger, directory, requests } = restartFixture();
     const lane = savedLane(store, config, "restart-fenced-lane", route("restart-fenced-lane"), process.pid);
@@ -1212,6 +1391,231 @@ describe("idle-only Gateway AND HEAD restart", () => {
     else expect(instance.store.getMeta("head:restart-fence")).toBeTruthy();
     expect(instance.requests).toEqual([]);
     expect(instance.main.prompts).toEqual([]);
+  });
+
+  for (const outcome of ["completed", "error", "aborted"] as const)
+  test.each(["before-attachment", "after-attachment", "between-state-and-entries", "entries-snapshot", "publication"] as const)(`surviving lane ${outcome} %s is recovered from authoritative runs without replay`, async timing => {
+    const instance = restartFixture();
+    const { store, config, hosts, main, runtime, messenger } = instance;
+    const lane = savedLane(store, config, "restart-surviving-lane", route("surviving-topic"), process.pid);
+    const native = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, native);
+    main.local = true;
+    const window = timing !== "before-attachment" && timing !== "after-attachment";
+    const original = message("surviving-original-request", lane.route);
+    const source = window ? message("surviving-parent-user", route("original-window-source")) : original;
+    if (window) {
+      store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+      store.settle(source.id, "done");
+    }
+    store.receive(original, lane.id, window ? { [`handoff-source:${original.id}`]: source.id } : {});
+    store.submit(original.id, "surviving-native-request", lane.generation);
+    const { restart } = savedRestart(instance);
+    const checkpoint = { ...restart, checkpoint: {
+      goalActive: false, model: executionModel, thinkingLevel: "high",
+      residents: [{ id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
+        inputId: original.id, requestIds: ["surviving-native-request"], ownedRuns: 1, entryId: "snapshot-leaf" }],
+    } };
+    store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
+    store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
+    native.entries = [{ id: "snapshot-leaf", type: "custom", customType: "checkpoint" }];
+    const recordYield = () => {
+      const message = { role: "assistant", stopReason: "stop",
+        content: [{ type: "text", text: window ? "Earlier successful native yield" : "Recovered original lane result" }] };
+      native.entries.push({ type: "message", id: "final-assistant", message }, {
+        type: "custom", customType: "rpc_prompt_result", data: {
+          sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+          frame: { id: "surviving-native-request", status: "completed", agentInvoked: true },
+        },
+      });
+      return message;
+    };
+    const start = { type: "custom", customType: "rpc_agent_start", data: {
+      sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+    } };
+    if (window) { recordYield(); native.entries.push(start); }
+    const recordCompletion = () => {
+      let message = window
+        ? { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Recovered original lane result" }] } : recordYield();
+      if (outcome !== "completed" || window) {
+        message = { role: "assistant", stopReason: outcome === "completed" ? "stop" : outcome,
+          content: [{ type: "text", text: outcome === "completed" ? "Recovered original lane result" : "Private detached continuation diagnostics" }] };
+        if (!window) native.entries.push({ type: "custom", customType: "rpc_agent_start", data: {
+          sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+        } });
+        native.entries.push({ type: "message", id: "continuation-assistant", message });
+      }
+      native.state.isSettled = true;
+      native.state.isStreaming = false;
+      return message;
+    };
+    if (timing === "before-attachment") recordCompletion();
+    else { native.state.isSettled = false; native.state.isStreaming = true; }
+    const terminal = () => {
+      const message = recordCompletion();
+      native.emit({ type: "message_end", message });
+      native.emit({ type: "agent_end", isTerminal: true, messages: [message] });
+      native.emit({ type: "session_settled" });
+    };
+    if (timing === "between-state-and-entries") native.beforeEntries = async () => {
+      native.beforeEntries = undefined;
+      const question = { type: "extension_ui_request", method: "confirm", id: "window-question", title: "Confirm original work" };
+      native.state.pendingUiRequests = [question];
+      native.emit(question);
+      await messenger.whenApproval();
+      native.state.pendingUiRequests = [];
+      native.emit({ type: "extension_ui_request", method: "cancel", targetId: question.id });
+      terminal();
+    };
+    if (timing === "entries-snapshot" || timing === "publication") native.afterEntries = () => {
+      native.afterEntries = undefined;
+      if (timing === "publication") queueMicrotask(terminal);
+      else terminal();
+    };
+    await runtime.start();
+    if (timing === "after-attachment") {
+      expect(store.input(original.id)?.state).toBe("submitted");
+      if (outcome !== "completed") native.emit({ type: "agent_start" });
+      native.emit({ type: "message_end", message: recordCompletion() });
+      // prompt_result is deliberately NOT delivered to this replacement client.
+      native.emit({ type: "session_settled" });
+    }
+    await main.whenPrompts(1);
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe(outcome === "completed" ? "done" : outcome === "error" ? "uncertain" : "cancelled");
+    expect(store.input(`report:${original.id}`)).toMatchObject({ route: source.route });
+    expect(store.getMeta(`activity-source:report:${original.id}`)).toBe(source.id);
+    expect(store.input(`report:${original.id}`)?.text).toContain(native.state.sessionId);
+    expect(store.input(`report:${original.id}`)?.text).toContain(lane.sessionFile);
+    if (timing === "between-state-and-entries") {
+      expect([...messenger.shown.values()]).toMatchObject([{ route: original.route, generation: lane.generation, requestId: "window-question" }]);
+      expect(messenger.dismissed).toHaveLength(1);
+    }
+    if (outcome === "completed") expect(store.input(`report:${original.id}`)?.text).toContain("Recovered original lane result");
+    else expect(store.input(`report:${original.id}`)?.text).not.toContain("Private detached continuation diagnostics");
+    expect(native.prompts).toEqual([]);
+    expect(native.abortCount).toBe(0);
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test.each(["retained", "before-checkpoint", "error", "aborted", "retry"] as const)("surviving lane empty-tail recovery respects its checkpoint boundary: %s", async scenario => {
+    const instance = restartFixture();
+    const { store, config, hosts, main, runtime, messenger } = instance;
+    const lane = savedLane(store, config, "retention-recovery", route("retention-recovery"), process.pid);
+    const native = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, native);
+    main.local = true;
+    const original = message("retention-recovery-original", lane.route);
+    store.receive(original, lane.id);
+    store.submit(original.id, "retention-recovery-native", lane.generation);
+    const { restart } = savedRestart(instance);
+    const checkpoint = { ...restart, checkpoint: {
+      goalActive: false, model: executionModel, thinkingLevel: "high",
+      residents: [{ id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
+        inputId: original.id, requestIds: ["retention-recovery-native"], ownedRuns: 1, entryId: "retention-checkpoint" }],
+    } };
+    store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
+    store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
+    const assistant = (text: string, stopReason = "stop") => ({ type: "message", message: {
+      role: "assistant", stopReason, content: [{ type: "text", text }],
+    } });
+    native.entries = [assistant("Unrelated old session secret"), {
+      id: "retention-checkpoint", ...assistant("Unowned pre-checkpoint answer"),
+    }];
+    if (scenario !== "before-checkpoint") native.entries.push(assistant("Earlier owned answer"));
+    native.entries.push({ type: "custom", customType: "rpc_prompt_result", data: {
+      sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+      frame: { id: "retention-recovery-native", status: scenario === "retry" ? "error" : "completed", agentInvoked: true },
+    } });
+    if (scenario === "error" || scenario === "aborted" || scenario === "retry") {
+      native.entries.push({ type: "custom", customType: "rpc_agent_start", data: {
+        sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+      } }, assistant("Private detached diagnostics", scenario === "retry" ? "error" : scenario));
+    }
+    if (scenario === "retained" || scenario === "retry") native.entries.push(assistant("Latest owned answer"));
+    if (scenario !== "error" && scenario !== "aborted") native.entries.push(
+      { type: "message", message: { role: "user", content: "TODO reminder: finish remaining work" } },
+      assistant(""), assistant(" \n\t"),
+      { type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "Private reasoning" }] } },
+    );
+    await runtime.start();
+    await main.whenPrompts(1);
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe(scenario === "error" ? "uncertain" : scenario === "aborted" ? "cancelled" : "done");
+    const report = store.input(`report:${original.id}`);
+    expect(report).toMatchObject({ route: original.route });
+    expect(report!.text).not.toContain("Unrelated old session secret");
+    expect(report!.text).not.toContain("Unowned pre-checkpoint answer");
+    expect(report!.text).not.toContain("Private detached diagnostics");
+    if (scenario === "retained" || scenario === "retry") expect(report!.text).toContain("Latest owned answer");
+    else expect(report!.text).not.toContain("Earlier owned answer");
+    expect(native.prompts).toEqual([]);
+    expect(native.abortCount).toBe(0);
+    expect(main.prompts).toHaveLength(1);
+    expect(messenger.sent.map(output => output.sourceId)).toEqual([restart.inputId]);
+  });
+
+  test.each(["error", "aborted"] as const)("a recovered older %s cannot settle a newer run started during final journal read", async olderOutcome => {
+    const instance = restartFixture();
+    const { store, config, hosts, main, runtime } = instance;
+    const lane = savedLane(store, config, "recovery-newer-run", route("newer-run"), process.pid);
+    const native = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, native);
+    main.local = true;
+    const original = message("newer-run-original", lane.route);
+    store.receive(original, lane.id);
+    store.submit(original.id, "newer-run-native", lane.generation);
+    const { restart } = savedRestart(instance);
+    const checkpoint = { ...restart, checkpoint: {
+      goalActive: false, model: executionModel, thinkingLevel: "high",
+      residents: [{ id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
+        inputId: original.id, requestIds: ["newer-run-native"], ownedRuns: 1, entryId: "newer-run-checkpoint" }],
+    } };
+    store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
+    store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
+    const start = () => ({ type: "custom", customType: "rpc_agent_start", data: {
+      sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+    } });
+    native.entries = [{ id: "newer-run-checkpoint", type: "custom", customType: "checkpoint" }, {
+      type: "custom", customType: "rpc_prompt_result", data: {
+        sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+        frame: { id: "newer-run-native", status: "completed", agentInvoked: true },
+      },
+    }, start(), { type: "message", message: {
+      role: "assistant", stopReason: olderOutcome, content: [{ type: "text", text: "Older private failure" }],
+    } }];
+    let started = false;
+    native.afterEntries = () => {
+      native.afterEntries = undefined;
+      native.beforeEntries = () => {
+        native.beforeEntries = undefined;
+        native.entries.push(start());
+        native.state.isSettled = false;
+        native.state.isStreaming = true;
+        native.emit({ type: "agent_start" });
+        started = true;
+      };
+    };
+    await runtime.start();
+    expect(started).toBe(true);
+    expect(store.input(original.id)?.state).toBe("submitted");
+    expect(store.input(`report:${original.id}`)).toBeNull();
+    expect(main.prompts).toEqual([]);
+    const finalMessage = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Newer run verified completion" }] };
+    native.entries.push({ type: "message", message: finalMessage });
+    native.state.isSettled = true;
+    native.state.isStreaming = false;
+    native.emit({ type: "message_end", message: finalMessage });
+    native.emit({ type: "session_settled" });
+    await main.whenPrompts(1);
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("done");
+    expect(store.input(`report:${original.id}`)).toMatchObject({ route: original.route });
+    expect(store.input(`report:${original.id}`)?.text).toContain("Newer run verified completion");
+    expect(store.input(`report:${original.id}`)?.text).not.toContain("Older private failure");
+    expect(native.prompts).toEqual([]);
+    expect(native.abortCount).toBe(0);
+    expect(main.prompts).toHaveLength(1);
   });
 
   test.each(["accepted", "uncertain", "missing-receipt", "wrong-request", "wrong-replacement", "old-owner-alive"] as const)("startup does not clear a %s fence without exact completed ownership evidence", async scenario => {
@@ -3623,14 +4027,168 @@ describe("real Store runtime coordination", () => {
     expect(store.lane("two")?.generation).toBe(0);
   });
 
+  test.each(["message_end", "agent_end-only"] as const)("HEAD retains its latest meaningful answer through a TODO empty tail via %s", async delivery => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const original = message("retained-head-answer");
+    const joined = message("retained-head-followup", original.route, "Include the latest status");
+    await admit(runtime, original);
+    await admit(runtime, joined);
+    expect(main.prompts).toHaveLength(2);
+    const answer = "  Latest verified HEAD answer\n";
+    const messages = [
+      { role: "user", content: "Original authorized request" },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Earlier answer" }] },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: answer }] },
+      { role: "user", content: "TODO reminder: continue until all tasks are complete" },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "" }] },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: " \n\t" }] },
+      { role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "Private reasoning" }] },
+      { role: "assistant", stopReason: "stop", content: [] },
+    ];
+    if (delivery === "message_end") for (const message of messages) main.emit({ type: "message_end", message });
+    main.state.isStreaming = false;
+    main.emit({ type: "agent_end", isTerminal: true, yielded: true, messages });
+    for (const prompt of main.prompts) main.emit({ type: "prompt_result", id: prompt.id, status: "completed", agentInvoked: true, sessionSettled: false });
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("submitted");
+    expect(messenger.sent).toEqual([]);
+    main.state.isSettled = true;
+    main.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("done");
+    expect(store.input(joined.id)?.state).toBe("done");
+    expect(store.output(`${original.id}:answer`)).toMatchObject({ sourceId: original.id, route: original.route, state: "sent", text: answer });
+    expect(store.output(`${joined.id}:answer`)).toBeNull();
+    expect(messenger.sent).toMatchObject([{ id: `${original.id}:answer`, sourceId: original.id, text: answer }]);
+
+    main.emit({ type: "agent_end", isTerminal: true, messages });
+    main.emit({ type: "session_settled" });
+    await admit(runtime, original);
+    expect(main.prompts).toHaveLength(2);
+    expect(messenger.attempted).toHaveLength(1);
+    const next = message("retained-next-request", route("another-conversation"));
+    await admit(runtime, next);
+    main.complete(" \n\t");
+    await runtime.kick();
+    expect(store.input(next.id)?.state).toBe("done");
+    expect(store.output(`${next.id}:answer`)).toBeNull();
+    expect(messenger.sent).toHaveLength(1);
+  });
+
+  test.each(["replacement", "error", "aborted"] as const)("terminal-only HEAD continuation applies %s text without replaying an earlier run", async scenario => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const original = message("retained-head-continuation");
+    await admit(runtime, original);
+    main.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Earlier run answer" }] } });
+    main.emit({ type: "prompt_result", id: main.prompts[0]!.id, status: "completed", agentInvoked: true, sessionSettled: false });
+    await runtime.kick();
+    main.emit({ type: "agent_start" });
+    main.emit({ type: "agent_end", isTerminal: true, messages: [
+      { role: "assistant", stopReason: scenario === "replacement" ? "stop" : scenario,
+        content: [{ type: "text", text: scenario === "replacement" ? "Latest continuation answer" : "Private failed response" }] },
+      { role: "assistant", stopReason: "stop", content: [] },
+    ] });
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("done");
+    if (scenario === "replacement") {
+      expect(messenger.sent).toMatchObject([{ sourceId: original.id, text: "Latest continuation answer" }]);
+      expect(store.output(`${original.id}:answer`)).toMatchObject({ state: "sent", text: "Latest continuation answer" });
+    } else {
+      expect(messenger.sent).toEqual([]);
+      expect(store.output(`${original.id}:answer`)).toBeNull();
+    }
+  });
+
+  for (const stopReason of ["error", "aborted"] as const)
+  test.each(["message_end", "agent_end-only"] as const)(`HEAD ${stopReason} clears retained text via %s`, async delivery => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const original = message("retained-head-failure");
+    await admit(runtime, original);
+    const earlier = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Earlier successful yield" }] };
+    main.emit({ type: "message_end", message: earlier });
+    main.emit({ type: "prompt_result", id: main.prompts[0]!.id, status: "completed", agentInvoked: true, sessionSettled: false });
+    await runtime.kick();
+    main.emit({ type: "agent_start" });
+    const terminal = { role: "assistant", stopReason, content: [], errorMessage: "Private provider diagnostics" };
+    if (delivery === "message_end") main.emit({ type: "message_end", message: terminal });
+    main.emit({ type: "agent_end", isTerminal: true, messages: [earlier, terminal] });
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe(stopReason === "error" ? "uncertain" : "cancelled");
+    expect(messenger.sent).toHaveLength(1);
+    expect(messenger.sent[0]!.text).toContain(stopReason === "error" ? "실패" : "중단");
+    expect(messenger.sent[0]!.text).not.toContain("Earlier successful yield");
+    expect(messenger.sent[0]!.text).not.toContain("Private provider diagnostics");
+    expect(store.output(`${original.id}:answer`)).toMatchObject({ state: "sent", text: messenger.sent[0]!.text });
+  });
+
+  test.each(["message_end", "agent_end-only"] as const)("HEAD retry success retains its answer through an empty terminal tail via %s", async delivery => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const original = message("retained-head-retry");
+    await admit(runtime, original);
+    main.emit({ type: "message_end", message: { role: "assistant", stopReason: "error", content: [] } });
+    main.emit({ type: "prompt_result", id: main.prompts[0]!.id, status: "error", agentInvoked: true, sessionSettled: false });
+    await runtime.kick();
+    main.emit({ type: "agent_start" });
+    const messages = [
+      { role: "assistant", stopReason: "error", content: [], errorMessage: "Private transient failure" },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Verified retry answer" }] },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "" }] },
+    ];
+    if (delivery === "message_end") for (const message of messages) main.emit({ type: "message_end", message });
+    else main.emit({ type: "message_end", message: messages[0] });
+    main.emit({ type: "agent_end", isTerminal: true, messages });
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("done");
+    expect(messenger.sent).toMatchObject([{ sourceId: original.id, text: "Verified retry answer" }]);
+    expect(store.output(`${original.id}:answer`)).toMatchObject({ state: "sent", text: "Verified retry answer" });
+  });
+
+  test.each(["error", "aborted"] as const)("a cumulative empty success cannot revive HEAD text cleared by %s", async stopReason => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const original = message("retained-head-cleared");
+    await admit(runtime, original);
+    const earlier = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Cleared earlier answer" }] };
+    main.emit({ type: "message_end", message: earlier });
+    main.emit({ type: "message_end", message: { role: "assistant", stopReason, content: [] } });
+    const empty = { role: "assistant", stopReason: "stop", content: [] };
+    main.emit({ type: "message_end", message: empty });
+    main.emit({ type: "agent_end", isTerminal: true, messages: [earlier, empty] });
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit({ type: "prompt_result", id: main.prompts[0]!.id, status: "completed", agentInvoked: true, sessionSettled: true });
+    main.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("done");
+    expect(store.output(`${original.id}:answer`)).toBeNull();
+    expect(messenger.sent).toEqual([]);
+  });
+
   test("local main commands cannot send a previous assistant answer", async () => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
+    await admit(runtime, message("local-prior-answer"));
+    main.complete("Previous request answer");
+    await runtime.kick();
     main.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "old unrelated secret" }] } });
     main.local = true;
     await admit(runtime, message("120", route(null, { guildId: null }), "/local-command"));
     expect(store.input("120")?.state).toBe("done");
-    expect(messenger.sent).toEqual([]);
+    expect(store.output("120:answer")).toBeNull();
+    expect(messenger.sent).toMatchObject([{ sourceId: "local-prior-answer", text: "Previous request answer" }]);
   });
 
   test("pause persists before abort failure, pauses goal, cancels native children and stale approvals", async () => {

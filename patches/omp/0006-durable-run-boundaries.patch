@@ -1,0 +1,73 @@
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts b/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
+index b10d2026aac40a2aa4518b5c61f28331fb0eee50..f6a02482728a2c591c7af40038d70c775f0cab9a 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-socket-host.ts
+@@ -330,6 +330,13 @@
+ 	}
+ 
+ 	sessionEvent(frame: RpcAgentSessionEventFrame): void {
++		if (frame.type === "agent_start") {
++			const manager = this.#session.sessionManager;
++			manager.appendCustomEntry("rpc_agent_start", {
++				sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(),
++			});
++			manager.flushSync();
++		}
+ 		for (const peer of this.#peers.values()) if (peer.kind !== "collab") peer.projector.forwardStamped(frame);
+ 	}
+ 
+diff --git a/packages/coding-agent/test/rpc-socket-host.test.ts b/packages/coding-agent/test/rpc-socket-host.test.ts
+index bed2fc11779f13b30cef930e0877f8b59b9329b7..3ac7958407fa2b981f9ca4543717d8100de4e334 100644
+--- a/packages/coding-agent/test/rpc-socket-host.test.ts
++++ b/packages/coding-agent/test/rpc-socket-host.test.ts
+@@ -107,19 +107,34 @@
+ 		expect((await fs.readFile(path.join(root, "socket-session.jsonl"), "utf8"))).toContain("Done");
+ 	}, 30_000);
+ 
+-	test("a running turn survives controller loss and journals its original-id result in the exact native session", async () => {
++	test("a running turn survives controller loss with exact native run boundaries and original-id results", async () => {
+ 		const owner = await connect();
++		const spectator = await connect();
++		await owner.setEventFilter(["notice"]);
++		await spectator.setEventFilter([]);
+ 		const originalState = await owner.getState();
++		const identity = { sessionId: originalState.sessionId, sessionFile: originalState.sessionFile };
+ 		const started = Promise.withResolvers<void>();
+ 		owner.onSessionEvent(event => { if (event.type === "notice" && event.message === "slow turn streaming") started.resolve(); });
+ 		await owner.request({ type: "prompt", message: "slow" }, { id: "durable-turn" });
+ 		await started.promise;
+-		await owner.stop();
++		const running = await owner.getEntries();
++		const runningStarts = running.entries.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_agent_start");
++		expect(runningStarts.map(entry => entry.data)).toEqual([identity]);
++		expect(running.entries.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_prompt_result")).toEqual([]);
++		const savedEntryId = running.leafId;
++		if (!savedEntryId) throw new Error("Expected a native entry cursor while the first run is streaming");
++		const runningJournal = parseSessionEntries(await Bun.file(path.join(root, "socket-session.jsonl")).text());
++		expect(runningJournal.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_agent_start")).toEqual(runningStarts);
++		await Promise.all([owner.stop(), spectator.stop()]);
+ 		const next = await connect();
+ 		expect((await next.getState()).isStreaming).toBe(true);
+ 		await expect(next.shutdownHost()).rejects.toMatchObject({ code: "session_busy" });
+ 		await next.abort();
+ 		await next.waitForSettled();
++		await next.setEventFilter([]);
++		const viewer = await connect();
++		await viewer.setEventFilter([]);
+ 		const delivered: RpcPromptResultFrame[] = [];
+ 		next.onPromptResult(frame => delivered.push(frame));
+ 		await next.promptAndWait("after reconnect");
+@@ -135,6 +150,13 @@
+ 		expect(journal.find(entry => entry.type === "session")?.id).toBe(originalState.sessionId);
+ 		expect(journal.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_prompt_result").map(entry => entry.data)).toEqual(expected);
+ 		const recovered = await next.getEntries();
++		const recoveredStarts = recovered.entries.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_agent_start");
++		expect(recoveredStarts.map(entry => entry.data)).toEqual([identity, identity]);
++		expect(new Set(recoveredStarts.map(entry => entry.id)).size).toBe(2);
++		expect(recoveredStarts.slice(0, 1)).toEqual(runningStarts);
++		expect(journal.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_agent_start")).toEqual(recoveredStarts);
++		const afterSaved = await next.getEntries(savedEntryId);
++		expect(afterSaved.entries.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_agent_start")).toEqual(recoveredStarts.slice(1));
+ 		expect(recovered.entries.filter(entry => entry.type === "custom").filter(entry => entry.customType === "rpc_prompt_result").map(entry => entry.data)).toEqual(expected);
+ 		expect(recovered.entries.filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(2);
+ 		await next.shutdownHost();

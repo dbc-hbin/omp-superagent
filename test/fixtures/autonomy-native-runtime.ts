@@ -134,6 +134,79 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     const input = (id: string, destination: Route, text: string): Inbound => ({
       id, messageId: id, route: destination, text, receivedAt: Date.now(), attachments: [],
     });
+    const headConnection = await HostConnection.connect(main.socketPath);
+    connections.add(headConnection);
+    const headRoute = { ...route, threadId: "9010" };
+    const nextHeadRoute = { ...route, threadId: "9011" };
+    const headTask = "Verify retained head reply 050";
+    const headReply = "HEAD_TODO_REPLY 050";
+    const headOutputStart = messenger.sent.length;
+    const headFrameStart = frames.length;
+    await runtime.receive(input("050", headRoute, "Prove native TODO continuation retains this head answer [head-todo-empty-tail]"));
+    await runtime.kick();
+    await until(() => store.input("050")?.state === "done" && store.output("050:answer")?.state === "sent",
+      "head reply survives native empty TODO continuation");
+    const headState = await headConnection.client.getState();
+    expect(headState).toMatchObject({ isSettled: true, isStreaming: false, hasPendingAsyncWork: false });
+    expect(headState.todoPhases).toMatchObject([{ name: "Head reply retention", tasks: [{ content: headTask }] }]);
+    expect(["pending", "in_progress"]).toContain(headState.todoPhases[0]!.tasks[0]!.status);
+    const headMessages = parseSessionEntries(await fs.readFile(main.sessionFile, "utf8"))
+      .filter(entry => entry.type === "message").map(entry => entry.message);
+    const initIndex = headMessages.findIndex(message => message.role === "toolResult" && message.toolName === "todo");
+    expect(initIndex).toBeGreaterThanOrEqual(0);
+    expect(headMessages[initIndex]).toMatchObject({ details: {
+      op: "init", phases: [{ name: "Head reply retention", tasks: [{ content: headTask }] }],
+    } });
+    const replyIndex = headMessages.findIndex(message => message.role === "assistant"
+      && message.content.some(part => part.type === "text" && part.text === headReply));
+    const reminderIndex = headMessages.findIndex(message => {
+      if (message.role !== "developer") return false;
+      const text = typeof message.content === "string" ? message.content
+        : message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+      return text.includes("You stopped with 1 incomplete todo item(s):") && text.includes(headTask);
+    });
+    expect(replyIndex).toBeGreaterThan(initIndex);
+    expect(reminderIndex).toBeGreaterThan(replyIndex);
+    const headFrames = frames.slice(headFrameStart).filter(event => event.socketPath === main.socketPath);
+    // Native emits empty assistants over RPC but does not persist content-free
+    // messages. Observe the actual frames consumed by the runtime.
+    const replyFrameIndex = headFrames.findIndex(({ frame }) => frame.type === "message_end"
+      && (frame.message as { content?: Array<{ type: string; text?: string }> })?.content
+        ?.some(part => part.type === "text" && part.text === headReply));
+    const reminderFrameIndex = headFrames.findIndex(({ frame }) => frame.type === "todo_reminder");
+    const emptyFrameIndex = headFrames.findIndex(({ frame }, index) => {
+      const message = frame.message as { role?: string; stopReason?: string; content?: unknown[] } | undefined;
+      return index > reminderFrameIndex && frame.type === "message_end"
+        && message?.role === "assistant" && message.stopReason === "stop" && message.content?.length === 0;
+    });
+    expect(replyFrameIndex).toBeGreaterThanOrEqual(0);
+    expect(reminderFrameIndex).toBeGreaterThan(replyFrameIndex);
+    expect(emptyFrameIndex).toBeGreaterThan(reminderFrameIndex);
+    expect(headFrames.filter(event => event.frame.type === "agent_start").length).toBeGreaterThanOrEqual(2);
+    expect(headFrames.some(event => event.frame.type === "todo_reminder")).toBe(true);
+    expect(headFrames.some(event => event.frame.type === "session_settled")).toBe(true);
+    expect(messenger.sent.slice(headOutputStart)).toEqual([
+      expect.objectContaining({ id: "050:answer", sourceId: "050", route: headRoute, text: headReply }),
+    ]);
+    expect(store.input("050")).toMatchObject({ id: "050", route: headRoute, target: "main", state: "done" });
+    expect(store.output("050:answer")).toMatchObject({ sourceId: "050", route: headRoute, text: headReply, state: "sent" });
+
+    await runtime.receive(input("051", nextHeadRoute, "Return an ordinary head answer after the TODO continuation."));
+    await runtime.kick();
+    await until(() => store.input("051")?.state === "done" && store.output("051:answer")?.state === "sent",
+      "subsequent ordinary head request does not duplicate or inherit the retained reply");
+    const nextHeadState = await headConnection.client.getState();
+    expect(nextHeadState).toMatchObject({ sessionId: headState.sessionId, isSettled: true, isStreaming: false });
+    expect(nextHeadState.todoPhases.flatMap(phase => phase.tasks)).toEqual([]);
+    const cleanedMessages = parseSessionEntries(await fs.readFile(main.sessionFile, "utf8"))
+      .filter(entry => entry.type === "message").map(entry => entry.message);
+    expect(cleanedMessages.slice(reminderIndex + 1).find(message => message.role === "toolResult" && message.toolName === "todo"))
+      .toMatchObject({ details: { op: "rm" } });
+    expect(messenger.sent.slice(headOutputStart)).toEqual([
+      expect.objectContaining({ id: "050:answer", sourceId: "050", route: headRoute, text: headReply }),
+      expect.objectContaining({ id: "051:answer", sourceId: "051", route: nextHeadRoute,
+        text: `HEAD ${store.input("051")!.id}` }),
+    ]);
     await runtime.receive(input("100", route, "Finish the entrusted two-turn objective"));
     await runtime.kick();
     await until(() => store.input("100")?.state === "done", "head intake");
@@ -280,7 +353,11 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     expect(frames.filter(event => event.socketPath === excluded.socketPath && event.frame.type === "agent_start")).toHaveLength(1);
     expect(await fs.readFile(settingsPath, "utf8")).toBe(settings);
     expect(errors).toEqual([]);
-    console.log(JSON.stringify({ nativeAutonomy: "passed", first: { sessionId: firstState.sessionId, runs: 2 },
+    console.log(JSON.stringify({ nativeAutonomy: "passed",
+      headEmptyTodoTail: { sessionId: headState.sessionId, sourceId: "050", route: headRoute,
+        meaningfulFrameIndex: replyFrameIndex, reminderFrameIndex, emptyFrameIndex,
+        emittedReplies: 1, nextSourceId: "051", nativeTodoCleared: true },
+      first: { sessionId: firstState.sessionId, runs: 2 },
       queuedResume: { sessionId: queueState.sessionId, sourceId: "queue-source", route: queueRoute, runs: 2, cancelled: true },
       resumed: { sessionId: resumedState.sessionId, runs: 3, sourceId: "202", route: second.route, correctionRuns: 1 },
       globalSettingsUnchanged: true }));

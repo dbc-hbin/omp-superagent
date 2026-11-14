@@ -301,6 +301,7 @@ export class GatewayService {
 
   private cancelRestart(): void {
     if (this.closed) return;
+    this.store.setMeta("gateway:operator-stop", crypto.randomUUID());
     this.stopGeneration++;
     const active = this.store.getMeta("gateway:restart-active");
     const record = this.store.getRestart(active || undefined);
@@ -353,11 +354,14 @@ export class GatewayService {
       await this.supervision;
       const fence = JSON.parse(this.store.getMeta("head:restart-fence") ?? "null") as {
         requestId?: string; inputId?: string; ackOutputId?: string; ownerPid?: number; sessionId?: string; sessionFile?: string;
+        stopBoundary?: string | null;
       } | null;
       if (!fence || fence.requestId !== request.requestId || fence.inputId !== request.inputId ||
           fence.ackOutputId !== request.ackOutputId || fence.ownerPid !== head.pid || fence.sessionId !== head.sessionId ||
           !fence.sessionFile || resolve(fence.sessionFile) !== resolve(head.sessionFile))
         return refuse("HEAD restart fence does not match the owned request; no process was stopped.");
+      if (this.store.getMeta("gateway:operator-stop") !== (fence.stopBoundary ?? null))
+        return refuse("An explicit operator stop superseded this original restart intent; no successor is authorized.");
       const actual = await this.identifyHead();
       if (!this.sameHead(actual, head))
         return refuse("Native HEAD ownership changed; no process was stopped.");
@@ -380,7 +384,9 @@ export class GatewayService {
         configHash: await restartConfigHash(this.config.path), socket, head };
       if (plan.configHash !== this.configHash)
         return refuse("Gateway configuration changed since activation; no process was stopped or successor authorized.");
-      if (stopGeneration !== this.stopGeneration)
+      const currentFence = JSON.parse(this.store.getMeta("head:restart-fence") ?? "null") as typeof fence;
+      if (stopGeneration !== this.stopGeneration || this.store.getMeta("gateway:operator-stop") !== (fence.stopBoundary ?? null)
+        || !currentFence || currentFence.requestId !== request.requestId || currentFence.ownerPid !== head.pid)
         return refuse("An explicit operator stop superseded restart acceptance; no successor was authorized.");
       this.store.setMeta(`gateway:restart-plan:${request.requestId}`, JSON.stringify(plan));
       this.store.setRestart(record);

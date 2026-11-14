@@ -337,6 +337,64 @@ test("ambiguous native answer is retained and reconciled without duplicate appro
   expect(nativeEffects).toBe(1);
 });
 
+test("a quarantined answer holds ordinary ingress but cannot trap owner restart behind it", async () => {
+  const admitted = Promise.withResolvers<GatewayRestartRecord>();
+  const checkpoint = Promise.withResolvers<void>();
+  const reconnecting = Promise.withResolvers<void>();
+  const reconnect = Promise.withResolvers<void>();
+  let gateReconnect = false;
+  let lifecycleAttempt = false;
+  const f = await fixture({ restart: async (request, store) => {
+    const result: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
+      sessionId: "existing-session", sessionFile: join(f.config.stateDir, "existing-session.jsonl"), state: "accepted" };
+    store.setRestart(result);
+    return result;
+  }, runRestart: () => {}, authorizeHead: async pid => {
+    if (pid !== process.pid) throw new DeliveryError("Foreign native owner", "rejected");
+    if (gateReconnect && !lifecycleAttempt) { reconnecting.resolve(); await reconnect.promise; }
+  } });
+  const client = f.client();
+  const received: string[] = [];
+  let cancelled = false;
+  let answerEffects = 0;
+  await client.start({
+    message: async message => {
+      received.push(message.id);
+      if (message.text === "/restart") {
+        const { request } = restartSource(f, message);
+        gateReconnect = true;
+        // Production receive schedules control work, then acknowledges ingress;
+        // lifecycle handoff is deliberately later, during a disconnected SSE.
+        void checkpoint.promise.then(() => client.requestRestart(request)).then(admitted.resolve, admitted.reject);
+      }
+    },
+    answer: async () => { answerEffects++; throw new DeliveryError("Original native response is unconfirmed", "uncertain"); },
+    reconcileAnswer: async () => cancelled ? "rejected" : "unresolved",
+  });
+  await f.server.initialReady.promise;
+  await f.messenger.handlers!.answer("quarantined-original-card", { confirmed: true }, route);
+  await eventually(() => f.store.unresolved() === 1);
+  await f.messenger.emit(input("ordinary-after-quarantine"));
+  await f.messenger.emit({ ...input("restart-through-quarantine"), text: "/restart" });
+  try {
+    await reconnecting.promise;
+    expect(f.server.connected).toBe(false);
+    expect(f.server.headReady).toBe(false);
+    lifecycleAttempt = true;
+    checkpoint.resolve();
+    const admittedRestart = await admitted.promise;
+    expect(admittedRestart.state).toBe("accepted");
+    expect(f.store.hasPendingAnswer("quarantined-original-card", route)).toBe(true);
+    expect(received).toEqual(["restart-through-quarantine"]);
+    expect(answerEffects).toBe(1);
+    expect(f.store.getRestart(admittedRestart.requestId)?.state).toBe("accepted");
+    cancelled = true; // The exact native generation was deliberately cancelled, not approved/replayed.
+  } finally { gateReconnect = false; lifecycleAttempt = true; checkpoint.resolve(); reconnect.resolve(); }
+  await eventually(() => f.store.pending() === 0);
+  expect(received).toEqual(["restart-through-quarantine", "ordinary-after-quarantine"]);
+  expect(answerEffects).toBe(1);
+});
+
 test("callback lost before receipt cannot replay without original native-state reconciliation", async () => {
   const f = await fixture();
   const options = { token: f.store.token(), clientId: crypto.randomUUID() };

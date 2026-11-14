@@ -153,7 +153,8 @@ function seedRestart(root: string, pid: number, id = crypto.randomUUID()): Gatew
     store.claimOutput(request.ackOutputId);
     store.finishOutput(request.ackOutputId, "sent", "remote-ack");
     store.setMeta("head:restart-fence", JSON.stringify({ ...request, ownerPid: pid,
-      sessionId: "gateway-fixture-session", sessionFile: join(root, "sessions", "main", "session.jsonl"), state: "accepted" }));
+      sessionId: "gateway-fixture-session", sessionFile: join(root, "sessions", "main", "session.jsonl"), state: "accepted",
+      stopBoundary: store.getMeta("gateway:operator-stop") }));
   } finally { store.close(); }
   return request;
 }
@@ -191,6 +192,25 @@ test("restart refuses native busy work before shutdown and preserves exact sent 
   expect(restartRecord(f.root, request.requestId)).toEqual(refused);
   await until(async () => existsSync(join(f.root, "restart-notices.jsonl")) &&
     (await readFile(join(f.root, "restart-notices.jsonl"), "utf8")).includes(request.requestId));
+});
+
+test("a refused busy CLI stop still supersedes restart intent captured before lifecycle acceptance", async () => {
+  const f = await fixture();
+  const pid = f.service.status().head.pid!;
+  const request = seedRestart(f.root, pid);
+  await writeFile(join(f.root, "busy"), "busy");
+  await expect(main(["stop", "main", "--config", f.config.path])).rejects.toThrow("Host is busy");
+  expect(f.service.status().gateway.stopping).toBe(false);
+  expect(restartRecord(f.root, request.requestId)).toBeNull();
+  await rm(join(f.root, "busy"));
+  const refused = await f.service.restart(request);
+  expect(refused.state).toBe("refused");
+  expect(refused.reason).toContain("operator stop");
+  f.service.runRestart(request.requestId);
+  expect(f.service.status().head.pid).toBe(pid);
+  expect(processAlive(pid)).toBe(true);
+  await until(() => existsSync(join(f.root, "shutdowns.jsonl"))); // Only the failed explicit stop was attempted.
+  expect((await readFile(join(f.root, "shutdowns.jsonl"), "utf8")).trim().split("\n")).toHaveLength(1);
 });
 
 test("duplicate accepted restart cannot adopt the old endpoint and explicit stop cancels successor authority", async () => {
