@@ -121,8 +121,12 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
 
 ## Working from chat
 
-- Ask “Explain the authentication flow in this repository.” The head can handle it directly.
-- Ask for a new independent topic normally. The head creates a supported native
+- Received messages get an eyes reaction. Native processing adds a temporary thought
+  balloon on Discord/Slack; Telegram uses a thinking face, then restores eyes.
+  Slack requires `reactions:write`; Discord requires Add Reactions.
+- Questions and connection tests get direct replies. For work instructions, the head
+  first opens a work topic and posts a brief concrete approach before starting execution.
+- Ask for work normally. The head creates a supported native
   thread/topic and binds its work session; private chats without native topics use
   logical topics. `/new` (Slack `!new`) remains an explicit DM topic control.
 - Follow up in the same conversation. The head receives the message, coordinates any

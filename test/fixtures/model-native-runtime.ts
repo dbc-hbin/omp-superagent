@@ -371,7 +371,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       expect(laneModel).not.toEqual(mainModel); // Advisory choice is intentionally not binding.
     }
 
-    const created = await runtime.startLane({ sourceId: topic.id, title: "Native independent topic", cwd: laneCwd,
+    const created = await runtime.startLane({ sourceId: topic.id, title: "Native independent topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: laneCwd,
       ...(modelSelection ? { preset: "middle" as const } : { model: laneModel }),
       modelReason, acceptance: ["Reply only inside the original topic thread"] });
     expect(created.route).toEqual(threadRoute);

@@ -312,7 +312,7 @@ export async function nativeSteeringRuntime(): Promise<void> {
     const sourceTwo = inbound("202", route, "[native-delegate] Topic two [native-barrier:lane-two]");
     await messenger.deliver(sourceOne);
     await wait(() => done(sourceOne.id), "first explicit lane source reaches head");
-    const selection = (sourceId: string, index: number) => ({ sourceId, title: `Native topic ${index + 1}`, cwd: workspaces[index]!,
+    const selection = (sourceId: string, index: number) => ({ sourceId, title: `Native topic ${index + 1}`, kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: workspaces[index]!,
       model: steeringModel, modelReason: "Choose the verified local native model for deterministic independent-session proof." });
     const laneOne = await runtime.startLane(selection(sourceOne.id, 0));
     await gate("lane-one");

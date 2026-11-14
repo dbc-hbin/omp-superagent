@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { Approval, Attachment, DialogResponse, Inbound, Messenger, OutputRecord, Platform, Route } from "../src/contracts";
+import type { Approval, Attachment, DialogResponse, Inbound, MessageActivity, Messenger, OutputRecord, Platform, Route } from "../src/contracts";
 import { MessengerHub } from "../src/messengers";
 
 class Transport implements Messenger {
@@ -7,6 +7,8 @@ class Transport implements Messenger {
   readonly sent: OutputRecord[] = [];
   readonly shown: Approval[] = [];
   readonly opened: Attachment[] = [];
+  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
+  beforeActivity?: () => Promise<void>;
   stops = 0;
   constructor(readonly platform: Platform, readonly failStart = false) {}
   async start(handlers: Parameters<Messenger["start"]>[0]) {
@@ -15,6 +17,10 @@ class Transport implements Messenger {
   }
   async stop() { this.stops++; }
   async send(output: OutputRecord) { this.sent.push(output); return `${this.platform}:receipt`; }
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity) {
+    await this.beforeActivity?.();
+    this.activities.push({ message, activity });
+  }
   async showApproval(approval: Approval) { this.shown.push(approval); return `${this.platform}:card`; }
   async dismissApproval(_approval: Approval) {}
   async createThread(route: Route) { return { ...route, threadId: `${this.platform}:thread` }; }
@@ -77,4 +83,30 @@ test("partial startup failure closes every opened transport including the failed
   expect(slack.handlers).toBeUndefined();
   await hub.stop();
   expect(discord.stops).toBe(1);
+});
+
+test.each([false, true])("reaction transitions serialize per physical message across logical topics, earlier failure: %s", async rejected => {
+  const telegram = new Transport("telegram"), slack = new Transport("slack");
+  const hub = new MessengerHub({ telegram, slack });
+  const gate = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  telegram.beforeActivity = async () => { entered.resolve(); await gate.promise; };
+  const original = { route: route("telegram"), messageId: "1" };
+  const first = hub.setActivity(original, "received");
+  const firstResult = first.then(() => "ok", () => "rejected");
+  await entered.promise;
+  const thinking = hub.setActivity({ ...original, route: { ...original.route, topicId: "another-logical-topic" } }, "thinking");
+  const idle = hub.setActivity(original, "idle");
+  try {
+    await hub.setActivity({ route: route("slack"), messageId: "1" }, "received");
+    expect(slack.activities.map(value => value.activity)).toEqual(["received"]);
+    expect(telegram.activities).toEqual([]);
+  } finally {
+    telegram.beforeActivity = undefined;
+    if (rejected) gate.reject(new Error("Reaction unavailable"));
+    else gate.resolve();
+  }
+  await Promise.all([thinking, idle]);
+  expect(await firstResult).toBe(rejected ? "rejected" : "ok");
+  expect(telegram.activities.map(value => value.activity)).toEqual(rejected ? ["thinking", "idle"] : ["received", "thinking", "idle"]);
 });

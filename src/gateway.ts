@@ -108,7 +108,7 @@ export class GatewayService {
       await this.server.listen();
       await this.messenger.start({
         ready: this.server.initialReady.promise,
-        message: async input => { this.store.admit({ kind: "message", input }); this.server.deliver(); },
+        message: async input => { this.server.admitMessage(input); },
         answer: async (approvalId, response, route) => {
           this.store.admit({ kind: "answer", approvalId, response, route }); this.server.deliver();
         },

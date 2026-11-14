@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import {
   ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelFlagsBitField, ChannelType, Client,
   Events, GatewayIntentBits, MessageFlags, ModalBuilder, Partials, PermissionFlagsBits, StringSelectMenuBuilder,
-  TextInputBuilder, TextInputStyle,
+  Routes, TextInputBuilder, TextInputStyle,
   type ForumChannel, type Interaction, type MediaChannel, type Message, type MessageCreateOptions, type PartialMessage,
 } from "discord.js";
-import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
 import { DeliveryError } from "./delivery.ts";
 
@@ -272,6 +272,20 @@ export class DiscordMessenger implements Messenger {
       const message = await channel.send(this.payload(output.text, discordNonce(output.id, output.route)));
       return message.id;
     } catch (error) { throw deliveryError(error); }
+  }
+
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+    try {
+      if (!/^[0-9]{1,20}$/.test(message.messageId)) throw new DeliveryError("Activity requires a Discord message snowflake", "rejected");
+      const channel = await this.destination(message.route);
+      const emoji = activity === "received" ? "\u{1F440}" : "\u{1F4AD}";
+      const reaction = Routes.channelMessageOwnReaction(channel.id, message.messageId, encodeURIComponent(emoji));
+      if (activity === "idle") await this.client.rest.delete(reaction);
+      else await this.client.rest.put(reaction);
+    } catch (error) {
+      const failure = deliveryError(error);
+      throw new DeliveryError("Discord activity update failed", failure.certainty, failure.retryAfterMs);
+    }
   }
 
   private control(pending: Pending, action: string): string { return `omp:${pending.token}:${action}`; }

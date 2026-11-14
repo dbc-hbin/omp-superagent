@@ -12,6 +12,7 @@ import { gatewayPaths } from "../src/gateway-protocol.ts";
 import { GatewayServer, type GatewayStatus } from "../src/gateway-server.ts";
 import { GatewayStore } from "../src/gateway-store.ts";
 import { Superagent, type RuntimeHost, type RuntimeState } from "../src/runtime.ts";
+import { MessengerHub } from "../src/messengers.ts";
 
 // These tests run the real grammY Api serializer/error boundary against an
 // in-process HTTP simulation. They never contact Telegram or activate a bot.
@@ -82,8 +83,10 @@ interface ApiFailure { error_code: number; description?: string; parameters?: Re
 class TelegramHttp {
   readonly calls: Call[] = [];
   readonly remote = new Map<number, Message>();
+  readonly reactions = new Map<string, unknown>();
   readonly failures = new Map<string, Array<ApiFailure | Error>>();
   webhook = "";
+  chatIdentity: number | null = null;
   topicsEnabled = false;
   forum = true;
   filePath = "documents/file_1.txt";
@@ -129,8 +132,10 @@ class TelegramHttp {
     let result: unknown;
     if (method === "getMe") result = { id: 900, is_bot: true, first_name: "Local Bot", username: "local_test_bot", has_topics_enabled: this.topicsEnabled };
     else if (method === "getWebhookInfo") result = { url: this.webhook, pending_update_count: 0 };
-    else if (method === "getChat") result = Number(payload.chat_id) > 0 ? { id: Number(payload.chat_id), type: "private", first_name: "Owner" } :
-      { id: Number(payload.chat_id), type: "supergroup", title: "Allowed", ...(this.forum ? { is_forum: true } : {}) };
+    else if (method === "getChat") {
+      const id = this.chatIdentity ?? Number(payload.chat_id);
+      result = id > 0 ? { id, type: "private", first_name: "Owner" } : { id, type: "supergroup", title: "Allowed", ...(this.forum ? { is_forum: true } : {}) };
+    }
     else if (method === "getUpdates") {
       if (this.queued.length) result = this.queued.shift();
       else {
@@ -154,6 +159,9 @@ class TelegramHttp {
       if (!previous) return Response.json({ ok: false, error_code: 400, description: "Bad Request: message to edit not found" });
       result = { ...previous, ...(method === "editMessageText" ? { text: payload.text } : {}), reply_markup: payload.reply_markup };
       this.remote.set(id, result as Message);
+    } else if (method === "setMessageReaction") {
+      this.reactions.set(`${payload.chat_id}:${payload.message_id}`, structuredClone(payload.reaction));
+      result = true;
     } else if (method === "answerCallbackQuery") result = true;
     else if (method === "createForumTopic") result = { message_thread_id: 88, name: payload.name, icon_color: 7322096 };
     else if (method === "getFile") result = { file_id: payload.file_id, file_unique_id: "unique", file_size: 8, file_path: this.filePath };
@@ -411,6 +419,82 @@ describe("Telegram output, topics, and attachment credentials", () => {
     expect(http.calls.filter(call => call.method === "download")).toHaveLength(1);
     http.filePath = "documents/file_1.txt"; http.fileStatus = 302;
     await expect(messenger.openAttachment(group, attachment, signal)).rejects.toThrow("redirects");
+  });
+});
+
+describe("Telegram message activity", () => {
+  test("fresh edit receipt cannot replace thinking on an already-active physical message", async () => {
+    const { messenger, http } = await fixture();
+    const hub = new MessengerHub({ telegram: messenger });
+    const original = { route: { ...dm, topicId: "original-topic" }, messageId: "123" };
+    await hub.setActivity(original, "received");
+    await hub.setActivity(original, "thinking");
+    await hub.setActivity({ ...original, route: { ...dm, topicId: "changed-logical-context" } }, "received");
+    expect([...http.reactions]).toEqual([[`${dm.channelId}:123`, [{ type: "emoji", emoji: "\u{1F914}" }]]]);
+    await hub.setActivity(original, "idle");
+    expect([...http.reactions]).toEqual([[`${dm.channelId}:123`, [{ type: "emoji", emoji: "\u{1F440}" }]]]);
+  });
+
+  test.each([
+    ["group", group],
+    ["forum topic", topic],
+    ["logical DM topic", { ...dm, topicId: "original-topic" }],
+  ] as const)("real SDK replaces the bot's reaction and restores eyes in the original %s", async (_name, target) => {
+    const { messenger, http } = await fixture();
+    const transitions = [
+      { activity: "received", emoji: "\u{1F440}" },
+      { activity: "received", emoji: "\u{1F440}" },
+      { activity: "thinking", emoji: "\u{1F914}" },
+      { activity: "thinking", emoji: "\u{1F914}" },
+      { activity: "idle", emoji: "\u{1F440}" },
+      { activity: "idle", emoji: "\u{1F440}" },
+    ] as const;
+    for (const { activity, emoji } of transitions) {
+      await messenger.setActivity({ route: target, messageId: "123" }, activity);
+      expect([...http.reactions]).toEqual([[`${target.channelId}:123`, [{ type: "emoji", emoji }]]]);
+    }
+    expect(http.calls.filter(call => call.method === "setMessageReaction").map(call => call.payload)).toEqual(transitions.map(({ emoji }) => ({
+      chat_id: target.channelId, message_id: 123, reaction: [{ type: "emoji", emoji }],
+    })));
+    expect(http.calls.some(call => call.method === "sendChatAction" || call.method === "sendMessageDraft")).toBe(false);
+  });
+
+  test("foreign bot, owner, chat identity, and malformed message IDs cannot mutate reactions", async () => {
+    const { messenger, http } = await fixture();
+    const foreign: Route[] = [
+      { ...group, platform: "discord" }, { ...group, accountId: "901" }, { ...group, authorityId: "43" },
+      { ...group, guildId: "-101", channelId: "-101" }, { ...group, guildId: "-101" },
+      { ...dm, channelId: "43" }, { ...topic, threadId: "invalid-thread" },
+    ];
+    for (const target of foreign) for (const activity of ["received", "thinking", "idle"] as const) {
+      await expect(messenger.setActivity({ route: target, messageId: "123" }, activity)).rejects.toMatchObject({ certainty: "rejected" });
+    }
+    for (const messageId of ["", "0", "-1", "1.5", "123/other", "9007199254740992"]) {
+      await expect(messenger.setActivity({ route: group, messageId }, "received")).rejects.toMatchObject({ certainty: "rejected" });
+    }
+    http.chatIdentity = -101;
+    await expect(messenger.setActivity({ route: group, messageId: "123" }, "thinking")).rejects.toMatchObject({ certainty: "rejected" });
+    expect(http.calls.filter(call => call.method === "setMessageReaction")).toEqual([]);
+    expect(http.reactions.size).toBe(0);
+  });
+
+  test.each([
+    { failure: { error_code: 400, description: `Bad Request: REACTION_INVALID ${token}` }, certainty: "rejected", retryAfterMs: undefined },
+    { failure: { error_code: 400, description: `Bad Request: message is not modified ${token}` }, certainty: "rejected", retryAfterMs: undefined },
+    { failure: { error_code: 429, parameters: { retry_after: 2 } }, certainty: "rejected", retryAfterMs: 2000 },
+    { failure: new Error(`connection lost ${token}`), certainty: "uncertain", retryAfterMs: undefined },
+  ])("reaction restrictions and uncertain failures remain sanitized without retry ($certainty)", async ({ failure, certainty, retryAfterMs }) => {
+    const { messenger, http } = await fixture();
+    http.fail("setMessageReaction", failure);
+    const caught: unknown = await messenger.setActivity({ route: topic, messageId: "123" }, "thinking").catch((error: unknown) => error);
+    expect(caught).toBeInstanceOf(DeliveryError);
+    if (!(caught instanceof DeliveryError)) throw new Error("Expected a sanitized delivery error");
+    expect(caught.certainty).toBe(certainty);
+    expect(caught.retryAfterMs).toBe(retryAfterMs);
+    expect(String(caught)).not.toContain(token);
+    expect(caught.cause).toBeUndefined();
+    expect(http.calls.filter(call => call.method === "setMessageReaction")).toHaveLength(1);
+    expect(http.reactions.size).toBe(0);
   });
 });
 

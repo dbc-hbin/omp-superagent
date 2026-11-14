@@ -18,10 +18,13 @@ tool.
   provides context, not dispatch authority. Choose a real workspace before explicit
   `lane_start`; send authorized existing-lane work with `lane_message`. Do not assume
   lane creation retroactively forwards pending clarifications or earlier messages.
-- Ordinary main-conversation work may stay here. A DM is not itself a reason to
-  delegate. A direct-head handoff creates a supported native thread/topic, falling
-  back to a logical topic only in private chats without that capability, while
-  preserving ownership of the original submitted input.
+- Answer ordinary questions, status queries, calculations and connection tests here.
+  For actionable messenger work, first create or reuse its work thread/topic with
+  `lane_start`, including a short user-language `kickoff` describing the concrete
+  approach. Do only minimal workspace/routing triage before this report; do not
+  silently implement in the parent conversation. A DM alone is not a reason to
+  delegate; the actionable-work request is. Native-topic-unsupported private chats
+  keep honest logical topics. Existing same-task follow-ups retain their topic.
 - For a clearly new independent topic/repository, make that handoff yourself rather
   than asking the user to issue `/new` or create a thread manually. Existing topic
   work retains its lane. A distinct topic inside a bound thread needs a sibling
@@ -58,13 +61,14 @@ tool.
 
 | Choice | Use when | Contract |
 | --- | --- | --- |
-| Direct head | Bounded main-context work is clear and doing it here costs less than handing it off, including nontrivial implementation. | Implement and verify normally; no forced delegation or plan ceremony. |
+| Direct head | Questions, status/calculation/test replies, coordination, or work the user explicitly keeps in the main conversation. | Keep direct execution tools; no planning ceremony. Actionable messenger work otherwise starts in its own work topic. |
 | Native `task` | A bounded investigation or implementation slice benefits from specialization/parallelism. | Use the currently advertised agent and schema; provide target, non-goals, relevant facts, allowed files, and acceptance. |
 | Independent lane | Topic isolation, independent lifetime, repository separation, or parallel editing materially helps. | Give an explicit workspace and brief; the lane works directly. |
 
 These boundaries specialize general model-profile delegation defaults: independent
 conversation/repository work uses head lane tools, not native `task` as a replacement
-lane, while bounded head work need not be delegated merely because it is nontrivial.
+lane. The messenger thread-first reporting preference, not task complexity, is the
+reason to route actionable work; the head keeps direct execution capability.
 Do not choose by hardcoded file counts, time limits, model names, or task categories.
 Keep clear tiny main-context work direct: it needs neither a new lane nor a judge
 comparison. For substantive new-lane model selection, and ambiguous capability,
@@ -240,6 +244,12 @@ a workflow name, board mention or invented ID is not authority. Keep the existin
 owner/records, and state any pending real approval separately.
 
 Call `lane_start` with the original `sourceId`, a meaningful `title`, verified `cwd`,
+and `kickoff`: one or two concise sentences in the user's language explaining what
+will be done and how. This externally delivered message is separate from the English
+internal `brief`. Runtime sends it to the selected work topic before dispatch and
+holds execution if delivery failed or is uncertain; never claim it was sent from
+mere queue admission. Identical retries reuse the original kickoff, not another send.
+Also supply
 exactly one of `model: {provider, id}` or `preset: string` naming any observed native
 preset, and
 nonempty `modelReason`, the `brief`, and an `acceptance` string array; add optional

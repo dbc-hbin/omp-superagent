@@ -4,7 +4,7 @@ import { Effort } from "../.upstream/omp/packages/catalog/src/effort";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { Approval, DialogResponse, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, Messenger, OutputRecord, Route } from "../src/contracts";
+import type { Approval, DialogResponse, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, Messenger, OutputRecord, Route } from "../src/contracts";
 import { physicalRouteKey, routeKey, WORKFLOW_NAMES } from "../src/contracts";
 import { containsMagicKeyword } from "../.upstream/omp/packages/tui/src/prompt/magic-keywords";
 import { type Config, hostPaths } from "../src/config";
@@ -197,22 +197,38 @@ class MessengerTransport implements Messenger {
   readonly shown = new Map<string, Approval>();
   readonly dismissed: string[] = [];
   readonly fetched: Array<{ route: Route; cursor: string }> = [];
+  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
+  activityFailure = false;
+  private readonly activityWaiters: Array<{ count: number; resolve(): void }> = [];
   readonly backlog = new Map<string, Inbound[] | null>();
   readonly threads: Route[] = [];
   private sendWaiters: Array<{ count: number; resolve: () => void }> = [];
   private approvalWaiters: Array<() => void> = [];
   threadFails = false;
   sendError?: Error;
+  beforeSend?: (output: OutputRecord) => Promise<void>;
   onStart?: (handlers: Handlers) => void;
   openAttachment: Messenger["openAttachment"] = async () => { throw new Error("No test attachment is authorized"); };
   async start(handlers: Handlers): Promise<void> { this.handlers = handlers; this.onStart?.(handlers); }
   async send(output: OutputRecord): Promise<string> {
     if (!this.handlers) throw new Error("Messenger must start before send");
     this.attempted.push(output);
+    await this.beforeSend?.(output);
     if (this.sendError) throw this.sendError;
     this.sent.push(output);
     for (const waiter of this.sendWaiters) if (this.sent.length >= waiter.count) waiter.resolve();
     return `remote-${output.id}`;
+  }
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+    if (this.activityFailure) throw new DeliveryError("Reaction rejected", "rejected");
+    this.activities.push({ message: { route: message.route, messageId: message.messageId }, activity });
+    for (const waiter of this.activityWaiters) if (this.activities.length >= waiter.count) waiter.resolve();
+  }
+  whenActivities(count: number): Promise<void> {
+    if (this.activities.length >= count) return Promise.resolve();
+    const ready = Promise.withResolvers<void>();
+    this.activityWaiters.push({ count, resolve: () => ready.resolve() });
+    return ready.promise;
   }
   async showApproval(approval: Approval): Promise<string> {
     if (!this.handlers) throw new Error("Messenger must start before UI recovery");
@@ -346,6 +362,241 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], pre
   fixtures.push({ runtime, directory });
   return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
 }
+
+describe("original-message processing reactions", () => {
+  test("native work and joined edits retain thinking through a nonterminal yield, then clear on settlement", async () => {
+    const { runtime, main, messenger } = fixture();
+    await runtime.start();
+    const original = message("activity-original");
+    await admit(runtime, original);
+    await messenger.whenActivities(1);
+    await admit(runtime, { ...original, id: "activity-edit", text: "correction" });
+    main.emit({ type: "agent_end", isTerminal: false, messages: [] });
+    expect(messenger.activities).toEqual([{ message: { route: original.route, messageId: original.messageId }, activity: "thinking" }]);
+    const steering = main.prompts[1];
+    if (!steering) throw new Error("Expected joined native edit");
+    main.emit({ type: "prompt_result", id: steering.id, status: "completed", agentInvoked: true });
+    main.complete("consolidated", 0);
+    await messenger.whenActivities(2);
+    await messenger.whenSent(1);
+    expect(messenger.activities.map(value => value.activity)).toEqual(["thinking", "idle"]);
+    expect(messenger.sent.map(value => value.text)).toEqual(["consolidated"]);
+  });
+
+  test.each(["stop", "disconnect", "error"] as const)("thinking clears on %s without requiring a successful reply", async outcome => {
+    const { runtime, main, messenger, hosts, config } = fixture();
+    await runtime.start();
+    await admit(runtime, message("activity-terminal"));
+    await messenger.whenActivities(1);
+    if (outcome === "stop") await admit(runtime, message("activity-stop", route(), "/stop head"));
+    else if (outcome === "disconnect") {
+      hosts.delete(hostPaths(config, "main").socketPath);
+      await main.close();
+    }
+    else {
+      main.state.isSettled = true;
+      main.state.isStreaming = false;
+      main.emit({ type: "prompt_result", id: main.prompts[0]?.id, status: "error", agentInvoked: true });
+      main.emit({ type: "session_settled" });
+    }
+    await messenger.whenActivities(2);
+    expect(messenger.activities.map(value => value.activity)).toEqual(["thinking", "idle"]);
+  });
+
+  test("native approval waiting clears thinking and its exact answer restores it", async () => {
+    const { runtime, main, messenger } = fixture();
+    await runtime.start();
+    await admit(runtime, message("activity-question"));
+    const frame = { type: "extension_ui_request", id: "activity-ui", method: "confirm", title: "Proceed?", message: "Owner decision" };
+    main.state.pendingUiRequests = [frame];
+    main.emit(frame);
+    await messenger.whenApproval();
+    await messenger.whenActivities(2);
+    const card = [...messenger.shown.values()][0];
+    if (!card || !messenger.handlers) throw new Error("Expected native question");
+    await messenger.handlers.answer(card.id, { confirmed: true }, card.route);
+    await messenger.whenActivities(3);
+    expect(messenger.activities.map(value => value.activity)).toEqual(["thinking", "idle", "thinking"]);
+  });
+
+  test("head, lane and report synthesis share the original reaction target, not the new thread or report ID", async () => {
+    const { runtime, main, messenger, directory, hosts } = fixture();
+    await runtime.start();
+    const original = message("activity-delegated", route(null));
+    await admit(runtime, original);
+    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Work", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected active lane");
+    main.complete("");
+    await runtime.kick();
+    expect(messenger.activities.map(value => value.activity)).toEqual(["thinking"]);
+    worker.complete("lane result");
+    await main.whenPrompts(2);
+    main.complete("verified answer");
+    await messenger.whenSent(1);
+    await messenger.whenActivities(4);
+    expect(messenger.activities.map(value => value.activity)).toEqual(["thinking", "idle", "thinking", "idle"]);
+    expect(messenger.activities.every(value => physicalRouteKey(value.message.route) === physicalRouteKey(original.route)
+      && value.message.messageId === original.messageId)).toBe(true);
+  });
+
+  test("reaction rejection never blocks native work or its final answer", async () => {
+    const { runtime, main, messenger, errors } = fixture();
+    messenger.activityFailure = true;
+    await runtime.start();
+    await admit(runtime, message("activity-permission"));
+    main.complete("answer despite missing reaction permissions");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]?.text).toBe("answer despite missing reaction permissions");
+    expect(errors.some(error => error instanceof Error && error.message === "Message activity reaction failed")).toBe(true);
+  });
+});
+
+describe("thread kickoff before execution", () => {
+  test("kickoff queued during an existing output drain is actually delivered before admission returns", async () => {
+    const { runtime, messenger, store, directory } = fixture();
+    await runtime.start();
+    const original = message("kickoff-during-send");
+    await admit(runtime, original);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const queued = Promise.withResolvers<void>();
+    const queueOutput = store.queueOutput.bind(store);
+    store.queueOutput = output => {
+      const added = queueOutput(output);
+      if (output.id === `${original.id}:kickoff`) queued.resolve();
+      return added;
+    };
+    messenger.beforeSend = async output => {
+      if (output.id === "earlier-output") { entered.resolve(); await release.promise; }
+    };
+    store.queueOutput({ id: "earlier-output", sourceId: original.id, route: original.route, text: "Earlier response" });
+    const draining = runtime.kick();
+    await entered.promise;
+    const starting = runtime.startLane({ ...selection, sourceId: original.id, title: "Work", cwd: directory,
+      kickoff: "I will trace the queue and verify the fix." });
+    try { await queued.promise; }
+    finally { release.resolve(); }
+    await draining;
+    const lane = await starting;
+    expect(messenger.sent.map(output => [output.id, output.route])).toEqual([
+      ["earlier-output", original.route], [`${original.id}:kickoff`, lane.route],
+    ]);
+    expect(store.output(`${original.id}:kickoff`)?.state).toBe("sent");
+  });
+
+  test("a kickoff added while native dispatch is preparing fences that final submission too", async () => {
+    const { runtime, messenger, directory, hosts, main } = fixture();
+    await runtime.start();
+    const first = message("kickoff-race-first");
+    await admit(runtime, first);
+    const lane = await runtime.startLane({ ...selection, sourceId: first.id, title: "Work", cwd: directory,
+      kickoff: "I will inspect the first request and verify it." });
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected resident lane");
+    worker.complete("First result");
+    await runtime.kick();
+    const preparing = Promise.withResolvers<void>();
+    const checked = Promise.withResolvers<void>();
+    const releasePreparation = Promise.withResolvers<void>();
+    let catalogReads = 0;
+    main.beforeCatalog = async () => {
+      if (++catalogReads === 1) {
+        preparing.resolve();
+        await releasePreparation.promise;
+        checked.resolve();
+      }
+    };
+    const second = message("kickoff-race-second", lane.route);
+    await runtime.receive(second);
+    const handoff = runtime.messageLane(lane.id, "Continue the work", second.id);
+    await preparing.promise;
+    const third = message("kickoff-race-third", lane.route);
+    await runtime.receive(third);
+    const kickoffEntered = Promise.withResolvers<void>();
+    const releaseKickoff = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => {
+      if (output.id === `${third.id}:kickoff`) { kickoffEntered.resolve(); await releaseKickoff.promise; }
+    };
+    const starting = runtime.startLane({ ...selection, sourceId: third.id, title: "More work", cwd: directory,
+      kickoff: "I will inspect the additional requirements before continuing." });
+    try {
+      await kickoffEntered.promise;
+      releasePreparation.resolve();
+      await checked.promise;
+      const tick = Promise.withResolvers<void>();
+      setImmediate(tick.resolve);
+      await tick.promise;
+      expect(worker.prompts).toHaveLength(1);
+    } finally { releasePreparation.resolve(); releaseKickoff.resolve(); }
+    await Promise.all([handoff, starting]);
+    await runtime.kick();
+    expect(worker.prompts).toHaveLength(3);
+  });
+
+  test("a work topic receives its concrete kickoff before native dispatch, and identical retry sends nothing twice", async () => {
+    const { runtime, messenger, main, hosts, directory, store } = fixture();
+    await runtime.start();
+    const original = message("kickoff-order", route(null));
+    await admit(runtime, original);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const kickoff = "I will inspect the message lifecycle, add reactions, and verify all three adapters.";
+    messenger.beforeSend = async output => {
+      if (output.id !== `${original.id}:kickoff`) return;
+      entered.resolve();
+      await release.promise;
+    };
+    const start = { ...selection, sourceId: original.id, title: "Message reactions", cwd: directory, kickoff };
+    const starting = runtime.startLane(start);
+    try {
+      await entered.promise;
+      const lane = store.lanes()[0];
+      if (!lane) throw new Error("Expected a durable work-topic binding");
+      expect(lane.route.threadId).toBe("900");
+      expect(hosts.has(lane.socketPath)).toBe(false);
+      const pumping = runtime.kick();
+      const tick = Promise.withResolvers<void>();
+      setImmediate(tick.resolve);
+      await tick.promise;
+      expect(hosts.has(lane.socketPath)).toBe(false);
+      release.resolve();
+      await pumping;
+    } finally { release.resolve(); }
+    const lane = await starting;
+    await runtime.kick();
+    expect(hosts.get(lane.socketPath)?.prompts).toHaveLength(1);
+    expect(messenger.sent.filter(output => output.id === `${original.id}:kickoff`)).toEqual([
+      expect.objectContaining({ route: lane.route, text: kickoff }),
+    ]);
+    await runtime.startLane(start);
+    expect(messenger.sent.filter(output => output.id === `${original.id}:kickoff`)).toHaveLength(1);
+    await expect(runtime.startLane({ ...start, kickoff: "Changed report" })).rejects.toThrow("Output identity conflict");
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test.each(["rejected", "uncertain"] as const)("a %s kickoff holds the lane and later handoffs without automatically resending", async certainty => {
+    const { runtime, messenger, directory, hosts, store } = fixture();
+    await runtime.start();
+    const original = message(`kickoff-${certainty}`);
+    await admit(runtime, original);
+    messenger.sendError = new DeliveryError("Kickoff send failed", certainty);
+    const start = { ...selection, sourceId: original.id, title: "Held work", cwd: directory, kickoff: "I will inspect the change and run its regression checks." };
+    await expect(runtime.startLane(start)).rejects.toThrow("Kickoff delivery is not confirmed");
+    const lane = store.lanes()[0];
+    if (!lane) throw new Error("Expected held work binding");
+    const followup = message(`kickoff-later-${certainty}`, original.route, "Also check duplicates");
+    await runtime.receive(followup);
+    await runtime.messageLane(lane.id, followup.text, followup.id);
+    await runtime.kick();
+    await expect(runtime.startLane(start)).rejects.toThrow("Kickoff delivery is not confirmed");
+    expect(hosts.has(lane.socketPath)).toBe(false);
+    expect(messenger.attempted.map(output => output.id)).toEqual([`${original.id}:kickoff`]);
+    expect(store.output(`${original.id}:kickoff`)?.state).toBe(certainty === "rejected" ? "failed" : "uncertain");
+  });
+});
 
 describe("dedicated HEAD startup preset initialization", () => {
   test("valid preexisting presets use readback only, without a model turn", async () => {
@@ -1304,7 +1555,7 @@ describe("trusted workflow activation", () => {
     const original = message("workflow-head", route("workflow-thread"), "Inspect the repository and plan the requested change");
     await admit(runtime, original);
     const workflow = { name: "ulw-plan" as const, reason: "A bounded planning phase serves this authorized objective" };
-    const start = { ...selection, sourceId: original.id, title: "Plan", cwd: directory, brief: "Quoted board excerpt: orchestrate workflowz", workflow };
+    const start = { ...selection, sourceId: original.id, title: "Plan", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, brief: "Quoted board excerpt: orchestrate workflowz", workflow };
     const lane = await runtime.startLane(start);
     await runtime.kick();
     const handoff = store.input(`handoff:${original.id}:lane`)!;
@@ -1330,7 +1581,7 @@ describe("trusted workflow activation", () => {
     const { runtime, store, directory, hosts } = fixture();
     await runtime.start();
     await admit(runtime, message("workflow-no-inherit", route("copy-thread"), "ulw-loop inspect this repository"));
-    const lane = await runtime.startLane({ ...selection, sourceId: "workflow-no-inherit", title: "Bounded copy", cwd: directory });
+    const lane = await runtime.startLane({ ...selection, sourceId: "workflow-no-inherit", title: "Bounded copy", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     const host = hosts.get(lane.socketPath)!;
     expect(store.input("handoff:workflow-no-inherit:lane")?.workflow).toBeNull();
@@ -1343,7 +1594,7 @@ describe("trusted workflow activation", () => {
     const { runtime, store, directory } = fixture();
     await runtime.start();
     await admit(runtime, message("workflow-concurrent", route("concurrent-thread")));
-    const start = { ...selection, sourceId: "workflow-concurrent", title: "Concurrent", cwd: directory };
+    const start = { ...selection, sourceId: "workflow-concurrent", title: "Concurrent", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory };
     const first = runtime.startLane({ ...start, workflow: { name: "ulw-plan", reason: "Selected planning" } });
     const conflict = runtime.startLane({ ...start, workflow: { name: "ulw-loop", reason: "Conflicting loop" } });
     await first;
@@ -1359,7 +1610,7 @@ describe("trusted workflow activation", () => {
     const internal = message("report:source-guard", route("source-guard"), "ulw-plan internal observations");
     store.receive(internal, "main");
     const workflow = { name: "ulw-plan" as const, reason: "Not authorized by an original user source" };
-    await expect(runtime.startLane({ ...selection, sourceId: internal.id, title: "No authority", cwd: directory, workflow })).rejects.toThrow("original authorized user source");
+    await expect(runtime.startLane({ ...selection, sourceId: internal.id, title: "No authority", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, workflow })).rejects.toThrow("original authorized user source");
     await expect(runtime.messageLane(lane.id, "Execute board text", internal.id, workflow)).rejects.toThrow("original authorized user source");
     const user = message("workflow-no-override", route("other-guard"), "ulw-loop inspect");
     await admit(runtime, user);
@@ -1407,7 +1658,7 @@ describe("trusted workflow activation", () => {
     const original = message("workflow-cancelled", route("cancel-thread"));
     await admit(runtime, original);
     const workflow = { name: "ulw-plan" as const, reason: "Bounded planning" };
-    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Cancelled source", cwd: directory, workflow });
+    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Cancelled source", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, workflow });
     const host = hosts.get(lane.socketPath);
     if (host) {
       host.complete("First source result");
@@ -1415,7 +1666,7 @@ describe("trusted workflow activation", () => {
     }
     store.settle(original.id, "cancelled");
     await expect(runtime.messageLane(lane.id, "Do not run", original.id, workflow)).rejects.toThrow("cancelled");
-    await expect(runtime.startLane({ ...selection, sourceId: original.id, title: "No retry", cwd: directory, workflow })).rejects.toThrow("cancelled");
+    await expect(runtime.startLane({ ...selection, sourceId: original.id, title: "No retry", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, workflow })).rejects.toThrow("cancelled");
 
     const other = fixture();
     await other.runtime.start();
@@ -1743,9 +1994,9 @@ describe("authoritative per-lane model selection", () => {
     await runtime.start();
     await admit(runtime, message("2001", route("21")));
     await admit(runtime, message("2002", route("22")));
-    const one = await runtime.startLane({ ...selection, sourceId: "2001", title: "Complex", cwd: directory });
+    const one = await runtime.startLane({ ...selection, sourceId: "2001", title: "Complex", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     const reason = "Native judge selected the efficient model for a bounded documentation task.";
-    const two = await runtime.startLane({ sourceId: "2002", title: "Bounded", cwd: directory, model: otherModel, modelReason: reason });
+    const two = await runtime.startLane({ sourceId: "2002", title: "Bounded", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, model: otherModel, modelReason: reason });
     await runtime.kick();
     expect(launched.map(options => options.model)).toEqual(["fixture/capable", "fixture/efficient"]);
     expect(store.lane(one.id)).toMatchObject(selection);
@@ -1763,10 +2014,10 @@ describe("authoritative per-lane model selection", () => {
     for (const model of [
       { provider: "fixture", id: "missing" }, { provider: "fixture", id: "judge" },
       { provider: "fixture", id: "cap" }, { provider: "foreign", id: "capable" },
-    ]) await expect(runtime.startLane({ ...selection, sourceId: source.id, title: "Invalid", cwd: directory, model })).rejects.toThrow("not an available native chat model");
-    await expect(runtime.startLane({ ...selection, sourceId: source.id, title: "Invalid", cwd: directory, modelReason: " " })).rejects.toThrow("modelReason");
+    ]) await expect(runtime.startLane({ ...selection, sourceId: source.id, title: "Invalid", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, model })).rejects.toThrow("not an available native chat model");
+    await expect(runtime.startLane({ ...selection, sourceId: source.id, title: "Invalid", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, modelReason: " " })).rejects.toThrow("modelReason");
     main.catalogSuccess = false;
-    await expect(runtime.startLane({ ...selection, sourceId: source.id, title: "No native acknowledgement", cwd: directory })).rejects.toThrow("not acknowledged");
+    await expect(runtime.startLane({ ...selection, sourceId: source.id, title: "No native acknowledgement", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory })).rejects.toThrow("not acknowledged");
     expect(store.lanes()).toEqual([]);
     expect(store.input(`handoff:${source.id}:lane`)).toBeNull();
     expect(store.getMeta(`handoff-route:${source.id}`)).toBeNull();
@@ -1779,11 +2030,11 @@ describe("authoritative per-lane model selection", () => {
     const { runtime, directory, store } = fixture();
     await runtime.start();
     await admit(runtime, message("2020", route("23")));
-    const first = runtime.startLane({ ...selection, sourceId: "2020", title: "Original", cwd: directory });
-    const conflict = runtime.startLane({ ...selection, sourceId: "2020", title: "Conflicting", cwd: directory, model: otherModel });
+    const first = runtime.startLane({ ...selection, sourceId: "2020", title: "Original", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
+    const conflict = runtime.startLane({ ...selection, sourceId: "2020", title: "Conflicting", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, model: otherModel });
     const lane = await first;
     await expect(conflict).rejects.toThrow("conflicts");
-    await expect(runtime.startLane({ ...selection, sourceId: "2020", title: "Replay conflict", cwd: directory, model: otherModel })).rejects.toThrow("different model");
+    await expect(runtime.startLane({ ...selection, sourceId: "2020", title: "Replay conflict", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, model: otherModel })).rejects.toThrow("different model");
     expect(store.lane(lane.id)).toMatchObject(selection);
     expect(store.lanes()).toHaveLength(1);
   });
@@ -1800,7 +2051,7 @@ describe("authoritative per-lane model selection", () => {
       await releaseCatalog.promise;
     };
     const preset = { ...executionModel };
-    const selecting = runtime.startLane({ ...selection, sourceId: "2025", title: "Preset snapshot", cwd: directory, model: preset });
+    const selecting = runtime.startLane({ ...selection, sourceId: "2025", title: "Preset snapshot", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, model: preset });
     await catalogStarted.promise;
     preset.id = otherModel.id;
     releaseCatalog.resolve();
@@ -2029,7 +2280,7 @@ describe("frozen native preset lane choices", () => {
     const saved = structuredClone(nativePresets.get("high")!);
     await runtime.start();
     await admit(runtime, message("2200", route("60")));
-    const lane = await runtime.startLane({ sourceId: "2200", title: "Frozen native preset", cwd: directory, preset: "high", modelReason: "Native judge recommends the saved high preset." });
+    const lane = await runtime.startLane({ sourceId: "2200", title: "Frozen native preset", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, preset: "high", modelReason: "Native judge recommends the saved high preset." });
     await runtime.kick();
     expect(store.lane(lane.id)).toMatchObject({ model: saved.model, modelPreset: "high", modelPresetSnapshot: saved.snapshot });
     expect(launched[0]?.modelPreset).toEqual({ name: "high", preset: saved.snapshot });
@@ -2038,11 +2289,11 @@ describe("frozen native preset lane choices", () => {
     host.shutdownDisconnect = true;
     host.complete("First native preset execution");
     await runtime.kick();
-    expect(messenger.sent).toEqual([]);
+    expect(messenger.sent).toEqual([expect.objectContaining({ id: "2200:kickoff", sourceId: "handoff:2200:lane", route: lane.route })]);
     await runtime.kick();
     await runtime.closeLane(lane.id, "completed", "Observed first preset execution complete");
     nativePresets.set("high", { ...structuredClone(nativePresets.get("low")!), preset: "high" });
-    expect(await runtime.startLane({ sourceId: "2200", title: "Original source replay", cwd: directory, preset: "high", modelReason: "Do not retarget an existing source." }))
+    expect(await runtime.startLane({ sourceId: "2200", title: "Original source replay", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, preset: "high", modelReason: "Do not retarget an existing source." }))
       .toMatchObject({ id: lane.id, model: saved.model, modelPresetSnapshot: saved.snapshot });
     config.model = "global/not-a-lane-default";
     await runtime.resume(lane.id);
@@ -2183,10 +2434,10 @@ describe("frozen native preset lane choices", () => {
     nativePresets.set("my-team-coding", { ...structuredClone(nativePresets.get("high")!), preset: "my-team-coding" });
     await runtime.start();
     await admit(runtime, message("2230", route("65")));
-    expect(await runtime.startLane({ sourceId: "2230", title: "Custom native preset", cwd: directory, preset: "my-team-coding", modelReason: "Use an existing operator native preset." })).toMatchObject({ modelPreset: "my-team-coding", model: executionModel });
+    expect(await runtime.startLane({ sourceId: "2230", title: "Custom native preset", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, preset: "my-team-coding", modelReason: "Use an existing operator native preset." })).toMatchObject({ modelPreset: "my-team-coding", model: executionModel });
     store.receive(message("2231", route(null)), "main");
     store.submit("2231", "already-head-owned", 0);
-    await expect(runtime.startLane({ sourceId: "2231", title: "Missing preset", cwd: directory, preset: "missing-native-name", modelReason: "No fallback is authorized." })).rejects.toThrow("not configured");
+    await expect(runtime.startLane({ sourceId: "2231", title: "Missing preset", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, preset: "missing-native-name", modelReason: "No fallback is authorized." })).rejects.toThrow("not configured");
     expect(messenger.threads).toEqual([]);
     expect(store.input("handoff:2231:lane")).toBeNull();
   });
@@ -2251,7 +2502,7 @@ describe("real Store runtime coordination", () => {
     await runtime.start();
     const firstRequest = event("000002", "/new first task", 500);
     await admit(runtime, firstRequest);
-    const first = await runtime.startLane({ ...selection, sourceId: firstRequest.id, title: "Slack first", cwd: directory });
+    const first = await runtime.startLane({ ...selection, sourceId: firstRequest.id, title: "Slack first", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await admit(runtime, event("000004", "/main", 1));
     await admit(runtime, event("000003", "Late first topic followup", 900));
     expect(store.input("slack:000003")).toMatchObject({ target: "main", route: first.route });
@@ -2308,7 +2559,7 @@ describe("real Store runtime coordination", () => {
     const dm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DPRIVATE" });
     await runtime.start();
     await admit(runtime, { ...message("slack:head", dm), messageId: "1750000000.000001" });
-    const delegated = await runtime.startLane({ ...selection, sourceId: "slack:head", title: "Handoff", cwd: directory });
+    const delegated = await runtime.startLane({ ...selection, sourceId: "slack:head", title: "Handoff", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     expect(store.input("slack:head")).toMatchObject({ target: "main", state: "submitted", route: dm });
     expect(store.input("handoff:slack:head:lane")?.target).toBe(delegated.id);
     expect(delegated.route.threadId).toBeNull();
@@ -2330,8 +2581,8 @@ describe("real Store runtime coordination", () => {
     await runtime.start();
     await admit(runtime, message("901", firstRoute));
     await admit(runtime, message("902", secondRoute));
-    const first = await runtime.startLane({ ...selection, sourceId: "901", title: "Forum one", cwd: directory });
-    const second = await runtime.startLane({ ...selection, sourceId: "902", title: "Forum two", cwd: directory });
+    const first = await runtime.startLane({ ...selection, sourceId: "901", title: "Forum one", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
+    const second = await runtime.startLane({ ...selection, sourceId: "902", title: "Forum two", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     expect(first.route).toEqual(firstRoute);
     expect(second.route).toEqual(secondRoute);
@@ -2344,7 +2595,10 @@ describe("real Store runtime coordination", () => {
     hosts.get(first.socketPath)!.complete("First forum reply");
     hosts.get(second.socketPath)!.complete("Second forum reply");
     await runtime.kick();
-    expect(messenger.sent).toEqual([]);
+    expect(messenger.sent).toEqual([
+      expect.objectContaining({ id: "901:kickoff", sourceId: "handoff:901:lane", route: firstRoute }),
+      expect.objectContaining({ id: "902:kickoff", sourceId: "handoff:902:lane", route: secondRoute }),
+    ]);
     expect(store.input("report:handoff:901:lane")?.route.threadId).toBe("42");
     expect(store.input("report:handoff:902:lane")?.route.threadId).toBe("43");
     await expect(runtime.receive(message("903", { ...firstRoute, guildId: "-100999", channelId: "-100999" }))).rejects.toThrow("Unauthorized");
@@ -2456,7 +2710,7 @@ describe("real Store runtime coordination", () => {
     expect(main.prompts).toHaveLength(2);
     expect(store.input("100-other-topic")).toMatchObject({ target: "main", state: "pending" });
     expect(messenger.sent).toEqual([]);
-    const lane = await runtime.startLane({ ...selection, sourceId: "100", title: "Topic", cwd: directory });
+    const lane = await runtime.startLane({ ...selection, sourceId: "100", title: "Topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     expect(store.input("100")?.target).toBe("main");
     expect(store.input("100-followup")).toMatchObject({ target: "main", state: "submitted" });
@@ -2467,7 +2721,7 @@ describe("real Store runtime coordination", () => {
     expect(store.input("handoff:100:lane")?.target).toBe(lane.id);
     expect(messenger.threads).toEqual([]);
     expect(lane.cwd).toBe(directory);
-    expect(await runtime.startLane({ ...selection, sourceId: "100", title: "Replay", cwd: directory })).toMatchObject({ id: lane.id, title: "Topic" });
+    expect(await runtime.startLane({ ...selection, sourceId: "100", title: "Replay", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory })).toMatchObject({ id: lane.id, title: "Topic" });
   });
 
   test("only head synthesis delivers lane reports on their immutable original conversations", async () => {
@@ -2601,7 +2855,7 @@ describe("real Store runtime coordination", () => {
     const { runtime, store, directory, messenger, hosts } = fixture();
     await runtime.start();
     await admit(runtime, message("first-independent", route("74")));
-    const lane = await runtime.startLane({ ...selection, sourceId: "first-independent", title: "Existing topic", cwd: directory });
+    const lane = await runtime.startLane({ ...selection, sourceId: "first-independent", title: "Existing topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     expect(lane.route).toEqual(route("74"));
     expect(lane.id).toBe(`lane-${createHash("sha256").update("handoff:first-independent:lane").digest("hex").slice(0, 24)}`);
@@ -2614,7 +2868,7 @@ describe("real Store runtime coordination", () => {
     expect(store.lane(lane.id)?.workState).toBe("paused");
     await runtime.resume(lane.id);
     await expect(runtime.messageLane(lane.id, "Must not resurrect cancellation", "cancel-head-source")).rejects.toThrow("cancelled request");
-    await expect(runtime.startLane({ ...selection, sourceId: "cancel-head-source", title: "Must not create", cwd: directory })).rejects.toThrow("cancelled main request");
+    await expect(runtime.startLane({ ...selection, sourceId: "cancel-head-source", title: "Must not create", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory })).rejects.toThrow("cancelled main request");
     expect(store.lanes()).toHaveLength(1);
   });
 
@@ -2629,7 +2883,7 @@ describe("real Store runtime coordination", () => {
     ] };
     await runtime.start();
     await admit(runtime, original);
-    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Delegated files", cwd: directory });
+    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Delegated files", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     expect(lane.route.threadId).toBe("900");
     expect(opened).toEqual([original.route, original.route]);
@@ -3210,8 +3464,8 @@ describe("real Store runtime coordination", () => {
     const original = message("170", route(null));
     await admit(runtime, original);
     const [one, two] = await Promise.all([
-      runtime.startLane({ ...selection, sourceId: original.id, title: "Delegation", cwd: directory }),
-      runtime.startLane({ ...selection, sourceId: original.id, title: "Delegation", cwd: directory }),
+      runtime.startLane({ ...selection, sourceId: original.id, title: "Delegation", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory }),
+      runtime.startLane({ ...selection, sourceId: original.id, title: "Delegation", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory }),
     ]);
     expect(one.id).toBe(two.id);
     expect(messenger.threads).toHaveLength(1);
@@ -3226,7 +3480,7 @@ describe("real Store runtime coordination", () => {
     await runtime.start();
     const dm = route(null, { guildId: null });
     await admit(runtime, message("180", dm));
-    const delegated = await runtime.startLane({ ...selection, sourceId: "180", title: "DM task", cwd: directory });
+    const delegated = await runtime.startLane({ ...selection, sourceId: "180", title: "DM task", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     expect(delegated.route.threadId).toBeNull();
     expect(delegated.route.topicId).toMatch(/^topic-/);
     expect(messenger.threads).toEqual([]);
@@ -3238,9 +3492,9 @@ describe("real Store runtime coordination", () => {
     store.receive(message("181", route(null)), "main");
     store.submit("181", "native-main-next", 0);
     messenger.threadFails = true;
-    await expect(runtime.startLane({ ...selection, sourceId: "181", title: "Uncertain", cwd: directory })).rejects.toThrow();
+    await expect(runtime.startLane({ ...selection, sourceId: "181", title: "Uncertain", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory })).rejects.toThrow();
     messenger.threadFails = false;
-    await expect(runtime.startLane({ ...selection, sourceId: "181", title: "Uncertain", cwd: directory })).rejects.toThrow("interrupted");
+    await expect(runtime.startLane({ ...selection, sourceId: "181", title: "Uncertain", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory })).rejects.toThrow("interrupted");
     expect(messenger.threads).toEqual([]);
   });
 
@@ -3290,11 +3544,11 @@ describe("real Store runtime coordination", () => {
     const firstRequest = message("600", dm, "/new first repository task");
     await admit(runtime, firstRequest);
     expect(main.prompts[0]!.command.message).not.toContain("/new first repository task");
-    const first = await runtime.startLane({ ...selection, sourceId: "600", title: "First", cwd: directory });
+    const first = await runtime.startLane({ ...selection, sourceId: "600", title: "First", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await admit(runtime, message("601", dm, "First followup"));
     expect(store.input("601")).toMatchObject({ target: "main", route: first.route });
     await admit(runtime, message("610", dm, "/new second repository task"));
-    const second = await runtime.startLane({ ...selection, sourceId: "610", title: "Second", cwd: directory });
+    const second = await runtime.startLane({ ...selection, sourceId: "610", title: "Second", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await admit(runtime, message("611", dm, "Second followup"));
     expect(store.input("611")).toMatchObject({ target: "main", route: second.route });
     expect(first.route.threadId).toBeNull();
@@ -3325,10 +3579,10 @@ describe("real Store runtime coordination", () => {
     const command = (id: string, text: string): Inbound => ({ ...message(id, dm, text), messageId: platform === "slack" ? `1750000000.${id.padStart(6, "0")}` : id });
     await runtime.start();
     await admit(runtime, command("700", "/new first task"));
-    const first = await runtime.startLane({ ...selection, sourceId: "700", title: "First", cwd: directory });
+    const first = await runtime.startLane({ ...selection, sourceId: "700", title: "First", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     await admit(runtime, command("710", "/new second task"));
-    const second = await runtime.startLane({ ...selection, sourceId: "710", title: "Second", cwd: directory });
+    const second = await runtime.startLane({ ...selection, sourceId: "710", title: "Second", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     const firstHost = hosts.get(first.socketPath)!;
     const secondHost = hosts.get(second.socketPath)!;

@@ -1,6 +1,7 @@
 import type { Config } from "./config";
 import { requireMessengerCredentials } from "./config";
-import type { Approval, Attachment, Inbound, Messenger, OutputRecord, Platform, Route, StorePort } from "./contracts";
+import type { Approval, Attachment, Inbound, MessageActivity, Messenger, OutputRecord, Platform, Route, StorePort } from "./contracts";
+import { physicalRouteKey } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { DiscordMessenger } from "./discord";
 import { SlackMessenger } from "./slack";
@@ -9,6 +10,8 @@ import { TelegramMessenger } from "./telegram";
 /** One head; transports retain their own authenticated account and recovery state. */
 export class MessengerHub implements Messenger {
   private readonly active: Messenger[] = [];
+  private readonly activityQueues = new Map<string, Promise<void>>();
+  private readonly thinkingMessages = new Set<string>();
   private started = false;
 
   constructor(private readonly adapters: Partial<Record<Platform, Messenger>>) {
@@ -51,6 +54,22 @@ export class MessengerHub implements Messenger {
   send(output: OutputRecord): Promise<string> {
     return this.adapter(output.route).send(output);
   }
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+    const key = JSON.stringify([physicalRouteKey(message.route), message.messageId]);
+    const apply = async () => {
+      // An edit is fresh ingress, but Telegram's single reaction must stay thinking.
+      if (activity === "received" && this.thinkingMessages.has(key)) return;
+      if (activity === "thinking") this.thinkingMessages.add(key);
+      else if (activity === "idle") this.thinkingMessages.delete(key);
+      await this.adapter(message.route).setActivity?.(message, activity);
+    };
+    const previous = this.activityQueues.get(key);
+    // A later state is independent of an earlier failed cosmetic operation.
+    const operation = previous ? previous.then(apply, apply) : apply();
+    this.activityQueues.set(key, operation);
+    try { await operation; }
+    finally { if (this.activityQueues.get(key) === operation) this.activityQueues.delete(key); }
+  }
   showApproval(approval: Approval): Promise<string> {
     return this.adapter(approval.route).showApproval(approval);
   }
@@ -71,6 +90,7 @@ export class MessengerHub implements Messenger {
   }
   async stop(): Promise<void> {
     this.started = false;
+    await Promise.allSettled(this.activityQueues.values());
     const stopped = await Promise.allSettled(this.active.splice(0).reverse().map(adapter => adapter.stop()));
     const failed = stopped.filter((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failed.length) throw new AggregateError(failed.map(result => result.reason), "Messenger shutdown failed");

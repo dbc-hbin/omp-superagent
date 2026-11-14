@@ -60,11 +60,28 @@ class Channel {
 
 class Gateway extends EventEmitter {
   user = { id: bot };
-  rest = { options: { retries: 3, rejectOnRateLimit: null as unknown } };
+  reactions = new Map<string, Set<string>>();
+  reactionCalls: { method: "PUT" | "DELETE"; path: string }[] = [];
+  reactionFailure: unknown;
+  rest = {
+    options: { retries: 3, rejectOnRateLimit: null as unknown },
+    put: (path: string) => this.react("PUT", path),
+    delete: (path: string) => this.react("DELETE", path),
+  };
   channelMap = new Map<string, Channel>();
   lookups: string[] = [];
   destroyed = false;
   channels = { fetch: async (id: string) => { this.lookups.push(id); return this.channelMap.get(id) ?? null; } };
+  private async react(method: "PUT" | "DELETE", path: string): Promise<void> {
+    this.reactionCalls.push({ method, path });
+    if (this.reactionFailure) throw this.reactionFailure;
+    const match = /^\/channels\/([^/]+)\/messages\/([0-9]+)\/reactions\/([^/]+)\/@me$/.exec(path);
+    if (!match?.[1] || !match[2] || !match[3]) throw new Error(`Unsupported own-reaction route: ${path}`);
+    const key = `${match[1]}:${match[2]}:${decodeURIComponent(match[3])}`;
+    const users = this.reactions.get(key) ?? new Set<string>();
+    if (method === "PUT") { users.add(bot); this.reactions.set(key, users); }
+    else users.delete(bot);
+  }
   isReady() { return true; }
   async destroy() { this.destroyed = true; }
 }
@@ -350,6 +367,81 @@ describe("Discord output delivery", () => {
     expect(dm.sent.map(value => value.content)).toEqual(["old result", "new result"]);
     expect(dm.sent[0]!.nonce).not.toBe(dm.sent[1]!.nonce);
     await messenger.stop();
+  });
+});
+
+describe("Discord message activity", () => {
+  test.each([
+    ["channel", route],
+    ["thread", { ...route, threadId: "thread" }],
+    ["logical DM topic", { ...route, guildId: null, channelId: "dm", topicId: "original-topic" }],
+  ] as const)("own reactions preserve receipt and other users in the original %s", async (_name, target) => {
+    const { messenger, gateway } = await fixture();
+    gateway.channelMap.set("thread", new Channel("thread", "guild", "parent"));
+    gateway.channelMap.set("dm", new Channel("dm", null));
+    const channelId = target.threadId ?? target.channelId;
+    const eyes = `${channelId}:100:\u{1F440}`;
+    const thought = `${channelId}:100:\u{1F4AD}`;
+    gateway.reactions.set(thought, new Set(["stranger"]));
+    try {
+      for (const activity of ["received", "received", "thinking", "thinking"] as const) await messenger.setActivity({ route: target, messageId: "100" }, activity);
+      expect(gateway.reactions.get(eyes)).toEqual(new Set([bot]));
+      expect(gateway.reactions.get(thought)).toEqual(new Set(["stranger", bot]));
+      await messenger.setActivity({ route: target, messageId: "100" }, "idle");
+      await messenger.setActivity({ route: target, messageId: "100" }, "idle");
+      expect([...gateway.reactions]).toEqual([[thought, new Set(["stranger"])], [eyes, new Set([bot])]]);
+      const prefix = `/channels/${channelId}/messages/100/reactions/`;
+      expect(gateway.reactionCalls).toEqual([
+        { method: "PUT", path: `${prefix}%F0%9F%91%80/@me` },
+        { method: "PUT", path: `${prefix}%F0%9F%91%80/@me` },
+        { method: "PUT", path: `${prefix}%F0%9F%92%AD/@me` },
+        { method: "PUT", path: `${prefix}%F0%9F%92%AD/@me` },
+        { method: "DELETE", path: `${prefix}%F0%9F%92%AD/@me` },
+        { method: "DELETE", path: `${prefix}%F0%9F%92%AD/@me` },
+      ]);
+    } finally { await messenger.stop(); }
+  });
+
+  test("foreign route identities and malformed message IDs cannot mutate reactions", async () => {
+    const { messenger, gateway } = await fixture();
+    const dm = new Channel("dm", null); dm.recipientId = "stranger";
+    gateway.channelMap.set("dm", dm);
+    gateway.channelMap.set("thread", new Channel("thread", "guild", "different-parent"));
+    const foreign: Route[] = [
+      { ...route, platform: "telegram" }, { ...route, accountId: "other" }, { ...route, authorityId: "other" },
+      { ...route, guildId: "other" }, { ...route, channelId: "other" }, { ...route, threadId: "thread" },
+      { ...route, guildId: null, channelId: "dm" },
+    ];
+    try {
+      for (const target of foreign) for (const activity of ["received", "thinking", "idle"] as const) {
+        await expect(messenger.setActivity({ route: target, messageId: "100" }, activity)).rejects.toMatchObject({ certainty: "rejected" });
+      }
+      for (const messageId of ["", "100/../101", "not-a-snowflake", "1".repeat(21)]) {
+        await expect(messenger.setActivity({ route, messageId }, "received")).rejects.toMatchObject({ certainty: "rejected" });
+      }
+      expect(gateway.reactionCalls).toEqual([]);
+      expect(gateway.reactions.size).toBe(0);
+    } finally { await messenger.stop(); }
+  });
+
+  test.each([
+    { failure: Object.assign(new Error("secret-discord-token"), { status: 403 }), certainty: "rejected", retryAfterMs: undefined },
+    { failure: Object.assign(new Error("secret-discord-token"), { status: 503 }), certainty: "uncertain", retryAfterMs: undefined },
+    { failure: Object.assign(new Error("secret-discord-token"), { name: "RateLimitError", retryAfter: 1250 }), certainty: "rejected", retryAfterMs: 1250 },
+  ])("reaction failure is sanitized and not retried ($certainty)", async ({ failure, certainty, retryAfterMs }) => {
+    const { messenger, gateway } = await fixture();
+    gateway.reactionFailure = failure;
+    try {
+      const caught: unknown = await messenger.setActivity({ route, messageId: "100" }, "thinking").catch((error: unknown) => error);
+      expect(caught).toBeInstanceOf(DeliveryError);
+      if (!(caught instanceof DeliveryError)) throw new Error("Expected a sanitized delivery error");
+      expect(caught.certainty).toBe(certainty);
+      expect(caught.retryAfterMs).toBe(retryAfterMs);
+      expect(String(caught)).not.toContain("secret-discord-token");
+      expect(caught.cause).toBeUndefined();
+      expect(gateway.reactionCalls).toHaveLength(1);
+      expect(gateway.reactions.size).toBe(0);
+    } finally { await messenger.stop(); }
   });
 });
 

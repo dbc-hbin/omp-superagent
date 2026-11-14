@@ -276,14 +276,16 @@ try {
     };
     const destination = { platform: "slack", accountId: "T:B", authorityId: "U", guildId: "T", channelId: "C", threadId: "1.2" };
     const modelChoice = { model: { provider: "fixture", id: "chat" }, modelReason: "Known task requirements" };
+    const kickoff = "I will inspect the workspace and verify the requested changes in this topic.";
     for (const platform of ["discord", "telegram", "slack"]) {
-      check("lane_start", { sourceId: "source", title: "title", cwd: workspace, ...modelChoice, destination: { ...destination, platform } }, true);
+      check("lane_start", { sourceId: "source", title: "title", cwd: workspace, kickoff, ...modelChoice, destination: { ...destination, platform } }, true);
     }
     check("lane_start", { sourceId: "source", title: "title" }, false);
     check("lane_start", { sourceId: "source", title: "title", cwd: workspace }, false);
-    check("lane_start", { sourceId: "source", title: "title", cwd: workspace, ...modelChoice, modelReason: "" }, false);
-    check("lane_start", { sourceId: "source", title: "title", cwd: workspace, preset: "middle", modelReason: "Native preset selected" }, true);
-    check("lane_start", { sourceId: "source", title: "title", cwd: workspace, ...modelChoice, destination: { ...destination, platform: "unknown" } }, false);
+    check("lane_start", { sourceId: "source", title: "title", cwd: workspace, ...modelChoice }, false);
+    check("lane_start", { sourceId: "source", title: "title", cwd: workspace, kickoff, ...modelChoice, modelReason: "" }, false);
+    check("lane_start", { sourceId: "source", title: "title", cwd: workspace, kickoff, preset: "middle", modelReason: "Native preset selected" }, true);
+    check("lane_start", { sourceId: "source", title: "title", cwd: workspace, kickoff, ...modelChoice, destination: { ...destination, platform: "unknown" } }, false);
     check("lane_models", {}, true);
     check("lane_models", { selectors: ["@smol", "@slow"] }, true);
     check("lane_models", { selectors: [] }, false);
@@ -296,11 +298,11 @@ try {
     check("lane_message", { id: "lane", text: "instruction" }, false);
     for (const name of ["ulw", "ulw-plan", "ulw-execute", "ulw-loop", "mass-ulw", "ulw-research"]) {
       const workflow = { name, reason: "Existing objective requires durable dependency handoffs" };
-      check("lane_start", { sourceId: "source", title: "title", cwd: workspace, ...modelChoice, workflow }, true);
+      check("lane_start", { sourceId: "source", title: "title", cwd: workspace, kickoff, ...modelChoice, workflow }, true);
       check("lane_message", { id: "lane", text: "instruction", sourceId: "source", workflow }, true);
     }
     for (const workflow of [{ name: "arbitrary", reason: "unknown" }, { name: "ulw-plan" }, { name: "ulw", reason: "" }]) {
-      check("lane_start", { sourceId: "source", title: "title", cwd: workspace, ...modelChoice, workflow }, false);
+      check("lane_start", { sourceId: "source", title: "title", cwd: workspace, kickoff, ...modelChoice, workflow }, false);
       check("lane_message", { id: "lane", text: "instruction", sourceId: "source", workflow }, false);
     }
     for (const name of ["lane_pause", "lane_resume"]) check(name, { id: "lane" }, true);

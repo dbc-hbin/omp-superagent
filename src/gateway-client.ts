@@ -1,7 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { Readable, Transform } from "node:stream";
 import type { Config } from "./config";
-import type { Approval, Attachment, Inbound, Messenger, OutputRecord, Route } from "./contracts";
+import type { Approval, Attachment, Inbound, MessageActivity, Messenger, OutputRecord, Route } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { gatewayCall, gatewayPaths, gatewayRequest, MAX_GATEWAY_ATTACHMENT, MAX_GATEWAY_FRAME, readGatewayJson, type GatewayResult } from "./gateway-protocol";
 import type { GatewayReceipt, QueuedEvent } from "./gateway-store";
@@ -120,6 +120,9 @@ class GatewayMessenger implements Messenger {
     return this.call<T>("/effect", { id: crypto.randomUUID(), operation, args });
   }
   send(output: OutputRecord): Promise<string> { return this.effect("send", [output]); }
+  setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+    return this.effect("setActivity", [{ route: message.route, messageId: message.messageId }, activity]);
+  }
   showApproval(approval: Approval): Promise<string> { return this.effect("showApproval", [approval]); }
   dismissApproval(approval: Approval): Promise<void> { return this.effect("dismissApproval", [approval]); }
   canCreateThread(route: Route): Promise<boolean> { return this.effect("canCreateThread", [route]); }

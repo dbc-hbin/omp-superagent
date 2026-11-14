@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { LogLevel, WebClient, type WebClientOptions } from "@slack/web-api";
 import { SocketModeClient } from "@slack/socket-mode";
-import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
 import { DeliveryError } from "./delivery.ts";
 import { compareMessageIds } from "./message-order.ts";
@@ -283,6 +283,20 @@ export class SlackMessenger implements Messenger {
     });
     if (!Array.isArray(completed.files) || !completed.files.some(file => object(file) && file.id === ticket.file_id)) throw new DeliveryError("Slack file publication has no authoritative receipt", "uncertain");
     return `file:${ticket.file_id}`;
+  }
+
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+    if (!timestamp(message.messageId)) throw new DeliveryError("Activity requires a Slack message timestamp", "rejected");
+    await this.destination(message.route);
+    const args = { channel: message.route.channelId, timestamp: message.messageId, name: activity === "received" ? "eyes" : "thought_balloon" };
+    try {
+      if (activity === "idle") await this.client.reactions.remove(args);
+      else await this.client.reactions.add(args);
+    } catch (error) {
+      if (object(error) && error.code === "slack_webapi_platform_error" && object(error.data) &&
+        error.data.error === (activity === "idle" ? "no_reaction" : "already_reacted")) return;
+      throw failure(error);
+    }
   }
 
   private control(pending: Pending, action: string): string { return `omp:${pending.token}:${action}`; }

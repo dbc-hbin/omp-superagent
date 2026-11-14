@@ -145,6 +145,7 @@ export interface StorePort {
   submit(id: string, requestId: string, generation: number): boolean;
   settle(id: string, state: "done" | "uncertain" | "cancelled", output?: { id: string; text: string }): boolean;
   queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error">): boolean;
+  output(id: string): OutputRecord | null;
   outputs(): OutputRecord[];
   claimOutput(id: string): boolean;
   finishOutput(id: string, state: "sent" | "uncertain" | "failed" | "pending", remoteId?: string, error?: string): void;
@@ -177,6 +178,8 @@ export interface DialogResponse {
   answers?: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
 }
 
+export type MessageActivity = "received" | "thinking" | "idle";
+
 export interface Messenger {
   start(handlers: {
     /** Authenticate first; do not consume inbound events until native approvals are reconciled. */
@@ -188,6 +191,8 @@ export interface Messenger {
     reconnect?(): Promise<void>;
   }): Promise<void>;
   send(output: OutputRecord): Promise<string>;
+  /** Cosmetic own reactions on the original message; never an admission or completion receipt. */
+  setActivity?(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void>;
   showApproval(approval: Approval): Promise<string>;
   dismissApproval(approval: Approval): Promise<void>;
   /** Read-only authenticated capability probe; false is unsupported, not a failed creation. */

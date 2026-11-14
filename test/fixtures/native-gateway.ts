@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseSessionEntries, type FileEntry } from "@oh-my-pi/pi-coding-agent";
 import { type Config, hostPaths, privateDirectory } from "../../src/config";
-import type { Approval, Inbound, Lane, Messenger, OutputRecord, Route } from "../../src/contracts";
+import type { Approval, Inbound, Lane, MessageActivity, Messenger, OutputRecord, Route } from "../../src/contracts";
 import { startGateway, gatewayPaths, type GatewayService, type GatewayStatus } from "../../src/gateway";
 import { HostConnection } from "../../src/host";
 import { nativeDisabledProviders } from "./native-extension";
@@ -17,6 +17,7 @@ const interrupted = new AbortController();
 let detectNativeFailure: (() => Promise<void>) | undefined;
 class RecordingMessenger implements Messenger {
   readonly sent: OutputRecord[] = [];
+  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
   handlers?: Handlers;
   async start(handlers: Handlers): Promise<void> { this.handlers = handlers; }
   async deliver(input: Inbound): Promise<void> {
@@ -26,6 +27,9 @@ class RecordingMessenger implements Messenger {
   async send(output: OutputRecord): Promise<string> {
     this.sent.push(structuredClone(output));
     return `gateway-native-receipt:${output.id}`;
+  }
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+    this.activities.push({ message: { route: structuredClone(message.route), messageId: message.messageId }, activity });
   }
   async showApproval(_approval: Approval): Promise<string> { throw new Error("Unexpected native Gateway approval"); }
   async dismissApproval(_approval: Approval): Promise<void> { throw new Error("Unexpected native Gateway approval dismissal"); }
@@ -404,7 +408,7 @@ try {
   assert.equal(input(`report:${followupHandoff}`)?.target, "main");
   await until(() => {
     const receipts = db.query("SELECT state FROM outputs ORDER BY sequence").all() as Array<{ state: string }>;
-    return receipts.length === 3 && receipts.every(receipt => receipt.state === "sent") &&
+    return receipts.length === 4 && receipts.every(receipt => receipt.state === "sent") &&
       gateway!.status().gateway.pendingEvents === 0;
   }, "initial head replies and durable external receipts settle before forced head loss");
 
@@ -513,14 +517,27 @@ try {
     assert.deepEqual(sent(item.id)[0]?.route, item.route);
     assert.equal(sent(item.id)[0]?.sourceId, reportId);
   }
-  const expectedOutputSources = ["201", ...expectedReports, "207"];
+  const kickoff = messenger.sent.filter(output => output.id === "202:kickoff");
+  assert.equal(kickoff.length, 1, "Thread kickoff must be externally delivered once, including duplicate source replay");
+  assert.deepEqual(kickoff[0]?.route, thread);
+  assert.equal(kickoff[0]?.sourceId, firstHandoff);
+  assert(kickoff[0]?.text.trim());
+  const expectedOutputSources = ["201", firstHandoff, ...expectedReports, "207"];
   assert.deepEqual(messenger.sent.map(output => output.sourceId).sort(), [...expectedOutputSources].sort());
-  assert.deepEqual(messenger.sent.flatMap(output => output.text.split("\n")).sort(), inputs.map(item => `HEAD:${item.id}`).sort(),
+  assert.deepEqual(messenger.sent.filter(output => output.id !== "202:kickoff").flatMap(output => output.text.split("\n")).sort(), inputs.map(item => `HEAD:${item.id}`).sort(),
     "Head-only delivery must account for every original input once, whether native work yields one or several outputs");
   for (const item of inputs) assert.equal(sent(item.id).length, 1);
-  const outputs = db.query("SELECT source_id,state,remote_id FROM outputs ORDER BY sequence").all() as Array<{ source_id: string; state: string; remote_id: string }>;
+  await until(() => inputs.every(item => messenger.activities.filter(value => value.message.messageId === item.messageId).at(-1)?.activity === "idle"),
+    "native head, lane and report processing reactions settle");
+  for (const item of inputs) {
+    const activities = messenger.activities.filter(value => value.message.messageId === item.messageId);
+    assert.equal(activities.filter(value => value.activity === "received").length, 1, "Duplicate ingress must not add another receipt reaction");
+    assert(activities.some(value => value.activity === "thinking"), "Real native processing must be visible on every original input");
+    assert(activities.every(value => JSON.stringify(value.message.route) === JSON.stringify(item.route)), "Reactions must stay on the original message route, not a report or newly selected destination");
+  }
+  const outputs = db.query("SELECT id,source_id,state,remote_id FROM outputs ORDER BY sequence").all() as Array<{ id: string; source_id: string; state: string; remote_id: string }>;
   assert.deepEqual(outputs.map(output => output.source_id).sort(), [...expectedOutputSources].sort());
-  assert(outputs.every(output => output.state === "sent" && output.remote_id === `gateway-native-receipt:${output.source_id}:answer`));
+  assert(outputs.every(output => output.state === "sent" && output.remote_id === `gateway-native-receipt:${output.id}`));
   const boardPosts = [...nativeToolResults(headEntries, "board_post"), ...nativeToolResults(laneEntries, "board_post")];
   const posted = boardPosts.map(post => {
     assert.notEqual(post.isError, true);

@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../src/config";
-import type { Approval, Attachment, Inbound, Messenger, OutputRecord, Route } from "../src/contracts";
+import type { Approval, Attachment, Inbound, MessageActivity, Messenger, OutputRecord, Route } from "../src/contracts";
 import { DeliveryError } from "../src/delivery";
 import { createGatewayMessenger } from "../src/gateway-client";
 import { gatewayCall, gatewayPaths, gatewayRequest } from "../src/gateway-protocol";
@@ -27,6 +27,8 @@ async function eventually(predicate: () => boolean): Promise<void> {
 class FakeMessenger implements Messenger {
   handlers?: Parameters<Messenger["start"]>[0];
   readonly sends: OutputRecord[] = [];
+  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
+  beforeActivity?: () => Promise<void> | void;
   readonly approvals = new Set<string>();
   stopped = false;
   sendFailure?: DeliveryError;
@@ -36,6 +38,10 @@ class FakeMessenger implements Messenger {
     this.sends.push(output);
     if (this.sendFailure) throw this.sendFailure;
     return "remote-message";
+  }
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity) {
+    await this.beforeActivity?.();
+    this.activities.push({ message: structuredClone(message), activity });
   }
   async showApproval(approval: Approval) { this.approvals.add(approval.id); return "remote-approval"; }
   async dismissApproval(approval: Approval) { this.approvals.delete(approval.id); }
@@ -76,7 +82,7 @@ async function fixture() {
   await server.listen();
   cleanups.push(() => server.close());
   await messenger.start({ ready: server.initialReady.promise,
-    message: async message => { store.admit({ kind: "message", input: message }); server.deliver(); },
+    message: async message => { server.admitMessage(message); },
     answer: async (approvalId, response, source) => { store.admit({ kind: "answer", approvalId, response, route: source }); server.deliver(); },
   });
   function client(): Messenger {
@@ -90,6 +96,54 @@ async function fixture() {
   }
   return { config, store, server, messenger, client, get stopRequests() { return stopRequests; } };
 }
+
+test("receipt reactions follow durable admission without delaying ACK or requiring a resident head", async () => {
+  const f = await fixture();
+  const client = f.client();
+  await client.start({ message: async () => {}, answer: async () => {} });
+  await f.server.initialReady.promise;
+  await client.stop();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.messenger.beforeActivity = async () => {
+    expect(f.store.pending()).toBe(1);
+    entered.resolve();
+    await release.promise;
+  };
+  try {
+    await f.messenger.emit(input("offline-reaction"));
+    await entered.promise;
+    await f.messenger.emit(input("offline-reaction"));
+    expect(f.messenger.activities).toEqual([]);
+    expect(f.store.pending()).toBe(1);
+  } finally { release.resolve(); }
+  await f.server.close();
+  expect(f.messenger.activities).toEqual([{ message: { route, messageId: "offline-reaction" }, activity: "received" }]);
+});
+
+test("reaction failures never reject durable input or a later answer and activity crosses real Gateway IPC", async () => {
+  const f = await fixture();
+  const client = f.client();
+  const answered = Promise.withResolvers<void>();
+  f.messenger.beforeActivity = () => { throw new Error("Missing reaction scope"); };
+  await client.start({
+    message: async message => {
+      try {
+        await client.setActivity?.(message, "thinking");
+      } catch { /* Cosmetic API failure only. */ }
+      await client.send({ id: "reply", sourceId: message.id, route: message.route, text: "answer",
+        state: "sending", remoteId: null, error: null });
+      answered.resolve();
+    },
+    answer: async () => {},
+  });
+  await f.messenger.emit(input("reaction-denied"));
+  await answered.promise;
+  expect(f.messenger.sends.map(output => output.text)).toEqual(["answer"]);
+  f.messenger.beforeActivity = undefined;
+  await client.setActivity?.(input("reaction-denied"), "idle");
+  expect(f.messenger.activities).toEqual([{ message: { route, messageId: "reaction-denied" }, activity: "idle" }]);
+});
 
 test("initial native approval readiness gates admission, while head detach preserves durable intake and dedup", async () => {
   const f = await fixture();

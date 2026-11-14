@@ -89,22 +89,23 @@ export class GatewayStore {
     this.db.query("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, value);
   }
 
-  admit(event: GatewayEvent): void {
+  admit(event: GatewayEvent): boolean {
     const key = event.kind === "message" ? `message:${event.input.id}`
       : event.kind === "answer" ? `answer:${event.approvalId}`
       : `reconnect:${crypto.randomUUID()}`;
-    this.db.transaction(() => {
+    return this.db.transaction(() => {
       // Repeated unresolved admissions must not grow a reconnect poison queue.
       if (event.kind === "reconnect" && this.db.query("SELECT 1 FROM gateway_events WHERE delivered_at IS NULL AND data = ?")
-        .get(JSON.stringify(event))) return;
+        .get(JSON.stringify(event))) return false;
       const existing = this.db.query("SELECT data FROM gateway_events WHERE identity = ?").get(key) as { data: string } | null;
       if (existing) {
         if (!isDeepStrictEqual(identity(JSON.parse(existing.data)), identity(event)))
           throw new Error("Gateway ingress identity conflict");
-        return;
+        return false;
       }
       this.db.query("INSERT INTO gateway_events(identity,data,received_at) VALUES (?,?,?)")
         .run(key, JSON.stringify(event), Date.now());
+      return true;
     }).immediate();
   }
 

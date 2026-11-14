@@ -125,7 +125,7 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
           channel: "general", text: "native-gateway:head-brief", mentions: [],
         });
         if (!called("lane_start")) return invoke("lane_start", {
-          sourceId: requestId, title: "Native Gateway independent topic", cwd: join(root, "topic"),
+          sourceId: requestId, title: "Native Gateway independent topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: join(root, "topic"),
           model: { provider, id: model }, modelReason: "Use the isolated deterministic available text model for actual Gateway native integration.",
           acceptance: ["Return findings to the head; never send directly to Messenger"],
         });

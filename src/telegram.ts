@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { Api, InputFile } from "grammy";
 import type { CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, UserFromGetMe } from "grammy/types";
-import { physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type Messenger, type OutputRecord, type Route, type StorePort } from "./contracts.ts";
+import { physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type Messenger, type OutputRecord, type Route, type StorePort } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
 import { DeliveryError } from "./delivery.ts";
 
@@ -295,6 +295,14 @@ export class TelegramMessenger implements Messenger {
     } catch (error) { throw telegramDeliveryError(error); }
   }
 
+  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+    try {
+      const messageId = this.messageId(message.messageId);
+      await this.destination(message.route);
+      await this.api.setMessageReaction(message.route.channelId, messageId, [{ type: "emoji", emoji: activity === "thinking" ? "\u{1F914}" : "\u{1F440}" }]);
+    } catch (error) { throw telegramDeliveryError(error); }
+  }
+
   private save(pending: Pending): void {
     const { messageId, attempted, active, question, answers, selected, customInput, lastUpdate, answerRequest } = pending;
     // Partial ask answers are needed only while the dialog remains live.
@@ -435,7 +443,7 @@ export class TelegramMessenger implements Messenger {
   }
 
   private messageId(id: string): number {
-    if (!integer(id) || Number(id) <= 0) throw new DeliveryError("Invalid Telegram card message ID", "rejected");
+    if (!integer(id) || Number(id) <= 0) throw new DeliveryError("Invalid Telegram message ID", "rejected");
     return Number(id);
   }
   private matchesControls(pending: Pending, message: Message): boolean {

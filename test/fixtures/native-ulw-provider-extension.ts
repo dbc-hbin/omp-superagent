@@ -90,7 +90,7 @@ export default function nativeUlwProvider(pi: ExtensionAPI): void {
     if (requestId === "303") {
       if (!called("board_post")) return invoke("board_post", { channel: "general", text: "ulw-execute quoted-board-only", mentions: ["head"] });
       if (!called("lane_start")) return invoke("lane_start", {
-        sourceId: requestId, title: "Actual native ULW lane proof", cwd: join(root, "topic"),
+        sourceId: requestId, title: "Actual native ULW lane proof", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: join(root, "topic"),
         model: { provider: "gateway-native", id: "local" }, modelReason: "Deterministic local native integration model, without paid requests.",
         workflow: { name: "ulw-plan", reason: "Head explicitly selects native planning for the original request." },
         acceptance: ["Return actual observed native activation to the head, without external delivery"],

@@ -23,6 +23,7 @@ const drain = async () => { const { promise, resolve } = Promise.withResolvers<v
 class SlackHTTP {
   calls: { method: string; args: Data; authorization: string | undefined; redirect: unknown }[] = [];
   remote = new Map<string, Data>();
+  reactions = new Map<string, Set<string>>();
   channels = new Map<string, Data>([
     ["CALLOWED", { id: "CALLOWED", is_channel: true, is_im: false, is_mpim: false, is_member: true, context_team_id: team }],
     ["DOWNER", { id: "DOWNER", is_im: true, is_mpim: false, user: owner, context_team_id: team }],
@@ -65,6 +66,14 @@ class SlackHTTP {
       const candidates = [...this.remote].filter(([key]) => key.startsWith(`${args.channel}:`)).map(([, value]) => value);
       const exact = args.oldest === args.latest && args.inclusive === "true";
       result = { messages: candidates.filter(value => exact ? value.ts === args.oldest : method === "conversations.replies" ? value.thread_ts === args.ts || value.ts === args.ts : !value.thread_ts || value.thread_ts === value.ts), has_more: false, response_metadata: { next_cursor: "" } };
+    } else if (method === "reactions.add" || method === "reactions.remove") {
+      const key = `${args.channel}:${args.timestamp}:${args.name}`;
+      const users = this.reactions.get(key) ?? new Set<string>();
+      if (method === "reactions.add") {
+        if (users.has(bot)) result = { ok: false, error: "already_reacted" };
+        else { users.add(bot); this.reactions.set(key, users); result = {}; }
+      } else if (!users.delete(bot)) result = { ok: false, error: "no_reaction" };
+      else result = {};
     } else if (method === "views.open") { const view = { ...args.view, id: `V${this.views.length + 1}` }; this.views.push(view); result = { view }; }
     else if (method === "files.info") result = { file: this.file };
     else if (method === "files.getUploadURLExternal") result = { file_id: "FOUTPUT", upload_url: "https://files.slack.com/upload/v1/signed-ticket" };
@@ -401,6 +410,93 @@ describe("Slack side effects, exact history, and threads", () => {
     http.behavior.set("conversations.history", () => ({ messages: [], has_more: true, response_metadata: { next_cursor: "repeated" } }));
     await expect(f.messenger.fetchAfter(route, "1000.000001")).rejects.toThrow("cursor did not advance");
     await f.messenger.stop();
+  });
+});
+
+describe("Slack message activity", () => {
+  test.each([
+    ["channel", route],
+    ["thread reply", { ...route, threadId: "1000.000001" }],
+    ["logical DM topic", { ...dm, topicId: "original-topic" }],
+  ] as const)("real SDK reactions preserve receipt and other users on the original %s", async (_name, target) => {
+    const f = await fixture();
+    const input = { route: target, messageId: "1000.000002" };
+    const eyes = `${target.channelId}:1000.000002:eyes`;
+    const thought = `${target.channelId}:1000.000002:thought_balloon`;
+    f.http.reactions.set(thought, new Set(["UOTHER"]));
+    try {
+      for (const activity of ["received", "received", "thinking", "thinking"] as const) await f.messenger.setActivity(input, activity);
+      expect(f.http.reactions.get(eyes)).toEqual(new Set([bot]));
+      expect(f.http.reactions.get(thought)).toEqual(new Set(["UOTHER", bot]));
+      await f.messenger.setActivity(input, "idle");
+      await f.messenger.setActivity(input, "idle");
+      expect([...f.http.reactions]).toEqual([[thought, new Set(["UOTHER"])], [eyes, new Set([bot])]]);
+      const calls = f.http.calls.filter(call => call.method.startsWith("reactions."));
+      expect(calls.map(call => [call.method, call.args.channel, call.args.timestamp, call.args.name])).toEqual([
+        ["reactions.add", target.channelId, "1000.000002", "eyes"],
+        ["reactions.add", target.channelId, "1000.000002", "eyes"],
+        ["reactions.add", target.channelId, "1000.000002", "thought_balloon"],
+        ["reactions.add", target.channelId, "1000.000002", "thought_balloon"],
+        ["reactions.remove", target.channelId, "1000.000002", "thought_balloon"],
+        ["reactions.remove", target.channelId, "1000.000002", "thought_balloon"],
+      ]);
+      expect(calls.every(call => call.authorization === "Bearer xoxb-test-private" && call.redirect === "error" && call.args.thread_ts === undefined)).toBe(true);
+    } finally { await f.messenger.stop(); }
+  });
+
+  test("foreign workspace, account, channel, and DM identities cannot mutate reactions", async () => {
+    const f = await fixture();
+    const foreign: Route[] = [
+      { ...route, platform: "discord" }, { ...route, accountId: "TOTHER:UBOT" }, { ...route, authorityId: "UOTHER" },
+      { ...route, guildId: "TOTHER" }, { ...route, channelId: "CDENIED" }, { ...route, channelId: "GMPIM" },
+      { ...dm, channelId: "DOTHER" }, { ...route, threadId: "invalid-thread" },
+    ];
+    try {
+      for (const target of foreign) for (const activity of ["received", "thinking", "idle"] as const) {
+        await expect(f.messenger.setActivity({ route: target, messageId: "1000.000002" }, activity)).rejects.toMatchObject({ certainty: "rejected" });
+      }
+      for (const messageId of ["", "1000", "1000.000002/other", "1000.2"]) {
+        await expect(f.messenger.setActivity({ route, messageId }, "received")).rejects.toMatchObject({ certainty: "rejected" });
+      }
+      f.http.channels.set("CALLOWED", { id: "CALLOWED", is_member: true, context_team_id: "TOTHER" });
+      await expect(f.messenger.setActivity({ route, messageId: "1000.000002" }, "thinking")).rejects.toMatchObject({ certainty: "rejected" });
+      expect(f.http.calls.filter(call => call.method.startsWith("reactions."))).toEqual([]);
+      expect(f.http.reactions.size).toBe(0);
+    } finally { await f.messenger.stop(); }
+  });
+
+  test.each([
+    { activity: "received", code: "no_reaction", certainty: "rejected" },
+    { activity: "idle", code: "already_reacted", certainty: "rejected" },
+    { activity: "thinking", code: "missing_scope", certainty: "rejected" },
+    { activity: "thinking", code: "internal_error", certainty: "uncertain" },
+  ] as const)("only operation-specific duplicate errors succeed ($activity, $code)", async ({ activity, code, certainty }) => {
+    const f = await fixture();
+    const method = activity === "idle" ? "reactions.remove" : "reactions.add";
+    f.http.behavior.set(method, () => ({ ok: false, error: code }));
+    try {
+      await expect(f.messenger.setActivity({ route, messageId: "1000.000002" }, activity)).rejects.toMatchObject({ certainty });
+      expect(f.http.calls.filter(call => call.method === method)).toHaveLength(1);
+      expect(f.http.reactions.size).toBe(0);
+    } finally { await f.messenger.stop(); }
+  });
+
+  test.each([
+    { behavior: () => { throw new Error("socket lost xoxb-test-private"); }, certainty: "uncertain", retryAfterMs: undefined },
+    { behavior: () => new Response("limited xoxb-test-private", { status: 429, headers: { "retry-after": "2" } }), certainty: "rejected", retryAfterMs: 2000 },
+  ])("reaction transport failures stay sanitized without retry ($certainty)", async ({ behavior, certainty, retryAfterMs }) => {
+    const f = await fixture();
+    f.http.behavior.set("reactions.add", behavior);
+    try {
+      const caught: unknown = await f.messenger.setActivity({ route, messageId: "1000.000002" }, "received").catch((error: unknown) => error);
+      expect(caught).toBeInstanceOf(DeliveryError);
+      if (!(caught instanceof DeliveryError)) throw new Error("Expected a sanitized delivery error");
+      expect(caught.certainty).toBe(certainty);
+      expect(caught.retryAfterMs).toBe(retryAfterMs);
+      expect(String(caught)).not.toContain("xoxb-test-private");
+      expect(caught.cause).toBeUndefined();
+      expect(f.http.calls.filter(call => call.method === "reactions.add")).toHaveLength(1);
+    } finally { await f.messenger.stop(); }
   });
 });
 

@@ -98,6 +98,7 @@ export interface LaneStart extends LaneModelChoice {
   sourceId: string;
   title: string;
   cwd: string;
+  kickoff: string;
   modelReason: string;
   brief?: string;
   acceptance?: string[];
@@ -150,6 +151,8 @@ export class Superagent {
   private readonly operations = new Map<string, Promise<Lane>>();
   private readonly modelChanges = new Map<string, Promise<unknown>>();
   private readonly tasks = new Set<Promise<unknown>>();
+  private readonly activeReactions = new Map<string, string>();
+  private readonly reactionQueues = new Map<string, Promise<void>>();
   private priorityTail: Promise<void> = Promise.resolve();
   private headCompaction?: { id: string; cancelled: boolean };
   private headStopping = 0;
@@ -717,9 +720,12 @@ export class Superagent {
       this.setInitialization({ ...this.initialization!, state: "uncertain",
         detail: "Native connection was lost during preset initialization; no replay. Inspect the native session, repair presets and restart the head to verify." });
     }
-    for (const { input } of live.admitted.values()) this.store.settle(input.id, "uncertain", input.id === live.input?.id ? {
-      id: `${input.id}:connection`, text: "OMP 연결이 끊겼습니다. 관련 후속 요청의 결과도 불확실하며 자동으로 다시 실행하지 않았습니다.",
-    } : undefined);
+    for (const { input } of live.admitted.values()) {
+      this.activity(input, false);
+      this.store.settle(input.id, "uncertain", input.id === live.input?.id ? {
+        id: `${input.id}:connection`, text: "OMP 연결이 끊겼습니다. 관련 후속 요청의 결과도 불확실하며 자동으로 다시 실행하지 않았습니다.",
+      } : undefined);
+    }
     if (live.id !== "main") this.store.updateLane(live.id, live.generation, { runtimeState: "interrupted" });
     // One connection-only reconciliation attempt, never a launch or prompt replay.
     this.background((async () => {
@@ -734,6 +740,34 @@ export class Superagent {
 
   private authorized(route: Route): void {
     if (!authorizeRoute(this.config, route)) throw new Error("Unauthorized messenger route");
+  }
+
+  private activity(input: InputRecord, active: boolean): void {
+    if (!this.messenger.setActivity || active && this.stopped) return;
+    let source: InputRecord | null = input;
+    // Follow stored links only. Never infer a remote target from report prose.
+    while (source && this.store.getMeta(`user-source:${source.id}`) !== "true") {
+      const sourceId: string | null = this.store.getMeta(`handoff-source:${source.id}`) ?? this.store.getMeta(`activity-source:${source.id}`);
+      source = sourceId ? this.store.input(sourceId) : null;
+    }
+    if (!source) return;
+    const message = { route: source.route, messageId: source.messageId };
+    const key = JSON.stringify([physicalRouteKey(source.route), source.messageId]);
+    const previouslyThinking = [...this.activeReactions.values()].includes(key);
+    if (active) this.activeReactions.set(input.id, key);
+    else this.activeReactions.delete(input.id);
+    const thinking = [...this.activeReactions.values()].includes(key);
+    if (previouslyThinking === thinking) return;
+    const apply = async () => {
+      try { await this.messenger.setActivity?.(message, thinking ? "thinking" : "idle"); }
+      catch { this.report(new Error("Message activity reaction failed")); }
+    };
+    const previous = this.reactionQueues.get(key);
+    const operation = previous ? previous.then(apply) : apply();
+    this.reactionQueues.set(key, operation);
+    this.background(operation.finally(() => {
+      if (this.reactionQueues.get(key) === operation) this.reactionQueues.delete(key);
+    }));
   }
 
   async receive(input: Inbound): Promise<void> {
@@ -986,6 +1020,7 @@ export class Superagent {
     if (typeof input.modelReason !== "string" || !input.modelReason.trim()) {
       throw new Error("lane_start requires a nonempty modelReason");
     }
+    if (typeof input.kickoff !== "string" || !input.kickoff.trim()) throw new Error("lane_start requires a concise user-language kickoff");
     // Preset objects belong to the caller. Snapshot the resolved identity before
     // the first asynchronous catalog read so later preset edits cannot retarget it.
     const selectedWorkflow = workflowChoice(input.workflow);
@@ -1008,6 +1043,7 @@ export class Superagent {
       if (!isDeepStrictEqual(handoff.workflow, headWorkflow(original.id, this.requestText(original), selected.workflow))) {
         throw new Error("Concurrent workflow selection conflicts with the source's existing handoff");
       }
+      if (this.store.output(`${input.sourceId}:kickoff`)?.text !== input.kickoff) throw new Error("Concurrent kickoff identity conflict");
       return lane;
     }
     const operation = this.createLane(selected);
@@ -1108,6 +1144,9 @@ export class Superagent {
     const paths = hostPaths(this.config, id);
     const now = Date.now();
     if (this.store.input(original.id)?.state === "cancelled") throw new Error("A cancelled main request cannot create new delegated work");
+    const kickoffId = `${original.id}:kickoff`;
+    // Persist the execution fence before admitting/binding work, including crash recovery.
+    this.store.setMeta(`kickoff-output:${source.id}`, kickoffId);
     // No await between durable handoff admission and lane binding: an unrelated
     // pump cannot consume the synthetic handoff as user intake during git I/O.
     if (handoff) this.store.receive(handoff, null, handoffMetadata, workflow);
@@ -1141,10 +1180,11 @@ export class Superagent {
         id: `${original.id}:topic-bound`, sourceId: original.id, route: original.route,
         text: `독립 작업 주제를 연결했습니다. 목적지: ${routeKey(lane.route)}\n레인: ${lane.id}\n독립 세션 기록: ${lane.sessionFile}\n호스트 실행은 예산과 대기 상태에 따라 시작됩니다. 연결만으로 실행 또는 완료를 주장하지 않습니다.`,
       });
-      this.store.queueOutput({
-        id: `${original.id}:topic-bound-destination`, sourceId: source.id, route: lane.route,
-        text: `이 주제는 독립 작업 레인 ${lane.id}에 연결되었습니다.\n독립 세션 기록: ${lane.sessionFile}\n메시지는 메인 헤드가 먼저 판단하며, 호스트 실행은 예산과 대기 상태에 따라 시작됩니다. 연결은 실행 또는 완료의 증거가 아닙니다.`,
-      });
+    }
+    this.store.queueOutput({ id: kickoffId, sourceId: source.id, route: lane.route, text: input.kickoff });
+    await this.flushOutputs();
+    if (this.store.output(kickoffId)?.state !== "sent") {
+      throw new Error("Kickoff delivery is not confirmed; lane execution is held without retrying the message");
     }
     void this.kick().catch(this.report);
     return lane;
@@ -1183,7 +1223,10 @@ export class Superagent {
     const live = this.live.get(id);
     const failures: unknown[] = [];
     if (live) {
-      for (const { input } of live.admitted.values()) this.store.settle(input.id, "cancelled");
+      for (const { input } of live.admitted.values()) {
+        this.activity(input, false);
+        this.store.settle(input.id, "cancelled");
+      }
       live.admitted.clear();
       live.input = undefined;
       live.result = undefined;
@@ -1568,7 +1611,10 @@ export class Superagent {
     for (const id of cancelledInputIds) this.store.settle(id, "cancelled");
     const head = this.live.get("main");
     if (head) for (const [requestId, admitted] of head.admitted) {
-      if (cancelledInputIds.includes(admitted.input.id)) head.admitted.delete(requestId);
+      if (cancelledInputIds.includes(admitted.input.id)) {
+        this.activity(admitted.input, false);
+        head.admitted.delete(requestId);
+      }
     }
     if (head?.input && cancelledInputIds.includes(head.input.id)) {
       head.input = undefined;
@@ -1818,6 +1864,13 @@ export class Superagent {
     await this.pumping;
   }
 
+  private kickoffHeld(target: string): boolean {
+    return this.store.inputs(target).some(input => {
+      const id = this.store.getMeta(`kickoff-output:${input.id}`);
+      return id !== null && this.store.output(id)?.state !== "sent";
+    });
+  }
+
   private async pump(): Promise<void> {
     try {
       do {
@@ -1857,6 +1910,7 @@ export class Superagent {
           if (input.target === "main" && (this.initializationHoldsHead() || this.headStopping > 0 || this.headCompaction)) continue;
           if (this.modelChanges.has(input.target)) continue;
           if (this.blocked.has(input.target)) continue;
+          if (this.kickoffHeld(input.target)) continue;
           // A settled Host does not resolve an earlier ambiguous submission.
           // Keep later requests behind the same target's durable uncertainty;
           // pause/resume cannot implicitly clear that original receipt.
@@ -2048,11 +2102,13 @@ export class Superagent {
       live.busy = !actual.isSettled;
       return;
     }
+    if (this.kickoffHeld(live.id)) return;
     const requestId = `sg-${key(input.id)}-${live.generation}`;
     this.store.setMeta(`steering-owner:${input.id}`, steering ? owner!.id : input.id);
     if (!this.store.submit(input.id, requestId, live.generation)) return;
     const submitted = { ...input, requestId, generation: live.generation, state: "submitted" as const };
     live.admitted.set(requestId, { input: submitted });
+    if (steering && live.running) this.activity(submitted, true);
     if (!steering) {
       live.input = submitted;
       live.result = undefined;
@@ -2099,6 +2155,7 @@ export class Superagent {
     } catch {
       const admitted = live.admitted.get(requestId);
       if (admitted && !admitted.result) {
+        this.activity(submitted, false);
         this.store.settle(input.id, "uncertain", { id: `${input.id}:admission`, text: "요청 접수 결과가 불확실합니다. 중복 실행을 막기 위해 자동 재시도하지 않습니다." });
         try { live.busy = !(await this.state(live)).isSettled; }
         catch { this.blocked.add(live.id); }
@@ -2133,6 +2190,7 @@ export class Superagent {
     if (frame.type === "agent_start") {
       live.busy = true;
       if (live.input) { live.ownedRuns++; live.running = true; }
+      for (const { input } of live.admitted.values()) this.activity(input, true);
     }
     if (frame.type === "agent_end") live.running = false;
     if (frame.type === "message_end" && live.input) {
@@ -2202,6 +2260,7 @@ export class Superagent {
         ? "실행이 중단되었습니다. 작업 완료로 처리하지 않았습니다."
         : "실행이 실패했습니다. 작업 완료로 처리하지 않았습니다.";
       for (const admitted of admissions) {
+        this.activity(admitted.input, false);
         if (admitted.input.id === input.id) continue;
         const status = admitted.result!.status;
         this.store.settle(admitted.input.id, status === "completed" ? "done" : status === "aborted" ? "cancelled" : "uncertain");
@@ -2271,6 +2330,7 @@ export class Superagent {
       id, target: live.id, generation: live.generation, requestId: frame.id,
       route, request: frame, state: "pending", remoteId: null,
     };
+    for (const { input } of live.admitted.values()) this.activity(input, false);
     this.cards.add(id);
     this.store.putApproval(approval);
     try {
@@ -2330,6 +2390,9 @@ export class Superagent {
       if (!Array.isArray(acknowledged.pendingUiRequests) || acknowledged.pendingUiRequests.some(frame => frame.id === approval.requestId)) {
         throw new Error("Native dialog response was not acknowledged; it will not be replayed");
       }
+      if (!acknowledged.pendingUiRequests.length) {
+        for (const { input } of live.admitted.values()) this.activity(input, true);
+      }
       await this.messenger.dismissApproval(this.store.approval(id)!);
     } catch (error) {
       if (attempted) throw new DeliveryError("Native approval outcome unresolved", "uncertain", undefined, { cause: error });
@@ -2340,23 +2403,28 @@ export class Superagent {
   private async flushOutputs(): Promise<void> {
     if (this.outbound) return this.outbound;
     if (this.stopped) return;
-    this.outbound = (async () => {
-      for (const output of this.store.outputs()) {
-        if (this.stopped || !this.store.claimOutput(output.id)) continue;
-        let remoteId: string;
-        try { remoteId = await this.messenger.send(output); }
-        catch (error) {
-          const rejected = error instanceof DeliveryError && error.certainty === "rejected";
-          this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
-          this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
-          continue;
+    this.outbound = Promise.resolve().then(async () => {
+      try {
+        while (!this.stopped) {
+          const outputs = this.store.outputs();
+          if (!outputs.length) break;
+          for (const output of outputs) {
+            if (this.stopped || !this.store.claimOutput(output.id)) continue;
+            let remoteId: string;
+            try { remoteId = await this.messenger.send(output); }
+            catch (error) {
+              const rejected = error instanceof DeliveryError && error.certainty === "rejected";
+              this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
+              this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
+              continue;
+            }
+            // Persist a successful remote send without reinterpreting a local failure.
+            this.store.finishOutput(output.id, "sent", remoteId);
+          }
         }
-        // If persistence fails after a successful send, leave sending for recovery;
-        // never reinterpret a local storage failure as a failed remote send.
-        this.store.finishOutput(output.id, "sent", remoteId);
-      }
-    })();
-    try { await this.outbound; } finally { this.outbound = undefined; }
+      } finally { this.outbound = undefined; }
+    });
+    await this.outbound;
   }
 
   async stop(): Promise<void> {
@@ -2370,6 +2438,9 @@ export class Superagent {
     this.ready = false;
     this.intakeReady.reject(new Error("Controller stopped before intake readiness"));
     if (this.timer) clearInterval(this.timer);
+    for (const live of this.live.values()) {
+      for (const { input } of live.admitted.values()) this.activity(input, false);
+    }
     await Promise.allSettled([this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values()]);
     await this.messenger.stop();
     await Promise.allSettled([...this.live.values()].map(async live => { live.unsubscribe(); await live.connection.close(); }));

@@ -420,7 +420,7 @@ Git 추적 파일에 쓰지 않는다. 아래 셋업은 별도 소유자 전용 
    Bot 설정의 **Privileged Gateway Intents → Message Content Intent**를 켠다.
    서버 메시지 본문을 수신하려면 코드의 intent 요청과 포털 설정이 모두 필요하다.
 2. 운영할 서버에 bot을 초대한다. 필요한 채널에 View Channel, Read Message History,
-   Send Messages, Send Messages in Threads, Create Public Threads, Attach Files 권한을 부여한다.
+   Send Messages, Send Messages in Threads, Create Public Threads, Attach Files, Add Reactions 권한을 부여한다.
    비공개 스레드 등은 봇이 실제로 접근할 수 있어야 한다. 관리자 권한은 요구하지 않는다.
 3. Discord 개발자 모드로 소유자 **사용자 ID**, 서버 ID, 허용할 **부모 채널 ID**를 복사한다.
    이름·멘션 문자열이 아니라 숫자로 된 ID 문자열을 설정한다.
@@ -490,6 +490,7 @@ export TELEGRAM_BOT_TOKEN
    | 용도 | Bot scope |
    | --- | --- |
    | 메시지 발송, 소유자 확인 | `chat:write`, `users:read` |
+   | 수신 확인·처리 중 반응 | `reactions:write` |
    | 공개/비공개 채널·1:1 DM 확인 | `channels:read`, `groups:read`, `im:read` |
    | 알려진 대화·스레드 복구와 승인 카드 확인 | `channels:history`, `groups:history`, `im:history` |
    | 첨부 확인·다운로드, 긴 출력 업로드 | `files:read`, `files:write` |
@@ -517,6 +518,40 @@ export SLACK_BOT_TOKEN SLACK_APP_TOKEN
 스레드 조회는 현재 공식 [conversations.replies](https://docs.slack.dev/reference/methods/conversations.replies/)
 문서의 bot history scopes를 따른다. bot token이면 채널 스레드를 무조건 조회할 수 없다는
 과거 제한을 전제로 하지 않는다. 실제 접근 권한·workspace 보존 정책·API rate limit은 여전히 적용된다.
+
+### 메시지 수신·처리 중 반응
+
+작업 지시는 헤드가 범위·작업 디렉터리를 최소 확인한 뒤 별도 스레드·topic을 열고
+**무엇을 어떻게 진행할지 짧은 착수 보고를 먼저** 보낸다. `lane_start`의 필수 `kickoff`는
+사용자 언어의 외부 보고이며, 영어 내부 `brief`와 별개다. 발송 영수증이 확인되기 전에는
+레인 실행을 시작하지 않는다. 보고 발송 실패·불확실성은 실행 보류이며 자동 재발송하지 않는다.
+질문·계산·연결 테스트는 기존 대화에서 바로 답하고, 같은 작업의 후속 지시는 기존 주제를 쓴다.
+native topic을 지원하지 않는 private chat은 기존의 논리 주제 제한을 유지한다.
+
+Gateway가 허용된 원본 메시지를 영속 접수한 뒤 수신 확인 반응을 남긴다. 헤드가 없어도
+접수 표시는 가능하며, 반응 API 응답을 기다리느라 플랫폼 ACK·offset이나 모델 실행·답변을
+지연하지 않는다. 같은 입력의 재전달에는 수신 반응을 다시 시도하지 않는다.
+
+| 플랫폼 | 접수 | native 처리 중 | 처리 종료·중단·승인 대기 |
+| --- | --- | --- | --- |
+| Discord | 👀 | 👀 유지 + 💭 | 봇 자신의 💭만 제거 |
+| Slack | `eyes` | `eyes` 유지 + `thought_balloon` | 봇 자신의 `thought_balloon`만 제거 |
+| Telegram | 👀 | 🤔로 교체 | 👀로 복귀 |
+
+Telegram은 [허용 반응 목록](https://core.telegram.org/bots/api/types/reactiontypeemoji.md)에
+💭가 없고 [봇은 메시지당 반응 하나만 설정](https://core.telegram.org/bots/api/methods/setmessagereaction.md)할
+수 있어 🤔를 사용한다. 채팅의 반응 제한이나 service message 등으로 거부될 수 있다.
+Discord는 [자신의 반응 API](https://docs.discord.com/developers/resources/message#create-reaction)를,
+Slack은 [`reactions.add`](https://docs.slack.dev/reference/methods/reactions.add)와
+[`reactions.remove`](https://docs.slack.dev/reference/methods/reactions.remove)를 사용한다.
+기존 Slack 앱은 `reactions:write` 추가 후 workspace 재설치가 필요하다.
+
+반응은 원래 계정·대화·메시지에만 적용한다. 레인용 새 스레드나 내부 report에 가짜 메시지
+반응을 만들지 않는다. 동일 메시지 수정본·헤드·레인이 겹쳐 처리되면 마지막 실행이 끝날 때
+처리 중 표시를 해제하며, native 승인 응답 뒤에는 다시 표시한다.
+권한·rate limit·네트워크 오류는 비밀 값 없는 진단으로만 남기고 메시지 접수·답변을 실패로
+바꾸거나 자동 재시도하지 않는다. 이 표시는 작업 성공·완료 검증이나 플랫폼 read receipt가
+아니다. 강제 종료·API 실패 시 원격 반응 정리는 보장하지 않는다.
 
 ## 3. 설정
 

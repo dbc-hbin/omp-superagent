@@ -2,7 +2,7 @@ import { once } from "node:events";
 import { chmod, lstat, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import type { Approval, Attachment, Messenger, OutputRecord, Route } from "./contracts";
+import type { Approval, Attachment, Inbound, Messenger, OutputRecord, Route } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { MAX_GATEWAY_ATTACHMENT, readGatewayJson, type GatewayResult } from "./gateway-protocol";
 import { GatewayStore } from "./gateway-store";
@@ -75,6 +75,18 @@ export class GatewayServer {
   get connected(): boolean { return !!this.client?.events && !this.client.events.destroyed; }
   get headReady(): boolean { return this.connected && !!this.client?.ready && !this.client.reconciliation && this.options.store.unresolved() === 0; }
   get ready(): boolean { return this.admissionReady; }
+
+  admitMessage(input: Inbound): void {
+    const fresh = this.options.store.admit({ kind: "message", input });
+    if (fresh && this.options.messenger.setActivity) {
+      const message = { route: input.route, messageId: input.messageId };
+      const operation = Promise.resolve().then(() => this.options.messenger.setActivity?.(message, "received"));
+      this.effects.add(operation);
+      void operation.catch(() => this.options.onError(new Error("Message receipt reaction failed")))
+        .finally(() => this.effects.delete(operation));
+    }
+    this.deliver();
+  }
 
   private openAdmission(): void {
     if (this.admissionReady) return;
@@ -218,7 +230,7 @@ export class GatewayServer {
     const { id, operation, args } = data;
     if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id) || typeof operation !== "string" || !Array.isArray(args))
       throw new DeliveryError("Invalid Gateway effect", "rejected");
-    const operations: Record<string, number[]> = { send: [1], showApproval: [1], dismissApproval: [1], canCreateThread: [1], createThread: [2, 3], fetchAfter: [2] };
+    const operations: Record<string, number[]> = { send: [1], setActivity: [2], showApproval: [1], dismissApproval: [1], canCreateThread: [1], createThread: [2, 3], fetchAfter: [2] };
     if (!Object.hasOwn(operations, operation) || !operations[operation]!.includes(args.length))
       throw new DeliveryError("Unknown Gateway effect", "rejected");
     const previous = this.options.store.beginEffect(id, operation, args);
@@ -226,7 +238,10 @@ export class GatewayServer {
     let result: GatewayResult;
     try {
       const messenger = this.options.messenger;
+      if (operation === "setActivity" && args[1] !== "received" && args[1] !== "thinking" && args[1] !== "idle")
+        throw new DeliveryError("Invalid message activity", "rejected");
       const value = operation === "send" ? await messenger.send(args[0] as OutputRecord)
+        : operation === "setActivity" ? await messenger.setActivity?.(args[0] as Pick<Inbound, "route" | "messageId">, args[1] as "received" | "thinking" | "idle")
         : operation === "showApproval" ? await messenger.showApproval(args[0] as Approval)
         : operation === "dismissApproval" ? await messenger.dismissApproval(args[0] as Approval)
         : operation === "canCreateThread" ? await messenger.canCreateThread?.(args[0] as Route) ?? false

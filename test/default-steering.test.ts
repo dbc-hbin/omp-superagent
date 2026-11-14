@@ -133,7 +133,7 @@ function fixture(maxHosts = 1) {
     },
   });
   fixtures.push({ runtime, store, directory });
-  const select = (sourceId: string, destination?: Route) => ({ sourceId, title: "Independent task", cwd: directory,
+  const select = (sourceId: string, destination?: Route) => ({ sourceId, title: "Independent task", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory,
     model, modelReason: "Use the verified available model.", ...(destination ? { destination } : {}) });
   return { runtime, store, messenger, main, hosts, directory, config, errors, select };
 }
@@ -276,7 +276,7 @@ describe("ordinary tracked steering", () => {
     expect(store.input(`handoff:601:${lane.id}`)?.state).toBe("done");
     expect(store.input("report:handoff:600:lane")?.text).toContain("Lane consolidated result");
     expect(store.input(`report:handoff:601:${lane.id}`)).toBeNull();
-    expect(messenger.sent).toHaveLength(0);
+    expect(messenger.sent).toEqual([expect.objectContaining({ id: "600:kickoff", sourceId: "handoff:600:lane", route: lane.route })]);
     expect(main.prompts).toHaveLength(2);
   });
 });
