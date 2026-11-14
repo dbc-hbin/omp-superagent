@@ -219,9 +219,12 @@ OS sandbox/capability framework가 아니며 별도 executor·추가 AI supervis
 
 ### 새 레인의 모델 선택
 
-최초 배포 후 **첫 실제 헤드 턴**에서 `lane_models({})`로 사용자 OMP의 native 프리셋 상태,
-안전한 기존 역할·thinking 설정, 초기화 필요 여부와 가용 모델을 조사한다. 이를 위해 유휴 LLM을
-깨우거나 폴링하지 않는다. OMP의 실제 프리셋은 `modelPresets.<name>` 아래의
+명시적 **`start` 시 기존 메인 헤드**가 native 연결·승인 복구 뒤 프리셋을 조사한다. 모두
+유효하고 가용하면 모델 호출·쓰기 없이 재사용한다. 최초 초기화가 필요하면 같은 헤드에
+전용 설정 턴 하나를 제출하며, 첫 사용자 메시지나 모델의 자발적인 도구 호출에 맡기지 않는다.
+이 턴에서 `lane_models({})`로 native 프리셋·기존 역할/thinking·가용 후보를 조사한다.
+터미널 `setup`과 `doctor`는 계속 모델·봇을 실행하지 않는다. 별도 셋업 에이전트나
+유휴 모델 폴링은 없다. OMP의 실제 프리셋은 `modelPresets.<name>` 아래의
 `{modelRoles: {...}, defaultThinkingLevel?}`이며 기존 **`/modelpreset list/save/switch/delete`**
 UI에서 보인다. high/middle/low는 이 메커니즘의 프리셋 이름이지 custom `@high` 역할이 아니다.
 
@@ -232,6 +235,16 @@ UI에서 보인다. high/middle/low는 이 메커니즘의 프리셋 이름이�
 무관한 설정을 보존하며 invalid/tombstoned/shadowed 충돌을 덮어쓰지 않는다. 실제 운영자 결정이
 필요한 충돌만 질문한다. 성공은 native 상태 재조회로 확인한다. 이 최초 생성만 영속 프리셋 쓰기의
 예외이며 레인 생성·재개·변경 때 반복하지 않는다. 이름은 실측 성능·비용 등급 보장이 아니다.
+
+`head.initialization`은 `checking/running/complete/blocked/failed/uncertain`을 구분한다.
+전용 턴이 성공적으로 실제 실행되고 세 프리셋을 다시 읽어 확인해야 `complete`이며, 답변만
+하거나 일부 생성으로 끝내면 완료가 아니다. `head.ready`도 초기화 완료를 요구한다.
+초기 승인 복구 후의 영속 수신·읽기 전용 제어·중지는 유지하지만 일반 작업은 초기화 뒤에
+실행한다. 초기 설정 출력은 메신저 답변으로 보내지 않는다.
+시도 기록을 제출 전에 저장하며 실패·연결 유실·재시작을 이유로 초기화 턴을 자동 반복하지 않는다.
+`blocked/failed/uncertain`이면 `status`의 세부 사유를 확인하고 기존 OMP의 `/modelpreset`
+기능으로 충돌·누락을 복구한 뒤 헤드를 재시작해 재조회한다. 완료 뒤 삭제한 프리셋도 자동으로
+다시 만들지 않는다. 단순 재시작은 불확실한 작업의 재실행 허가가 아니다.
 
 레인에는 프리셋 전체 역할·thinking을 `Lane.modelPresetSnapshot`, 해석된 정확한 기본 모델을
 `Lane.model`, 프리셋 이름(직접 모델 선택은 null)을 `modelPreset`에 저장한다. 나중에 native
@@ -397,7 +410,8 @@ mode 활성화·goal 생성·실제 모델 응답의 검증과 별개다.
 
 ## 2. 플랫폼별 앱과 접근 범위
 
-사용할 플랫폼만 준비한다. 토큰은 **환경변수로만** 전달하며 JSON, argv, 저장소에 쓰지 않는다.
+사용할 플랫폼만 준비한다. 토큰은 어댑터에 **환경변수로만** 전달하며 일반 설정 JSON, argv,
+Git 추적 파일에 쓰지 않는다. 아래 셋업은 별도 소유자 전용 환경 파일에 저장할 수 있다.
 `tokenEnv`·`botTokenEnv`·`appTokenEnv`에는 토큰 자체가 아니라 환경변수 이름을 넣는다.
 
 ### 2.1 Discord
@@ -438,9 +452,10 @@ export DISCORD_BOT_TOKEN
    전달된다고 가정하지 않는다. 설정 변경 후 그룹 재추가가 필요한지는 Telegram 안내를 따른다.
 4. native forum topic은 forum을 켠 supergroup에서 사용한다. 새 topic 생성에는 봇의 관리자
    **`can_manage_topics`** 권한이 필요하고 메시지·문서 전송도 허용되어야 한다.
-   실제 `message_thread_id`로 레인을 분리한다. private chat은 기본적으로 `/new`·`/main`의
-   논리 주제를 사용하며, Telegram이 `getMe.has_topics_enabled`를 제공하는 봇은 실제 private
-   topic도 지원한다. 일반 그룹에 가짜 forum/thread ID를 만들지 않는다.
+   실제 `message_thread_id`로 레인을 분리한다. `getMe.has_topics_enabled`인 봇은 private
+   chat에서도 헤드의 새 주제 인계 시 실제 topic을 우선 생성한다. 미지원 private chat은
+   `/new`·`/main`의 논리 주제를 사용한다. 일반 그룹에 가짜 forum/thread ID를 만들거나
+   topic 모드를 임의로 활성화하지 않는다.
 5. 시작 시 grammY `getMe`로 봇을 확인하고 `getWebhookInfo`를 확인한 뒤 `getUpdates` long polling을
    사용한다. public endpoint는 필요 없다. **기존 webhook이 있으면 시작을 거부하며 자동 삭제하지
    않는다.** 기존 webhook/polling 소비자와 함께 실행하지 말고 운영자가 명시적으로 전환한다.
@@ -505,12 +520,87 @@ export SLACK_BOT_TOKEN SLACK_APP_TOKEN
 
 ## 3. 설정
 
-`config.example.json`을 `config.local.json`으로 복사하고 **모든 경로와 REPLACE 값**을 바꾼다.
+### 터미널 셋업
+
+준비된 저장소에서 다음 래퍼를 실행한다. Hermes의 `/dev/tty` 셋업 진입과 비밀 입력·별도
+환경 파일 패턴을 참고한 독립 구현이며, Hermes 설치기나 Gateway 서비스 설치는 실행하지 않는다.
+
+```sh
+bash scripts/setup.sh
+# 다른 경로:
+bash scripts/setup.sh --config /absolute/path/to/config.json
+# 같은 동작의 직접 CLI:
+bun --no-env-file src/cli.ts setup --config config.local.json
+# package script를 사용할 때도 바깥 Bun의 자동 로딩을 끈다:
+bun --no-env-file run setup
+```
+
+`bash scripts/setup.sh --help`는 controlling terminal 없이도 도움말만 출력한다.
+실제 설정·토큰 입력은 여전히 terminal이 없으면 저장 없이 거부한다.
+
+래퍼의 기본 경로는 저장소의 `config.local.json`이다. 새 설정은 사용할 플랫폼을 선택하고
+소유자 ID, Slack workspace ID, 선택적 허용 그룹/채널, 실제 headCwd/stateDir와 실행 예산을
+입력받는다. 빈 그룹/채널 allowlist는 전체 허용이 아니라 기존 정책대로 그룹 접근 차단이다.
+패치된 OMP 경로는 pin metadata에서, 예산 제안값은 기존 `config.example.json`에서 가져온다.
+모델 제공자·프리셋·계정을 새로 설정하지 않는다.
+
+토큰은 controlling terminal에서 숨김 입력하고 마지막 저장 확인 전에는 확정하지 않는다.
+Ctrl-C/EOF로 취소할 수 있으며 터미널이 없으면 비밀을 echo하는 입력 방식으로 우회하지 않는다.
+기존 유효한 JSON은 다시 쓰지 않는다. 구성된 credential 이름만 묻고 Enter로 기존 값을
+유지할 수 있으며 기존 자격 증명 변경에는 별도 확인이 필요하다.
+
+파일은 `<config 경로>.env`에 mode `0600`으로 저장한다. 예를 들어 `config.local.json.env`다.
+이는 암호화 저장소가 아니라 현재 OS 사용자의 평문 비밀 파일이므로 Git·공유 폴더·지원 로그에
+올리지 않는다. 기본 `.env`와 달리 Bun의 작업 디렉터리 자동 로딩 대상으로 만들지 않는다.
+`start`/`doctor`만 표준 dotenv parser로 읽고 구성된 credential 이름만 환경에 전달한다.
+셸 `source`/`eval`은 하지 않는다. 기존 셸의 비어 있지 않은 값이 파일보다 우선하므로 저장한
+새 토큰을 사용하려면 해당 셸 변수의 이전 값을 제거해야 한다. 심볼릭 링크·다른 소유자·공개
+권한의 비밀 파일은 거부한다. 값은 진단 출력이나 오류 메시지에 표시하지 않는다.
+래퍼·아래 직접 CLI 명령·새로 생성한 native Bun command는 `--no-env-file`로 작업 디렉터리의
+무관한 `.env` 자동 로딩도 끈다. 수동으로 이 옵션 없이 Bun을 실행하거나 기존 설정의 Bun
+command를 유지하면 애플리케이션 진입 전에 Bun이 환경 파일을 읽을 수 있으며, 나중의
+credential loader가 이를 원래 셸 환경과 구별해 되돌릴 수는 없다.
+바깥 명령을 `bun run setup`처럼 옵션 없이 실행하면 wrapper가 시작하기 전에 이미 자동
+로딩된 값이 상속될 수 있으므로 위 표기를 사용한다.
+OMP 라이브러리 자체의 프로젝트 dotenv 해석은 Bun의 자동 로딩 옵션과 별개다.
+셋업·진단은 해당 runtime 모듈을 import하지 않으며, `start`는 명시적 환경/선택한 비밀 파일의
+필수 자격 증명 검사를 통과한 뒤에만 Gateway 모듈을 로드한다. OMP 모델 제공자의 기존 환경
+해석 정책을 바꾸거나 같은 OS 사용자로부터 비밀 파일을 격리하는 보안 경계는 아니다.
+
+자격 증명 갱신은 `<config 경로>.env.lock`으로 직렬화하고 잠금 안에서 읽었던 원본이
+그대로인지 다시 확인한다. 다른 셋업의 잠금을 빼앗거나 변경된 내용을 덮어쓰지 않는다.
+강제 종료로 PID가 기록된 lock이 남으면 해당 셋업이 더는 실행 중이 아님을 확인한 뒤에만
+명시적으로 정리한다. 초기 파일 공개 도중 남은 owner-only staging hard link는 기존 비밀
+파일을 읽지 못하게 만들지 않으며, 읽기 과정에서 임의로 삭제하지 않는다.
+
+셋업은 봇 로그인·연결·메시지 전송·Gateway 시작/재시작·서비스 등록·셸 설정 변경을 하지 않는다.
+저장 뒤 별도로 `doctor`, 이후 원하는 시점에 `start`를 실행한다. 실제 토큰 유효성·플랫폼
+권한은 로컬 준비만으로 검증된 것이 아니다. 기존 환경변수 전용 실행도 계속 지원한다.
+
+처음 새 구성을 만들 때는 **Mnemopi 장기 기억 사용을 권장**하고 동의를 묻는다. 명시적인
+`y`/`yes`를 선택하고 최종 저장까지 승인하면 native OMP의 **전역 `memory.backend: mnemopi`**
+만 저장·재조회한다. Enter·`no`·취소는 메모리 설정을 변경하지 않으며, 기존 구성의 토큰 갱신에는
+이 질문이 없다. 메모리 DB·스코프·embedding·LLM·자동 저장 옵션과 기존 기억은 그대로 보존한다.
+기억은 대화가 끝난 뒤에도 남는다. SQLite 저장이라고 해서 모든 처리가 로컬이거나 무료라는
+뜻은 아니며 기존 native 옵션에 따라 모델 처리·모델 다운로드가 발생할 수 있다.
+이 선택은 다른 OMP 세션에도 적용될 수 있는 전역 설정이다. 명시적인 전역 값은 RPC의
+기본 memory-off보다 우선하지만 프로젝트·overlay가 덮으면 그 실효 상태를 따로 알린다.
+셋업 자체는 메모리 backend를 초기화하거나 모델·서비스를 실행하지 않는다.
+메모리 저장·확인에 실패하면 이미 저장된 로컬 설정/자격 증명과 실패한 메모리 설정을 구분해
+보고한다. 메모리가 활성화되었다고 가장하거나 기존 로컬 저장을 자동 롤백하지 않는다.
+쓰기에는 pinned core의 `Settings.loadConfigOnly()`를 사용하여 기존 계정 DB를 열거나
+인증 데이터를 마이그레이션하지 않는다. 현대 native config가 없고 legacy 설정/계정 DB만
+남아 있으면 기존 환경을 가릴 수 있는 새 파일을 만들지 않고 실패를 알린다. 이 경우 먼저
+일반 OMP의 `config set memory.backend mnemopi`로 native 이전·설정을 처리한다.
+
+### 수동 설정과 필드
+
+수동으로는 `config.example.json`을 `config.local.json`으로 복사하고 **모든 경로와 REPLACE 값**을 바꾼다.
 예시에는 플랫폼별 블록이 하나씩 있다. **사용하지 않을 블록은 삭제**하고 최소 하나를 남긴다.
 남긴 모든 블록의 ID 자리표시자는 의도적으로 유효한 플랫폼 ID가 아니므로 치환 전에는 시작할 수
 없다. Discord만 있던 기존 설정도 그대로 유효하다. 토큰 자체를 넣는 필드는 없다.
-high/middle/low는 최초 배포 후 첫 실제 헤드 턴에서 기존 OMP 설정을 조사해 native 메커니즘으로
-누락 항목만 초기화한다. 이 설정 파일에 별도의 프리셋 블록을 추가하지 않는다.
+high/middle/low는 명시적 `start`의 전용 초기 설정 턴에서 기존 헤드가 native 메커니즘으로
+누락 항목만 초기화하고 완료를 재조회한다. 이 설정 파일에 별도의 프리셋 블록을 추가하지 않는다.
 
 | 필드 | 의미 |
 | --- | --- |
@@ -540,8 +630,8 @@ high/middle/low는 최초 배포 후 첫 실제 헤드 턴에서 기존 OMP 설�
 모든 관리 명령에 `--config FILE`이 필요하다. 먼저 봇을 시작하지 않는 진단을 실행한다.
 
 ```sh
-bun src/cli.ts doctor --config config.local.json
-bun src/cli.ts status --config config.local.json
+bun --no-env-file src/cli.ts doctor --config config.local.json
+bun --no-env-file src/cli.ts status --config config.local.json
 ```
 
 `doctor`는 설정과 OMP `--help`의 `--rpc-socket` 지원을 확인한다. `platforms`에 설정된 플랫폼,
@@ -557,8 +647,9 @@ bun src/cli.ts status --config config.local.json
 | `gateway.admissionReady` | 최초 head의 native 승인 복구 barrier를 통과해 durable 수신을 열었는지 |
 | `gateway.unresolvedEvents` | 안전한 접수/답변 복구를 기다리는 미해결 ingress 수. 모호한 입력을 거부/완료로 버리지 않음 |
 | `head.pid` | native head 프로세스 식별자. controller/adapter 준비나 작업 완료와 다름 |
-| `head.ready` | head controller gate 준비 상태. 미해결 admission이 안전한 복구를 기다리는 동안 false 유지 |
+| `head.ready` | head controller gate와 프리셋 초기화 완료 상태. 초기화 미완료·미해결 admission이면 false 유지 |
 | `head.connected` | Gateway와 head client의 연결 상태 |
+| `head.initialization` | native 프리셋 초기화 상태·세부 사유. transport 로그인·입력 접수와 별개이며 `complete`만 완료 |
 
 최초 admission barrier를 통과한 Gateway는 이후 head 부재에도 durable admission을 유지한다.
 `head.ready`/`head.connected`가 내려갔다고 이미 열린 수신을 잃거나 모델을 폴링하지 않는다.
@@ -567,7 +658,7 @@ bun src/cli.ts status --config config.local.json
 start를 대신하지 않는다. 실제 자격 증명으로 실행하면 설정된 Discord·Telegram·Slack 모두에 연결한다.
 
 ```sh
-bun src/cli.ts start --config config.local.json
+bun --no-env-file src/cli.ts start --config config.local.json
 ```
 
 start는 **detached Gateway를 먼저 실행**하고 Gateway가 지정 head 하나를 시작하거나 소유권이
@@ -597,19 +688,46 @@ crash 복구를 보장하지 않는다. 기존 head transcript 재시작에는 `
 헤드는 주제 바인딩을 맥락으로 보고 새 작업은 `lane_start`, 기존 작업 지시는 `lane_message`로
 명시적으로 보낸다. 레인 생성만으로 이미 접수된 후속 입력을 자동으로 옮기지 않는다.
 lane 결과는 durable report로 head에 들어오며 메신저에 직접 발송하지 않는다. 외부 회신은 head의
-답변 또는 명시적으로 head가 통제하는 delivery만 사용하고 원래 route를 보존한다.
+답변 또는 명시적으로 head가 통제하는 delivery만 사용한다. 자동 생성한 주제의 lane report는
+헤드가 선택·기록한 thread를 목적지로 사용하고 원래 메인 답변은 원래 route에 남는다.
+
+**일반 후속 입력의 기본값은 steer다.** 같은 platform/account/authority/channel/thread/topic의
+활성 실행에 일반 후속 요청을 native steer로 전달한다. `/steer`는 필요 없다. 다른 대화,
+내부 보고, workflow 선택과 제어 명령은 현재 실행에 섞지 않으며 일시정지·승인·압축·불확실성
+보류를 우회하지 않는다. 입력마다 실제 native 완료 receipt를 확인하고 같은 실행의 최종
+답변/보고는 중복 발송하지 않는다.
+
+**새 주제도 명령 없이 요청할 수 있다.** 헤드가 독립 범위와 저장소를 결정해 `lane_start`하면
+실제 지원을 확인하고 thread/topic을 만들어 독립 OMP 세션에 연결한다. 기존 thread에서
+다른 주제로 갈 때는 같은 허용 부모에 sibling을 만든다. 주제 판단은 헤드가 하며 Gateway는
+LLM 분류나 lane 실행을 하지 않는다.
+
+| 플랫폼 | 자동 주제 생성 |
+| --- | --- |
+| Discord | 허용된 text/announcement 채널의 public thread와 forum/media의 starter-message post. DM은 논리 주제. 필수 태그가 있는 forum/media는 태그를 추측하지 않고 거부 |
+| Telegram | 관리자·`can_manage_topics` 권한을 가진 forum supergroup, 또는 `has_topics_enabled` 봇의 private topic. 미지원 private chat은 논리 주제; 일반 그룹은 native topic 생성 불가 |
+| Slack | 허용 채널과 owner-DM의 실제 root 메시지 `ts`에 thread. 기존 thread에서 새 주제로 분리하면 별도 root 생성 |
+
+공식 API: [Discord threads](https://docs.discord.com/developers/topics/threads),
+[Telegram createForumTopic](https://core.telegram.org/bots/api/methods/createforumtopic.md),
+[Telegram bot capability](https://core.telegram.org/bots/api/types/user.md),
+[Slack thread_ts](https://docs.slack.dev/messaging/sending-and-scheduling-messages/#threading).
+새 채널·서버를 임의로 만들거나 권한·BotFather 설정을 바꾸지 않는다. 권한/네트워크 실패는
+미지원으로 숨기지 않으며 불확실한 생성·발송은 재전달 때 자동 반복하지 않는다.
+
 별도 슬래시 명령 등록은 하지 않는다. 다음은 Discord·Telegram에 보내는 **일반 텍스트 명령**이며
 Slack에서는 같은 위치에 `!new`·`!main`을 사용한다.
 
 | DM 입력 | 동작 |
 | --- | --- |
-| `/new 요청 내용` | 실제 DM 채널을 바꾸지 않고 독립 논리 주제를 열어 활성화. 헤드가 저장소를 선택한 뒤 그 주제의 레인을 연결 |
+| `/new 요청 내용` | 독립 주제 경계를 접수. 헤드가 저장소를 선택한 뒤 native topic을 우선 생성·연결하며 미지원 DM만 논리 주제를 유지 |
 | `/new` | 빈 주제만 활성화하고 요청 내용을 묻는 고정 안내를 한 번 회신. 이 명령만으로 모델 호출·레인 시작은 하지 않음 |
-| 일반 후속 메시지 | 선택된 주제·기존 lane 정보를 담아 head로 전달. head가 필요한 업무만 명시적으로 lane에 전달 |
+| 일반 후속 메시지 | 선택된 주제·기존 lane 맥락을 담아 head로 전달. 같은 주제의 활성 실행은 기본 steer; lane에는 head가 명시적으로 전달 |
 | `/main` | 앞으로의 입력 맥락을 메인 대화로 돌림. 모든 입력은 원래도 head 경유이며 이전 주제·레인은 보존 |
 
 헤드는 이미 제출받은 일반 DM 작업도 `lane_start`로 독립 주제에 인계할 수 있다.
-원래 헤드 요청의 소유권은 유지하고 별도 handoff를 만들며 이후 DM 입력은 새 주제를 따른다.
+원래 헤드 요청의 소유권은 유지하고 별도 handoff를 만든다. native thread를 만든 경우
+안내된 thread에서 후속 대화를 이어간다. 논리 주제 fallback에서는 이후 DM 입력이 그 주제를 따른다.
 서버를 만들 필요는 없고, 명시적으로 허용된 서버 스레드 목적지를 지정하는 인계도 가능하다.
 그룹·workspace 채널 대화에서 `/new`(Slack `!new`)는 새 스레드/topic 사용 안내를 보내며
 OMP 자체 `/new`로 전달하지 않는다. 연결된 레인 대화의 `/stop`, `/resume`
@@ -617,6 +735,82 @@ OMP 자체 `/new`로 전달하지 않는다. 연결된 레인 대화의 `/stop`,
 이미 접수된 `/new`·`/main` 제어 메시지를 수정해도 기존 경계·작업·현재 주제는 바뀌지 않으며,
 기록과 고정 안내만 남기고 새 메시지로 제어하도록 요청한다. Slack의 `!` 제어도 같은 정책이다.
 일반 작업 메시지 수정은 새 입력 revision이며 이미 실행된 외부 효과를 취소하지 않는다.
+
+### 헤드의 모델·effort
+
+다음 명령은 DM·허용 채널·스레드에서 **현재 메인 헤드 세션**에 적용된다. 레인에 연결된
+스레드에서도 그 레인이 아니라 헤드를 제어한다. Discord·Telegram은 일반 `/` 텍스트,
+Slack은 일반 `!model`·`!effort` 텍스트를 사용하며 native slash-command 등록은 필요 없다.
+
+| 명령 | 동작 |
+| --- | --- |
+| `/model` | 헤드의 실제 provider/model과 현재 effort 조회 |
+| `/model list` | 현재 native 인증·활성화 상태에서 선택 가능한 chat 모델 목록 |
+| `/model <provider/model>` | 목록의 정확한 provider/model로 헤드 모델 변경 |
+| `/effort` | 헤드의 실제 effort와 현재 모델이 지원하는 선택값 조회 |
+| `/effort <level>` | 조회에 표시된 값으로 헤드 effort 변경 |
+| `/model preset` 또는 `/model preset list` | 기존 native 프리셋의 이름·유효성·가용 기본 모델 조회 |
+| `/model preset <name>` | 해당 native 프리셋의 전체 역할·기본 effort를 유휴 헤드 세션에 적용 |
+| `/model preset <name> --global` | 현재 헤드에 적용·확인한 동일 snapshot을 native 전역 기본 역할·effort에도 저장 |
+
+조회는 실행 중에도 모델 호출 없이 처리한다. 변경은 헤드가 유휴이고 승인·goal·백그라운드
+작업·소유 서비스·compaction·불확실한 제출이 없을 때만 처리한다. 바쁘면 거부하므로 작업이
+정리된 뒤 새 명령을 보내야 한다. 변경을 위해 실행 중 작업을 자동 중단하지 않는다.
+모델 변경 후 effort가 native 지원 범위에 맞춰 조정될 수 있으며 응답은 실제 readback 값을
+표시한다. 사용 불가능한 모델이나 effort를 임의의 대체값으로 바꾸지 않는다.
+native 상태에 명시적 effort가 없으면 모델 기본값으로 표시하며 `off`와 혼동하지 않는다.
+RPC에 광고되지 않는 `auto`·`inherit`는 이 메신저 명령의 선택값이 아니다.
+
+옵션 없는 변경은 전역 OMP 기본값과 기존 레인의 선택을 유지한다. 모든 메신저가 같은 헤드를 사용하므로
+헤드의 이후 작업에는 동일하게 적용되고, 동일 native 세션을 재시작해도 기록된 선택을
+복원한다. 일반 `/model`·`/effort`의 `--global`과 모든 `--once`는 지원하지 않는다. 수신 중복은 재적용하지 않으며 변경
+응답이 유실되거나 실제 상태를 확인하지 못하면 성공으로 표시하거나 자동 재실행하지 않는다.
+이때 `/model`·`/effort`로 실제 상태를 조회할 수 있지만 조회가 기존 불확실성을 해제하지는 않는다.
+
+프리셋은 OMP의 기존 `modelPresets`에서 읽는다. 메신저에서 이름 있는 프리셋 원본을 만들거나
+수정·삭제하지 않으며 high/middle/low 외에 실제 설정된 이름도 사용할 수 있다. 적용 후 전체 역할과 기본 effort를
+native 상태로 확인한다. 확인된 세션별 설정과 제거된 역할만 재기동용 metadata로 보관하고,
+새 Host의 private 설정 overlay로 복원한다. 이후 `/model`·`/effort`로 별도 선택한 활성 값은
+native transcript에서 복원하므로 과거 프리셋의 기본값으로 덮어쓰지 않는다.
+프리셋의 기본 effort가 생략되어 있으면 현재 헤드 세션의 정책을 유지한다. 영속 기본값을
+다시 가져오지 않는다. 명시적인 프리셋 effort와 모델 selector의 effort 우선순위는 그대로다.
+
+**기본 적용 범위는 이번 헤드 세션뿐이다.** `--global`을 명시한 프리셋 선택만 현재 헤드의
+적용 확인 뒤 같은 역할·기본 effort를 native 전역 설정에 저장한다. 기존 실행 중인 레인과
+명시적인 다른 세션 선택은 바꾸지 않으며 다른 프로젝트의 설정 override를 지우지 않는다.
+변경 알림은 프리셋 이름, 변경 전후의 실제 모델·effort, `session-only` 또는 전역 저장
+여부를 표시한다. 헤드 적용은 성공했지만 전역 저장/확인이 실패했다면 그 두 결과를 분리해서
+알리고, 자동 재시도나 성공으로 가장하지 않는다. 전역 기본값 변경은 새 세션·기본값을
+상속하는 경로에 영향을 줄 수 있다.
+
+### 상태·맥락·사용량·중단
+
+아래 명령도 Discord·Telegram의 일반 텍스트이며 Slack에서는 `/` 대신 `!`를 쓴다.
+
+| 명령 | 동작 |
+| --- | --- |
+| `/help` | 실제 지원 명령과 적용 대상 안내 |
+| `/status` | 공유 헤드의 실행 상태, 현재 주제·연결 레인, 대기·미해결 입력과 승인 확인 |
+| `/context` | 헤드 native 컨텍스트 사용량·한도 조회. 추정치·미상은 그대로 표시 |
+| `/usage` | 헤드 native 세션 토큰·캐시·비용 기록 조회. 계정 전체 청구액이나 제공자 잔액은 아님 |
+| `/compact [보존할 내용]` | 유휴 헤드의 native 컨텍스트 압축. 여러 줄 보존 지시 전달 가능 |
+| `/stop` | 연결된 레인이 있으면 그 레인 일시정지, 없으면 헤드 작업 중단 |
+| `/stop head` | 현재 주제와 무관하게 공유 헤드 작업 중단 |
+| `/stop <lane-id>` | 해당 instance에 등록되고 허가된 레인만 일시정지 |
+
+조회와 중단은 일반 모델 답변을 기다리지 않는다. 압축은 native 요약 모델을 호출할 수 있으며,
+일반 대화 실행·세션 초기화가 아니다. 실행·승인·goal·소유 서비스·미해결 제출이 있으면
+압축을 거부한다. 압축 중에도 상태 조회와 `/stop head`를 처리하고, native 완료를 확인하기 전에는
+압축 성공이나 뒤의 작업 실행을 선언하지 않는다.
+
+헤드 중단은 현재 작업과 중단 접수 시점까지 이미 들어온 일반 헤드 대기·미제출 설정 변경을 취소하고,
+native 입력 큐·활성 실행·압축·하위 작업·승인을 정리하며 goal의 자동 계속 실행을 멈춘다.
+이미 제출한 설정 변경이나 이전 불확실한 외부 효과를 되돌렸다고 간주하지 않으며, 남은 서비스나 비동기 작업은
+관측 결과대로 알린다. Gateway·다른 레인을 종료하지 않는다. 중단 이후 새 요청은 새 업무이며,
+취소된 요청을 자동 재실행하지 않는다. 서비스 전체 종료는 로컬 CLI `stop main`으로 구분한다.
+
+### 승인·질문 응답
+
 승인·질문은 각 플랫폼의 아래 UI로 응답한다. 주제를 바꾼 뒤에도 이전 주제의
 미해결 승인은 **그 카드에 연결된 정확한 native 요청**으로만 응답할 수 있다.
 현재 주제나 일반 메시지 텍스트가 승인 목적지를 바꾸지 않으며 만료·소비된 응답은 거부한다.
@@ -645,10 +839,10 @@ Telegram은 인증한 승인 카드의 account·실제 chat/thread·메시지 ID
 입력 답안을 제거한다. 이는 원래 native 세션이나 이미 접수된 기록 전체를 삭제한다는 뜻은 아니다.
 
 ```sh
-bun src/cli.ts attach main --config config.local.json --read-only
-bun src/cli.ts attach LANE_ID --config config.local.json
-bun src/cli.ts stop LANE_ID --config config.local.json
-bun src/cli.ts stop main --config config.local.json
+bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
+bun --no-env-file src/cli.ts attach LANE_ID --config config.local.json
+bun --no-env-file src/cli.ts stop LANE_ID --config config.local.json
+bun --no-env-file src/cli.ts stop main --config config.local.json
 ```
 
 `LANE_ID`는 status에서 확인한 실제 값으로 바꾼다. target 생략 시 main이다.
@@ -770,6 +964,27 @@ managed extension 중복/disabled 처리, 비차단 updater startup과 native bi
 
 | 검증 항목 | 현재 결과 |
 | --- | --- |
+| 2026-11-14 최종 프리셋·Mnemopi·완료 이벤트 통합 | `tsc --noEmit` 통과. native-presets/runtime/Gateway/Gateway lifecycle/setup/실제 setup PTY 6파일 전체에서 210개·4,986 assertion 통과·16.20초. 최초 생성의 Mnemopi 명시적 yes·거절·Enter·취소·출판 실패·기존 구성 갱신·shadowed 설정·동시 변경·비밀 오류 비노출을 확인했다. terminal receipt가 완료 drain 종료 경계에 도착해도 유실되지 않는 결정적 회귀 포함. 운영 Gateway와 사용자 설정은 변경하지 않음 |
+| 2026-11-14 최종 native 초기화·복구·effort | native-gateway와 native-model-selection 전체 2파일에서 6개·436 assertion 통과·28.38초. 생성/기존 유효/실패/미실행/중단 5개 Gateway 시나리오, 초기화 중 영속 입력 보존·정확한 head 소유권·재시작 무재실행·실제 CLI `status`의 running/complete 및 ready 전환·실제 HEAD effort 상속 확인. 최초 scripted provider의 last-user-wins와 1-input/1-report 가정을 source-aware·실제 steering cohort 계약으로 수정하고 전체 시나리오를 유지했다. mock과 광고 context window는 기존 ULW fixture와 같은 65,536으로 맞췄으며 native compaction은 유지했다. 실제 OMP/RPC·결정적 로컬 제공자·기록용 Messenger 범위이며 운영 봇의 새 코드 재시작 검증은 아님 |
+| 2026-11-14 config-only native 설정 API | native `settings-manager.test.ts` 전체 157개·619 assertion 통과·2.40초. 계정 DB 미생성·기존 계정 바이트 미접근/보존·동시 무관 키 보존·malformed 및 legacy 설정 보호를 확인했다. `0002-config-only-settings.patch`를 변경 전 사본에 적용하여 실행 소스와 테스트의 바이트 일치를 확인했으며 배포 patch 목록과 순서별 결합 digest를 갱신했다 |
+| 2026-11-14 프리셋 초기화·effort 수정 — 타입·단위 | 최종 `tsc --noEmit` 통과. native-presets/runtime/Gateway/Gateway lifecycle/setup 5파일 전체에서 191개·1,549 assertion 통과·6.90초. 최초 3개 lifecycle 실패는 초기화 완료 상태를 내보내지 않던 격리 Host fixture를 새 준비 계약에 맞춘 뒤 해결했다. 기존 준비 게이트를 완화하지 않았으며 운영 봇·사용자 프리셋은 변경하지 않음 |
+| 2026-11-14 헤드 effort 상속 — 실제 OMP | native-model-selection 전체 파일 1개·431 assertion 통과·5.56초. 실제 NativePresetManager와 native RPC로 세션 정책 `low` 뒤 thinking을 생략한 프리셋을 적용해 정책 유지 확인. 명시적 정책·selector 우선순위와 기존 레인 고정 정책도 대상 단위 묶음에서 확인. 초기 fixture의 상위 judge 역할 shadowing과 비추론 모델의 유효 thinking 기대값을 수정했으며, 정책 `low`와 유효 thinking `undefined`를 구분한다. 격리 설정·결정적 로컬 제공자 범위이며 새 코드로 운영 Gateway를 재시작한 검증은 아님 |
+| 셋업 비대화형 도움말 | wrapper/direct CLI의 `--help` 성공과 실제 secret 입력의 no-TTY 거부를 기존/미생성 설정 양쪽에서 확인: 대상 회귀 1개·80 assertion 통과. 설정·비밀 파일 무변경·비활성화 조건 유지. 아래 28개 묶음 이후의 좁은 수정 검증이며 합산하지 않음 |
+| Hermes 참고 토큰 CLI 셋업 | 최종 타입 검사 통과. setup/config/실제 PTY/Gateway lifecycle 4파일에서 28개·692 assertion 통과·5.08초. 모든 메신저 입력, 숨김·xtrace/argv 비노출, mode 0600·literal dotenv, 기존 JSON 보존, 명시적 셸 우선순위, ambient dotenv 차단, Ctrl-C/EOF 및 부모 PID만의 SIGINT/SIGTERM/SIGHUP·terminal echo/reader 회수, no-TTY·긴 socket 경로의 무저장 거부, 2개 프로세스의 stale 갱신 거부, 실제 native `--help`를 사용하는 doctor와 명시적 Gateway 수명 확인. 합성 토큰·격리 경로이며 운영 계정은 활성화하지 않음 |
+| 사용자 요청 최종 로컬 통합 검증 | `tsc --noEmit` 통과 후 변경 관련 12개 파일에서 358개 통과·0개 실패·3,144 assertion·16.65초. runtime/store/역할·기본 steer·3개 플랫폼·hub/Gateway·native topic capability 및 실제 native steering/중단/재시작 검증 포함. 아래 초기 실패와 기대값 충돌 모두 반영한 실행이며 저장소 전체 테스트나 운영 메신저 로그인 검증을 뜻하지 않음 |
+| 기본 steer·주제 바인딩 최종 타입·대상 회귀 | `tsc --noEmit` 통과. 새 `default-steering.test.ts` 13개·90 assertion 통과; 기존 local-command 회귀 1개·2 assertion 통과. 같은 route와 교차 주제, 입력별 완료·중복·취소·disconnect, native 생성/논리 fallback·불확실성·sibling·head-only 결과 목적지 확인. 이후 사용자 승인으로 갱신한 기존 routing 계약 회귀도 1개·20 assertion 통과 |
+| 기본 steer·자동 주제의 실제 OMP | `test/native-steering.test.ts` 1개·140 assertion 통과·4.40초. 실제 native tool barrier 중 same-run steer 반영·각 source receipt·단일 최종 답변, 다른 topic 분리, 명시적 lane steer와 독립 2개 세션, controller 재연결·원본 재전달 중복 방지, `/stop`의 두 ticket abort·후속 실행 없음, in-flight head SIGKILL 뒤 두 입력 uncertain·동일 native transcript 재시작 후 자동 replay 없음 확인. 결정적 로컬 제공자·기록용 Messenger이며 운영 계정 로그인은 미수행 |
+| native topic capability·Gateway IPC | 어댑터·hub·Gateway 7파일에서 147개·1,101 assertion 통과. 이후 Discord forum/media 생성 확장 뒤 native-thread-capabilities·Discord 2파일 65개·652 assertion 통과. 두 묶음은 중복되므로 합산하지 않음. 실제 SDK 경계의 권한·필수 태그 거부·원래 source identity·네트워크 불확실성 확인; 운영 API 호출 성공 증거는 아님 |
+| steer 변경 뒤 기존 runtime/store/skills 회귀 | 최초 189개 통과·2개 실패. 명시적 local 완료 응답(`agentInvoked:false`)에는 추가 `prompt_result`가 없다는 native 계약을 source에서 복구하고 해당 기존 회귀 통과. 나머지 pending-only 후속 기대값은 사용자 승인 뒤 기본 steer 계약으로 갱신: 같은 주제는 tracked steer로 제출되지만 main 소유 유지, 다른 주제는 pending 유지, lane 생성 후에도 두 입력 모두 자동 재배정·handoff 없음 검증. 해당 회귀 1개·20 assertion 통과. 두 수정 뒤 전체 묶음을 재실행한 결과로 확대하지 않음 |
+| 명시적 preset `--global`·변경 알림 | 타입 검사 통과. native-presets 격리 wrapper 1개 통과, runtime preset/global 대상 17개 통과 후 잘못된 테스트 route 2개를 수정해 해당 2개·155 assertion 통과. session-only 무쓰기, 정확한 frozen 전역 저장·미제공/실패/불일치의 부분 성공 알림·중복 재저장 방지 확인 |
+| preset 전역 저장 실제 OMP E2E | 최종 native-model-selection 1개 통과·421 assertion·4.32초. 실제 native Settings 전역 역할·effort 저장, 프리셋 원본·무관 설정 보존, 새 Settings 인스턴스 readback, 이후 더 새로운 전역 선택을 과거 명령 재전달이 덮지 않음, 기존 레인 불변, 실제 변경 전후·범위 알림과 session-only 복원 확인. 초기 테스트의 비추론 모델 effort 기대값을 native `undefined`로 정정한 뒤 통과. 격리된 로컬 fixture 설정만 변경했고 운영 계정·사용자 전역 설정은 미변경 |
+| 우선 메신저 명령·native 프리셋 타입 검사 | 통과 — `bun run check` (`tsc --noEmit`) |
+| 우선 메신저 명령·설정 복원 회귀 | Bun 1.4.4에서 runtime·Slack·Host·Gateway lifecycle 200개 통과·0개 실패·1,398 assertion. 조회의 native 값·busy 안전성, head/lane stop·접수 경계·중복·복구, 압축의 완료·중단·불확실성, 전체 native 프리셋 적용·세션별 원자적 복원 기록, Gateway 재기동 private overlay 확인 |
+| 우선 메신저 명령 실제 OMP E2E | native-model-selection 1개 통과·365 assertion·4.42초. 기록용 Messenger와 실제 patched OMP에서 조회 무모델 호출, 전체 프리셋 적용과 이후 개별 모델·effort 선택의 재시작 복원, 실제 컨텍스트 압축·다중행 지시, 압축 중 조회·중단, 실제 streaming 작업 중단과 새 요청, 지정 레인 일시정지 확인. 결정적 로컬 제공자이며 운영 계정·외부 제공자는 미사용 |
+| native RPC 우선 조회·중단·장기 응답 | rpc-input-frame·rpc-user-input-order·rpc-client.start의 39개 통과·130 assertion과 별도 zero-deadline 1개·5 assertion 통과. 압축 시작/후속 mutation 순서 보존, 대기 중 압축 취소, 압축 도중 상태 조회·abort, `timeoutMs: 0` 응답/연결 종료 확인. 초기 실행은 자식 Bun 1.4.2 선택과 테스트 rejection matcher의 EOF 유발 순서 오류로 실패/timeout했으며, 고정 Bun PATH 및 테스트 순서 수정 후 위 범위 통과 |
+| 헤드 `/model`·`/effort` 타입 검사 | 통과 — `bun run check` (`tsc --noEmit`) |
+| 헤드 명령·기존 runtime·Slack 회귀 | Bun 1.4.4에서 `test/runtime.test.ts`, `test/slack.test.ts` 170개 통과·0개 실패·1,194 assertion. 세션 범위, busy 조회/변경 거부, 지원값, 원래 route, 순서·중복·불확실성 fence, Slack live/catchup `!` 정규화 확인 |
+| 헤드 명령 실제 native OMP 검증 | `test/native-model-selection.test.ts` 1개 통과·187 assertion·5.22초. 기존 judge·레인 프리셋 경로와 함께 기록용 Messenger → 실제 head RPC 모델·effort/off 변경, 레인 불변, 모델 턴 미발생, 중복 방지, 설정 파일 바이트 보존, 동일 head transcript 재시작 후 모델·effort 복원 확인. 운영 메신저 로그인·실제 제공자 호출은 하지 않음 |
 | 현재 root 타입 검사 | 최종 통과 — 마지막 수정 뒤 최종 담당자의 실제 tsc 실행 |
 | 현재 전체 root 회귀 | Bun 1.4.4에서 345개 통과·7개 skip·0개 실패·2,542 assertion. local-Git 설치 CLI·반복/동시 준비·업데이트/rewind/실패·old-live/new-host·delayed Gateway 회귀 포함. 마지막 native bind→chmod readiness 수정 전 결과이며 그 뒤 전체 재실행으로 확대하지 않음 |
 | 현재 마지막 Host readiness 수정 회귀 | 15개·58 assertion 통과 — 실제 bind 뒤 chmod하도록 수정한 뒤의 targeted Host 결과 |
@@ -805,6 +1020,19 @@ managed extension 중복/disabled 처리, 비차단 updater startup과 native bi
 | 운영 Telegram·Slack 로그인·수신·발송·승인·복구 | 미수행 — 실제 계정·토큰으로 활성화하지 않음 |
 | 실제 모델 제공자 호출 | 미확인 — 잘못된 generator 호출의 보조 OMP가 파일 설명 응답을 반환했으나 실행 파일/PID/세션/제공자 사용량 미확보. 실제 제공자·비용 부작용은 검증하지 못했으며 결정적 로컬 테스트 증거와 별개 |
 | herdr pane 연결·해제 후 실행 유지 | 미수행 — herdr는 설치되어 있으나 `HERDR_ENV`가 없고 제어를 시도하지 않음 |
+
+steer 검증의 초기 실패/timeout은 새 fixture의 terminal-row 조회, 유효한 native Host 예산,
+prompt와 읽기 전용 catalog 요청 구분, 기존 `/stop` receipt 상태, 종료한 fake Host 재연결
+관측 오류를 포함한다. 새 fixture를 실제 API 계약에 맞추고 위 성공 기준은 유지했다.
+별도로 확인된 production local 완료 처리 누락은 source를 수정해 기존 회귀로 검증했다.
+기존 pending-only 기대값은 사용자 승인 뒤 새 동작과 원래 재배정 방지 조건을 함께 검증하도록
+갱신했다. 이후 사용자 요청으로 위 12파일 최종 통합 검증을 실행해 통과했으며, 이를 저장소
+전체 테스트나 운영 계정 검증으로 확대하지 않는다.
+
+토큰 셋업의 초기 검증에서는 새 PTY relay/stream reader의 관측·타입 오류와 긴 임시 socket
+경로를 수정했다. 별도로 실제 PTY에서 발견한 native 라이브러리 import의 ambient dotenv
+주입은 제품 코드의 lazy import·시작 전 필수 credential 검사로 수정했다. 저장된 토큰·
+셸 우선순위 기대값이나 비활성화 조건을 낮추지 않고 위 최종 묶음에서 확인했다.
 
 운영 전에는 미검증 항목을 별도로 확인해야 한다. 테스트·PTY 결과를 실제 메신저나
 herdr 사용자 흐름의 검증 결과로 대신 표시하지 않는다.

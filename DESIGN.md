@@ -104,6 +104,7 @@ Gateway를 모든 lane 실행을 소유하는 별도 manager로 확장하지 않
 | 소스 | 구현 책임 |
 | --- | --- |
 | `src/cli.ts`, `src/config.ts` | `--config` 필수 CLI, 명시적 start, 설정·소유 경로 검증, doctor/status/attach/stop |
+| `scripts/setup.sh`, `src/setup.ts`, `src/credentials.ts` | controlling-terminal 셋업·토큰 숨김 입력, 기존 config 검증 재사용, owner-only sibling 환경 파일과 start/doctor의 제한된 로딩. 봇 활성화 없음 |
 | `src/gateway*.ts` | detached Gateway 기동·소유권·영속 수신/receipt·헤드 감독·로컬 transport 효과 proxy |
 | `src/gateway-client.ts` | `createGatewayMessenger(config): Messenger`. 헤드 runtime에 기존 Messenger 계약을 제공하며 stop은 client만 detach |
 | `src/extension.ts` | `role=head`인 부모 없는 root에서만 runtime 시작과 9개 관리 도구 등록 |
@@ -247,6 +248,30 @@ controller-ready이며 native PID 생존·정확한 identity·Gateway adapter-re
 설치·권한·토큰 입력 절차와 공식 API 문서 링크는 [운영·설치 가이드의 플랫폼별 설정](docs/OPERATIONS.md#2-플랫폼별-앱과-접근-범위)을 따른다.
 토큰은 JSON/argv 대신 이름이 지정된 환경변수로만 전달한다.
 
+`bash scripts/setup.sh`는 새 구성의 플랫폼·소유자·허용 대화·경로를 묻고 토큰을 숨김
+입력으로 받는다. JSON에는 기존 `tokenEnv` 계열 이름만 저장하고 비밀 값은 명시적 저장
+확인 뒤 `<config 경로>.env`(`0600`)에 분리한다. 기존 유효한 JSON은 보존한다.
+CLI `start`/`doctor`만 표준 dotenv parser로 구성된 자격 증명 이름을 읽으며 비어 있지 않은
+셸 환경값이 우선한다. shell source/eval이나 Bun의 기본 `.env` 자동 로딩을 사용하지 않는다.
+래퍼·권장 CLI 호출·새 native command에는 `--no-env-file`을 사용한다. 기존 설정은 자동으로
+재작성하지 않으므로 수동 Bun 호출에서 이 옵션을 생략한 경우의 사전 dotenv 로딩까지
+애플리케이션 loader가 취소한다고 주장하지 않는다.
+OMP 라이브러리의 programmatic dotenv 로딩은 별도이므로 setup/doctor에서는 runtime
+모듈을 import하지 않는다. start는 선택한 자격 증명의 필수 검사를 마친 뒤에만 Gateway를
+로드해 누락된 토큰을 ambient 프로젝트 dotenv가 대신 채워 실행시키지 못하게 한다.
+평문 파일·같은 OS 사용자라는 한계는 유지하며 새 인증 엔진·보안 샌드박스를 주장하지 않는다.
+셋업·doctor는 실제 계정 연결이나 토큰 유효성 검증이 아니고 명시적 start 경계를 유지한다.
+
+새 구성의 최초 셋업은 native Mnemopi 장기 기억을 권장하되 명시적인 `yes` 동의와 최종 저장
+확인 뒤에만 OMP 전역 `memory.backend`를 `mnemopi`로 저장한다. Enter·거절·취소는 변경하지
+않고 기존 구성의 자격 증명 갱신에서는 다시 묻지 않는다. native 설정 API로 이 키만 변경하고
+재조회하며 다른 backend 옵션·모델·스코프·기존 기억을 보존한다. 프로젝트 override 등으로
+실효 설정이 다르면 전역 저장과 실제 활성 설정을 구분해 알린다. 로컬 구성 저장 뒤 메모리 설정이
+실패해도 로컬 저장을 취소한 것처럼 말하지 않는다. native 설정 import는 자격 증명 접수·저장
+뒤로 지연하며 셋업 자체는 메모리 backend·모델·서비스를 시작하지 않는다. 기억은 대화 이후에도
+남고 기존 native 옵션에 따라 모델 처리·다운로드가 발생할 수 있으며, 전역 선택은 다른 OMP
+세션에도 영향을 줄 수 있다.
+
 | 플랫폼 | 설정 및 실제 권한 경계 |
 | --- | --- |
 | Discord | `tokenEnv`, 숫자 `ownerId`, `allowedGuildIds`, `allowedChannelIds`. bot/Gateway 계정과 소유자를 확인하며 서버·부모 채널 allowlist를 모두 요구. 소유자 1:1 DM은 별도 허용 |
@@ -256,7 +281,8 @@ controller-ready이며 native PID 생존·정확한 identity·Gateway adapter-re
 Telegram은 public webhook endpoint 없이 polling한다. 이미 활성 webhook이 있으면 **거부**하고
 자동 삭제·교체하지 않는다. 그룹 가시성은 BotFather Privacy Mode/관리자 설정에 달려 있고,
 supergroup forum 생성에는 `can_manage_topics`가 필요하다. private topic은 getMe가 해당 기능을
-알려준 봇에서만 native thread로 인정하며 기본 private `/new`는 논리 주제다.
+알려준 봇에서만 native thread로 인정한다. private `/new`의 접수 경계는 논리 주제로
+기록하지만 헤드가 레인을 연결할 때 native topic 지원 여부를 확인해 실제 topic을 우선 생성한다.
 
 Slack은 Socket Mode·Interactivity·`message.channels/groups/im` 구독으로 공개 endpoint 없이
 동작한다. bot scopes는 `chat:write`, `users:read`, `files:read/write`와 사용하는 대화 유형별
@@ -283,7 +309,9 @@ Slack은 Socket Mode·Interactivity·`message.channels/groups/im` 구독으로 �
   각 새 지시는 실제 저장된 입력 ID와 명시적인 head dispatch를 요구한다.
 - 새 레인은 메인 헤드의 전체 대화를 상속하지 않는다. 원본 요청, 관련 근거, 제약만 인계한다.
 - 별도 주제로 분리된 요청은 새 연결을 만든다. 불명확한 주제 전환을 모델 추측만으로 확정하지 않는다.
-- 스레드 없는 DM은 메인 대화를 기본으로 하며 `/new 요청` 또는 헤드의 명시적 인계로 독립 논리 주제를 만든다.
+- 스레드 없는 DM은 메인 대화를 기본으로 한다. 명확한 독립 주제는 별도 사용자 명령 없이
+  헤드가 `lane_start`로 분리하며 native thread/topic을 우선 생성하고 미지원 private chat만
+  논리 주제를 사용한다. `/new 요청`은 명시적 주제 경계 제어로 유지한다.
 - 종료된 작업의 후속 대화는 같은 기록을 재개할 수 있다. 일시정지·취소된 작업을 자동 입력으로 재개하지 않는다.
 
 스레드 없는 private/DM의 논리 주제는 실제 플랫폼 thread로 위장하지 않는다. `Route.topicId`는
@@ -293,6 +321,105 @@ Slack은 같은 의미의 **`!new [요청]`, `!main`, `!stop`, `!resume`** 일�
 Slack client가 가로챌 수 있는 `/new`를 등록된 slash command처럼 안내하지 않는다.
 실제 메시지 ID/ts로 순서를 보존하며 가짜 slash-command timestamp를 만들지 않는다.
 
+### 기본 steer와 자동 native 주제 연결
+
+활성 실행과 **platform/account/authority/channel/thread/topic 전체 route가 같은** 일반
+후속 입력은 native `prompt`의 `streamingBehavior: "steer"`로 전달한다. 별도 `/steer`
+명령은 요구하지 않는다. 새 source ID를 유지하며 레인 입력은 여전히 헤드의 명시적
+`lane_message`가 필요하다. 다른 대화·내부 보고·workflow 선택·제어 명령은 현재 실행에
+섞지 않는다. 일시정지·승인·압축·불확실성 보류도 우회하지 않는다.
+
+각 입력을 native 제출 전에 영속화하고 개별 `prompt_result`와 실제 settled 상태를
+대조한다. admission ACK는 완료가 아니다. 같은 대화의 합쳐진 실행은 최종 답변/레인
+보고를 한 번만 만들며 개별 접수 기록은 모두 정리한다. abort/disconnect/restart에서도
+steer로 합류한 입력을 누락하거나 자동 재제출하지 않는다.
+
+| 플랫폼 | 자동 생성 범위 | 미지원/제약 |
+| --- | --- | --- |
+| Discord | 허용된 서버 text/announcement 부모의 public thread, forum/media의 starter-message post | DM은 논리 주제. 필수 태그가 있는 forum/media는 임의 태그 선택 없이 거부 |
+| Telegram | forum supergroup의 topic 또는 `getMe.has_topics_enabled`인 owner-private topic | supergroup 관리자·`can_manage_topics` 필요. 일반 그룹은 topic 생성 불가 |
+| Slack | 허용 채널·owner-DM의 실제 root `ts`에 붙는 thread | 기존 thread 안에는 중첩하지 않고 별도 root를 생성 |
+
+실제 capability는 인증된 어댑터가 읽고 Gateway가 전달한다. 권한·네트워크 실패를
+“미지원”으로 바꿔 조용히 다른 목적지에 보내지 않는다. 봇 topic 모드·권한을 변경하거나
+채널·서버를 임의로 생성하지 않는다.
+
+기존 thread의 같은 주제는 연결된 세션을 재사용한다. 명확히 다른 주제/저장소는 헤드가
+`destination`에 같은 허용 부모와 `threadId:null`(논리 `topicId` 없음)을 지정해 sibling
+생성을 선택한다. 원래 thread의 binding은 보존한다. 생성 의도와 결과를 원본 source ID에
+고정하고 원격 생성 전에 불확실성 기록을 남긴다. 모호한 원격 결과는 맹목 재생성하지 않는다.
+논리 주제에서 native thread로 넘어간 alias는 head 맥락에만 사용하며 과거 대기 입력을
+이동시키지 않는다.
+
+바인딩 안내는 영속 outbox로 발송하며 저장된 레인·대화 식별자와 실제 Host 실행 여부를
+구분한다. 원래 메인 답변은 원래 대화에 남는다. 생성한 주제 레인의 결과는 head가 명시적으로
+선택한 목적지를 가진 durable report로 돌아오고 그 보고에 대한 헤드 답변이 해당 thread로
+나간다. 레인이 직접 외부 발송하거나 마지막 활성 대화로 결과를 보내지 않는다.
+
+### 헤드 모델·effort 제어
+
+`/model`, `/model list`, `/model <provider/model>`, `/effort`, `/effort <level>`은
+head runtime이 일반 코드로 처리하는 메신저 명령이다. Slack은 `!model`, `!effort` 표기를
+같은 경로로 정규화한다. 현재 주제가 레인에 연결되어 있어도 대상은 **공유 메인 헤드
+세션**이며, 응답에 대상을 표시하고 원래 요청 route로만 보낸다. 모델 턴이나 레인 dispatch는
+만들지 않는다. 모델은 native 가용 chat 목록의 정확한 provider/id, effort는 native
+`get_available_thinking_levels`가 광고한 값만 허용한다. 별도 모델·effort 목록을 유지하지 않는다.
+
+`/model preset`(또는 `/model preset list`)은 기존 `NativePresetManager.inspect()`로
+프리셋을 조회하고 `/model preset <name>`은 기존 resolve 결과의 전체 역할·기본 thinking
+snapshot을 native `set_model_preset`으로 적용한다. 기본은 head 세션 전용이고 프리셋 원본을
+저장·생성·삭제하지 않는다. `/model preset <name> --global`을 명시한 경우에만 헤드 적용을
+확인한 동일 snapshot을 기존 native Settings의 전역 기본 역할·thinking으로 저장한다.
+프리셋이 thinking 정책을 생략하면 현재 헤드의 세션 정책을 상속한다. 영속 기본값으로
+되돌리지 않으며, 프리셋의 명시적 정책과 모델 selector의 명시적 effort 우선순위는 유지한다.
+레인은 기존처럼 생성 시점의 유효 정책을 고정하므로 이후 전역 변경으로 재해석하지 않는다.
+전역 저장은 기존 실행 레인이나 프로젝트 override를 바꾸지 않는다. 변경 전후 실제 모델·effort와
+세션/전역 범위를 회신하고 세션 적용 성공·전역 저장 실패의 부분 결과를 구분한다.
+적용은 유휴·session scope와 전체 native readback을 요구한다. 확인된
+head 설정은 native session ID별 metadata에 보관하고 재시작의 private `--config` overlay로
+복원한다. 제거된 역할은 null tombstone으로 복원해 이전 전역 역할이 다시 살아나지 않게 한다.
+`--model-preset`을 재실행하지 않으므로 이후 transcript에 기록된 명시적 모델·effort 선택을
+과거 프리셋 기본값으로 덮지 않는다.
+
+조회는 실행 중에도 가능하다. 변경은 실행·대기 중인 native 작업, 승인, goal, compaction,
+소유 서비스 또는 미해결 제출이 없는 헤드에서만 허용하며 자동 중단하거나 나중에 몰래
+적용하지 않는다. 실제 native `settingsScope: "session"`을 확인한 뒤 `set_model` /
+`set_thinking_level`을 호출하고 같은 세션의 `get_state`로 적용 결과를 확인한다. 모델 변경이
+effort를 native 지원 범위로 조정할 수 있으므로 요청값이 아닌 실제 결과를 회신한다.
+입력을 먼저 영속화하고 mutation 제출을 기록한다. 중복 수신은 다시 변경하지 않으며,
+응답 유실·readback 불일치는 불확실성으로 남기고 자동 재시도하지 않는다.
+
+기본 적용 범위는 현재 head 세션이다. 명시적인 프리셋 `--global` 외에는 전역 OMP
+설정·기본 모델을 바꾸지 않으며 기존 레인은 어느 경우에도 변경하지 않는다.
+여러 메신저가 동일한 head를 공유하므로 그 head의 이후 작업에는 함께 적용된다.
+동일 transcript 재시작의 모델·effort 복원은 OMP native 세션 기록을 사용하며 별도 설정
+저장소를 추가하지 않는다. 프리셋 외 일반 모델·effort의 `--global`과 모든 `--once`는 지원하지 않는다. Hermes의 세션 override
+UX를 참고하되 OMP 공개 RPC를 사용한 독립 구현이다
+([참고 revision](https://github.com/NousResearch/hermes-agent/blob/0d2dec897ff8e2dfba853c313f05cdd2624d6200/gateway/slash_commands_model.py)).
+
+### 메신저 운영 명령
+
+`/help`, `/status`, `/context`, `/usage`는 확정적인 head runtime 조회이며 모델 턴 없이
+처리한다. 상태는 현재 주제·연결 레인과 공유 헤드의 native 실행 상태·대기·승인·불확실성을
+구분한다. 사용량은 native 세션 기록이지 계정 전체 청구액이 아니고, 컨텍스트 추정치와 미상
+필드를 확정값이나 0으로 바꾸지 않는다. credential-bearing native DTO 전체를 외부에 보내지 않는다.
+
+`/compact [보존 지시]`는 기존 native 압축을 사용하며 대화 초기화나 별도 요약 엔진이 아니다.
+유휴·안전한 헤드에서만 시작하고 제출을 먼저 기록한다. 완료 전 뒤의 헤드 실행·설정 변경을
+막되 조회와 긴급 중단은 계속 처리한다. native RPC의 압축 실행과 중단·조회 경로를 분리해
+압축을 기다리는 serialized command tail이 `/stop head`를 막지 않게 한다.
+
+`/stop`은 연결 레인이 있으면 기존 pause 계약을 유지하고, 없으면 헤드 작업을 중단한다.
+`/stop head`와 `/stop <lane-id>`로 대상을 명시할 수 있다. 원래 route 권한과 실제 관리
+대상을 확인하고 임의 세션·소켓을 제어하지 않는다. 헤드 중단 접수 이전의 현재/대기 일반 입력과
+아직 제출되지 않은 설정 변경 명령을
+영속 취소하고 native queue를 버리며 활성 실행·압축·하위 작업·승인을 정리한다. goal 자동 계속
+실행도 멈춘다. 미해결 uncertain 효과를 소급 취소하거나 완료로 바꾸지 않는다. 중단 뒤 새
+입력은 별도 새 작업으로 처리하며 Gateway와 무관한 레인은 유지한다. Slack은 위 명령의
+동일한 `!` 표기를 기존 정규화 지점에서 지원한다.
+
+### 주제 명령의 영속 경계
+
 - `/new 요청`은 원래 입력을 새 논리 주제에 미할당 대기로 영속화하고 별도 메인 라우팅 envelope를
   만든다. 헤드가 실제 존재하는 절대 cwd를 선택한 뒤 `lane_start`가 그 주제를 레인에 연결한다.
 - 내용 없는 `/new`는 주제를 활성화하고 고정 안내만 회신한다. 모델 호출이나 레인을 시작하지 않는다.
@@ -300,7 +427,7 @@ Slack client가 가로챌 수 있는 `/new`를 등록된 slash command처럼 안
   조사하고, 있으면 그 연결을 참고해 명시적으로 전달한다. 주제 바인딩이 자동 발송을 만들지 않는다.
 - `/main`은 이후 입력의 맥락을 메인 대화로 돌리며 기존 레인·작업 기록은 보존한다.
 - 이미 제출한 일반 DM 작업도 `lane_start`로 인계할 수 있다. 원래 입력은 main 소유로 두고
-  별도 handoff와 논리 주제를 생성·활성화한다. 서버 소속은 필수가 아니며 허용된 명시적 서버
+  별도 handoff와 지원되는 native 주제(미지원 DM은 논리 주제)를 연결한다. 서버 소속은 필수가 아니며 허용된 명시적 서버
   스레드 목적지를 지정할 수도 있다.
 - 주제 경계와 실제 채널 cursor를 함께 영속화한다. 늦은 catchup은 명령 메시지 ID 순서로
   주제를 결정하며, 접수된 명령 재전달은 불변인 원래 연결을 사용하고 현재 선택을 초기화하지 않는다.
@@ -552,8 +679,11 @@ execute→`orchestrate`의 model-context notice와 영속 custom_message/directi
 
 ### Native judge 자문과 모델 동일성의 구분
 
-최초 배포 후 첫 실제 헤드 턴은 `lane_models`로 사용자의 native 프리셋 상태·안전한 기존 역할과
-thinking·bootstrap 필요 여부·가용 모델을 조사한다. 별도 idle LLM wake나 폴링으로 초기화하지 않는다.
+명시적 `start`는 기존 메인 헤드의 native 연결·승인 복구 뒤 프리셋을 조사한다. 세 프리셋이
+유효하고 가용하면 모델 호출·쓰기 없이 완료한다. 최초 초기화가 필요하면 같은 헤드에 전용
+초기 설정 턴 하나를 제출한다. 첫 사용자 메시지에 맡기거나 별도 셋업 에이전트·모델을 만들지
+않는다. 이 턴은 `lane_models`로 native 프리셋·기존 역할/thinking·가용 후보를 조사하고
+필요한 선택과 생성을 수행한다. 터미널 `setup`과 `doctor`는 계속 봇·모델을 실행하지 않는다.
 실제 OMP 프리셋은 `modelPresets.<name> = {modelRoles:{...}, defaultThinkingLevel?}`이고 기존
 `/modelpreset list/save/switch/delete`로 관리한다. high/middle/low는 이 프리셋 이름이며 custom
 `@high` 역할이 아니다. 세 프리셋이 유효하게 있으면 쓰기 없이 재사용한다.
@@ -563,7 +693,14 @@ thinking·bootstrap 필요 여부·가용 모델을 조사한다. 별도 idle LL
 다른 기존 역할/thinking을 snapshot한다. 기존 프리셋·기본/활성 역할·judge·무관한 설정을 보존한다.
 invalid/tombstoned/shadowed 충돌은 덮어쓰지 않고 진짜 운영자 결정이 필요할 때만 질문한다.
 이 최초 생성만 의도된 영속 preset 쓰기이며 재시작·레인 생성·재개·실패·모델 변경 때 반복하지
-않는다. 성공은 native readback으로 확인한다. 이름은 측정된 성능·가격 등급이 아니다.
+않는다. 전용 턴의 성공적인 실제 실행 결과와 세 프리셋의 native readback을 모두 확인해야
+완료다. 모델이 생성 도구를 호출하지 않거나 일부만 생성한 경우도 완료가 아니다.
+`head.initialization`은 `checking/running/complete/blocked/failed/uncertain`을 구분하며
+`head.ready`는 초기화 완료까지 요구한다. 최초 승인 복구 후의 영속 수신과 읽기 전용 제어·중지는
+유지하되 일반 사용자 작업은 초기화 뒤에 실행한다. 초기 설정 출력은 외부 답변으로 발송하지 않는다.
+제출 전 시도 상태를 저장하고 자동 재연결·재시작으로 불확실한 모델 턴을 반복하지 않는다.
+실패·충돌·완료 후 삭제는 운영자가 native 프리셋을 복구한 뒤 헤드를 재시작하여 재조회한다.
+별도 유휴 모델 폴링·자동 재시도 루프는 없다. 이름은 측정된 성능·가격 등급이 아니다.
 
 레인 선택은 프리셋 전체 역할/thinking을 `Lane.modelPresetSnapshot`, 해석된 정확한 기본 모델을
 `Lane.model`, 이름/null을 `modelPreset`에 저장한다. high/middle/low 외에도 관측한 임의의 native
@@ -626,7 +763,9 @@ runtime은 관측한 drift를 추가 dispatch 전에 보류하며 저장된 선�
 `--model-preset` 시작과 RPC `set_model_preset`은 실제 native preset helper를 overlay에 적용한다.
 별도 preset 엔진을 만들지 않으며 세션 모델 변경 transcript는 계속 영속화한다. 위의 누락 native
 프리셋 최초 생성만 의도된 전역 preset 쓰기다. 기존 native 인증·judge 설정과 auth DB의 정상
-자격 증명 갱신은 유지한다. 따라서 모델/config 쓰기 불변이지 OMP 아래 모든 파일의 바이트 불변을
+자격 증명 갱신은 유지한다. 운영자의 명시적 `/model preset <name> --global`은 별도로
+전역 기본 역할·thinking 저장을 허가하지만 이름 있는 preset 원본은 바꾸지 않는다.
+따라서 일상적인 session-only 작업의 모델/config 쓰기 불변이지 OMP 아래 모든 파일의 바이트 불변을
 주장하지 않는다. shadow credential store를 만들거나 lane의 high 선택을 위해 전역 프리셋/
 modelRoles를 다시 쓰지 않는다.
 
@@ -807,7 +946,7 @@ queued 미해결 답변은 보존·대조하며 오류 receipt만으로 버리�
 답변 ACK 역시 durable 접수 뒤에만 진행하며 단순 handler 진입을 성공으로 보지 않는다.
 
 Gateway client가 proxy하는 효과는 기존 Messenger의 `send`, `showApproval`, `dismissApproval`,
-`createThread`, `fetchAfter`, `openAttachment`로 한정한다. private Unix socket에서 원래 route와
+`canCreateThread`(읽기 전용 capability), `createThread`, `fetchAfter`, `openAttachment`로 한정한다. private Unix socket에서 원래 route와
 stable ID를 보존하며 임의 URL·범용 native RPC forwarding을 추가하지 않는다. `DeliveryError`의
 확정 실패/불확실성, 첨부 스트림의 실제 byte limit·abort, mutation 자동 재시도 금지를 IPC 너머로
 보존한다. 수신 event receipt는 외부 효과 성공 영수증이 아니다.
@@ -938,7 +1077,7 @@ commit SHA를 만들어 pin된 검증 근거로 제시하지 않는다.
      재사용 충돌·unavailable·drift 보류, unload/재시작/기존 기록 채택의 모델 유지와 자식 권한.
    - 최초 native high/middle/low 초기화의 기존 프리셋·기본/활성 역할·judge 보존, 충돌 덮어쓰기
      거부, 전체 역할/thinking snapshot과 편집 후 기존 레인 불변, 명시적 유휴 레인 변경,
-     최초 생성 외 전역 모델/config 쓰기 금지·TUI replica/헤드/다른 레인 격리를 확인한다.
+     최초 생성 및 운영자의 명시적 preset `--global` 외 전역 모델/config 쓰기 금지·TUI replica/헤드/다른 레인 격리를 확인한다.
      정상 native 인증 갱신은 유지하며 모든 OMP 파일 불변으로 과장하지 않는다.
    - 스킬의 자문 정책과 runtime 강제를 구분하고 실제 judge 자문/사용량은 native purpose
      `judge` 증거로 따로 확인. 기존 로컬 fixture나 과거 통과 수치로 대신하지 않음.

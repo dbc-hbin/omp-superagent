@@ -11,7 +11,7 @@ import { type Config, hostPaths } from "../src/config";
 import type { HostOptions } from "../src/host";
 import { DeliveryError } from "../src/delivery";
 import { compareMessageIds } from "../src/message-order";
-import { Superagent, type RuntimeHost, type RuntimeState } from "../src/runtime";
+import { Superagent, type RuntimeAdapters, type RuntimeHost, type RuntimeState } from "../src/runtime";
 import { Store } from "../src/store";
 
 const executionModel: LaneModel = { provider: "fixture", id: "capable" };
@@ -39,14 +39,32 @@ class HostTransport implements RuntimeHost {
   models: unknown[] = [executionModel, { ...otherModel, kind: "chat" }, { provider: "fixture", id: "judge", kind: "judge" }];
   catalogSuccess = true;
   beforeCatalog?: () => Promise<void> | void;
+  beforeLevels?: () => Promise<void> | void;
   beforeSetModel?: () => Promise<void> | void;
-  modelSetResult: "success" | "throw-before" | "throw-after" | "mismatch" = "success";
+  beforeSetEffort?: () => Promise<void> | void;
+  beforeCompact?: () => Promise<void> | void;
+  beforeAbort?: () => Promise<void> | void;
+  compactResult: "success" | "rejected" | "throw-after" = "success";
+  compactAbort?: () => void;
+  abortCount = 0;
+  stats: Record<string, unknown> = {
+    userMessages: 11, assistantMessages: 12, toolCalls: 13, toolResults: 14, totalMessages: 25,
+    tokens: { input: 101, output: 202, reasoning: 33, cacheRead: 404, cacheWrite: 505, total: 1212 },
+    premiumRequests: 2, cost: 0.125,
+  };
+  modelSetResult: "success" | "throw-before" | "throw-after" | "mismatch" | "rejected" = "success";
+  effortSetResult: "success" | "throw-after" | "model-mismatch" | "missing-effort" | "rejected" = "success";
+  levels: unknown[] = ["off", "minimal", "high"];
+  levelsSuccess = true;
+  effortClamp?: string;
+  modelEffort?: string | null;
   state: RuntimeState;
 
   constructor(sessionFile: string, sessionId: string, model: LaneModel | null = executionModel) {
-    this.state = { sessionFile, sessionId, model, settingsScope: "session",
+    this.state = { sessionFile, sessionId, model, thinkingLevel: "high", isCompacting: false, queuedMessageCount: 0, settingsScope: "session",
       modelSettings: { modelRoles: { default: "fixture/capable", smol: "fixture/efficient" }, defaultThinkingLevel: Effort.High },
-      hostPid: process.pid, isSettled: true, isStreaming: false, hasOwnedRunningWork: false, pendingUiRequests: [], goal: null };
+      contextUsage: { tokens: 321, contextWindow: 200_000, percent: 0.1605 },
+      hostPid: process.pid, isSettled: true, isStreaming: false, hasPendingAsyncWork: false, hasOwnedRunningWork: false, pendingUiRequests: [], goal: null };
     const deferred = Promise.withResolvers<void>();
     this.exited = deferred.promise;
     this.exit = () => deferred.resolve();
@@ -54,9 +72,15 @@ class HostTransport implements RuntimeHost {
   client = {
     getState: async () => structuredClone(this.state),
     abortAndRestoreQueue: async () => {
+      this.abortCount++;
+      await this.beforeAbort?.();
       if (this.abortFails) throw new Error("native abort failed");
+      this.compactAbort?.();
       this.state.isStreaming = false;
       this.state.isSettled = true;
+      this.state.isCompacting = false;
+      this.state.queuedMessageCount = 0;
+      return { steering: [{ text: "withdrawn secret input" }], followUp: [] };
     },
     getSubagents: async () => this.children,
     cancelSubagent: async (id: string) => { this.cancelled.push(id); },
@@ -67,6 +91,29 @@ class HostTransport implements RuntimeHost {
       await this.beforeCatalog?.();
       return { success: this.catalogSuccess, data: { models: structuredClone(this.models) } };
     }
+    if (command.type === "get_available_thinking_levels") {
+      await this.beforeLevels?.();
+      return { success: this.levelsSuccess, data: { levels: structuredClone(this.levels) } };
+    }
+    if (command.type === "get_session_stats") return { success: true, data: { sessionId: this.state.sessionId, sessionFile: this.state.sessionFile, ...structuredClone(this.stats) } };
+    if (command.type === "compact") {
+      if (this.compactResult === "rejected") return { success: false, error: "secret rejected compact" };
+      this.state.isCompacting = true;
+      try { await this.beforeCompact?.(); }
+      finally { this.state.isCompacting = false; }
+      this.state.contextUsage = { tokens: 123, contextWindow: 200_000, percent: 0.0615 };
+      if (this.compactResult === "throw-after") throw new Error("secret lost compact acknowledgement");
+      return { success: true, data: { summary: "secret native summary", firstKeptEntryId: "kept-1", tokensBefore: 321 } };
+    }
+    if (command.type === "set_thinking_level") {
+      await this.beforeSetEffort?.();
+      if (this.state.settingsScope !== "session" || this.effortSetResult === "rejected") return { success: false, error: "secret endpoint/token native error" };
+      this.state.thinkingLevel = this.effortClamp ?? String(command.level);
+      if (this.effortSetResult === "model-mismatch") this.state.model = { ...otherModel };
+      if (this.effortSetResult === "missing-effort") this.state.thinkingLevel = undefined;
+      if (this.effortSetResult === "throw-after") throw new Error("secret endpoint/token lost effort acknowledgement");
+      return { success: true };
+    }
     if (command.type === "get_available_commands") {
       await this.beforeCapabilities?.();
       return { success: true, data: { commands: this.workflowAvailable ? WORKFLOW_NAMES.map(name => ({
@@ -76,6 +123,7 @@ class HostTransport implements RuntimeHost {
     if (command.type === "set_model" || command.type === "set_model_preset") {
       await this.beforeSetModel?.();
       if (this.modelSetResult === "throw-before") throw new Error("Native model request transport outcome unknown");
+      if (this.modelSetResult === "rejected") return { success: false, error: "secret endpoint/token native error" };
       if (this.state.settingsScope !== "session") return { success: false, error: "Session-isolated settings required" };
       if (this.modelSetResult !== "mismatch") {
         if (command.type === "set_model_preset") {
@@ -84,7 +132,11 @@ class HostTransport implements RuntimeHost {
           if (!model) throw new Error("Fixture native preset has no exact available default");
           this.state.model = { ...model };
           this.state.modelSettings = { modelRoles: { ...preset.modelRoles }, defaultThinkingLevel: preset.defaultThinkingLevel ?? this.state.modelSettings?.defaultThinkingLevel };
-        } else this.state.model = { provider: String(command.provider), id: String(command.modelId) };
+          this.state.thinkingLevel = this.state.modelSettings.defaultThinkingLevel;
+        } else {
+          this.state.model = { provider: String(command.provider), id: String(command.modelId) };
+          if (this.modelEffort !== undefined) this.state.thinkingLevel = this.modelEffort ?? undefined;
+        }
       }
       if (this.modelSetResult === "throw-after") throw new Error("Native model acknowledgement lost");
       return { success: true, data: command.type === "set_model_preset"
@@ -231,7 +283,7 @@ function delegated(store: Store, sourceId: string) {
   return store.input(`handoff:${sourceId}:${lane.id}`);
 }
 
-function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"]) {
+function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], presetAdapters: Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset"> = {}) {
   const directory = realpathSync(mkdtempSync("/tmp/sa-runtime-"));
   const config: Config = {
     path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
@@ -247,14 +299,28 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"]) {
   const launchBehavior: { model?: LaneModel | null; pid?: number } = {};
   const nativePresets = new Map<string, ResolvedLanePreset>([
     ["high", { model: executionModel, preset: "high", snapshot: { modelRoles: { default: "fixture/capable", smol: "fixture/efficient" }, defaultThinkingLevel: Effort.High } }],
+    ["middle", { model: executionModel, preset: "middle", snapshot: { modelRoles: { default: "fixture/capable" } } }],
     ["low", { model: otherModel, preset: "low", snapshot: { modelRoles: { default: "fixture/efficient", smol: "fixture/efficient" }, defaultThinkingLevel: Effort.Low } }],
   ]);
+  const persistedPresets: ResolvedLanePreset[] = [];
+  const presetPersistence: { save?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot> } = {};
   const errors: unknown[] = [];
   const runtime = new Superagent(config, store, messenger, join(directory, "extension.ts"), error => errors.push(error), {
     resolvePreset: async name => {
       const preset = nativePresets.get(name);
       if (!preset) throw new Error("Native preset is not configured");
       return structuredClone(preset);
+    },
+    inspectPresets: async () => ({
+      settings: structuredClone(main.state.modelSettings!),
+      configuredDefault: { available: true, resolvedDefault: { ...executionModel } },
+      availableModels: [{ ...executionModel }, { ...otherModel }],
+      presets: [...nativePresets].map(([name, value]) => ({ name, status: "valid", globalEntry: true, available: true, resolvedDefault: { ...value.model } })),
+      bootstrap: { missing: [], blocked: [] },
+    }),
+    persistPreset: async selection => {
+      persistedPresets.push(structuredClone(selection));
+      return presetPersistence.save ? await presetPersistence.save(selection) : structuredClone(selection.snapshot);
     },
     connect: async path => {
       const host = hosts.get(path);
@@ -275,10 +341,143 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"]) {
       if (!existsSync(options.sessionFile)) writeFileSync(options.sessionFile, JSON.stringify({ type: "session", version: 3, id: host.state.sessionId, cwd: options.cwd }) + "\n");
       return { pid: launchBehavior.pid ?? process.pid };
     },
+    ...presetAdapters,
   });
   fixtures.push({ runtime, directory });
-  return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets };
+  return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
 }
+
+describe("dedicated HEAD startup preset initialization", () => {
+  test("valid preexisting presets use readback only, without a model turn", async () => {
+    const { runtime, store, main } = fixture();
+    await runtime.start();
+    expect(JSON.parse(store.getMeta("head:preset-bootstrap")!)).toMatchObject({ state: "complete", sessionId: "session-main" });
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("bootstrap holds ordered user input, never delivers its text, and requires actual readback", async () => {
+    let created = false;
+    const { runtime, store, main, messenger } = fixture(3, undefined, {
+      inspectPresets: async () => ({ settings: { modelRoles: { default: "fixture/capable" } },
+        configuredDefault: { available: true }, availableModels: [executionModel],
+        presets: ["high", "middle", "low"].map(name => ({ name, status: created ? "valid" : "missing", available: created, globalEntry: created })),
+        bootstrap: { missing: created ? [] : ["high", "middle", "low"], blocked: [] } }),
+    });
+    await runtime.start();
+    expect(main.prompts).toHaveLength(1);
+    expect(main.prompts[0]!.id.startsWith("sg-bootstrap-")).toBe(true);
+    expect(store.inputs()).toEqual([]);
+    await admit(runtime, message("bootstrap-first"));
+    await admit(runtime, message("bootstrap-second", route("other-bootstrap")));
+    expect(store.inputs().map(input => [input.id, input.state])).toEqual([["bootstrap-first", "pending"], ["bootstrap-second", "pending"]]);
+    expect(main.prompts).toHaveLength(1);
+    created = true;
+    main.complete("INTERNAL SETUP TEXT MUST NOT BE DELIVERED");
+    await main.whenPrompts(2);
+    expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).toBe("complete");
+    expect(String(main.prompts[1]!.command.message)).toContain("Request ID: bootstrap-first");
+    expect(messenger.sent).toEqual([]);
+    main.complete("first user answer");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]!.text).toBe("first user answer");
+    expect(store.input("bootstrap-second")?.state).not.toBe("done");
+  });
+
+  test("skipped or completed-without-creation initializers never become complete", async () => {
+    for (const skipped of [false, true]) {
+      const { runtime, main, store, messenger } = fixture(3, undefined, {
+        inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
+          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+      });
+      main.local = skipped;
+      await runtime.start();
+      if (!skipped) main.complete("No presets were saved");
+      // Drain the event-driven finish/readback chain, not a guessed time delay.
+      const drained = Promise.withResolvers<void>();
+      setImmediate(drained.resolve);
+      await drained.promise;
+      await admit(runtime, message(`bootstrap-status-${skipped}`, route(), "/status"));
+      expect(messenger.sent.at(-1)!.text).toContain("Preset initialization: failed");
+      expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).toBe("failed");
+      await admit(runtime, message(`bootstrap-held-${skipped}`));
+      expect(store.input(`bootstrap-held-${skipped}`)?.state).toBe("pending");
+      expect(main.prompts).toHaveLength(1);
+    }
+  });
+
+  test("all prior terminal/ambiguous lifecycles fence automatic recreation, including prior no-op complete", async () => {
+    for (const prior of ["running", "failed", "blocked", "uncertain", "complete", "checking"] as const) {
+      const { runtime, store, main } = fixture(3, undefined, {
+        inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
+          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+      });
+      store.setMeta("head:preset-bootstrap", JSON.stringify({ sessionId: "session-main", state: prior,
+        ...(prior === "running" ? { requestId: "original-bootstrap" } : {}),
+        ...(prior === "checking" ? { replayBlocked: true } : {}), detail: "Earlier lifecycle" }));
+      await runtime.start();
+      expect(main.prompts).toEqual([]);
+      expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).not.toBe("complete");
+      await admit(runtime, message(`restart-held-${prior}`));
+      expect(store.input(`restart-held-${prior}`)?.state).toBe("pending");
+    }
+  });
+
+  test("native-only bootstrap approval stays pending and owner stop prevents replay", async () => {
+    const { runtime, main, store } = fixture(3, undefined, {
+      inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
+        availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+    });
+    await runtime.start();
+    const dialog = { id: "bootstrap-approval", method: "confirm", title: "Native setup permission" };
+    main.state.pendingUiRequests = [dialog];
+    main.emit({ type: "extension_ui_request", ...dialog });
+    expect(main.responses).toEqual([]);
+    expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).toBe("blocked");
+    await admit(runtime, message("stop-bootstrap", route(), "/stop head"));
+    expect(main.responses).toContainEqual({ id: dialog.id, response: { cancelled: true } });
+    expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).toBe("failed");
+    await admit(runtime, message("after-bootstrap-stop"));
+    expect(store.input("after-bootstrap-stop")?.state).toBe("pending");
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test("initial approval inventory is reconciled before inspection and blocks startup model work", async () => {
+    const frame = { id: "original-main-approval", method: "confirm", title: "Original owner permission" };
+    const id = `a-${createHash("sha256").update(`main:0:${frame.id}`).digest("hex").slice(0, 24)}`;
+    const f = fixture(3, undefined, {
+      inspectPresets: async () => {
+        expect(f.messenger.shown.get(id)?.remoteId).toBe("original-card");
+        expect(f.main.responses).toEqual([]);
+        return { settings: { modelRoles: {} }, configuredDefault: { available: true },
+          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } };
+      },
+    });
+    f.main.state.pendingUiRequests = [frame];
+    f.store.putApproval({ id, target: "main", generation: 0, requestId: frame.id, route: route(),
+      request: frame, state: "pending", remoteId: "original-card" });
+    await f.runtime.start();
+    expect(f.main.prompts).toEqual([]);
+    expect(JSON.parse(f.store.getMeta("head:preset-bootstrap")!).state).toBe("blocked");
+    expect(f.store.approval(id)?.state).toBe("pending");
+    await admit(f.runtime, message("approval-startup-held"));
+    expect(f.store.input("approval-startup-held")?.state).toBe("pending");
+  });
+
+  test("restart retains a native-only setup dialog and never repeats its original initializer", async () => {
+    const { runtime, main, store } = fixture(3, undefined, {
+      inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
+        availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+    });
+    store.setMeta("head:preset-bootstrap", JSON.stringify({ sessionId: "session-main", state: "running",
+      requestId: "original-bootstrap", detail: "Interrupted setup" }));
+    main.state.pendingUiRequests = [{ id: "original-setup-dialog", method: "confirm", title: "Native owner permission" }];
+    main.state.isSettled = false;
+    await runtime.start();
+    expect(main.responses).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(JSON.parse(store.getMeta("head:preset-bootstrap")!)).toMatchObject({ state: "uncertain", requestId: "original-bootstrap" });
+  });
+});
 
 function savedLane(store: Store, config: Config, id: string, destination: Route, pid: number | null = null): Lane {
   const paths = hostPaths(config, id);
@@ -318,6 +517,736 @@ function modelChangeSource(store: Store, id: string): string {
   store.settle(id, "done");
   return id;
 }
+
+describe("messenger head session controls", () => {
+  test("busy queries bypass prompt dispatch and expose only safe native model identities and effort", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    main.models.push({ ...otherModel, apiKey: "secret-api-key", baseUrl: "https://private-endpoint", headers: { Authorization: "secret-header" } });
+    await runtime.start();
+    await admit(runtime, message("head-running"));
+    for (const [index, text] of ["/model", "/model list", "/effort"].entries()) {
+      await admit(runtime, message(`head-query-${index}`, route("other-source"), text));
+      expect(store.input(`head-query-${index}`)?.state).toBe("done");
+    }
+    expect(main.prompts).toHaveLength(1);
+    expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
+    const replies = messenger.sent.map(output => output.text).join("\n");
+    expect(replies).toContain("HEAD session only");
+    expect(replies).toContain("fixture/capable");
+    expect(replies).toContain("fixture/efficient");
+    expect(replies).toContain("effort: high");
+    expect(replies).toContain("off, minimal, high");
+    expect(replies).not.toContain("fixture/judge");
+    expect(replies).not.toContain("secret");
+    expect(replies).not.toContain("private-endpoint");
+    expect(store.input("head-running")?.state).toBe("submitted");
+  });
+
+  test("scoped model and effort changes persist intent, read back effective effort, and leave bound lanes and native defaults unchanged", async () => {
+    const { runtime, store, config, main, messenger, launched } = fixture();
+    const lane = savedLane(store, config, "head-bound-reference", route("head-bound-reference"));
+    const saved = structuredClone(store.lane(lane.id));
+    const settings = structuredClone(main.state.modelSettings);
+    main.modelEffort = "minimal";
+    main.beforeSetModel = () => {
+      expect(store.input("head-model-change")).toMatchObject({ state: "submitted", target: "main", generation: 0 });
+      expect(store.input("head-model-change")?.requestId).toBeTruthy();
+    };
+    main.beforeSetEffort = () => {
+      expect(store.input("head-effort-change")?.state).toBe("submitted");
+    };
+    await runtime.start();
+    await admit(runtime, message("head-model-change", lane.route, "/model fixture/efficient"));
+    main.effortClamp = "off";
+    await admit(runtime, message("head-effort-change", lane.route, "/effort minimal"));
+    expect(main.state.model).toEqual(otherModel);
+    expect(main.state.thinkingLevel).toBe("off");
+    expect(main.state.modelSettings).toEqual(settings);
+    expect(store.lane(lane.id)).toEqual(saved);
+    expect(launched).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(messenger.sent).toHaveLength(2);
+    expect(messenger.sent[0]).toMatchObject({ route: lane.route });
+    expect(messenger.sent[0]!.text).toContain("HEAD session only (not lanes or global defaults)");
+    expect(messenger.sent[0]!.text).toContain("effort: minimal");
+    expect(messenger.sent[1]!.text).toContain("effort: off");
+    expect(messenger.sent[1]!.text).toContain("differs from the requested level");
+    expect(store.input("head-model-change")?.state).toBe("done");
+    expect(store.input("head-effort-change")?.state).toBe("done");
+  });
+
+  test("DM topic commands retain their original route and still change only HEAD", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const destination = route(null, { guildId: null });
+    await admit(runtime, message("1001", destination, "/new"));
+    await admit(runtime, message("1002", destination, "/model fixture/efficient"));
+    const original = store.input("1002")!;
+    expect(original.route.topicId).toBeTruthy();
+    expect(main.state.model).toEqual(otherModel);
+    expect(messenger.sent.at(-1)?.route).toEqual(original.route);
+    await admit(runtime, message("1003", destination, "/main"));
+    await admit(runtime, message("1002", destination, "/model fixture/efficient"));
+    expect(store.input("1002")?.route).toEqual(original.route);
+    expect(main.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("model changes and queries preserve legitimate native model-default effort rather than inventing off", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    main.state.thinkingLevel = undefined;
+    main.modelEffort = null;
+    await runtime.start();
+    await admit(runtime, message("head-default-effort-query", route(), "/effort"));
+    await admit(runtime, message("head-default-effort-model", route(), "/model fixture/efficient"));
+    expect(store.input("head-default-effort-model")?.state).toBe("done");
+    expect(main.state.model).toEqual(otherModel);
+    expect(main.state.thinkingLevel).toBeUndefined();
+    expect(messenger.sent[0]!.text).toContain("effort: model default");
+    expect(messenger.sent[1]!.text).toContain("effort: model default");
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("only native advertised effort levels and exact chat model identities are accepted", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    main.levels = ["off", "balanced-2"];
+    await runtime.start();
+    await admit(runtime, message("head-custom-effort", route(), "/effort balanced-2"));
+    expect(main.state.thinkingLevel).toBe("balanced-2");
+    for (const [index, text] of ["/model capable", "/model fixture/judge", "/model fixture/missing", "/model list extra", "/effort high", "/effort auto", "/effort inherit", "/effort off extra"].entries()) {
+      const id = `head-invalid-${index}`;
+      await admit(runtime, message(id, route(), text));
+      expect(store.input(id)?.state).toBe("cancelled");
+    }
+    expect(main.commands.filter(command => command.type === "set_thinking_level")).toEqual([{ type: "set_thinking_level", level: "balanced-2" }]);
+    expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(messenger.sent.at(-1)?.text).toContain("off, balanced-2");
+  });
+
+  test("unverified native capabilities produce safe deterministic replies without invoking a model", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    main.catalogSuccess = false;
+    await admit(runtime, message("head-failed-catalog", route(), "/model list"));
+    main.levelsSuccess = false;
+    await admit(runtime, message("head-failed-levels", route(), "/effort"));
+    main.levelsSuccess = true;
+    main.levels = [{ token: "secret-native-payload" }];
+    await admit(runtime, message("head-malformed-levels", route(), "/effort off"));
+    for (const id of ["head-failed-catalog", "head-failed-levels", "head-malformed-levels"]) expect(store.input(id)?.state).toBe("cancelled");
+    expect(main.prompts).toEqual([]);
+    expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
+    expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("secret-native-payload");
+  });
+
+  test("quoted text, command lookalikes, reports, and lane handoffs have no head control authority", async () => {
+    const { runtime, store, config, main, hosts } = fixture();
+    const lane = savedLane(store, config, "head-control-handoff", route("head-control-handoff"));
+    await runtime.start();
+    for (const [index, text] of ['"/model fixture/efficient"', "please /effort off", "/models", "/effortless"].entries()) {
+      await admit(runtime, message(`head-passive-${index}`, route(), text));
+      main.complete("Ordinary input");
+      await runtime.kick();
+    }
+    store.receive(message("report:head-command", route(), "/model fixture/efficient"), "main");
+    await runtime.kick();
+    main.complete("Internal report is data");
+    await runtime.kick();
+    await delegate(runtime, message("head-handoff-source", lane.route, "/effort off"));
+    expect(hosts.get(lane.socketPath)?.prompts).toHaveLength(1);
+    expect(main.prompts).toHaveLength(5);
+    expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
+    expect(main.state.model).toEqual(executionModel);
+    expect(main.state.thinkingLevel).toBe("high");
+  });
+
+  test("concurrent and replayed commands mutate once in durable arrival order before later ordinary input", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    main.beforeSetModel = async () => { entered.resolve(); await release.promise; };
+    await runtime.start();
+    const first = message("head-concurrent-model", route(), "/model fixture/efficient");
+    await runtime.receive(first);
+    await entered.promise;
+    await runtime.receive(first);
+    await runtime.receive(message("head-concurrent-effort", route(), "/effort minimal"));
+    await runtime.receive(message("head-concurrent-ordinary"));
+    release.resolve();
+    await runtime.kick();
+    expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level" || command.type === "prompt").map(command => command.type)).toEqual(["set_model", "set_thinking_level", "prompt"]);
+    expect(store.input(first.id)?.state).toBe("done");
+    expect(store.input("head-concurrent-effort")?.state).toBe("done");
+    expect(main.prompts).toHaveLength(1);
+    expect(main.state.thinkingLevel).toBe("minimal");
+    expect(messenger.sent).toHaveLength(2);
+    await admit(runtime, first);
+    expect(main.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+  });
+
+  test("mutations refuse active main input while read-only diagnostics remain available", async () => {
+    const { runtime, main, store } = fixture();
+    await runtime.start();
+    await admit(runtime, message("head-active-original"));
+    for (const [index, text] of ["/model fixture/efficient", "/effort off"].entries()) {
+      await admit(runtime, message(`head-busy-input-${index}`, route(), text));
+      expect(store.input(`head-busy-input-${index}`)?.state).toBe("cancelled");
+    }
+    await admit(runtime, message("head-busy-diagnostic", route(), "/model"));
+    expect(store.input("head-busy-diagnostic")?.state).toBe("done");
+    expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test("mutations refuse every native busy ownership state and unsafe settings scope", async () => {
+    const cases: Partial<RuntimeState>[] = [
+      { isSettled: false }, { isStreaming: true }, { hasPendingAsyncWork: true }, { hasOwnedRunningWork: true },
+      { pendingUiRequests: [{ id: "busy-native-ui", method: "unknown" }] }, { goal: { enabled: true } },
+      { isCompacting: true }, { queuedMessageCount: 1 }, { settingsScope: "persistent" }, { settingsScope: undefined },
+    ];
+    for (const [index, state] of cases.entries()) {
+      const { runtime, main, store } = fixture();
+      await runtime.start();
+      Object.assign(main.state, state);
+      await admit(runtime, message(`head-unsafe-${index}`, route(), index % 2 ? "/effort off" : "/model fixture/efficient"));
+      expect(store.input(`head-unsafe-${index}`)?.state).toBe("cancelled");
+      expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
+      expect(main.prompts).toEqual([]);
+    }
+  });
+
+  test("durable approvals and earlier held or uncertain main inputs cannot be bypassed", async () => {
+    for (const hold of ["approval", "pending", "uncertain"] as const) {
+      const { runtime, main, store } = fixture();
+      await runtime.start();
+      if (hold === "approval") store.putApproval({ id: "head-approval-hold", target: "main", generation: 0, requestId: "head-ui", route: route(), request: { method: "confirm" }, state: "pending", remoteId: null });
+      else {
+        store.receive(message("head-earlier-held"), "main");
+        if (hold === "uncertain") {
+          store.submit("head-earlier-held", "head-held-receipt", 0);
+          store.settle("head-earlier-held", "uncertain");
+        } else main.state.pendingUiRequests = [{ id: "hold-ordinary", method: "unknown" }];
+      }
+      await admit(runtime, message(`head-held-${hold}`, route(), "/model fixture/efficient"));
+      expect(store.input(`head-held-${hold}`)?.state).toBe("cancelled");
+      await admit(runtime, message(`head-held-query-${hold}`, route(), "/effort"));
+      expect(store.input(`head-held-query-${hold}`)?.state).toBe("done");
+      expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+      expect(main.prompts).toEqual([]);
+    }
+  });
+
+  test("ownership and isolation are rechecked after capability reads before native mutation", async () => {
+    for (const changed of [{ hasPendingAsyncWork: true }, { settingsScope: "persistent" as const }]) {
+      const { runtime, main, store } = fixture();
+      await runtime.start();
+      main.beforeCatalog = () => { Object.assign(main.state, changed); };
+      await admit(runtime, message("head-capability-race", route(), "/model fixture/efficient"));
+      expect(store.input("head-capability-race")?.state).toBe("cancelled");
+      expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+    }
+  });
+
+  test("effort mutation refuses a model change during capability discovery", async () => {
+    const { runtime, main, store } = fixture();
+    await runtime.start();
+    main.beforeLevels = () => { main.state.model = { ...otherModel }; };
+    await admit(runtime, message("head-effort-model-race", route(), "/effort minimal"));
+    expect(store.input("head-effort-model-race")?.state).toBe("cancelled");
+    expect(main.commands.filter(command => command.type === "set_thinking_level")).toEqual([]);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("lost acknowledgement, raw failure, and mismatched readback fence later work without mutation replay", async () => {
+    for (const result of ["throw-before", "throw-after", "mismatch", "rejected"] as const) {
+      const { runtime, main, store, messenger } = fixture();
+      main.modelSetResult = result;
+      await runtime.start();
+      const original = message(`head-ambiguous-${result}`, route(), "/model fixture/efficient");
+      await admit(runtime, original);
+      expect(store.input(original.id)?.state).toBe("uncertain");
+      await admit(runtime, original);
+      await admit(runtime, message(`head-fenced-${result}`));
+      await admit(runtime, message(`head-fenced-mutation-${result}`, route(), "/effort off"));
+      await admit(runtime, message(`head-diagnostic-${result}`, route(), "/model"));
+      expect(store.input(`head-fenced-${result}`)?.state).toBe("pending");
+      expect(store.input(`head-fenced-mutation-${result}`)?.state).toBe("cancelled");
+      expect(store.input(`head-diagnostic-${result}`)?.state).toBe("done");
+      expect(main.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+      expect(main.commands.filter(command => command.type === "set_thinking_level")).toEqual([]);
+      expect(main.prompts).toEqual([]);
+      const replies = messenger.sent.map(output => output.text).join("\n");
+      expect(replies).toContain("uncertain");
+      expect(replies).not.toContain("secret");
+      expect(replies).not.toContain("endpoint/token");
+    }
+  });
+
+  test("effort acknowledgement loss and identity drift remain uncertain with safe diagnostics and no replay", async () => {
+    for (const result of ["throw-after", "model-mismatch", "missing-effort", "rejected"] as const) {
+      const { runtime, main, store, messenger } = fixture();
+      main.effortSetResult = result;
+      await runtime.start();
+      const original = message(`head-effort-ambiguous-${result}`, route(), "/effort minimal");
+      await admit(runtime, original);
+      await admit(runtime, original);
+      await admit(runtime, message(`head-effort-diagnostic-${result}`, route(), "/effort"));
+      expect(store.input(original.id)?.state).toBe("uncertain");
+      expect(store.input(`head-effort-diagnostic-${result}`)?.state).toBe("done");
+      expect(main.commands.filter(command => command.type === "set_thinking_level")).toHaveLength(1);
+      expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("secret");
+    }
+  });
+
+  test("session or settings scope changes during mutation cannot produce a verified success", async () => {
+    for (const identity of ["session", "scope"] as const) {
+      const { runtime, main, store } = fixture();
+      await runtime.start();
+      main.beforeSetModel = () => {
+        if (identity === "session") main.state.sessionId = "replaced-head-session";
+        else main.state.settingsScope = "persistent";
+      };
+      const original = message(`head-identity-${identity}`, route(), "/model fixture/efficient");
+      await admit(runtime, original);
+      await admit(runtime, original);
+      expect(store.input(original.id)?.state).toBe("uncertain");
+      expect(main.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+      expect(main.prompts).toEqual([]);
+    }
+  });
+
+  test("a persisted submitted control recovers as uncertain and is never automatically replayed", async () => {
+    const { runtime, store, main } = fixture();
+    const original = message("head-crashed-control", route(), "/model fixture/efficient");
+    store.receive(original, "main", { [`user-source:${original.id}`]: "true" });
+    store.submit(original.id, "persisted-head-control-intent", 0);
+    await runtime.start();
+    await admit(runtime, original);
+    await admit(runtime, message("head-crashed-diagnostic", route(), "/model"));
+    await admit(runtime, message("head-crashed-later-work"));
+    expect(store.input(original.id)?.state).toBe("uncertain");
+    expect(store.input("head-crashed-diagnostic")?.state).toBe("done");
+    expect(store.input("head-crashed-later-work")?.state).toBe("pending");
+    expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+    expect(main.prompts).toEqual([]);
+  });
+});
+
+describe("priority native head commands", () => {
+  test("busy help status context usage and preset lists are native read-only safe projections", async () => {
+    const { runtime, main, store, messenger, config } = fixture();
+    const lane = savedLane(store, config, "query-bound", route("query-bound"));
+    main.state.pendingUiRequests = [{ id: "native-ui", method: "unknown", prompt: "secret native prompt", token: "secret-token" }];
+    await runtime.start();
+    main.state.pendingUiRequests = [];
+    await admit(runtime, message("query-active", lane.route));
+    main.state.pendingUiRequests = [{ id: "native-ui", method: "unknown", prompt: "secret native prompt" }];
+    for (const [index, text] of ["/help", "/status", "/context", "/usage", "/model preset", "/model preset list"].entries()) {
+      await admit(runtime, message(`priority-query-${index}`, lane.route, text));
+      expect(store.input(`priority-query-${index}`)?.state).toBe("done");
+    }
+    expect(main.prompts).toHaveLength(1);
+    const replies = messenger.sent.map(output => output.text).join("\n");
+    for (const value of ["!status", "/stop [head|lane-id]", "session-main", "query-bound", "submitted: 1", "321", "200000", "101", "202", "404", "505", "1212", "0.125", "not proof of task completion"]) expect(replies).toContain(value);
+    expect(replies).not.toContain("secret");
+    expect(main.commands.some(command => ["compact", "set_model", "set_model_preset", "set_thinking_level"].includes(String(command.type)))).toBe(false);
+    main.stats = { tokens: {}, cost: undefined };
+    main.state.contextUsage = undefined;
+    await admit(runtime, message("unknown-context", route(), "/context"));
+    await admit(runtime, message("unknown-usage", route(), "/usage"));
+    expect(messenger.sent.at(-2)?.text).toContain("unknown");
+    expect(messenger.sent.at(-1)?.text).toContain("unknown");
+  });
+
+  test("head stop cancels only its durable ordinary boundary and drains native work without revival", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    await admit(runtime, message("stop-current"));
+    await runtime.receive(message("stop-queued"));
+    store.receive(message("historical-uncertain"), "main");
+    store.submit("historical-uncertain", "historical-request", 0);
+    store.settle("historical-uncertain", "uncertain");
+    main.state.goal = { enabled: true, mode: "active" };
+    main.state.queuedMessageCount = 2;
+    main.children = [{ id: "original-child" }];
+    store.putApproval({ id: "original-approval", target: "main", generation: 0, requestId: "original-ui", route: route(), request: { method: "confirm" }, state: "pending", remoteId: "card" });
+    const stop = message("stop-boundary", route(), "/stop head");
+    await runtime.receive(stop);
+    await runtime.receive(message("stop-later"));
+    await runtime.kick();
+    expect(store.input("stop-current")?.state).toBe("cancelled");
+    expect(store.input("stop-queued")?.state).toBe("cancelled");
+    expect(store.input("historical-uncertain")?.state).toBe("uncertain");
+    expect(store.input("stop-later")?.state).toBe("pending"); // Historical ambiguity is not erased by stop.
+    expect(store.input(stop.id)?.state).toBe("cancelled");
+    expect(main.abortCount).toBe(1);
+    expect(main.cancelled).toEqual(["original-child"]);
+    expect(main.responses).toContainEqual({ id: "original-ui", response: { cancelled: true } });
+    expect(main.state.queuedMessageCount).toBe(0);
+    expect(main.state.goal).toBeNull();
+    main.complete("late answer must not revive stopped input");
+    await admit(runtime, stop);
+    expect(main.abortCount).toBe(1);
+    expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("late answer");
+    expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("withdrawn secret");
+  });
+
+  test("unbound stop permits later requests while bound and explicit lane stops stay lane-local", async () => {
+    const { runtime, main, store, config, hosts } = fixture();
+    const lane = savedLane(store, config, "stop-bound", route("stop-bound"));
+    const other = savedLane(store, config, "stop-unrelated", route("stop-unrelated"));
+    await runtime.start();
+    await admit(runtime, message("ordinary-before-stop", route("unbound")));
+    await admit(runtime, message("unbound-stop", route("unbound"), "/stop"));
+    expect(main.abortCount).toBe(1);
+    await admit(runtime, message("ordinary-after-stop", route("unbound")));
+    expect(main.prompts).toHaveLength(2);
+    expect(store.input("ordinary-after-stop")?.state).toBe("submitted");
+    await admit(runtime, message("bare-bound-stop", lane.route, "/stop"));
+    expect(store.lane(lane.id)?.workState).toBe("paused");
+    expect(main.abortCount).toBe(1);
+    await admit(runtime, message("explicit-lane-stop", route("unbound"), `/stop ${other.id}`));
+    expect(store.lane(other.id)?.workState).toBe("paused");
+    expect(hosts.size).toBe(1);
+    for (const [index, text] of ["/stop head extra", "/stop unknown", "/stop lane-foreign", "/status extra", "/context extra", "/usage extra", "/help extra"].entries()) {
+      await admit(runtime, message(`invalid-priority-${index}`, route(), text));
+      expect(store.input(`invalid-priority-${index}`)?.state).toBe("cancelled");
+    }
+    expect(main.abortCount).toBe(1);
+    expect(main.prompts).toHaveLength(2);
+  });
+
+  test("persisted stop cancellation survives startup without replaying stopped work or uncertain controls", async () => {
+    const { runtime, main, store } = fixture();
+    store.receive(message("restart-stopped-active"), "main");
+    store.submit("restart-stopped-active", "original-active-request", 0);
+    store.receive(message("restart-stopped-queued"), "main");
+    store.receive(message("restart-stop", route(), "/stop head"), "main", { "user-source:restart-stop": "true" });
+    store.submit("restart-stop", "original-stop-request", 0);
+    store.setMeta("head:stop-boundary", JSON.stringify({ inputId: "restart-stop", cancelledInputIds: ["restart-stopped-active", "restart-stopped-queued"] }));
+    await runtime.start();
+    expect(store.input("restart-stopped-active")?.state).toBe("cancelled");
+    expect(store.input("restart-stopped-queued")?.state).toBe("cancelled");
+    expect(store.input("restart-stop")?.state).toBe("uncertain");
+    await admit(runtime, message("restart-after-stop"));
+    await admit(runtime, message("restart-stop", route(), "/stop head"));
+    expect(store.input("restart-after-stop")?.state).toBe("pending");
+    expect(main.abortCount).toBe(0);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("priority command lookalikes and quoted tokens remain ordinary user data", async () => {
+    const { runtime, main } = fixture();
+    await runtime.start();
+    for (const [index, text] of ["/stopper", "/compactness", "/statuses", "/helpful", "/usageful", "/contextual", '"/stop head"'].entries()) {
+      await admit(runtime, message(`priority-lookalike-${index}`, route(), text));
+      main.complete("Ordinary data response");
+      await runtime.kick();
+    }
+    expect(main.prompts).toHaveLength(7);
+    expect(main.abortCount).toBe(0);
+    expect(main.commands.some(command => command.type === "compact")).toBe(false);
+  });
+
+  test("overlapping stops serialize native cleanup and a failed stop holds later work", async () => {
+    const { runtime, main, store } = fixture();
+    await runtime.start();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    main.beforeAbort = async () => { entered.resolve(); await release.promise; };
+    await runtime.receive(message("overlap-stop-1", route(), "/stop head"));
+    await entered.promise;
+    await runtime.receive(message("overlap-stop-2", route(), "/stop head"));
+    await runtime.receive(message("after-overlap"));
+    expect(main.abortCount).toBe(1);
+    expect(main.prompts).toEqual([]);
+    release.resolve();
+    await runtime.kick();
+    expect(main.abortCount).toBe(2);
+    expect(store.input("after-overlap")?.state).toBe("submitted");
+    main.abortFails = true;
+    await admit(runtime, message("failed-stop", route(), "/stop head"));
+    await admit(runtime, message("after-failed-stop"));
+    expect(store.input("failed-stop")?.state).toBe("uncertain");
+    expect(store.input("after-failed-stop")?.state).toBe("pending");
+  });
+
+  test("stop bypasses an earlier model capability wait and durably cancels that pending change", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    main.beforeCatalog = async () => { entered.resolve(); await release.promise; };
+    await runtime.start();
+    const pendingChange = message("stop-pending-model", route(), "/model fixture/efficient");
+    await runtime.receive(pendingChange);
+    await entered.promise;
+    await runtime.receive(message("stop-before-model-effect", route(), "/stop head"));
+    await messenger.whenSent(1);
+    expect(store.input(pendingChange.id)?.state).toBe("cancelled");
+    expect(main.abortCount).toBe(1);
+    expect(main.commands.some(command => command.type === "set_model")).toBe(false);
+    release.resolve();
+    await runtime.kick();
+    await admit(runtime, pendingChange);
+    expect(main.commands.some(command => command.type === "set_model")).toBe(false);
+    expect(main.state.model).toEqual(executionModel);
+  });
+
+  test("compaction preserves multiline instructions and reports native completion plus updated context", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const instructions = "Keep decisions\n\nand exact constraints";
+    main.beforeCompact = () => { expect(store.input("native-compact")?.state).toBe("submitted"); };
+    const input = message("native-compact", route(), `/compact ${instructions}`);
+    await admit(runtime, input);
+    await messenger.whenSent(1);
+    expect(store.input(input.id)?.state).toBe("done");
+    expect(main.commands.filter(command => command.type === "compact")).toEqual([{ type: "compact", customInstructions: instructions }]);
+    expect(messenger.sent[0]?.text).toContain("123");
+    expect(messenger.sent[0]?.text).not.toContain("secret native summary");
+    await admit(runtime, input);
+    expect(main.commands.filter(command => command.type === "compact")).toHaveLength(1);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("pending compact allows read-only commands and stop but fences ordinary work and model mutations", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    main.beforeCompact = async () => { entered.resolve(); await release.promise; };
+    main.compactAbort = () => release.resolve();
+    await runtime.start();
+    await admit(runtime, message("compact-pending", route(), "/compact"));
+    await entered.promise;
+    for (const [index, text] of ["/status", "/help", "/context", "/usage", "/model fixture/efficient"].entries()) await admit(runtime, message(`during-compact-${index}`, route(), text));
+    await runtime.receive(message("compact-ordinary"));
+    expect(store.input("during-compact-0")?.state).toBe("done");
+    expect(store.input("during-compact-4")?.state).toBe("cancelled");
+    expect(main.prompts).toEqual([]);
+    await admit(runtime, message("stop-compact", route(), "/stop head"));
+    expect(store.input("compact-pending")?.state).toBe("cancelled");
+    expect(store.input("compact-ordinary")?.state).toBe("cancelled");
+    expect(store.input("stop-compact")?.state).toBe("cancelled");
+    expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("compaction completed");
+    await admit(runtime, message("after-compact-stop"));
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test("compact rejection is definitive while lost acknowledgement fences without replay", async () => {
+    for (const result of ["rejected", "throw-after"] as const) {
+      const { runtime, main, store, messenger } = fixture();
+      main.compactResult = result;
+      await runtime.start();
+      const original = message(`compact-${result}`, route(), "/compact");
+      await admit(runtime, original);
+      await messenger.whenSent(1);
+      await admit(runtime, original);
+      expect(store.input(original.id)?.state).toBe(result === "rejected" ? "cancelled" : "uncertain");
+      await admit(runtime, message(`compact-after-${result}`));
+      expect(main.prompts).toHaveLength(result === "rejected" ? 1 : 0);
+      expect(main.commands.filter(command => command.type === "compact")).toHaveLength(1);
+      expect(messenger.sent[0]?.text).not.toContain("secret");
+    }
+  });
+
+  test("preset selection freezes full native roles session-only and persists only confirmed effective snapshots", async () => {
+    const { runtime, main, store, config, nativePresets, launched, persistedPresets, messenger } = fixture();
+    const lane = savedLane(store, config, "preset-unmodified", route("preset-unmodified"));
+    const beforeLane = structuredClone(lane);
+    main.state.modelSettings!.modelRoles.obsolete = "fixture/capable";
+    nativePresets.set("exact-custom", { model: otherModel, preset: "exact-custom", snapshot: {
+      modelRoles: { default: "fixture/efficient", smol: "fixture/capable", judge: "fixture/efficient", vision: "fixture/capable" }, defaultThinkingLevel: Effort.Low,
+    } });
+    const originalPresets = structuredClone([...nativePresets]);
+    main.beforeSetModel = () => { expect(store.input("head-preset")?.state).toBe("submitted"); };
+    await runtime.start();
+    const original = message("head-preset", lane.route, "/model preset exact-custom");
+    await admit(runtime, original);
+    expect(main.state.modelSettings).toEqual(nativePresets.get("exact-custom")!.snapshot);
+    expect(JSON.parse(store.getMeta("head:model-settings:session-main")!)).toEqual({ settings: main.state.modelSettings, clearedRoles: ["obsolete"] });
+    expect(store.lane(lane.id)).toEqual(beforeLane);
+    expect([...nativePresets]).toEqual(originalPresets);
+    expect(launched).toEqual([]);
+    await admit(runtime, original);
+    expect(main.commands.filter(command => command.type === "set_model_preset")).toHaveLength(1);
+    expect(persistedPresets).toEqual([]);
+    expect(messenger.sent[0]?.text).toContain('Preset "exact-custom"');
+    expect(messenger.sent[0]?.text).toContain('previous model: "fixture/capable"; effort: high -> actual model: "fixture/efficient"; effort: low');
+    expect(messenger.sent[0]?.text).toContain("session-only (global defaults not saved)");
+    expect(messenger.sent[0]?.text).toContain("Existing lanes unchanged");
+    for (const [index, text] of ["/model preset unknown", "/model preset exact-custom extra", "/model preset save", "/model preset reset"].entries()) {
+      await admit(runtime, message(`bad-preset-${index}`, route(), text));
+      expect(store.input(`bad-preset-${index}`)?.state).toBe("cancelled");
+    }
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("global preset selection saves once only after session readback, using exact frozen roles and inherited thinking", async () => {
+    for (const argument of ["exact-global --global", "--global exact-global"]) {
+      const { runtime, main, store, config, nativePresets, launched, messenger, persistedPresets, presetPersistence } = fixture();
+      const lane = savedLane(store, config, "global-preset-unmodified", route("70"));
+      const beforeLane = structuredClone(lane);
+      nativePresets.set("exact-global", { model: otherModel, preset: "exact-global", snapshot: {
+        modelRoles: { default: "fixture/efficient", smol: "fixture/capable", judge: "fixture/efficient", vision: "fixture/capable" },
+      } });
+      const expected = { ...structuredClone(nativePresets.get("exact-global")!), snapshot: {
+        ...structuredClone(nativePresets.get("exact-global")!.snapshot), defaultThinkingLevel: Effort.High,
+      } };
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      main.beforeSetModel = () => {
+        nativePresets.set("exact-global", { ...structuredClone(nativePresets.get("high")!), preset: "exact-global" });
+      };
+      presetPersistence.save = async selection => {
+        expect(selection).toEqual(expected);
+        expect(main.state.model).toEqual(expected.model);
+        expect(main.state.modelSettings).toEqual(expected.snapshot);
+        expect(JSON.parse(store.getMeta("head:model-settings:session-main")!).settings).toEqual(expected.snapshot);
+        expect(store.input("global-preset-once")?.state).toBe("submitted");
+        entered.resolve();
+        await release.promise;
+        return structuredClone(selection.snapshot);
+      };
+      await runtime.start();
+      const destination = route(null, { guildId: null });
+      await admit(runtime, message("3001", destination, "/new"));
+      const original = { ...message("global-preset-once", destination, `/model preset ${argument}`), messageId: "3002" };
+      await runtime.receive(original);
+      const originalRoute = store.input(original.id)!.route;
+      await entered.promise;
+      await runtime.receive(message("3003", destination, "/main"));
+      await runtime.receive(original);
+      release.resolve();
+      await runtime.kick();
+      await admit(runtime, original);
+      expect(store.input(original.id)?.state).toBe("done");
+      expect(persistedPresets).toEqual([expected]);
+      expect(main.commands.filter(command => command.type === "set_model_preset")).toEqual([
+        { type: "set_model_preset", name: "exact-global", preset: expected.snapshot },
+      ]);
+      expect(store.lane(lane.id)).toEqual(beforeLane);
+      expect(launched).toEqual([]);
+      expect(main.prompts).toEqual([]);
+      expect(store.input(original.id)?.route).toEqual(originalRoute);
+      expect(originalRoute.topicId).toBeTruthy();
+      const notifications = messenger.sent.filter(output => output.id === `${original.id}:head-control`);
+      expect(notifications).toHaveLength(1);
+      expect(notifications[0]?.route).toEqual(originalRoute);
+      const notification = notifications[0]!.text;
+      expect(notification).toContain('Preset "exact-global"');
+      expect(notification).toContain('previous model: "fixture/capable"; effort: high -> actual model: "fixture/efficient"; effort: high');
+      expect(notification).toContain("Session applied; global saved (future/default settings)");
+      expect(notification).toContain("Existing lanes unchanged");
+      expect(notification).not.toContain("HEAD session only");
+    }
+  });
+
+  test("failed or mismatched global readback reports session applied honestly and never replays the original save", async () => {
+    for (const failure of ["throw", "roles", "missing-role", "thinking", "mutated-selection"] as const) {
+      const { runtime, main, store, messenger, persistedPresets, presetPersistence, nativePresets } = fixture();
+      const applied = structuredClone(nativePresets.get("low")!);
+      presetPersistence.save = async selection => {
+        expect(main.state.modelSettings).toEqual(applied.snapshot);
+        if (failure === "throw") throw new Error("secret provider credentials https://private-endpoint");
+        const readback = structuredClone(selection.snapshot);
+        if (failure === "roles") readback.modelRoles.judge = "fixture/capable";
+        if (failure === "missing-role") delete readback.modelRoles.smol;
+        if (failure === "thinking") readback.defaultThinkingLevel = Effort.High;
+        if (failure === "mutated-selection") {
+          selection.snapshot.modelRoles.judge = "fixture/capable";
+          return selection.snapshot;
+        }
+        return readback;
+      };
+      await runtime.start();
+      const destination = route(null, { guildId: null });
+      await admit(runtime, message("3101", destination, "/new"));
+      const original = { ...message(`global-preset-failure-${failure}`, destination, "/model preset low --global"), messageId: "3102" };
+      await admit(runtime, original);
+      const originalRoute = store.input(original.id)!.route;
+      await admit(runtime, message("3103", destination, "/main"));
+      await admit(runtime, original);
+      await admit(runtime, message(`global-preset-held-${failure}`, route("72")));
+      await admit(runtime, message(`global-preset-query-${failure}`, route(), "/model"));
+      expect(store.input(original.id)).toMatchObject({ state: "uncertain", route: originalRoute });
+      expect(originalRoute.topicId).toBeTruthy();
+      expect(store.input(`global-preset-held-${failure}`)?.state).toBe("pending");
+      expect(store.input(`global-preset-query-${failure}`)?.state).toBe("done");
+      expect(persistedPresets).toEqual([applied]);
+      expect(main.commands.filter(command => command.type === "set_model_preset")).toHaveLength(1);
+      expect(main.state.model).toEqual(applied.model);
+      expect(main.state.modelSettings).toEqual(applied.snapshot);
+      expect(JSON.parse(store.getMeta("head:model-settings:session-main")!).settings).toEqual(applied.snapshot);
+      expect(main.prompts).toEqual([]);
+      const notifications = messenger.sent.filter(output => output.id === `${original.id}:head-control`);
+      expect(notifications).toHaveLength(1);
+      expect(notifications[0]?.route).toEqual(originalRoute);
+      const notification = notifications[0]!.text;
+      expect(notification).toContain('Preset "low"');
+      expect(notification).toContain('previous model: "fixture/capable"; effort: high -> actual model: "fixture/efficient"; effort: low');
+      expect(notification).toContain("Session applied; global save unconfirmed/failed");
+      expect(notification).toContain("session change remains applied");
+      expect(notification).toContain("Existing lanes unchanged");
+      expect(notification).not.toContain("no change");
+      expect(notification).not.toContain("global saved");
+      expect(notification).not.toContain("HEAD session only");
+      expect(notification).not.toContain("secret");
+      expect(notification).not.toContain("private-endpoint");
+    }
+  });
+
+  test("global preset query/list, duplicate and unknown flags reject deterministically even while HEAD is busy", async () => {
+    const { runtime, main, store, messenger, persistedPresets } = fixture();
+    await runtime.start();
+    await admit(runtime, message("global-syntax-busy"));
+    for (const [index, text] of [
+      "/model preset --global", "/model preset list --global", "/model preset --global list",
+      "/model preset low --global --global", "/model preset --global low --global",
+      "/model preset low --unknown", "/model preset low --global --unknown", "/model preset --unknown",
+      "/model preset low -g", "/model preset low --global extra",
+    ].entries()) {
+      const id = `invalid-global-preset-${index}`;
+      await admit(runtime, message(id, route(), text));
+      expect(store.input(id)?.state).toBe("cancelled");
+      expect(messenger.sent.at(-1)?.text).toContain("Invalid preset syntax");
+    }
+    expect(main.prompts).toHaveLength(1);
+    expect(persistedPresets).toEqual([]);
+    expect(main.commands.some(command => command.type === "set_model_preset")).toBe(false);
+    await admit(runtime, message("global-preset-help", route(), "/help"));
+    const help = messenger.sent.at(-1)!.text;
+    expect(help).toContain("/model preset <exact-name> --global");
+    expect(help).toContain("future/default settings");
+    expect(help).toContain("Existing lanes remain unchanged");
+    expect(help).toContain("failed/unconfirmed global save does not undo the session change");
+  });
+
+  test("preset lost acknowledgements and incomplete full-role readbacks remain fenced without reaching global persistence", async () => {
+    for (const global of [false, true]) for (const result of ["throw-after", "mismatch", "role-readback"] as const) {
+      const { runtime, main, store, persistedPresets } = fixture();
+      if (result === "role-readback") {
+        const readState = main.client.getState;
+        main.client.getState = async () => {
+          const state = await readState();
+          if (main.commands.some(command => command.type === "set_model_preset")) state.modelSettings!.modelRoles.judge = "fixture/capable";
+          return state;
+        };
+      } else main.modelSetResult = result;
+      await runtime.start();
+      const original = message(`preset-ambiguous-${result}`, route(), `/model preset low${global ? " --global" : ""}`);
+      await admit(runtime, original);
+      await admit(runtime, original);
+      await admit(runtime, message(`preset-later-${result}`));
+      expect(store.input(original.id)?.state).toBe("uncertain");
+      expect(store.input(`preset-later-${result}`)?.state).toBe("pending");
+      expect(store.getMeta("head:model-settings:session-main")).toBeNull();
+      expect(main.commands.filter(command => command.type === "set_model_preset")).toHaveLength(1);
+      expect(persistedPresets).toEqual([]);
+      expect(main.prompts).toEqual([]);
+    }
+  });
+});
 
 describe("trusted workflow activation", () => {
   test("preserves real user leading invocation, original route/request, and deduplicates redelivery", async () => {
@@ -1511,7 +2440,7 @@ describe("real Store runtime coordination", () => {
     expect(store.approvals()).toEqual([]);
   });
 
-  test("unknown topics enter head directly and lane selection never rebinds queued followups", async () => {
+  test("unknown topics steer same-topic followups and lane selection never rebinds admitted inputs", async () => {
     const { runtime, store, main, messenger, directory } = fixture();
     await runtime.start();
     await admit(runtime, message("100"));
@@ -1519,12 +2448,22 @@ describe("real Store runtime coordination", () => {
     expect(store.input("route:100")).toBeNull();
     expect(main.prompts[0]!.command.message).toContain("sourceId: 100");
     await admit(runtime, message("100-followup"));
-    expect(main.prompts).toHaveLength(1);
+    expect(main.prompts).toHaveLength(2);
+    expect(main.prompts[1]!.command).toMatchObject({ streamingBehavior: "steer" });
+    expect(main.prompts[1]!.command.message).toContain("sourceId: 100-followup");
+    expect(store.input("100-followup")).toMatchObject({ target: "main", state: "submitted" });
+    await admit(runtime, message("100-other-topic", route("11")));
+    expect(main.prompts).toHaveLength(2);
+    expect(store.input("100-other-topic")).toMatchObject({ target: "main", state: "pending" });
     expect(messenger.sent).toEqual([]);
     const lane = await runtime.startLane({ ...selection, sourceId: "100", title: "Topic", cwd: directory });
     await runtime.kick();
     expect(store.input("100")?.target).toBe("main");
-    expect(store.input("100-followup")).toMatchObject({ target: "main", state: "pending" });
+    expect(store.input("100-followup")).toMatchObject({ target: "main", state: "submitted" });
+    expect(store.input("100-other-topic")).toMatchObject({ target: "main", state: "pending" });
+    expect(main.prompts).toHaveLength(2);
+    expect(store.input(`handoff:100-followup:${lane.id}`)).toBeNull();
+    expect(store.input(`handoff:100-other-topic:${lane.id}`)).toBeNull();
     expect(store.input("handoff:100:lane")?.target).toBe(lane.id);
     expect(messenger.threads).toEqual([]);
     expect(lane.cwd).toBe(directory);
@@ -2113,6 +3052,59 @@ describe("real Store runtime coordination", () => {
       expect(launched).toHaveLength(1);
       expect(delegated(store, "socket-waiting")?.state).toBe("submitted");
     } finally { socket.stop(true); }
+  });
+
+  test("a native settle in the finish drain's final microtask gap still reports the completed lane", async () => {
+    const { runtime, store, config, hosts, main, messenger, errors } = fixture(2);
+    const lane = savedLane(store, config, "finish-gap", route("finish-gap"));
+    const original = message("finish-gap-source", lane.route);
+    await runtime.start();
+    await delegate(runtime, original);
+    const host = hosts.get(lane.socketPath)!;
+    // Finish the admission-triggered busy read before arranging this distinct
+    // prompt_result -> pending-async -> session_settled sequence.
+    const admitted = Promise.withResolvers<void>();
+    setImmediate(admitted.resolve);
+    await admitted.promise;
+    host.state.isStreaming = false;
+    host.state.hasPendingAsyncWork = true;
+    const readState = host.client.getState;
+    const trace: string[] = [];
+    let firstRead = true;
+    host.client.getState = async () => {
+      const state = await readState();
+      if (!firstRead) { trace.push("fresh state"); return state; }
+      firstRead = false;
+      Object.defineProperty(state, "isSettled", { get() {
+        trace.push("busy state");
+        // finishOnce returns immediately after reading false. The first hop
+        // queues the event behind the inner drain's final condition check; the
+        // second emits it before the outer finish() await can resume. There is
+        // no sleep, polling, replaced runtime method, or extra later wakeup.
+        queueMicrotask(() => queueMicrotask(() => {
+          trace.push("late native settle");
+          host.state.isSettled = true;
+          host.state.hasPendingAsyncWork = false;
+          host.emit({ type: "session_settled" });
+        }));
+        return false;
+      } });
+      return state;
+    };
+    host.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "native lane result" }] } });
+    host.emit({ type: "prompt_result", id: host.prompts[0]!.id, agentInvoked: true, status: "completed", sessionSettled: false });
+    const drained = Promise.withResolvers<void>();
+    setImmediate(drained.resolve);
+    await drained.promise;
+    expect(trace.slice(0, 3)).toEqual(["busy state", "late native settle", "fresh state"]);
+    expect(delegated(store, original.id)?.state).toBe("done");
+    const reportId = `report:handoff:${original.id}:${lane.id}`;
+    expect(store.input(reportId)).toMatchObject({ target: "main", route: original.route });
+    expect(store.input(reportId)!.text).toContain("native lane result");
+    expect(main.prompts).toHaveLength(1);
+    expect(String(main.prompts[0]!.command.message)).toContain(`Request ID: ${reportId}`);
+    expect(messenger.sent).toEqual([]);
+    expect(errors).toEqual([]);
   });
 
   test("settled answers report to head while a persistent owned service retains its host slot", async () => {

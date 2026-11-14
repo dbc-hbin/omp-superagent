@@ -44,7 +44,6 @@ Git, **Bun >= 1.4.4**, 로컬 Unix socket 지원 환경, Rust/Cargo와 플랫폼
 bun scripts/prepare-omp.ts
 bun install --frozen-lockfile
 bun --cwd=.upstream/omp run build:native
-cp config.example.json config.local.json
 ```
 
 prepare는 고정 OMP checkout·패치·의존성과 필수 관리형 `omp-ulw`를 준비합니다.
@@ -52,38 +51,69 @@ prepare는 고정 OMP checkout·패치·의존성과 필수 관리형 `omp-ulw`�
 
 ### 2. 설정과 자격 증명
 
-- `config.local.json`의 모든 placeholder와 경로를 바꿉니다. `command`에는 **Bun 실행 파일과 패치된
-  `.upstream/omp/packages/coding-agent/src/cli.ts`의 절대 경로**를 넣습니다.
-- 사용할 플랫폼을 최소 하나 남기고 사용하지 않을 플랫폼 블록은 삭제합니다. 소유자 ID와 허용 채널을 설정합니다.
-- `stateDir`와 `headCwd`를 정하고, 모델 제공자 인증은 기존 OMP 방식으로 준비합니다.
-- 비밀 토큰은 환경변수로만 전달합니다. `tokenEnv` 등에는 환경변수 **이름**만 넣고, 토큰 값은 JSON·argv·저장소에 기록하지 않습니다.
+플랫폼 앱을 준비한 뒤 터미널에서 실행합니다.
+
+```sh
+bash scripts/setup.sh
+```
+
+플랫폼·소유자·허용 채널·경로를 입력받아 `config.local.json`을 만들고 토큰은 숨김 입력으로 받습니다.
+토큰은 JSON·argv가 아니라 소유자 전용 `config.local.json.env`(`0600`)에 저장합니다.
+기존 유효한 JSON은 보존하며 자격 증명 변경은 확인 후 저장합니다. 봇은 시작하지 않습니다.
+
+최초 셋업은 Mnemopi 장기 기억을 권장합니다. 명시적인 `yes`와 최종 저장 확인이 있어야만
+native OMP 전역 `memory.backend`를 `mnemopi`로 바꿉니다. 거절·취소·기존 자격 증명 갱신은
+메모리 설정을 건드리지 않습니다. 다른 메모리 옵션은 유지하며 이후 OMP 사용 시 해당 옵션에
+따라 모델 처리·다운로드가 발생할 수 있습니다. 셋업 자체는 메모리 backend를 시작하지 않습니다.
+
+`doctor`와 명시적 `start`만 해당 파일의 구성된 자격 증명 이름을 환경에 읽습니다.
+이미 셸에 설정된 비어 있지 않은 환경변수가 우선합니다. 파일은 암호화 저장소가 아닌 평문입니다.
+래퍼와 아래 명령은 Bun의 작업 디렉터리 `.env` 자동 로딩을 끕니다.
+모델 제공자 인증은 기존 OMP 방식으로 유지합니다.
+
+다른 경로는 `bash scripts/setup.sh --config /절대/경로/config.json`으로 지정합니다.
+예제 JSON의 수동 설정과 환경변수만 사용하는 방식도 유지합니다.
 
 [플랫폼별 앱·권한 준비](docs/OPERATIONS.md#2-플랫폼별-앱과-접근-범위)와 [설정 필드](docs/OPERATIONS.md#3-설정)를 참고하세요.
 
 ### 3. 진단 후 명시적으로 시작
 
 ```sh
-bun src/cli.ts doctor --config config.local.json
+bun --no-env-file src/cli.ts doctor --config config.local.json
 ```
 
 소스 준비와 `doctor`는 메신저에 로그인하지 않습니다. `doctor`로 로컬 설정과 CLI·자격 증명 환경을 진단한 뒤 시작합니다.
 
 ```sh
-bun src/cli.ts start --config config.local.json
+bun --no-env-file src/cli.ts start --config config.local.json
 ```
+
+최초 시작 때 누락된 native `high`/`middle`/`low` 프리셋은 같은 헤드의 전용 초기 설정 턴에서
+생성·재조회하고, 그 뒤 일반 작업을 실행합니다. 기존 프리셋은 보존합니다. `status`는 프리셋
+초기화와 transport 준비를 구분하며 실패·미완료를 준비 완료로 표시하지 않습니다.
+`setup`과 `doctor`는 계속 봇·모델을 실행하지 않습니다.
 
 `start`는 설정에 남긴 **모든 플랫폼**을 활성화하고, detached Gateway와 헤드를 시작합니다.
 같은 Host를 native TUI로 읽기 전용 관찰하려면 다음을 실행합니다.
 
 ```sh
-bun src/cli.ts attach main --config config.local.json --read-only
+bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
 ```
 
 ## 사용 방법
 
 - **직접 처리:** 메인 대화에서 작은 조사나 수정을 요청합니다. 헤드가 직접 처리할 수 있으며 레인은 필수가 아닙니다.
-- **독립 주제:** Discord·Telegram에서 `/new 저장소 A의 로그인 오류를 고쳐줘`로 저장소·이슈 레인을 엽니다. Slack에서는 `!new`를 씁니다.
-- **후속 요청:** “수정은 어디까지 됐어?”도 헤드가 먼저 받아 레인에 필요한 지시를 전달하고 결과를 종합합니다.
+- **독립 주제:** 일반 메시지로 새 작업을 요청하면 헤드가 범위를 판단해 지원되는 실제 스레드·topic을 만들고 독립 세션을 연결합니다. native topic이 없는 DM은 논리 주제로 분리합니다. `/new`(Slack `!new`)도 명시적 DM 주제 제어로 유지합니다.
+- **후속 요청:** 같은 주제의 일반 후속 입력은 실행 중인 작업에 기본 steer로 전달합니다. `/steer`는 필요 없습니다. 헤드가 먼저 받고 필요한 레인 지시를 명시적으로 전달하며, 다른 대화·제어 명령·workflow 선택은 섞지 않습니다.
+- **헤드 모델·effort:** `/model`·`/effort`로 조회하고, `/model list`의 정확한 모델을
+  `/model <provider/model>`로 선택하거나 `/effort <level>`로 변경합니다. Slack은 `!model`·`!effort`입니다.
+  유휴 헤드 세션에만 적용하며 전역 기본값과 기존 레인은 유지합니다.
+- **운영 제어:** `/help`·`/status`·`/context`·`/usage`로 상태를 확인하고,
+  `/compact [보존할 내용]`으로 유휴 헤드 맥락을 압축합니다. `/model preset`으로 목록을 보고
+  `/model preset <name>`으로 native 프리셋을 적용합니다. `/stop head`는 Gateway 종료 없이 헤드 작업을 중단합니다.
+  Slack에서는 같은 명령에 `!`를 씁니다.
+- **명시적 전역 저장:** `/model preset <name> --global`만 native 기본 역할·effort도 저장합니다.
+  옵션이 없으면 이번 헤드 세션 전용이며, 변경 알림에 실제 모델·effort와 적용 범위를 표시합니다.
 
 ## ULW
 

@@ -4,9 +4,10 @@
   "revision": "c308970263ae13744ea15ab67302e3dac840e266",
   "checkout": ".upstream/omp",
   "patches": [
-    "patches/omp/0001-process-owned-local-rpc-and-native-attach.patch"
+    "patches/omp/0001-process-owned-local-rpc-and-native-attach.patch",
+    "patches/omp/0002-config-only-settings.patch"
   ],
-  "patchSha256": "07ab9f779e93e0344fc5fc3d2428a43051bd130f0853bb3ad8cc6d6b9201f245",
+  "patchSha256": "093c81207b2cfc2912fac7b9bf6a8a5f5b1bbb57b1c84633dbfbfeedf4294f51",
   "runtime": {
     "bun": "1.4.4",
     "entry": "packages/coding-agent/src/cli.ts",

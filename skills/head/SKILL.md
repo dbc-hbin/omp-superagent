@@ -73,11 +73,13 @@ edits to the bundle; native `skill://superagent-head` URIs remain available.
 Apply the already-loaded procedures to their decision points:
 - `references/routing.md`: choose an unclear workspace, route a new topic, delegate,
   arrange parallel edits, or justify/select and explicitly dispatch an ULW method.
-- `references/model-selection.md`: on the first real head turn after deployment,
+- `references/model-selection.md`: during the explicit-start bootstrap turn,
   initialize only missing native high/middle/low presets from the user's existing
   OMP settings. Preserve existing presets and defaults. This deliberate native
   bootstrap is the only intended persistent preset write; do not create project-local
-  preset configuration. Also apply it before substantive new-lane model selection,
+  preset configuration or defer bootstrap to the first user message. Completion
+  requires native readback; an answer without initialization is not success.
+  Also apply it before substantive new-lane model selection,
   an explicitly authorized idle-lane model change, or an ambiguous capability, risk,
   or briefing decision. Normally consult native `eval` judge on factual requirements
   and available candidates, then critically choose the exact model yourself; advice
@@ -102,6 +104,17 @@ manager/board authority boundaries remain unchanged.
   when work should reach a lane; creating a lane never moves pending follow-ups for you.
   Topic commands and exact native approval responses are handled by the head runtime,
   not Gateway decisions. Preserve prompt pause/cancel handling and immutable boundaries.
+- Ordinary same-topic follow-ups steer an active native run by default; do not ask
+  for `/steer`. Use each new envelope's actual source ID when explicitly passing
+  work to its lane. Different routes, workflow selections, controls, and internal
+  reports remain separate; receiving a steer does not authorize new effects.
+- When a clearly independent topic or repository appears, choose its scope and
+  workspace and call `lane_start` without requiring `/new`. Runtime creates a
+  supported native thread/topic and binds its independent session. Existing topic
+  work stays with its current lane. To split from an existing thread, use its
+  authorized parent `destination` with `threadId:null` and no `topicId`; this creates
+  a sibling, never a nested thread or a new channel. Unsupported private chats use
+  honest logical topics; do not invent thread IDs or enable platform features.
 - Discord/Telegram use ordinary `/new`, `/main`, `/stop`, `/resume` messages; Slack
   uses `!new`, `!main`, `!stop`, `!resume`, not registered slash commands. Logical DM
   topics retain the real channel; never fabricate a native thread ID. An admitted
@@ -156,5 +169,6 @@ manager/board authority boundaries remain unchanged.
   sends head output to the originating conversation through Gateway. Lane ordinary
   output is a durable report to you, not an already-sent messenger answer. Review it
   and own the external response or explicit head-controlled delivery; preserve the
-  report's original route, not the last active chat. Never post an independent
+  report's recorded delivery route (including an explicitly created topic), not
+  the last active chat. Never post an independent
   duplicate or claim delivery, release, pause, or completion without observed evidence.

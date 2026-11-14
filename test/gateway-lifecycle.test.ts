@@ -56,6 +56,7 @@ async function fixture(updateManagedUlw?: () => Promise<ManagedUlwStatus>) {
     }
   });
   await until(() => service.status().head.ready);
+  expect(service.status().head.initialization).toMatchObject({ sessionId: "gateway-fixture-session", state: "complete" });
   return { root, config, service, get stopped() { return stopped; },
     async emit(id: string) {
       const input: Inbound = { id, route, messageId: id, text: id, receivedAt: Date.now(), attachments: [] };
@@ -107,6 +108,15 @@ test("Gateway owns one credential-free native head; busy CLI stop refuses, expli
 
 test("confirmed-dead owned head restarts, offline input stays durable, and existing native model is not reset", async () => {
   const f = await fixture();
+  const coordination = new Store(join(f.root, "coordination.sqlite"));
+  const snapshot = { modelRoles: { default: "provider/preset-model", smol: "provider/small-model" }, defaultThinkingLevel: "low" };
+  try {
+    coordination.setMeta("main:sessionId", "gateway-fixture-session");
+    coordination.setMeta("head:model-settings:gateway-fixture-session", JSON.stringify({ settings: snapshot, clearedRoles: ["slow"] }));
+    coordination.setMeta("head:model-settings:unrelated-session", JSON.stringify({
+      settings: { modelRoles: { default: "provider/wrong-session" } }, clearedRoles: [],
+    }));
+  } finally { coordination.close(); }
   const old = f.service.status().head.pid!;
   process.kill(old, "SIGKILL");
   await f.emit("offline-original-source");
@@ -117,6 +127,10 @@ test("confirmed-dead owned head restarts, offline input stays durable, and exist
   const launches = (await readFile(join(f.root, "launches.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
   expect(launches).toHaveLength(2);
   expect(launches[1].args).not.toContain("--model");
+  expect(launches[1].args).not.toContain("--model-preset");
+  expect(launches[1].config).toMatchObject({
+    ...snapshot, modelRoles: { ...snapshot.modelRoles, slow: null },
+  });
   const messages = (await readFile(join(f.root, "received.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
   expect(messages.map(message => message.id)).toEqual(["offline-original-source"]);
 });

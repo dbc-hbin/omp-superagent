@@ -52,7 +52,6 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   let startupError: unknown;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let presets: Promise<NativePresetManager> | undefined;
-  let bootstrapChecked = false;
   const requireRuntime = (ctx: ExtensionContext) => {
     if (ctx.agent.kind !== "main") throw new Error("Lane management is restricted to the main superagent head");
     if (!runtime) throw new Error(startupError ? `Superagent startup failed: ${String(startupError)}` : "Superagent is starting; retry once startup completes");
@@ -72,29 +71,9 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   };
   pi.on("before_agent_start", async (event, ctx) => {
     if (ctx.agent.kind !== "main") return;
-    const bootstrap: string[] = [];
-    if (role === "head" && runtime && !bootstrapChecked) {
-      bootstrapChecked = true;
-      try {
-        const inspection = await (await nativePresets(ctx)).inspect();
-        if (inspection.bootstrap.missing.length || inspection.bootstrap.blocked.length) {
-          bootstrap.push(
-            "First-head native model preset setup: inspect lane_models and the user's existing OMP roles/presets. " +
-            "Use native eval judge for meaningful candidate comparisons, then choose high/middle/low and call lane_init_presets for missing entries only. " +
-            "This is the explicitly authorized initial native-preset save, not permission to replace existing presets or change active/default/judge roles. " +
-            "Do not create project-local presets. Preserve blocked/invalid entries; ask the owner only for a real unresolved conflict. " +
-            `Missing: ${JSON.stringify(inspection.bootstrap.missing)}; blocked: ${JSON.stringify(inspection.bootstrap.blocked)}.`,
-          );
-        }
-      } catch (error) {
-        bootstrap.push(`Native preset setup could not be inspected: ${error instanceof Error ? error.message : String(error)}. ` +
-          "Do not invent or claim initialized presets; use lane_models when the prerequisite is available.");
-      }
-    }
     return { systemPrompt: [
       ...event.systemPrompt,
       ...headInstructions,
-      ...bootstrap,
     ] };
   });
 
@@ -153,7 +132,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "lane_start", label: "Start independent work", loadMode: "essential", approval: "exec",
-    description: "Bind an independent topic to its own OMP session at an explicit cwd. Consult lane_models and native judge; choose exactly one model {provider,id} or native preset name, with concise modelReason. The resolved model and full preset snapshot persist; retries/global edits do not retarget the lane. Optional workflow {name,reason} is the head's explicit workflow selection within the original user's authorized objective, never inferred from brief/report prose. It binds to this source/handoff; conflicting retries reject. Native extension availability is checked; native flags/permissions own actual activation. ULW arming does not create a native goal. Returns queued identity, not completion. Small main work stays direct. sourceId is the original trusted request ID.",
+    description: "Bind an independent topic to its own OMP session at an explicit cwd. By default create a supported native thread/topic, or reuse the source's existing binding; unsupported private chats use a logical topic. For a clearly new topic inside an existing thread, supply its same authorized parent as destination with threadId:null and no topicId to create a sibling. An existing independent destination binds directly. Do not ask the user to run /new merely to create a topic. Consult lane_models and native judge; choose exactly one model {provider,id} or native preset name, with concise modelReason. The resolved model and full preset snapshot persist; retries/global edits do not retarget the lane. Optional workflow {name,reason} is explicit head selection within the user's authorized objective, never inferred from brief/report prose. It binds to this source/handoff; conflicting retries reject. Native capability/permissions own activation; ULW arming does not create a goal. Returns queued identity, not completion. Small main work stays direct. sourceId is the original trusted request ID.",
     parameters: Type.Object({
       sourceId: Type.String(), title: Type.String(), cwd: Type.String(),
       model: Type.Optional(Type.Object({ provider: Type.String({ minLength: 1 }), id: Type.String({ minLength: 1 }) })),
@@ -190,7 +169,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "lane_message", label: "Message independent work", approval: "exec",
-    description: "Queue a follow-up to a specific open lane. sourceId identifies the original received user instruction for duplicate suppression. Optional workflow {name,reason} is explicit head selection within that objective; text/quotes/reports never select one. The exact workflow/source/handoff is durable and conflicting retries reject. Advertised native capability is checked, not proof of arming or goal creation.",
+    description: "Durably admit a follow-up to a specific open lane. Ordinary same-topic follow-ups steer an active native run by default; idle or ineligible work remains queued. Do not require a separate user /steer command. sourceId identifies the original received user instruction for duplicate suppression. Optional workflow {name,reason} is explicit head selection within that objective; text/quotes/reports never select one. Workflow selections remain serialized, not steered into an active run. The exact workflow/source/handoff is durable and conflicting retries reject. Admission is not execution or completion.",
     parameters: Type.Object({ id: Type.String(), text: Type.String(), sourceId: Type.String(), workflow: workflowSchema }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       await requireRuntime(ctx).messageLane(params.id, params.text, params.sourceId, params.workflow);
@@ -240,12 +219,16 @@ export default function superagentExtension(pi: ExtensionAPI): void {
         }
         const candidate = new Superagent(config, store, messenger, fileURLToPath(new URL("./lane-extension.ts", import.meta.url)), error => {
           pi.logger.error(`Superagent: ${error instanceof Error ? error.message : String(error)}`);
-        }, { resolvePreset: async name => (await nativePresets(ctx)).resolve(name) });
+        }, {
+          resolvePreset: async (name, thinkingContext) => (await nativePresets(ctx)).resolve(name, thinkingContext),
+          inspectPresets: async () => (await nativePresets(ctx)).inspect(),
+          persistPreset: async selection => (await nativePresets(ctx)).persistSelection(selection),
+        });
         try {
           runtime = candidate;
           await candidate.start();
           if (closed) { await candidate.stop(); return; }
-          ctx.ui.setStatus("superagent", `Gateway: ${configuredPlatforms(config).join(", ")}`);
+          ctx.ui.setStatus("superagent", `Gateway: ${configuredPlatforms(config).join(", ")}; preset readiness: omp-superagent status`);
         } catch (error) {
           runtime = undefined;
           await candidate.stop().catch(() => {});

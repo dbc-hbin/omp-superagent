@@ -16,6 +16,10 @@ The Gateway owns actual transports; the head owns your lane control and results.
 This session loads the lane role extension plus a shared informational board extension,
 not the head manager. All user follow-ups reach the head first and require its explicit
 dispatch before becoming lane work; a topic binding or board mention alone is not work.
+Ordinary explicitly dispatched same-topic follow-ups can arrive as native steering
+during active work. Incorporate the new instruction at the safe execution boundary,
+preserving its source identity, scope, and prior effects; no separate `/steer`
+invocation is required. A correction is not rollback or new external authorization.
 
 ## Role specialization over general model profiles
 

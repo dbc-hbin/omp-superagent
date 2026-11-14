@@ -523,6 +523,27 @@ export class TelegramMessenger implements Messenger {
     } finally { this.pending.delete(token); }
   }
 
+  /** Telegram exposes topic mode and administrator rights through read APIs. */
+  async canCreateThread(route: Route): Promise<boolean> {
+    this.assertRoute(route);
+    if (route.threadId !== null) return false;
+    try {
+      const chat = await this.destination(route);
+      // https://core.telegram.org/bots/api/methods/createforumtopic.md
+      // https://core.telegram.org/bots/api/types/user.md
+      if (chat.type === "private") {
+        const me = await this.api.getMe();
+        if (!me.is_bot || me.id !== this.me!.id) throw new DeliveryError("Telegram bot identity changed", "rejected");
+        this.me = me;
+        return me.has_topics_enabled === true;
+      }
+      if (chat.type !== "supergroup" || !chat.is_forum) return false;
+      const member = await this.api.getChatMember(route.channelId, this.me!.id);
+      if (member.user.id !== this.me!.id || !member.user.is_bot) throw new DeliveryError("Telegram topic administrator identity changed", "rejected");
+      return member.status === "administrator" && member.can_manage_topics === true;
+    } catch (error) { throw telegramDeliveryError(error); }
+  }
+
   async createThread(route: Route, title: string, _sourceMessageId?: string): Promise<Route> {
     try {
       this.assertRoute(route);

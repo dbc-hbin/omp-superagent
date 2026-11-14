@@ -57,6 +57,9 @@ export class MessengerHub implements Messenger {
   dismissApproval(approval: Approval): Promise<void> {
     return this.adapter(approval.route).dismissApproval(approval);
   }
+  canCreateThread(route: Route): Promise<boolean> {
+    return this.adapter(route).canCreateThread?.(route) ?? Promise.resolve(false);
+  }
   createThread(route: Route, title: string, sourceMessageId?: string): Promise<Route> {
     return this.adapter(route).createThread(route, title, sourceMessageId);
   }

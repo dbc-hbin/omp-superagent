@@ -9,7 +9,8 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test test",
-    "start": "bun src/cli.ts start",
+    "start": "bun --no-env-file src/cli.ts start",
+    "setup": "bash scripts/setup.sh",
     "prepare:omp": "bun scripts/prepare-omp.ts",
     "prepare:ulw": "bun scripts/prepare-ulw.ts",
     "postinstall": "bun scripts/prepare-ulw.ts"

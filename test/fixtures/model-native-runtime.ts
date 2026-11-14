@@ -14,7 +14,8 @@ import { NativePresetManager } from "../../src/native-presets";
 import { Store } from "../../src/store";
 import { Effort } from "../../.upstream/omp/packages/catalog/src/effort";
 import { nativeDisabledProviders } from "./native-extension";
-import { modelFixtureModels, modelFixtureProvider, modelJudgeMarker, modelRolesMarker } from "./model-selection-extension";
+import { modelAbortMarker, modelCompactAbortInstructions, modelCompactInstructions, modelCompactMarker, modelCompactSummary,
+  modelFixtureModels, modelFixtureProvider, modelJudgeMarker, modelRolesMarker } from "./model-selection-extension";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 
 const selectionProviderFixture = path.resolve(import.meta.dir, "model-selection-extension.ts");
@@ -179,12 +180,19 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     ...(modelSelection ? {
       modelRoles: { default: `${mainModel.provider}/${mainModel.id}`, judge: `${modelFixtureProvider}/${modelFixtureModels.judge.id}` },
       modelPresets: {
-        high: { modelRoles: { default: `${mainModel.provider}/${mainModel.id}` } },
+        // Keep the base judge explicit: this preset exercises omitted thinking,
+        // not native cross-layer role shadowing when a parent role is removed.
+        high: { modelRoles: { default: `${mainModel.provider}/${mainModel.id}`,
+          judge: `${modelFixtureProvider}/${modelFixtureModels.judge.id}` } },
         middle: middlePreset,
         low: lowPreset,
         preserved: { modelRoles: { default: `${mainModel.provider}/${mainModel.id}` } },
       },
       eval: { js: true, py: false },
+      // Native manual compaction always retains a recent suffix. This fixture
+      // has short deterministic turns, so retain one group rather than the
+      // production 20k-token default, which correctly rejects tiny sessions.
+      compaction: { methodOrder: ["soft"], keepRecentTokens: 1, autoContinue: false },
     } : {}),
   };
   await fs.writeFile(path.join(agent, "config.yml"), JSON.stringify(agentConfig), { mode: 0o600 });
@@ -246,7 +254,10 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       });
       return connection;
     },
-    ...(presetManager ? { resolvePreset: name => presetManager.resolve(name) } : {}),
+    ...(presetManager ? {
+      resolvePreset: (name, thinkingContext) => presetManager.resolve(name, thinkingContext), inspectPresets: () => presetManager.inspect(),
+      persistPreset: selection => presetManager.persistSelection(selection),
+    } : {}),
   });
   const exit = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
   void exit.promise.catch(() => {});
@@ -276,6 +287,9 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
   const expectedDelivered = [ordinary, { ...topic, id: report(firstHandoff) }];
   let initialHeadRoles: Record<string, unknown> | undefined;
   let advisoryUsageIds: string[] = [];
+  let confirmedHeadSettings: LanePresetSnapshot | undefined;
+  let confirmedClearedRoles: string[] | undefined;
+  let cancelledRequestId: string | undefined;
   const laneRoles = async (id: string, token: string) => {
     const connection = await HostConnection.connect(store.lane(id)!.socketPath);
     connections.add(connection);
@@ -405,7 +419,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       await fs.writeFile(config.path, JSON.stringify(config), { mode: 0o600 });
       await unchangedNativeSettings();
       // Simulate an operator editing only this test's isolated native config.
-      // This deliberate edit establishes a new baseline; model operations may never write it.
+      // This deliberate edit establishes a new baseline; session-only model operations may never write it.
       const editedConfig = { ...agentConfig,
         modelRoles: { ...agentConfig.modelRoles, default: config.model },
         modelPresets: { ...agentConfig.modelPresets, middle: {
@@ -500,6 +514,353 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     })));
     expect(errors).toEqual([]);
 
+    if (modelSelection) {
+      // Messenger controls use the real head RPC without a model turn, including
+      // when sent from a conversation bound to an independent lane.
+      const laneBefore = await laneRoles(finalLane.id, "before-head-controls");
+      const laneTranscriptBefore = await fs.readFile(finalLane.sessionFile, "utf8");
+      const laneRecordBefore = structuredClone(store.lane(finalLane.id));
+      const headBefore = await nativeModelRoles(initial, "before-head-controls");
+      const resultsBefore = nativeResults.length;
+      const commandReply = async (id: string, text: string, outcome: "done" | "cancelled" = "done") => {
+        await messenger.deliver(inbound(id, threadRoute, text));
+        await until(() => store.input(id)?.state === outcome && outbox().some(row => row.source_id === id && row.state === "sent"), `head command ${text}`);
+        const response = messenger.sent.find(output => output.sourceId === id)!;
+        expect(response.route).toEqual(threadRoute);
+        expect(response.text).not.toContain("local-test-only");
+        expect(response.text).not.toContain("mock://");
+        return response.text;
+      };
+      const visibleNumber = (text: string, value: number) => {
+        expect(Number.isFinite(value)).toBe(true);
+        expect(text.replaceAll(",", "")).toMatch(new RegExp(`\\b${String(value).replaceAll(".", "\\.")}\\b`));
+      };
+      const help = await commandReply("210", "/help");
+      for (const name of ["help", "status", "stop", "context", "compact", "usage", "model", "effort"]) expect(help).toContain(`/${name}`);
+      const status = await commandReply("211", "/status");
+      expect(status).toContain(headState.sessionId);
+      expect(status).toContain(`${mainModel.provider}/${mainModel.id}`);
+      expect(status).toContain(finalLane.id);
+      const nativeContext = (await initial.client.getState()).contextUsage;
+      expect(nativeContext).toBeDefined();
+      expect(nativeContext!.tokens).toBeGreaterThan(0);
+      const context = await commandReply("212", "/context");
+      visibleNumber(context, nativeContext!.tokens);
+      visibleNumber(context, nativeContext!.contextWindow);
+      const nativeUsage = await initial.client.getSessionStats();
+      expect(nativeUsage.tokens.input).toBeGreaterThan(0);
+      expect(nativeUsage.tokens.output).toBeGreaterThan(0);
+      const usage = await commandReply("213", "/usage");
+      for (const value of [nativeUsage.tokens.input, nativeUsage.tokens.output, nativeUsage.tokens.total, nativeUsage.cost]) visibleNumber(usage, value);
+      for (const [id, text] of [["214", "/model preset"], ["215", "/model preset list"]]) {
+        const presets = await commandReply(id!, text!);
+        for (const name of Object.keys(agentConfig.modelPresets!)) expect(presets).toMatch(new RegExp(`\\b${name}\\b`));
+      }
+      expect((await nativeModelRoles(initial, "after-read-only-head-controls")).calls).toEqual(headBefore.calls);
+      expect(await initial.client.getSessionStats()).toEqual(nativeUsage);
+      expect(await initial.client.getState()).toMatchObject({ model: mainModel, sessionId: headState.sessionId });
+      await commandReply("216", "/model preset low");
+      expect(await nativeModelRoles(initial, "head-low-preset")).toMatchObject({ model: modelFixtureModels.changedLane,
+        smol: modelFixtureModels.changedDefault, judge: modelFixtureModels.judge, calls: headBefore.calls });
+      expect(await initial.client.getState()).toMatchObject({ sessionId: headState.sessionId, model: modelFixtureModels.changedLane,
+        modelSettings: lowPreset, thinkingLevel: Effort.Low, settingsScope: "session" });
+      expect(JSON.parse(store.getMeta(`head:model-settings:${headState.sessionId}`)!)).toMatchObject({ settings: lowPreset, clearedRoles: expect.any(Array) });
+      // Resolve through the actual NativePresetManager, not a hand-built
+      // snapshot. high omits effort; persistent base policy is not the HEAD's
+      // just-applied low policy and must not replace it during this switch.
+      const baseThinking = (await presetManager!.inspect()).settings.defaultThinkingLevel;
+      expect(baseThinking).not.toBe(Effort.Low);
+      await commandReply("2161", "/model preset high");
+      const inheritedHeadState = await initial.client.getState();
+      expect(inheritedHeadState).toMatchObject({ sessionId: headState.sessionId, model: mainModel, settingsScope: "session" });
+      expect(inheritedHeadState.modelSettings).toEqual({
+        modelRoles: { default: `${mainModel.provider}/${mainModel.id}`, judge: `${modelFixtureProvider}/${modelFixtureModels.judge.id}` },
+        defaultThinkingLevel: Effort.Low,
+      });
+      // The selected model has no reasoning effort. Its effective level is
+      // unset, while the current HEAD policy must still survive the switch.
+      expect(inheritedHeadState.thinkingLevel).toBeUndefined();
+      await commandReply("2162", "/model preset low");
+      expect(store.lane(finalLane.id)).toEqual(laneRecordBefore);
+      expect(await fs.readFile(finalLane.sessionFile, "utf8")).toBe(laneTranscriptBefore);
+      await unchangedNativeSettings();
+      const controls = [
+        inbound("201", threadRoute, "/model"),
+        inbound("202", threadRoute, "/model list"),
+        inbound("203", threadRoute, `/model ${modelFixtureModels.changedLane.provider}/${modelFixtureModels.changedLane.id}`),
+        inbound("204", threadRoute, "/effort"),
+        inbound("205", threadRoute, "/effort off"),
+        inbound("206", threadRoute, `/effort ${Effort.Minimal}`),
+      ];
+      for (const control of controls) {
+        await messenger.deliver(control);
+        await until(() => delivered(control.id), `head control ${control.text}`);
+        const response = messenger.sent.find(output => output.sourceId === control.id)!;
+        expect(response.route).toEqual(threadRoute);
+        expect(response.text).not.toContain("local-test-only");
+        expect(response.text).not.toContain("mock://");
+        if (control.id === "205") expect((await initial.client.getState()).thinkingLevel).toBe("off");
+      }
+      expect(messenger.sent.find(output => output.sourceId === "201")?.text).toContain(`${modelFixtureModels.changedLane.provider}/${modelFixtureModels.changedLane.id}`);
+      expect(messenger.sent.find(output => output.sourceId === "202")?.text).toContain(
+        `${modelFixtureModels.changedLane.provider}/${modelFixtureModels.changedLane.id}`);
+      expect(messenger.sent.find(output => output.sourceId === "206")?.text).toContain(Effort.Minimal);
+      expect(await initial.client.getState()).toMatchObject({
+        sessionId: headState.sessionId, model: modelFixtureModels.changedLane,
+        thinkingLevel: Effort.Minimal, settingsScope: "session", isSettled: true,
+      });
+      const laneAfter = await laneRoles(finalLane.id, "after-head-controls");
+      expect(laneAfter.state.model).toEqual(laneBefore.state.model);
+      expect(laneAfter.state.thinkingLevel).toEqual(laneBefore.state.thinkingLevel);
+      expect(laneAfter.state.modelSettings).toEqual(laneBefore.state.modelSettings);
+      const sentBeforeReplay = messenger.sent.length;
+      await messenger.deliver(controls[2]!);
+      await messenger.deliver(controls[5]!);
+      await runtime.kick();
+      expect(messenger.sent.length).toBe(sentBeforeReplay);
+      expect(nativeResults.length).toBe(resultsBefore);
+      expect((await nativeModelRoles(initial, "after-head-controls")).calls).toEqual(headBefore.calls);
+      expect(store.inputs()).toEqual([]);
+      await unchangedNativeSettings();
+
+      // The frozen role default differs from the later transcript model, and
+      // its thinking policy differs from the later transcript effort. Resume
+      // must restore both sources independently, not reapply the preset.
+      await commandReply("207", `/model ${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`);
+      await commandReply("208", `/effort ${Effort.Minimal}`);
+      expect(await initial.client.getState()).toMatchObject({ model: modelFixtureModels.changedDefault,
+        thinkingLevel: Effort.Minimal, modelSettings: lowPreset, sessionId: headState.sessionId });
+
+      const beforeCompactEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+      const beforeCompactMessages = await initial.client.getMessages();
+      const compactReply = await commandReply("217", `/compact ${modelCompactInstructions}`);
+      const compactEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+      const compactions = compactEntries.filter(entry => entry.type === "compaction");
+      expect(compactions).toHaveLength(beforeCompactEntries.filter(entry => entry.type === "compaction").length + 1);
+      const compact = compactions.at(-1)!;
+      expect(compact.summary).toContain(modelCompactSummary);
+      expect(compact.tokensBefore).toBeGreaterThan(0);
+      expect(compactEntries.some(entry => entry.id === compact.firstKeptEntryId)).toBe(true);
+      const compactRecords = compactEntries.flatMap(entry => entry.type === "custom" && entry.customType === modelCompactMarker ? [entry.data] : []);
+      expect(compactRecords).toEqual(expect.arrayContaining([
+        expect.objectContaining({ phase: "prepared", instructions: modelCompactInstructions, firstKeptEntryId: compact.firstKeptEntryId }),
+        expect.objectContaining({ phase: "provider-summary", instructions: modelCompactInstructions,
+          prompt: expect.stringContaining(`Additional focus: ${modelCompactInstructions}`) }),
+      ]));
+      const compactMessages = await initial.client.getMessages();
+      expect(compactMessages).not.toEqual(beforeCompactMessages);
+      expect(compactMessages).toEqual(expect.arrayContaining([expect.objectContaining({ role: "compactionSummary", summary: expect.stringContaining(modelCompactSummary) })]));
+      expect(compactMessages.length).toBeLessThan(beforeCompactMessages.length);
+      const compactState = await initial.client.getState();
+      expect(compactState).toMatchObject({ sessionId: headState.sessionId, model: modelFixtureModels.changedDefault,
+        thinkingLevel: Effort.Minimal, modelSettings: lowPreset, isSettled: true, isCompacting: false });
+      expect(compactState.contextUsage).toBeDefined();
+      visibleNumber(compactReply, compactState.contextUsage!.tokens);
+      visibleNumber(compactReply, compactState.contextUsage!.contextWindow);
+      expect(nativeResults.length).toBe(resultsBefore);
+      expect(requestIds(compactEntries)).toEqual(requestIds(beforeCompactEntries));
+      await unchangedNativeSettings();
+
+      const beforeBlockedCalls = (await nativeModelRoles(initial, "before-head-stop")).calls as Record<string, number>;
+      const controlledModelKey = `${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`;
+      const ready = Promise.withResolvers<void>();
+      const stopWatching = initial.onFrame(frame => {
+        if (frame.type !== "extension_ui_request" || frame.method !== "notify" || typeof frame.message !== "string") return;
+        try {
+          const marker: unknown = JSON.parse(frame.message);
+          if (marker && typeof marker === "object" && Reflect.get(marker, "fixture") === modelAbortMarker
+            && Reflect.get(marker, "phase") === "ready" && Reflect.get(marker, "requestId") === "301") ready.resolve();
+        } catch { /* Only this provider readiness notification unblocks stop. */ }
+      });
+      const laneBeforeStop = structuredClone(store.lane(finalLane.id));
+      const blocked = inbound("301", threadRoute, "Wait in the local provider until the native head abort signal fires.");
+      try {
+        await messenger.deliver(blocked);
+        await within(ready.promise, 10_000, "Native provider did not publish abort-signal readiness");
+        expect(await initial.client.getState()).toMatchObject({ hostPid: child.pid, sessionId: headState.sessionId, isStreaming: true, isSettled: false });
+        cancelledRequestId = store.input(blocked.id)?.requestId ?? undefined;
+        expect(cancelledRequestId).toMatch(/^sg-/);
+        await commandReply("302", "/stop head", "cancelled");
+      } finally { stopWatching(); }
+      await until(() => nativeResults.some(result => result.id === cancelledRequestId), "native aborted task completion");
+      expect(store.input(blocked.id)).toMatchObject({ state: "cancelled", target: "main", requestId: cancelledRequestId });
+      expect(await initial.client.getState()).toMatchObject({ hostPid: child.pid, sessionId: headState.sessionId, isSettled: true,
+        isStreaming: false, hasOwnedRunningWork: false, queuedMessageCount: 0, pendingUiRequests: [] });
+      expect(alive(child.pid!)).toBe(true);
+      expect(messenger.handlers).toBeDefined();
+      expect(store.lane(finalLane.id)).toEqual(laneBeforeStop);
+      expect(await runtime.inspect(finalLane.id)).toMatchObject({ state: { hostPid: finalLane.pid, sessionId: firstLane.sessionId, isSettled: true } });
+      const abortEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+      expect(abortEntries.flatMap(entry => entry.type === "custom" && entry.customType === modelAbortMarker ? [entry.data] : [])).toEqual([
+        { phase: "ready", requestId: blocked.id }, { phase: "aborted", requestId: blocked.id },
+      ]);
+      const stoppedCalls = (await nativeModelRoles(initial, "after-head-stop")).calls;
+      expect(stoppedCalls).toEqual({ ...beforeBlockedCalls, [controlledModelKey]: beforeBlockedCalls[controlledModelKey]! + 1 });
+      const completionsAfterStop = nativeResults.length;
+      const deliveriesAfterStop = messenger.sent.length;
+      await messenger.deliver(blocked);
+      await runtime.kick();
+      expect((await nativeModelRoles(initial, "after-cancelled-input-replay")).calls).toEqual(stoppedCalls);
+      expect(nativeResults.length).toBe(completionsAfterStop);
+      expect(messenger.sent.length).toBe(deliveriesAfterStop);
+      expect(messenger.sent.some(output => output.sourceId === blocked.id)).toBe(false);
+
+      const fresh = inbound("303", route, "Answer this fresh request after stopping the previous head task.");
+      await messenger.deliver(fresh);
+      await until(() => delivered(fresh.id), "fresh native head request after stop");
+      expect(messenger.sent.find(output => output.sourceId === fresh.id)?.text).toBe(reply);
+      expect(store.input(fresh.id)).toMatchObject({ target: "main", state: "done" });
+
+      // A second real native summary deliberately parks on its own abort signal.
+      // Status and stop must overtake the still-pending compact RPC, rather than
+      // waiting behind its serial command handler or claiming prompt acceptance.
+      const compactReady = Promise.withResolvers<void>();
+      const stopWatchingCompact = initial.onFrame(frame => {
+        if (frame.type !== "extension_ui_request" || frame.method !== "notify" || typeof frame.message !== "string") return;
+        try {
+          const marker: unknown = JSON.parse(frame.message);
+          if (marker && typeof marker === "object" && Reflect.get(marker, "fixture") === modelAbortMarker
+            && Reflect.get(marker, "phase") === "ready" && Reflect.get(marker, "requestId") === "305") compactReady.resolve();
+        } catch { /* Other native notifications cannot establish readiness. */ }
+      });
+      const compactInput = inbound("305", threadRoute, `/compact ${modelCompactAbortInstructions}`);
+      try {
+        await messenger.deliver(compactInput);
+        await within(compactReady.promise, 10_000, "Native compact provider did not publish abort-signal readiness");
+        expect(store.input(compactInput.id)).toMatchObject({ state: "submitted" });
+        expect(await initial.client.getState()).toMatchObject({ isCompacting: true, sessionId: headState.sessionId });
+        expect(messenger.sent.some(output => output.sourceId === compactInput.id)).toBe(false);
+        const duringCompact = await commandReply("306", "/status");
+        expect(duringCompact).toContain(headState.sessionId);
+        await commandReply("307", "/context");
+        await commandReply("308", "/usage");
+        await commandReply("309", "/stop head", "cancelled");
+      } finally { stopWatchingCompact(); }
+      expect(store.input(compactInput.id)).toMatchObject({ state: "cancelled" });
+      expect(await initial.client.getState()).toMatchObject({ sessionId: headState.sessionId, hostPid: child.pid,
+        isCompacting: false, isSettled: true, queuedMessageCount: 0, hasOwnedRunningWork: false });
+      const afterCompactAbort = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+      expect(afterCompactAbort.filter(entry => entry.type === "compaction")).toHaveLength(compactions.length);
+      expect(afterCompactAbort.flatMap(entry => entry.type === "custom" && entry.customType === modelAbortMarker ? [entry.data] : [])).toEqual([
+        { phase: "ready", requestId: blocked.id }, { phase: "aborted", requestId: blocked.id },
+        { phase: "ready", requestId: compactInput.id }, { phase: "aborted", requestId: compactInput.id },
+      ]);
+      expect(store.lane(finalLane.id)).toEqual(laneBeforeStop);
+      expect(messenger.sent.some(output => output.sourceId === compactInput.id)).toBe(false);
+      const beforeLaneStop = await nativeModelRoles(initial, "before-lane-stop");
+      const laneStopResults = nativeResults.length;
+      const headBeforeLaneStop = await initial.client.getState();
+      await commandReply("304", `/stop ${finalLane.id}`, "cancelled");
+      expect(store.lane(finalLane.id)).toMatchObject({ workState: "paused", runtimeState: "idle", pid: finalLane.pid,
+        sessionId: firstLane.sessionId, generation: finalLane.generation, model: modelFixtureModels.changedLane, modelPresetSnapshot: lowPreset });
+      expect(await runtime.inspect(finalLane.id)).toMatchObject({ state: { hostPid: finalLane.pid, sessionId: firstLane.sessionId, isSettled: true } });
+      expect(await initial.client.getState()).toMatchObject({ hostPid: child.pid, sessionId: headState.sessionId,
+        model: headBeforeLaneStop.model, thinkingLevel: headBeforeLaneStop.thinkingLevel, isSettled: true });
+      expect((await nativeModelRoles(initial, "after-lane-stop")).calls).toEqual(beforeLaneStop.calls);
+      expect(nativeResults.length).toBe(laneStopResults);
+      expect(messenger.handlers).toBeDefined();
+      expect(alive(child.pid!)).toBe(true);
+      await unchangedNativeSettings();
+
+      // Only an explicit --global may cross the native settings boundary. All
+      // session-only controls and priority/abort proofs above retain the exact
+      // operator-edited file bytes before this first global save.
+      const nativeConfigPath = path.join(agent, "config.yml");
+      const beforeGlobalConfig = Bun.YAML.parse(await fs.readFile(nativeConfigPath, "utf8")) as Record<string, unknown>;
+      const laneBeforeGlobal = await runtime.inspect(finalLane.id);
+      const laneRecordBeforeGlobal = structuredClone(store.lane(finalLane.id));
+      const laneTranscriptBeforeGlobal = await fs.readFile(finalLane.sessionFile, "utf8");
+      const callsBeforeGlobal = (await nativeModelRoles(initial, "before-global-head-preset")).calls;
+      const nativeResultsBeforeGlobal = nativeResults.length;
+      expect(beforeGlobalConfig.modelRoles).not.toEqual(lowPreset.modelRoles);
+      expect(beforeGlobalConfig.defaultThinkingLevel).not.toBe(lowPreset.defaultThinkingLevel);
+      const globalLow = inbound("218", threadRoute, "/model preset low --global");
+      const globalNotice = await commandReply(globalLow.id, globalLow.text);
+      expect(globalNotice).toContain(`Preset "low": previous model: "${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}"; effort: ${Effort.Minimal} -> actual model: "${modelFixtureModels.changedLane.provider}/${modelFixtureModels.changedLane.id}"; effort: ${Effort.Low}.`);
+      expect(globalNotice).toContain("Session applied; global saved (future/default settings).");
+      expect(globalNotice).toContain("Existing lanes unchanged.");
+      expect(await initial.client.getState()).toMatchObject({ sessionId: headState.sessionId,
+        model: modelFixtureModels.changedLane, thinkingLevel: Effort.Low, modelSettings: lowPreset, settingsScope: "session" });
+      expect(await nativeModelRoles(initial, "head-global-low-preset")).toMatchObject({ model: modelFixtureModels.changedLane,
+        smol: modelFixtureModels.changedDefault, judge: modelFixtureModels.judge, calls: callsBeforeGlobal });
+      const lowGlobalBytes = await fs.readFile(nativeConfigPath);
+      const lowGlobalConfig = Bun.YAML.parse(lowGlobalBytes.toString()) as Record<string, unknown>;
+      expect(lowGlobalConfig).toEqual({ ...beforeGlobalConfig, modelRoles: lowPreset.modelRoles,
+        defaultThinkingLevel: lowPreset.defaultThinkingLevel });
+      expect(lowGlobalConfig.modelPresets).toEqual(beforeGlobalConfig.modelPresets);
+      expect(await fs.readFile(path.join(agent, "models.yml"))).toEqual(nativeSettings.get("models.yml")!);
+      const verifyGlobalDefaults = async (expected: LanePresetSnapshot) => {
+        const saved = await Settings.loadIsolated({ cwd: headCwd, agentDir: agent });
+        try {
+          expect(saved.getGlobalSettings().modelRoles).toEqual(expected.modelRoles);
+          expect(saved.getGlobalSettings().defaultThinkingLevel).toBe(expected.defaultThinkingLevel);
+        } finally { saved.cancelPendingSaves(); }
+      };
+      await verifyGlobalDefaults(lowPreset);
+      // Establish the new byte invariant only after the independent parsed
+      // expectation proves the exact allowed fields changed and nothing else.
+      nativeSettings.set("config.yml", lowGlobalBytes);
+      await unchangedNativeSettings();
+
+      // A newer explicit global selection must survive replay of the old
+      // request. Bytes, timestamps or callback counts alone cannot prove that
+      // a duplicate did not reapply the old native/global selection.
+      const newerGlobalPreset: LanePresetSnapshot = {
+        modelRoles: { default: `${mainModel.provider}/${mainModel.id}`,
+          smol: `${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`,
+          judge: `${modelFixtureModels.judge.provider}/${modelFixtureModels.judge.id}` },
+        defaultThinkingLevel: Effort.Minimal,
+      };
+      await commandReply("219", "/model preset middle --global");
+      const newerGlobalState = await initial.client.getState();
+      expect(newerGlobalState).toMatchObject({ sessionId: headState.sessionId, model: mainModel,
+        modelSettings: newerGlobalPreset, settingsScope: "session" });
+      // This model has no reasoning effort; the frozen/persisted Minimal policy
+      // remains intact even though native effective thinking is model default.
+      expect(newerGlobalState.thinkingLevel).toBeUndefined();
+      const newerGlobalBytes = await fs.readFile(nativeConfigPath);
+      const newerGlobalConfig = Bun.YAML.parse(newerGlobalBytes.toString()) as Record<string, unknown>;
+      expect(newerGlobalConfig).toEqual({ ...beforeGlobalConfig, modelRoles: newerGlobalPreset.modelRoles,
+        defaultThinkingLevel: newerGlobalPreset.defaultThinkingLevel });
+      expect(newerGlobalConfig.modelPresets).toEqual(beforeGlobalConfig.modelPresets);
+      await verifyGlobalDefaults(newerGlobalPreset);
+      nativeSettings.set("config.yml", newerGlobalBytes);
+      const sentBeforeGlobalReplay = messenger.sent.length;
+      await messenger.deliver(globalLow);
+      await runtime.kick();
+      expect(messenger.sent.length).toBe(sentBeforeGlobalReplay);
+      const afterGlobalReplay = await initial.client.getState();
+      expect(afterGlobalReplay).toMatchObject({ sessionId: headState.sessionId, model: mainModel,
+        modelSettings: newerGlobalPreset, settingsScope: "session" });
+      expect(afterGlobalReplay.thinkingLevel).toBeUndefined();
+      await verifyGlobalDefaults(newerGlobalPreset);
+      await unchangedNativeSettings();
+
+      // Restore the frozen low policy separately from the later transcript
+      // model/effort, retaining the existing same-session restart proof below.
+      await commandReply("220", "/model preset low");
+      await commandReply("221", `/model ${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`);
+      await commandReply("222", `/effort ${Effort.Minimal}`);
+      expect(await initial.client.getState()).toMatchObject({ sessionId: headState.sessionId,
+        model: modelFixtureModels.changedDefault, thinkingLevel: Effort.Minimal, modelSettings: lowPreset, settingsScope: "session" });
+      expect((await nativeModelRoles(initial, "after-global-head-controls")).calls).toEqual(callsBeforeGlobal);
+      expect(nativeResults.length).toBe(nativeResultsBeforeGlobal);
+      expect(store.lane(finalLane.id)).toEqual(laneRecordBeforeGlobal);
+      expect(await runtime.inspect(finalLane.id)).toEqual(laneBeforeGlobal);
+      expect(await fs.readFile(finalLane.sessionFile, "utf8")).toBe(laneTranscriptBeforeGlobal);
+      await unchangedNativeSettings();
+
+      const confirmedSettingsRecord = JSON.parse(store.getMeta(`head:model-settings:${headState.sessionId}`)!) as {
+        settings: LanePresetSnapshot; clearedRoles: string[];
+      };
+      confirmedHeadSettings = confirmedSettingsRecord.settings;
+      confirmedClearedRoles = confirmedSettingsRecord.clearedRoles;
+      expect(confirmedHeadSettings).toEqual(lowPreset);
+      expect(confirmedClearedRoles).toEqual(expect.any(Array));
+      expect(await initial.client.getState()).toMatchObject({ modelSettings: confirmedHeadSettings,
+        model: modelFixtureModels.changedDefault, thinkingLevel: Effort.Minimal });
+    }
+
     // stop() detaches rather than killing OMP. Inspect and explicitly shut down
     // only the native processes whose identities belong to this test's ledger.
     await runtime.stop();
@@ -509,7 +870,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       const connection = await HostConnection.connect(host.socketPath);
       connections.add(connection);
       expect(await connection.client.getState()).toMatchObject({ sessionFile: host.sessionFile, sessionId: id === "main" ? headState.sessionId : firstLane.sessionId,
-        model: id === "main" ? mainModel : modelSelection ? modelFixtureModels.changedLane : laneModel,
+        model: modelSelection ? id === "main" ? modelFixtureModels.changedDefault : modelFixtureModels.changedLane : id === "main" ? mainModel : laneModel,
         hostPid: host.pid, isSettled: true, settingsScope: "session", pendingUiRequests: [], hasOwnedRunningWork: false });
       expect(await connection.request({ type: "shutdown_host" }, `native-runtime-shutdown-${id}`)).toMatchObject({ command: "shutdown_host", success: true });
       await within(connection.exited, 10_000, `Native ${id} did not close after shutdown`);
@@ -517,6 +878,30 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       await expect(fs.lstat(host.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
     }
     expect(await within(exit.promise, 10_000, "Native head process did not exit cleanly")).toEqual({ code: 0, signal: null });
+    if (modelSelection) {
+      // Frozen roles/policy are a private config overlay; native transcript
+      // model and effort remain independent and win over that role default.
+      const restartOptions: HostOptions = { ...headOptions, model: undefined,
+        modelSettings: confirmedHeadSettings, clearedModelRoles: confirmedClearedRoles };
+      const restartArgs = buildHostArgs(restartOptions, nativeConfig);
+      expect(restartArgs).not.toContain("--model-preset");
+      expect(restartArgs).not.toContain("--model");
+      const restarted = await startHost(restartOptions);
+      owned.set("main", { ...mainPaths, pid: restarted.pid });
+      const resumed = await HostConnection.connect(mainPaths.socketPath);
+      connections.add(resumed);
+      expect(await resumed.client.getState()).toMatchObject({
+        hostPid: restarted.pid, sessionId: headState.sessionId, sessionFile: mainPaths.sessionFile,
+        model: modelFixtureModels.changedDefault, thinkingLevel: Effort.Minimal,
+        modelSettings: confirmedHeadSettings, settingsScope: "session", isSettled: true,
+      });
+      expect(await nativeModelRoles(resumed, "head-after-restart")).toMatchObject({ model: modelFixtureModels.changedDefault,
+        smol: modelFixtureModels.changedDefault, judge: modelFixtureModels.judge });
+      await unchangedNativeSettings();
+      expect(await resumed.request({ type: "shutdown_host" })).toMatchObject({ success: true });
+      await within(resumed.exited, 10_000, "Restored native head did not close after shutdown");
+      await processExited(restarted.pid);
+    }
     const headEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
     const laneEntries = parseSessionEntries(await fs.readFile(firstLane.sessionFile, "utf8"));
     expect(headEntries[0]).toMatchObject({ type: "session", id: headState.sessionId });
@@ -524,7 +909,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     const headRequestIds = requestIds(headEntries);
     const laneRequestIds = requestIds(laneEntries);
     expect(headRequestIds).toEqual([ordinary.id, topic.id, report(firstHandoff), followup.id, report(followupHandoff),
-      ...(modelSelection ? [modelChangeSource.id, changedFollowup.id, report(`handoff:${changedFollowup.id}:${created.id}`)] : [])]);
+      ...(modelSelection ? [modelChangeSource.id, changedFollowup.id, report(`handoff:${changedFollowup.id}:${created.id}`), "301", "303"] : [])]);
     expect(laneRequestIds).toEqual([firstHandoff, followupHandoff, ...(modelSelection ? [`handoff:${changedFollowup.id}:${created.id}`] : [])]);
     expect(new Set(headRequestIds).size).toBe(headRequestIds.length);
     expect(new Set(laneRequestIds).size).toBe(laneRequestIds.length);
@@ -533,19 +918,19 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
         target: string; state: string; requestId: string;
       } | null;
       if (!receipt?.requestId) throw new Error(`Missing durable native dispatch receipt for ${id}`);
-      expect(receipt.state).toBe("done");
+      expect(receipt.state).toBe(id === "301" ? "cancelled" : "done");
       return receipt;
     });
     expect(new Set(dispatched.map(input => input.requestId)).size).toBe(dispatched.length);
     expect(nativeResults.map(result => result.id).sort()).toEqual(dispatched.map(input => input.requestId).sort());
     for (const input of dispatched) {
       const result = nativeResults.find(result => result.id === input.requestId);
-      expect(result).toMatchObject({ status: "completed", agentInvoked: true, sessionSettled: true,
+      expect(result).toMatchObject({ status: input.requestId === cancelledRequestId ? "aborted" : "completed", agentInvoked: true, sessionSettled: true,
         socketPath: input.target === "main" ? mainPaths.socketPath : firstLane.socketPath });
     }
     // Empty head answers produce discarded native internal turns, not new
     // runtime prompts. Assert their durable dispatch/completion identities above.
-    for (const [entries, cwd, shutdownCount] of [[headEntries, headCwd, 1], [laneEntries, laneCwd, modelSelection ? 2 : 1]] as const) {
+    for (const [entries, cwd, shutdownCount] of [[headEntries, headCwd, modelSelection ? 2 : 1], [laneEntries, laneCwd, modelSelection ? 2 : 1]] as const) {
       const header = entries[0] as SessionHeader;
       expect(await fs.realpath(header.cwd)).toBe(await fs.realpath(cwd));
       const shutdowns = entries.filter(entry => entry.type === "custom" && entry.customType === "omp-superagent-native-test");
@@ -565,6 +950,8 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
         expect.objectContaining({ token: "initial-middle", model: laneModel, smol: mainModel, judge: modelFixtureModels.judge }),
         expect.objectContaining({ token: "resumed-middle", model: laneModel, smol: mainModel, judge: modelFixtureModels.judge }),
         expect.objectContaining({ token: "changed-low", model: modelFixtureModels.changedLane, smol: modelFixtureModels.changedDefault, judge: modelFixtureModels.judge }),
+        expect.objectContaining({ token: "before-head-controls", model: modelFixtureModels.changedLane, smol: modelFixtureModels.changedDefault, judge: modelFixtureModels.judge }),
+        expect.objectContaining({ token: "after-head-controls", model: modelFixtureModels.changedLane, smol: modelFixtureModels.changedDefault, judge: modelFixtureModels.judge }),
       ]);
       const persistedJudgeUsage = headEntries.flatMap(entry => entry.type === "model_usage" && entry.purpose === "judge" ? [entry] : []);
       expect(persistedJudgeUsage.length).toBeGreaterThanOrEqual(1);

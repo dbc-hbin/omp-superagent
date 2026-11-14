@@ -2,6 +2,7 @@ import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { IsStandardObject as isRecord } from "@sinclair/typebox/value";
 import { acquireModelRoleMutation, captureModelPreset, createModelPresetIfMissing, getModelPreset, getModelPresetNames, isValidModelPresetName } from "@oh-my-pi/pi-coding-agent/config/model-presets";
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import type { Settings, SettingsMirrorState } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { MODEL_PRESET_NAMES, type LaneModel, type LanePresetSnapshot, type ResolvedLanePreset } from "./contracts";
@@ -61,7 +62,10 @@ export class NativePresetManager {
     }
   }
 
-  private freeze(name: string, preset: LanePresetSnapshot, models: NativeModel[]): ResolvedLanePreset {
+  private freeze(
+    name: string, preset: LanePresetSnapshot, models: NativeModel[],
+    thinkingContext?: Pick<LanePresetSnapshot, "defaultThinkingLevel">,
+  ): ResolvedLanePreset {
     const selector = preset.modelRoles.default;
     const resolved = selector ? resolveModelRoleValue(selector, models, {
       settings: this.settings,
@@ -83,9 +87,11 @@ export class NativePresetManager {
     const snapshot: LanePresetSnapshot = {
       ...preset,
       modelRoles: { ...preset.modelRoles, default: `${model.provider}/${model.id}${suffix}` },
-      // Native omission keeps the current level. Freeze that effective level
-      // now, not whichever global level exists when this lane is reopened.
-      defaultThinkingLevel: preset.defaultThinkingLevel ?? cfgDefaultThinkingLevel.get(this.settings),
+      // Native omission keeps the current level. A supplied HEAD context owns
+      // that policy even when undefined; lanes freeze the persistent base now
+      // rather than reading a changed level when the lane is reopened.
+      defaultThinkingLevel: preset.defaultThinkingLevel ?? (thinkingContext !== undefined
+        ? thinkingContext.defaultThinkingLevel : cfgDefaultThinkingLevel.get(this.settings)),
     };
     return { preset: name, model: { provider: model.provider, id: model.id }, snapshot };
   }
@@ -136,12 +142,49 @@ export class NativePresetManager {
     return this.inspectLoaded((await this.availableModels()).filter(isCodingModel));
   }
 
-  async resolve(name: string): Promise<ResolvedLanePreset> {
+  async resolve(name: string, thinkingContext?: Pick<LanePresetSnapshot, "defaultThinkingLevel">): Promise<ResolvedLanePreset> {
     if (typeof name !== "string" || !isValidModelPresetName(name)) throw new Error("Invalid native preset name");
     await this.settings.reloadFromDisk();
     const lookup = getModelPreset(this.settings, name);
     if (lookup.kind !== "found") throw new Error(`Native preset "${name}" is ${lookup.kind}`);
-    return this.freeze(name, lookup.preset, (await this.availableModels()).filter(isCodingModel));
+    return this.freeze(name, lookup.preset, (await this.availableModels()).filter(isCodingModel), thinkingContext);
+  }
+
+  /**
+   * Persist the frozen snapshot only after the head has successfully applied it.
+   * Global defaults are replaced in full, independent of modelRoleStorage; named
+   * presets and higher-priority project/overlay/runtime settings stay untouched.
+   * Those layers can still shadow these defaults in other sessions. A failed
+   * save/readback is reported without rolling back the successful head selection.
+   */
+  async persistSelection(selection: ResolvedLanePreset): Promise<LanePresetSnapshot> {
+    const expected: LanePresetSnapshot = {
+      modelRoles: { ...selection.snapshot.modelRoles },
+      ...(selection.snapshot.defaultThinkingLevel !== undefined
+        ? { defaultThinkingLevel: selection.snapshot.defaultThinkingLevel } : {}),
+    };
+    const release = await acquireModelRoleMutation();
+    try {
+      await this.settings.reloadFromDisk();
+      // Whole-record native writes clear omitted global roles without touching
+      // project roles or synchronizing the base's runtime role overrides.
+      cfgModelRoles.set(this.settings, expected.modelRoles);
+      if (expected.defaultThinkingLevel !== undefined) {
+        cfgDefaultThinkingLevel.set(this.settings, expected.defaultThinkingLevel);
+      } else cfgDefaultThinkingLevel.unset(this.settings);
+      await this.settings.flush();
+      await this.settings.reloadFromDisk();
+      const global = this.settings.getGlobalSettings();
+      const persisted = {
+        modelRoles: global.modelRoles,
+        ...(global.defaultThinkingLevel !== undefined
+          ? { defaultThinkingLevel: global.defaultThinkingLevel } : {}),
+      };
+      if (!Bun.deepEquals(persisted, expected)) {
+        throw new Error("Global model defaults do not match the applied preset after native readback");
+      }
+      return persisted as LanePresetSnapshot;
+    } finally { release(); }
   }
 
   /**

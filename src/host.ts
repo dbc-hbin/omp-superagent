@@ -39,6 +39,9 @@ export interface HostOptions {
   logPath: string;
   model?: string;
   modelPreset?: { name: string; preset: LanePresetSnapshot };
+  /** Restore session-local preset roles without overriding the transcript's active model/effort. */
+  modelSettings?: LanePresetSnapshot;
+  clearedModelRoles?: string[];
   subagentConcurrency: number;
 }
 
@@ -182,7 +185,12 @@ export class HostConnection {
   request(command: Record<string, unknown>, id?: string): Promise<RpcResponse> {
     if (typeof command.type !== "string" || !command.type) throw new Error("RPC command requires a type");
     if (Object.hasOwn(command, "id")) throw new Error("Pass the persisted request id as the second argument");
-    return this.client.request(command as RpcCommand, { id });
+    return this.client.request(command as RpcCommand, {
+      id,
+      // Native compaction owns its cancellation/deadline. Keep its correlated
+      // result alive until completion, explicit abort, or transport loss.
+      ...(command.type === "compact" ? { timeoutMs: 0 } : {}),
+    });
   }
 
   uiResponse(id: string, response: DialogResponse): void {
@@ -293,6 +301,14 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
     await fs.writeFile(configPath, JSON.stringify({
       task: { maxConcurrency: options.subagentConcurrency },
       ...(options.modelPreset ? { modelPresets: { [options.modelPreset.name]: options.modelPreset.preset } } : {}),
+      ...(options.modelSettings ? {
+        modelRoles: {
+          ...Object.fromEntries((options.clearedModelRoles ?? []).map(role => [role, null])),
+          ...options.modelSettings.modelRoles,
+        },
+        ...(options.modelSettings.defaultThinkingLevel !== undefined
+          ? { defaultThinkingLevel: options.modelSettings.defaultThinkingLevel } : {}),
+      } : {}),
     }), { flag: "wx", mode: 0o600 });
     log = await fs.open(options.logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
     const stat = await log.stat();

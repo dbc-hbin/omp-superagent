@@ -1046,7 +1046,7 @@ index db7e94f..92e080d 100644
  						startupLease,
  						initialArgs.goal,
 diff --git a/packages/coding-agent/src/modes/rpc/rpc-client.ts b/packages/coding-agent/src/modes/rpc/rpc-client.ts
-index cfcbbde..e8d51e1 100644
+index cfcbbde..2739556 100644
 --- a/packages/coding-agent/src/modes/rpc/rpc-client.ts
 +++ b/packages/coding-agent/src/modes/rpc/rpc-client.ts
 @@ -62,7 +62,7 @@ import type {
@@ -1058,11 +1058,13 @@ index cfcbbde..e8d51e1 100644
  
  /** Process transport consumed by {@link RpcClient}. */
  export interface RpcAgentProcess {
-@@ -370,6 +370,25 @@ export class RpcClient {
+@@ -370,6 +370,27 @@ export class RpcClient {
  		this.#customTools = [...(options.customTools ?? [])];
  	}
  
-+	/** Send with an optional caller-persisted identity; no retry or replay is performed. */
++	/** Send with an optional caller-persisted identity; no retry or replay is performed.
++	 * timeoutMs defaults to 30 seconds; 0 disables the deadline, not disconnect/error rejection.
++	 */
 +	request(command: RpcCommandBody, options?: { id?: string; timeoutMs?: number }): Promise<RpcResponse> {
 +		return this.#send(command, options?.timeoutMs, options?.id);
 +	}
@@ -1084,7 +1086,7 @@ index cfcbbde..e8d51e1 100644
  	/**
  	 * Start the RPC agent process.
  	 *
-@@ -1676,6 +1695,9 @@ export class RpcClient {
+@@ -1676,17 +1697,22 @@ export class RpcClient {
  		if (!this.#process?.stdin) {
  			throw new Error("Client not started");
  		}
@@ -1094,8 +1096,29 @@ index cfcbbde..e8d51e1 100644
  		const fullCommand = { ...command, id } as RpcCommand;
  		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
  		let settled = false;
+-		const timeoutId = this.#startTimeout(timeoutMs, () => {
+-			if (settled) return;
+-			this.#pendingRequests.delete(id);
+-			settled = true;
+-			reject(
+-				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+-			);
+-		});
++		const timeoutId = timeoutMs === 0
++			? undefined
++			: this.#startTimeout(timeoutMs, () => {
++					if (settled) return;
++					this.#pendingRequests.delete(id);
++					settled = true;
++					reject(
++						new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
++					);
++				});
+ 
+ 		this.#pendingRequests.set(id, {
+ 			resolve: response => {
 diff --git a/packages/coding-agent/src/modes/rpc/rpc-mode.ts b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
-index 4408b13..2c8cfe7 100644
+index 4408b13..d1929d5 100644
 --- a/packages/coding-agent/src/modes/rpc/rpc-mode.ts
 +++ b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
 @@ -20,6 +20,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -1114,7 +1137,83 @@ index 4408b13..2c8cfe7 100644
  	RpcCommand,
  	RpcExtensionUIRequest,
  	RpcExtensionUIResponse,
-@@ -1372,6 +1374,14 @@ export function registerRpcPersistenceSurface(
+@@ -439,6 +441,20 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
+ 	"abort_branch_summary",
+ ]);
+ 
++/** Interrupts and read-only queries must not wait for compaction or model discovery.
++ * Keep compact itself on the serial tail: later prompts/model/session mutations must not overtake it.
++ * get_state awaits goal-tool restoration, then captures its snapshot without another await; stats
++ * and contextUsage (included in get_state) read the same process-owned, synchronously updated session.
++ */
++const PRIORITY_COMMANDS: Partial<Record<RpcCommand["type"], true>> = {
++	abort: true,
++	abort_and_restore_queue: true,
++	get_state: true,
++	get_session_stats: true,
++	get_available_models: true,
++	get_available_thinking_levels: true,
++};
++
+ /**
+  * Dispatch a single parsed frame from the RPC input stream.
+  *
+@@ -526,7 +542,7 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
+ /**
+  * Orders user input and decides whether an accepted frame is still wanted.
+  *
+- * Every user-input, abort and session-change frame gets a sequence number when it
++ * Every user-input, compact, abort and session-change frame gets a sequence number when it
+  * is accepted (read from stdin), not when its handler runs. An abort invalidates
+  * input accepted before it immediately. A session change invalidates input accepted
+  * before the change frame, and only once the change succeeds: a vetoed change keeps
+@@ -544,6 +560,7 @@ export class RpcUserInputGate {
+ 			command.type === "abort" || command.type === "abort_and_prompt" || command.type === "abort_and_restore_queue";
+ 		if (
+ 			!isAbort &&
++			command.type !== "compact" &&
+ 			!Object.hasOwn(USER_INPUT_TYPES, command.type) &&
+ 			!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)
+ 		) {
+@@ -578,7 +595,7 @@ export class RpcUserInputGate {
+ }
+ 
+ /** Starts prompts, steers, follow-ups and `steer_subagent` after earlier ordinary commands, without
+- * awaiting admission. Control frames, `bash` and `predict_word` dispatch immediately (see
++ * awaiting admission. Priority interrupts/snapshots, control frames, `bash` and `predict_word` dispatch immediately (see
+  * dispatchRpcInputFrame). `acceptInput` runs synchronously in {@link dispatch}, before the
+  * handler is queued, so an abort can invalidate a frame that has not started yet. */
+ export class RpcInputDispatcher {
+@@ -612,11 +629,14 @@ export class RpcInputDispatcher {
+ 				return;
+ 			}
+ 
+-			const task = this.#tail.then(
+-				() => this.#dispatchSerialCommand(command),
+-				() => this.#dispatchSerialCommand(command),
+-			);
+-			this.#tail = task.catch(() => {});
++			const priority = Object.hasOwn(PRIORITY_COMMANDS, command.type);
++			const task = priority
++				? this.#dispatchSerialCommand(command)
++				: this.#tail.then(
++						() => this.#dispatchSerialCommand(command),
++						() => this.#dispatchSerialCommand(command),
++					);
++			if (!priority) this.#tail = task.catch(() => {});
+ 			this.#tasks.add(task);
+ 			void task.finally(() => {
+ 				this.#tasks.delete(task);
+@@ -627,7 +647,7 @@ export class RpcInputDispatcher {
+ 		}
+ 	}
+ 
+-	/** Await every accepted serial command, including commands queued before EOF. */
++	/** Await every accepted serial/priority command, including commands queued before EOF. */
+ 	async drain(): Promise<void> {
+ 		while (this.#tasks.size > 0) {
+ 			await Promise.allSettled(Array.from(this.#tasks));
+@@ -1372,6 +1392,14 @@ export function registerRpcPersistenceSurface(
  
  /** Startup options for {@link runRpcMode}. */
  export interface RpcModeOptions {
@@ -1129,7 +1228,7 @@ index 4408b13..2c8cfe7 100644
  	/** `--mode rpc-ui`: route tool UI (e.g. ask) over the protocol, independently of headless extensions. */
  	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
  	/** `--no-ui`: extensions run with `hasUI=false` and no UI frames; tool UI and host-issued login are unaffected. */
-@@ -1395,7 +1405,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -1395,7 +1423,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  		setToolUIContext,
  		headless = false,
  		subagentEventBus,
@@ -1138,7 +1237,7 @@ index 4408b13..2c8cfe7 100644
  		createLiveSession,
  		createDictationController,
  	} = options;
-@@ -1407,6 +1417,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -1407,6 +1435,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  	process.env.PI_NOTIFICATIONS = "off";
  
  	const frameEncoder = new RpcFrameEncoder();
@@ -1148,7 +1247,7 @@ index 4408b13..2c8cfe7 100644
  	// Bun on Windows writes a piped process.stdout with a blocking WriteFile on the
  	// JS thread and never reports backpressure, so a client that stops reading
  	// stdout froze the whole worker, stdin reader included. An fd write stream
-@@ -1414,23 +1427,25 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -1414,23 +1445,25 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  	const stdout = process.platform === "win32" ? fs.createWriteStream("", { fd: 1, autoClose: false }) : process.stdout;
  	// The writer can fail before the bridge is constructed.
  	let dictationBridge: RpcDictationBridge | undefined = undefined;
@@ -1180,7 +1279,7 @@ index 4408b13..2c8cfe7 100644
  		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
  			frameEncoder.setProtocolVersion(2);
  	};
-@@ -1467,7 +1482,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -1467,7 +1500,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  		costCapRefusal: () => session.costCapRefusal,
  		settledWithoutRun: () => void settleWatcher.check(),
  	});
@@ -1194,7 +1293,7 @@ index 4408b13..2c8cfe7 100644
  
  	const pendingExtensionRequests = new RpcPendingExtensionRequests();
  	const hostToolBridge = new RpcHostToolBridge(output);
-@@ -1846,7 +1866,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -1846,7 +1884,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  			if (!persistenceFailure || error !== persistenceFailure) throw error;
  			// The notice frame this failure queued must reach the client before the
  			// process ends (review 3983906393).
@@ -1204,7 +1303,7 @@ index 4408b13..2c8cfe7 100644
  			try {
  				if (!process.stderr.write(`${formatPersistenceDurabilityFailure(persistenceFailure.message)}\n`)) {
  					const { promise, resolve } = Promise.withResolvers<void>();
-@@ -1870,7 +1891,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -1870,7 +1909,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  		}
  		// A failure that already reported and then recovered still leaves its notice
  		// queued here, so the success path drains the same queue before it exits.
@@ -1214,7 +1313,7 @@ index 4408b13..2c8cfe7 100644
  		process.exit(0);
  	};
  
-@@ -2024,6 +2046,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -2024,6 +2064,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  		const id = command.id;
  
  		switch (command.type) {
@@ -1231,7 +1330,7 @@ index 4408b13..2c8cfe7 100644
  			case "negotiate_protocol": {
  				if (command.protocolVersion !== 2)
  					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
-@@ -2262,6 +2294,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -2262,6 +2312,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  				await goalController.settled();
  				const queuedMessages = session.getQueuedMessages();
  				const state: RpcSessionState = {
@@ -1241,7 +1340,7 @@ index 4408b13..2c8cfe7 100644
  					model: session.model,
  					thinkingLevel: session.thinkingLevel,
  					isStreaming: session.isStreaming,
-@@ -2533,6 +2568,21 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+@@ -2533,6 +2586,21 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
  				return success(id, "set_model", model);
  			}
  
@@ -1263,6 +1362,14 @@ index 4408b13..2c8cfe7 100644
  			case "cycle_model": {
  				const result = await session.cycleModel();
  				if (!result) {
+@@ -2598,6 +2666,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions
+ 			// =================================================================
+ 
+ 			case "compact": {
++				if (!inputGate.isCurrent(command)) return error(id, "compact", "Compaction cancelled before admission");
+ 				const result = await session.compact(command.customInstructions);
+ 				return success(id, "compact", result);
+ 			}
 diff --git a/packages/coding-agent/src/modes/rpc/rpc-session-events.ts b/packages/coding-agent/src/modes/rpc/rpc-session-events.ts
 index 71fbce6..c33aeff 100644
 --- a/packages/coding-agent/src/modes/rpc/rpc-session-events.ts
@@ -3659,3 +3766,440 @@ index 0000000..fe2c556
 +		});
 +	}
 +});
+diff --git a/packages/coding-agent/test/rpc-client.start.test.ts b/packages/coding-agent/test/rpc-client.start.test.ts
+index 8021d77..2804b89 100644
+--- a/packages/coding-agent/test/rpc-client.start.test.ts
++++ b/packages/coding-agent/test/rpc-client.start.test.ts
+@@ -40,6 +40,45 @@ describe("RpcClient.start", () => {
+ });
+ 
+ describe("RpcClient stdin failures", () => {
++	test("a zero-deadline request waits for its correlated response but still rejects on disconnect", async () => {
++		const exited = Promise.withResolvers<number>();
++		const encoder = new TextEncoder();
++		let stdout!: ReadableStreamDefaultController<Uint8Array>;
++		const written: string[] = [];
++		const proc: RpcAgentProcess = {
++			stdin: { write: (data: string) => written.push(data) },
++			stdout: new ReadableStream<Uint8Array>({ start(controller) {
++				stdout = controller;
++				controller.enqueue(encoder.encode(`${JSON.stringify({ type: "ready" })}\n`));
++			} }),
++			peekStderr: () => "",
++			kill: () => exited.resolve(0),
++			exited: exited.promise,
++		};
++		using client = new RpcClient({ spawn: () => proc });
++		await client.start();
++		let settled = false;
++		const response = client.request({ type: "compact" }, { id: "long-compact", timeoutMs: 0 });
++		void response.then(() => { settled = true; }, () => { settled = true; });
++		// Exercise real platform deadlines alongside stream delivery; Bun rejection matchers wait immediately.
++		// The previous setTimeout(..., 0) implementation rejects before this timer boundary.
++		const timerBoundary = Promise.withResolvers<void>();
++		setTimeout(timerBoundary.resolve, 10);
++		await timerBoundary.promise;
++		expect(settled).toBe(false);
++		expect(written.map(line => JSON.parse(line))).toContainEqual({ type: "compact", id: "long-compact" });
++		stdout.enqueue(encoder.encode(`${JSON.stringify({ type: "response", command: "compact", id: "long-compact", success: true, data: {} })}\n`));
++		expect(await response).toMatchObject({ id: "long-compact", command: "compact", success: true });
++
++		await expect(client.request({ type: "get_state" }, { timeoutMs: 1 })).rejects.toThrow("Timeout waiting for response to get_state");
++
++		const disconnected = client.request({ type: "compact" }, { id: "disconnected-compact", timeoutMs: 0 });
++		// Bun's rejection matcher waits immediately; trigger EOF before invoking it.
++		exited.resolve(0);
++		stdout.close();
++		await expect(disconnected).rejects.toThrow(/process exited|output stream ended/);
++	}, 5_000);
++
+ 	test("fails the request and stops the client when write rejects and flush throws", async () => {
+ 		const exited = Promise.withResolvers<number>();
+ 		const proc: RpcAgentProcess & { stdin: { flush(): never } } = {
+diff --git a/packages/coding-agent/test/rpc-input-frame.test.ts b/packages/coding-agent/test/rpc-input-frame.test.ts
+index 4e0810a..94c2a84 100644
+--- a/packages/coding-agent/test/rpc-input-frame.test.ts
++++ b/packages/coding-agent/test/rpc-input-frame.test.ts
+@@ -1,9 +1,11 @@
+ import { describe, expect, spyOn, test } from "bun:test";
+-import { Agent } from "@oh-my-pi/pi-agent-core";
++import { Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
++import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+ import { RpcHostToolBridge } from "@oh-my-pi/pi-coding-agent/modes/rpc/host-tools";
+ import {
+ 	dispatchRpcInputFrame,
+@@ -22,7 +24,9 @@ import type {
+ } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
++import { cfgCompactionKeepRecentTokens, cfgCompactionMethodOrder } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
++import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+ import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
+ 
+ type OutputFrame = RpcResponse | object;
+@@ -206,6 +210,118 @@ describe("dispatchRpcInputFrame", () => {
+ });
+ 
+ describe("RpcInputDispatcher", () => {
++	test.each(["abort", "abort_and_restore_queue"] as const)(
++		"%s interrupts real manual compact while snapshots/discovery remain independent and mutations stay ordered",
++		async interrupt => {
++			const authStorage = await AuthStorage.create(":memory:");
++			authStorage.keys.setRuntime("anthropic", "test-key");
++			const modelRegistry = new ModelRegistry(authStorage);
++			const sessionManager = SessionManager.inMemory();
++			const compactEntered = Promise.withResolvers<void>();
++			const compactAborted = Promise.withResolvers<void>();
++			const compactCleanup = Promise.withResolvers<void>();
++			const discovery = Promise.withResolvers<void>();
++			const read = Promise.withResolvers<void>();
++			const readEntered = Promise.withResolvers<void>();
++			const order: string[] = [];
++			const runtime = new ExtensionRuntime();
++			const extension = await loadExtensionFromFactory(pi => {
++				pi.on("session_before_compact", async event => {
++					compactEntered.resolve();
++					event.signal.addEventListener("abort", () => compactAborted.resolve(), { once: true });
++					await compactCleanup.promise;
++					return { cancel: true };
++				});
++				pi.registerCommand("noop", { handler: async () => { order.push("prompt"); } });
++			}, process.cwd(), new EventBus(), runtime, "rpc-compact-control");
++			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
++			if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
++			const session = new AgentSession({
++				agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [] } }),
++				sessionManager,
++				settings: Settings.isolated({ "compaction.autoContinue": false, "todo.enabled": false }),
++				modelRegistry,
++				extensionRunner: new ExtensionRunner([extension], runtime, process.cwd(), sessionManager, modelRegistry),
++			});
++			cfgCompactionKeepRecentTokens.set(session.settings, 1);
++			cfgCompactionMethodOrder.set(session.settings, ["soft"]);
++			sessionManager.appendMessage({ role: "user", content: "first turn", timestamp: Date.now() });
++			sessionManager.appendMessage({
++				role: "assistant", content: [{ type: "text", text: "previous answer" }],
++				api: "anthropic-messages", provider: "anthropic", model: model.id, stopReason: "stop",
++				usage: { input: 1_000, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 1_100,
++					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: Date.now(),
++			});
++			sessionManager.appendMessage({ role: "user", content: "second turn", timestamp: Date.now() });
++			const responses = new Map<string, PromiseWithResolvers<RpcResponse>>();
++			const { deps } = makeDeps(async command => {
++				if (command.type === "compact") {
++					order.push("compact");
++					try { await session.compact(); } finally { order.push("compact-cleaned"); }
++				} else if (command.type === "abort" || command.type === "abort_and_restore_queue") {
++					if (command.type === "abort_and_restore_queue") session.clearQueue({ forInterrupt: true });
++					await session.abort({ reason: "user-interrupt" });
++				} else if (command.type === "get_state") {
++					if (command.id === "held-read") { readEntered.resolve(); await read.promise; }
++					return { id: command.id, type: "response", command: command.type, success: true,
++						data: { isCompacting: session.isCompacting, contextUsage: session.getContextUsage() } } as RpcResponse;
++				} else if (command.type === "get_session_stats") {
++					return { id: command.id, type: "response", command: command.type, success: true, data: session.getSessionStats() };
++				} else if (command.type === "get_available_models") {
++					await discovery.promise;
++				} else if (command.type === "prompt") {
++					await session.prompt(command.message);
++				} else if (command.type === "set_thinking_level") {
++					order.push("mutation");
++					session.setThinkingLevel(command.level);
++				} else throw new Error(`unexpected command ${command.type}`);
++				return { id: command.id, type: "response", command: command.type, success: true } as RpcResponse;
++			});
++			deps.output = frame => { if ("id" in frame && typeof frame.id === "string") responses.get(frame.id)?.resolve(frame as RpcResponse); };
++			const background: Promise<void>[] = [];
++			deps.trackBackgroundTask = task => { background.push(task); };
++			const dispatcher = new RpcInputDispatcher({ deps });
++			const send = (command: RpcCommand & { id: string }) => {
++				const response = Promise.withResolvers<RpcResponse>();
++				responses.set(command.id, response);
++				dispatcher.dispatch(command);
++				return response.promise;
++			};
++			try {
++				const compact = send({ id: "compact", type: "compact" });
++				await compactEntered.promise;
++				const prompt = send({ id: "prompt", type: "prompt", message: "/noop" });
++				const mutation = send({ id: "mutation", type: "set_thinking_level", level: ThinkingLevel.Low });
++				const models = send({ id: "models", type: "get_available_models" });
++				const heldRead = send({ id: "held-read", type: "get_state" });
++				await readEntered.promise;
++				expect(await send({ id: "state", type: "get_state" })).toMatchObject({ success: true, data: { isCompacting: true } });
++				expect(await send({ id: "stats", type: "get_session_stats" })).toMatchObject({ success: true });
++				expect(order).toEqual(["compact"]);
++				const stopped = send({ id: "stop", type: interrupt });
++				await compactAborted.promise;
++				// Cancellation was delivered, but no mutation may cross native subscription cleanup.
++				expect(order).toEqual(["compact"]);
++				compactCleanup.resolve();
++				expect(await stopped).toMatchObject({ id: "stop", command: interrupt, success: true });
++				expect(await compact).toMatchObject({ id: "compact", success: false });
++				await Promise.all([prompt, mutation]);
++				expect(order).toEqual(["compact", "compact-cleaned", "prompt", "mutation"]);
++				read.resolve();
++				discovery.resolve();
++				await Promise.all([heldRead, models]);
++			} finally {
++				compactCleanup.resolve();
++				read.resolve();
++				discovery.resolve();
++				await dispatcher.drain();
++				await Promise.all(background);
++				await session.dispose();
++				authStorage.close();
++			}
++		},
++	);
++
+ 	test("control frames resolve extension UI requests while an ordinary command is active", async () => {
+ 		const { deps, outputs } = makeDeps(async command => {
+ 			if (command.type !== "get_state") throw new Error(`unexpected command type: ${command.type}`);
+@@ -284,34 +400,13 @@ describe("RpcInputDispatcher", () => {
+ 				await releaseFirst.promise;
+ 				return { id: command.id, type: "response", command: "abort_retry", success: true };
+ 			}
+-			if (command.type === "get_state") {
++			if (command.type === "get_available_commands") {
+ 				return {
+ 					id: command.id,
+ 					type: "response",
+-					command: "get_state",
++					command: "get_available_commands",
+ 					success: true,
+-					data: {
+-						thinkingLevel: undefined,
+-						isStreaming: false,
+-						isCompacting: false,
+-						steeringMode: "all",
+-						followUpMode: "all",
+-						interruptMode: "immediate",
+-						sessionId: "session-1",
+-						autoCompactionEnabled: false,
+-						fastModeEnabled: false,
+-						fastModeActive: false,
+-						slowModeSupported: false,
+-						slowModeEnabled: false,
+-						tokensPerSecond: null,
+-						messageCount: 0,
+-						queuedMessageCount: 0,
+-						hasPendingAsyncWork: false,
+-						isSettled: true,
+-						queuedMessages: { steering: [], followUp: [], liveSteered: 0 },
+-						todoPhases: [],
+-						goal: null,
+-					},
++					data: { commands: [] },
+ 				};
+ 			}
+ 			throw new Error(`unexpected command type: ${command.type}`);
+@@ -319,7 +414,7 @@ describe("RpcInputDispatcher", () => {
+ 		const dispatcher = new RpcInputDispatcher({ deps });
+ 
+ 		dispatcher.dispatch({ id: "first", type: "abort_retry" });
+-		dispatcher.dispatch({ id: "second", type: "get_state" });
++		dispatcher.dispatch({ id: "second", type: "get_available_commands" });
+ 		await flushMicrotasks();
+ 
+ 		expect(started).toEqual(["abort_retry"]);
+@@ -328,10 +423,10 @@ describe("RpcInputDispatcher", () => {
+ 		releaseFirst.resolve();
+ 		await dispatcher.drain();
+ 
+-		expect(started).toEqual(["abort_retry", "get_state"]);
++		expect(started).toEqual(["abort_retry", "get_available_commands"]);
+ 		expect((outputs[0] as RpcResponse).id).toBe("first");
+ 		expect((outputs[1] as RpcResponse).id).toBe("second");
+-		expect((outputs[1] as RpcResponse).command).toBe("get_state");
++		expect((outputs[1] as RpcResponse).command).toBe("get_available_commands");
+ 	});
+ 
+ 	test("a steer_subagent waiting for the subagent to accept does not block a later abort", async () => {
+@@ -349,6 +444,7 @@ describe("RpcInputDispatcher", () => {
+ 		const dispatcher = new RpcInputDispatcher({ deps });
+ 
+ 		dispatcher.dispatch({ id: "steer", type: "steer_subagent", subagentId: "SubagentA", message: "go" });
++		await flushMicrotasks();
+ 		dispatcher.dispatch({ id: "abort", type: "abort" });
+ 		await flushMicrotasks();
+ 
+@@ -425,14 +521,14 @@ describe("RpcInputDispatcher", () => {
+ 			reset.resolve();
+ 			await dispatcher.drain();
+ 			expect(promptedSession).toBe("new");
+-			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["reset", "abort"]);
++			expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort", "reset"]);
+ 		} finally {
+ 			reset.resolve();
+ 			admission.resolve();
+ 			await dispatcher.drain();
+ 			await background;
+ 		}
+-		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["reset", "abort", "prompt"]);
++		expect(outputs.map(frame => (frame as RpcResponse).id)).toEqual(["abort", "reset", "prompt"]);
+ 	});
+ 
+ 	test("serial command rejection emits an error response and does not poison the queue", async () => {
+@@ -488,21 +584,21 @@ describe("RpcInputDispatcher", () => {
+ 		]);
+ 		const started: string[] = [];
+ 		const { deps, outputs } = makeDeps(async command => {
+-			if (command.type !== "get_state") throw new Error(`unexpected command type: ${command.type}`);
++			if (command.type !== "get_available_commands") throw new Error(`unexpected command type: ${command.type}`);
+ 			started.push(command.id ?? "");
+ 			await tool.execute(`toolu_${command.id}`, {});
+ 			return {
+ 				id: command.id,
+ 				type: "response",
+-				command: "get_state",
++				command: "get_available_commands",
+ 				success: true,
+ 				data: { agentInvoked: true },
+ 			} as unknown as RpcResponse;
+ 		});
+ 		const dispatcher = new RpcInputDispatcher({ deps });
+ 
+-		dispatcher.dispatch({ id: "active", type: "get_state" });
+-		dispatcher.dispatch({ id: "queued", type: "get_state" });
++		dispatcher.dispatch({ id: "active", type: "get_available_commands" });
++		dispatcher.dispatch({ id: "queued", type: "get_available_commands" });
+ 		await flushMicrotasks();
+ 		expect(started).toEqual(["active"]);
+ 		expect(hostToolFrames).toHaveLength(1);
+@@ -522,14 +618,14 @@ describe("RpcInputDispatcher", () => {
+ 			{
+ 				id: "active",
+ 				type: "response",
+-				command: "get_state",
++				command: "get_available_commands",
+ 				success: false,
+ 				error: disconnectMessage,
+ 			},
+ 			{
+ 				id: "queued",
+ 				type: "response",
+-				command: "get_state",
++				command: "get_available_commands",
+ 				success: false,
+ 				error: disconnectMessage,
+ 			},
+@@ -542,13 +638,13 @@ describe("RpcInputDispatcher", () => {
+ 		const started: string[] = [];
+ 		const { deps, outputs } = makeDeps(
+ 			async command => {
+-				if (command.type !== "get_state") throw new Error(`unexpected command type: ${command.type}`);
++				if (command.type !== "get_available_commands") throw new Error(`unexpected command type: ${command.type}`);
+ 				started.push(command.id ?? "");
+ 				await requestExtensionInput(depsRef, `${command.id}-dialog`, `${command.id} dialog`);
+ 				return {
+ 					id: command.id,
+ 					type: "response",
+-					command: "get_state",
++					command: "get_available_commands",
+ 					success: true,
+ 					data: { agentInvoked: true },
+ 				} as unknown as RpcResponse;
+@@ -558,8 +654,8 @@ describe("RpcInputDispatcher", () => {
+ 		const depsRef = deps;
+ 		const dispatcher = new RpcInputDispatcher({ deps });
+ 
+-		dispatcher.dispatch({ id: "active", type: "get_state" });
+-		dispatcher.dispatch({ id: "queued", type: "get_state" });
++		dispatcher.dispatch({ id: "active", type: "get_available_commands" });
++		dispatcher.dispatch({ id: "queued", type: "get_available_commands" });
+ 		await flushMicrotasks();
+ 		expect(started).toEqual(["active"]);
+ 		expect(outputs).toEqual([
+@@ -585,7 +681,7 @@ describe("RpcInputDispatcher", () => {
+ 			{
+ 				id: "active",
+ 				type: "response",
+-				command: "get_state",
++				command: "get_available_commands",
+ 				success: false,
+ 				error: disconnectMessage,
+ 			},
+@@ -598,7 +694,7 @@ describe("RpcInputDispatcher", () => {
+ 			{
+ 				id: "queued",
+ 				type: "response",
+-				command: "get_state",
++				command: "get_available_commands",
+ 				success: false,
+ 				error: disconnectMessage,
+ 			},
+diff --git a/packages/coding-agent/test/rpc-user-input-order.test.ts b/packages/coding-agent/test/rpc-user-input-order.test.ts
+index 0558629..c38c923 100644
+--- a/packages/coding-agent/test/rpc-user-input-order.test.ts
++++ b/packages/coding-agent/test/rpc-user-input-order.test.ts
+@@ -56,6 +56,40 @@ test("abort_and_restore_queue invalidates input accepted before it, like abort",
+ 	expect(gate.isCurrent(after)).toBe(true);
+ });
+ 
++test.each(["abort", "abort_and_restore_queue"] as const)("%s cancels a compact queued before admission", async type => {
++	const gate = new RpcUserInputGate();
++	const modelStarted = Promise.withResolvers<void>();
++	const releaseModel = Promise.withResolvers<void>();
++	const interrupted = Promise.withResolvers<void>();
++	const started: string[] = [];
++	const dispatcher = new RpcInputDispatcher({
++		deps: deps(async command => {
++			if (command.type === "set_model") {
++				modelStarted.resolve();
++				await releaseModel.promise;
++			} else if (command.type === "compact") {
++				if (gate.isCurrent(command)) started.push("compact");
++			} else if (command.type === type) {
++				interrupted.resolve();
++			} else throw new Error(`unexpected command ${command.type}`);
++			return { id: command.id, type: "response", command: command.type, success: true } as RpcResponse;
++		}),
++		acceptInput: command => gate.accept(command),
++	});
++	dispatcher.dispatch({ type: "set_model", provider: "mock", modelId: "mock" });
++	await modelStarted.promise;
++	dispatcher.dispatch({ type: "compact" });
++	dispatcher.dispatch({ type });
++	await interrupted.promise;
++	expect(started).toEqual([]);
++	releaseModel.resolve();
++	await dispatcher.drain();
++	expect(started).toEqual([]);
++	const later = { type: "compact" } as const;
++	gate.accept(later);
++	expect(gate.isCurrent(later)).toBe(true);
++});
++
+ test("later input does not start until the earlier submission's work settles", async () => {
+ 	const gate = new RpcUserInputGate();
+ 	const release = Promise.withResolvers<void>();
+@@ -91,11 +125,11 @@ test("dispatch captures the frame before its handler runs, including while an ea
+ 	await flush();
+ 
+ 	expect(accepted).toEqual(["set_model", "prompt", "abort"]);
+-	expect(started).toEqual(["set_model"]);
++	expect(started).toEqual(["abort", "set_model"]);
+ 
+ 	release.resolve();
+ 	await dispatcher.drain();
+-	expect(started).toEqual(["set_model", "prompt", "abort"]);
++	expect(started).toEqual(["abort", "set_model", "prompt"]);
+ });
+ 
+ test("abort starts immediately and is not stuck behind steer waiting on an admitting prompt", async () => {
+@@ -134,6 +168,8 @@ test("abort starts immediately and is not stuck behind steer waiting on an admit
+ 
+ 	// Sequence: prompt (vision description running) -> steer -> abort
+ 	dispatcher.dispatch({ id: "p", type: "prompt", message: "image prompt" });
++	// The interrupt now bypasses even commands not yet started on the serial tail.
++	await flush();
+ 	dispatcher.dispatch({ id: "s", type: "steer", message: "steering note" });
+ 	dispatcher.dispatch({ id: "a", type: "abort" });
+ 

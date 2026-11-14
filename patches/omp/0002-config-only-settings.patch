@@ -1,0 +1,92 @@
+diff --git a/packages/coding-agent/src/config/settings.ts b/packages/coding-agent/src/config/settings.ts
+--- a/packages/coding-agent/src/config/settings.ts
++++ b/packages/coding-agent/src/config/settings.ts
+@@ -819,6 +819,25 @@
+ 	 */
+ 	static loadReadOnly(options: SettingsOptions = {}): Promise<Settings> {
+ 		return Promise.try(() => new Settings({ ...options, readOnly: true }).#loadReadOnly());
++	}
++
++	/**
++	 * Edit config through native locked persistence without opening account storage,
++	 * migrating legacy state, binding runtime effects, or changing the singleton.
++	 */
++	static async loadConfigOnly(
++		options: Omit<SettingsOptions, "inMemory" | "readOnly"> = {},
++	): Promise<Settings> {
++		const instance = await new Settings({ ...options, inMemory: false, readOnly: true }).#loadReadOnly();
++		// Creating config.yml would hide settings that normal startup still needs
++		// to migrate. Do not inspect/migrate an account database to guess its contents.
++		if (!fs.existsSync(instance.#configPath!) &&
++			(fs.existsSync(path.join(instance.#agentDir, "settings.json")) ||
++				fs.existsSync(getAgentDbPath(instance.#agentDir)))) {
++			throw new Error("Migrate legacy settings with normal OMP before config-only writes");
++		}
++		instance.#persist = true;
++		return instance;
+ 	}
+ 
+ 	/**
+diff --git a/packages/coding-agent/test/settings-manager.test.ts b/packages/coding-agent/test/settings-manager.test.ts
+--- a/packages/coding-agent/test/settings-manager.test.ts
++++ b/packages/coding-agent/test/settings-manager.test.ts
+@@ -295,6 +295,59 @@
+ 			const settings = await Settings.init({ cwd: projectDir, agentDir, configFiles: [configPath] });
+ 
+ 			expect(() => settings.getShellConfig()).toThrow(`Please update shellPath in ${configPath}`);
++		});
++	});
++
++	describe("config-only persistence", () => {
++		it("creates a native memory preference without creating account storage", async () => {
++			const settings = await Settings.loadConfigOnly({ cwd: projectDir, agentDir });
++			try {
++				cfgMemoryBackend.set(settings, "mnemopi");
++				await settings.flush();
++				const actual = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
++				expect(cfgMemoryBackend.get(actual)).toBe("mnemopi");
++				expect(await Bun.file(getAgentDbPath(agentDir)).exists()).toBe(false);
++			} finally {
++				settings.cancelPendingSaves();
++			}
++		});
++
++		it("preserves account bytes and concurrent unrelated configuration", async () => {
++			const accountPath = getAgentDbPath(agentDir);
++			const accountBytes = "Opaque account bytes; configuration must not open this database";
++			await Bun.write(accountPath, accountBytes);
++			const original = { memory: { backend: "off" }, modelRoles: { default: "keep/model" },
++				mnemopi: { scoping: "global", autoRetain: false } };
++			await writeSettings(original);
++			const settings = await Settings.loadConfigOnly({ cwd: projectDir, agentDir });
++			try {
++				cfgMemoryBackend.set(settings, "mnemopi");
++				const concurrent = { ...original, theme: { dark: "titanium" } };
++				await writeSettings(concurrent);
++				await settings.flush();
++				expect(await readSettings()).toEqual({ ...concurrent, memory: { backend: "mnemopi" } });
++				expect(await Bun.file(accountPath).text()).toBe(accountBytes);
++			} finally {
++				settings.cancelPendingSaves();
++			}
++		});
++
++		it.each(["settings.json", "agent.db"])("does not shadow unmigrated %s with a new config", async name => {
++			const legacyPath = name === "agent.db" ? getAgentDbPath(agentDir) : path.join(agentDir, name);
++			const original = '{"modelRoles":{"default":"keep/legacy"}}';
++			await Bun.write(legacyPath, original);
++			await expect(Settings.loadConfigOnly({ cwd: projectDir, agentDir })).rejects.toThrow("Migrate legacy settings");
++			expect(await Bun.file(legacyPath).text()).toBe(original);
++			expect(await Bun.file(getConfigPath()).exists()).toBe(false);
++		});
++
++		it("rejects malformed config without quarantining it or opening storage", async () => {
++			const original = 'memory:\n  backend: "unterminated\n';
++			await Bun.write(getConfigPath(), original);
++			await expect(Settings.loadConfigOnly({ cwd: projectDir, agentDir })).rejects.toThrow("Settings config is invalid");
++			expect(await Bun.file(getConfigPath()).text()).toBe(original);
++			expect(fs.readdirSync(agentDir).filter(name => name.startsWith("config.yml.broken-"))).toEqual([]);
++			expect(await Bun.file(getAgentDbPath(agentDir)).exists()).toBe(false);
+ 		});
+ 	});
+ 

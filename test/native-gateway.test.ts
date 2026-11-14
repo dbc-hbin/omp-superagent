@@ -13,7 +13,8 @@ async function within<T>(work: Promise<T>, ms: number, label: string): Promise<T
   finally { clearTimeout(timer); }
 }
 
-nativeTest("production Gateway durably receives during native head recovery and real head tools exclusively control lane delivery", async () => {
+for (const presetScenario of ["create", "valid", "failed", "skipped", "interrupted"]) {
+nativeTest(`production Gateway native preset startup (${presetScenario}) preserves setup state, queued input and actual head ownership`, async () => {
   // Native imports and subprocesses begin only after HOME/settings isolation.
   const root = await fs.mkdtemp(path.join(await fs.realpath("/tmp"), "osg-"));
   await fs.chmod(root, 0o700);
@@ -32,6 +33,7 @@ nativeTest("production Gateway durably receives during native head recovery and 
         XDG_CACHE_HOME: path.join(root, "cache"), XDG_STATE_HOME: path.join(root, "state"),
         CODEX_HOME: path.join(root, "codex"), CLAUDE_CONFIG_DIR: path.join(root, "claude"), COPILOT_HOME: path.join(root, "copilot"),
         TMPDIR: root, TMP: root, TEMP: root, OMP_NATIVE_GATEWAY_ROOT: root,
+        OMP_NATIVE_GATEWAY_PRESETS: presetScenario,
         OMP_TEST_COMMAND: process.env.OMP_TEST_COMMAND ?? "",
         ...(process.env.OMP_TEST_NATIVES_DIR ? { PI_NATIVES_DIR: process.env.OMP_TEST_NATIVES_DIR } : {}),
       },
@@ -56,3 +58,4 @@ nativeTest("production Gateway durably receives during native head recovery and 
     if (succeeded) await fs.rm(root, { recursive: true, force: true });
   }
 }, 270_000);
+}

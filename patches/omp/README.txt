@@ -3,10 +3,14 @@ OMP process-owned local host prerequisite
 Base: https://github.com/can1357/oh-my-pi.git
 Tag: v18.20.0
 Revision: c308970263ae13744ea15ab67302e3dac840e266
-Patch: 0001-process-owned-local-rpc-and-native-attach.patch
+Patches, in order:
+  0001-process-owned-local-rpc-and-native-attach.patch
+  0002-config-only-settings.patch
+upstream/omp.json patchSha256 hashes their concatenated contents in this order.
 
 Apply from a clean checkout of the exact base revision:
   git apply /absolute/omp-superagent/patches/omp/0001-process-owned-local-rpc-and-native-attach.patch
+  git apply /absolute/omp-superagent/patches/omp/0002-config-only-settings.patch
   bun install --frozen-lockfile
 
 Use Bun 1.4.4 or a compatible newer version. The outer project links the local
@@ -43,6 +47,14 @@ does not use --no-session or a copied auth/config directory. Without the flag,
 ordinary native settings persistence is unchanged. Deliberate first-run preset
 creation must use a separate explicitly authorized native Settings instance;
 routine model/preset choices must use the managed session's overlay.
+Offline setup preferences use Settings.loadConfigOnly(), which strictly reads
+native config sources then enables the existing locked, per-key persistence.
+It never opens/migrates account storage, runs legacy migrations, binds runtime
+effects, or replaces the Settings singleton. With no modern config and legacy
+settings/account storage present, it refuses to create a file that could shadow
+unmigrated preferences; use normal OMP configuration to migrate/repair first.
+Fresh read-only native readback must distinguish saved global preference from
+an effective value shadowed by project/overlay settings.
 Use native createModelPresetIfMissing(settings, name, preset) for authorized
 bootstrap only. It checks raw own-key presence under the existing native YAML
 write lock and returns created/preserved/conflict after native readback. Even
@@ -91,7 +103,23 @@ slot/process release. A successful response acknowledges shutdown: wait for host
 exit 0 to confirm persisted disposal. No implicit retry or prompt/result journal
 is added: a disconnected unconfirmed submission is uncertain, not replayable.
 
+Manual compact remains on the native serial command tail, so later prompts,
+model/settings changes and session mutations cannot overtake its admission or
+cleanup. abort and abort_and_restore_queue bypass that tail and cancel manual
+compaction through the native session abort barrier, including a compact still
+queued before admission. Read-only get_state (including contextUsage),
+get_session_stats, get_available_models and get_available_thinking_levels also
+bypass it; a pending discovery or read does not block another query or stop.
+Snapshots reflect the authoritative process-owned session, not a serial fence
+for earlier unacknowledged mutations. RpcClient.request timeoutMs: 0 explicitly
+disables the response deadline for long compact work; disconnection still
+rejects outstanding requests and never retries them. Existing wire shapes and
+request correlation are unchanged; there is no abort_compaction wire command.
+
 Run targeted tests once after integration, from the upstream root:
+  bun test packages/coding-agent/test/rpc-input-frame.test.ts \
+    packages/coding-agent/test/rpc-user-input-order.test.ts \
+    packages/coding-agent/test/rpc-client.start.test.ts
   bun test packages/coding-agent/test/managed-extension-precedence.test.ts \
     packages/coding-agent/test/extensions-discovery.test.ts \
     packages/coding-agent/test/plugin-extensions-discovery.test.ts \
@@ -99,6 +127,7 @@ Run targeted tests once after integration, from the upstream root:
     packages/coding-agent/test/task/discovery.test.ts
   bun test packages/coding-agent/test/cli-session-settings.test.ts
   bun test packages/coding-agent/test/model-presets.test.ts
+  bun test packages/coding-agent/test/settings-manager.test.ts
   bun test packages/coding-agent/test/rpc-socket-host.test.ts \
     packages/coding-agent/test/collab/chunked-welcome.test.ts \
     packages/coding-agent/test/collab/replication-shrink.test.ts \

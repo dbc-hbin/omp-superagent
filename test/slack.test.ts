@@ -228,13 +228,31 @@ describe("Slack authenticated intake and durable ACK", () => {
 
   test("native message control spellings normalize identically during live intake and catchup", async () => {
     const f = await fixture();
-    const commands = ["!new independent request", "!main", "!stop", "!resume", "!newspaper", "quoted !new request", " !main"];
+    const commands = [
+      "!new independent request", "!main", "!stop", "!resume",
+      "!model", "!model fixture/efficient", "!effort", "!effort high",
+      "!newspaper", "!models", "!effortless",
+      "quoted !new request", "quoted !model", " !main", " !effort high",
+      "!help", "!status", "!stop head", "!stop lane-example", "!context",
+      "!compact preserve the API contract", "!usage", "!model preset", "!model preset high",
+      "!helper", "!statusline", "!contextual", "!compacted", "!usages",
+      "quoted !help", " !status", "please !compact now", "trailing !usage",
+    ];
     for (const [index, text] of commands.entries()) {
       const original = message(`1000.${String(index + 1).padStart(6, "0")}`, { text });
       f.http.remote.set(`CALLOWED:${original.ts}`, original);
       const event = incoming(original); f.socket.emit("slack_event", event); await event.done;
     }
-    const expected = ["/new independent request", "/main", "/stop", "/resume", "!newspaper", "quoted !new request", " !main"];
+    const expected = [
+      "/new independent request", "/main", "/stop", "/resume",
+      "/model", "/model fixture/efficient", "/effort", "/effort high",
+      "!newspaper", "!models", "!effortless",
+      "quoted !new request", "quoted !model", " !main", " !effort high",
+      "/help", "/status", "/stop head", "/stop lane-example", "/context",
+      "/compact preserve the API contract", "/usage", "/model preset", "/model preset high",
+      "!helper", "!statusline", "!contextual", "!compacted", "!usages",
+      "quoted !help", " !status", "please !compact now", "trailing !usage",
+    ];
     expect(f.received.map(input => input.text)).toEqual(expected);
     const recovered = await f.messenger.fetchAfter(route, "1000.000000");
     expect(recovered.map(input => input.text)).toEqual(expected);

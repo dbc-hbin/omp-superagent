@@ -54,7 +54,6 @@ From the repository root:
 bun scripts/prepare-omp.ts
 bun install --frozen-lockfile
 bun --cwd=.upstream/omp run build:native
-cp config.example.json config.local.json
 ```
 
 Preparation installs the pinned OMP source, its patches, and the managed `omp-ulw` integration.
@@ -62,44 +61,78 @@ It does not start a bot or replace your global OMP installation.
 
 ### 2. Configure
 
-- Follow the [platform setup guide](docs/OPERATIONS.md#2-플랫폼별-앱과-접근-범위).
-  Keep at least one messenger block; remove those you do not use.
-- Replace the example values and paths. Set `command` to the absolute paths of Bun and
-  `.upstream/omp/packages/coding-agent/src/cli.ts`.
-- Choose `stateDir`, `headCwd`, allowed owner/channel IDs, and Host/subagent budgets.
-  Configure model authentication through OMP.
-- Keep tokens in environment variables. Fields such as `tokenEnv` contain variable
-  **names**, never token values.
+Run the terminal setup wrapper after preparing the platform apps:
 
-See the [configuration guide](docs/OPERATIONS.md#3-설정) for field details.
+```sh
+bash scripts/setup.sh
+```
+
+It creates `config.local.json`, asks for platform/owner/channel settings, and accepts
+tokens without echoing them. Tokens go into owner-only `config.local.json.env` (`0600`),
+not JSON or command arguments. Existing valid JSON is preserved; credential changes
+require confirmation. No bot is started.
+
+First-time setup recommends Mnemopi persistent memory. Only explicit `yes` plus
+final save confirmation sets native OMP's global `memory.backend` to `mnemopi`;
+declining or refreshing credentials leaves it untouched. Existing memory options
+remain unchanged and may involve model processing/downloads when OMP uses memory.
+Setup itself does not start the memory backend.
+
+`doctor` and explicit `start` load only the configured credential names from that file.
+Nonempty shell environment values take precedence. The file is plaintext—not a vault.
+The wrapper and commands below disable Bun's automatic working-directory `.env` loading.
+Configure model authentication through OMP as before.
+
+Use `bash scripts/setup.sh --config /absolute/path/to/config.json` for another location.
+Manual configuration from `config.example.json` and environment-only credentials remain supported.
+
+See the [platform setup guide](docs/OPERATIONS.md#2-플랫폼별-앱과-접근-범위) and
+[configuration guide](docs/OPERATIONS.md#3-설정) for permissions and field details.
 
 ### 3. Start
 
 Check local configuration without logging into the messengers:
 
 ```sh
-bun src/cli.ts doctor --config config.local.json
+bun --no-env-file src/cli.ts doctor --config config.local.json
 ```
 
 Start the detached Gateway and head, connecting **all configured messengers**:
 
 ```sh
-bun src/cli.ts start --config config.local.json
+bun --no-env-file src/cli.ts start --config config.local.json
 ```
+
+On first startup, missing native `high`/`middle`/`low` presets are initialized in a
+dedicated turn of the same head, before ordinary work. Existing presets are preserved.
+`status` distinguishes preset initialization from transport readiness; incomplete or
+failed initialization is not reported as ready. `setup` and `doctor` remain offline.
 
 Attach a read-only native TUI to the same head:
 
 ```sh
-bun src/cli.ts attach main --config config.local.json --read-only
+bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
 ```
 
 ## Working from chat
 
 - Ask “Explain the authentication flow in this repository.” The head can handle it directly.
-- Open a separate topic with `/new Fix the login bug in repository A` in a Discord or
-  Telegram DM. Use `!new` on Slack; use native threads/topics in group channels.
+- Ask for a new independent topic normally. The head creates a supported native
+  thread/topic and binds its work session; private chats without native topics use
+  logical topics. `/new` (Slack `!new`) remains an explicit DM topic control.
 - Follow up in the same conversation. The head receives the message, coordinates any
   lane work, and returns the result. Separate repository work keeps its own lane context.
+  Ordinary same-topic follow-ups steer active work by default; no `/steer` is needed.
+  Different conversations, controls, and workflow selections remain separate.
+- Inspect the shared head with `/model` or `/effort`; use `/model list`, then
+  `/model <provider/model>` or `/effort <level>` to change its idle session.
+  Slack uses `!model` and `!effort`. Global defaults and existing lanes stay unchanged.
+- Use `/help`, `/status`, `/context`, and `/usage` for native state; `/compact [instructions]`
+  compacts the idle head. `/model preset` lists native presets and `/model preset <name>`
+  applies one to the head session. `/stop head` interrupts head work without stopping the Gateway.
+  Slack uses the same commands with `!`.
+- Add `--global` only to `/model preset <name>` when you explicitly want to save native
+  default roles and effort too. The change reply reports the actual model/effort and scope.
 
 [Commands, approvals, and everyday use](docs/OPERATIONS.md#4-명령과-일상-사용)
 

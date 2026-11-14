@@ -190,6 +190,8 @@ export interface Messenger {
   send(output: OutputRecord): Promise<string>;
   showApproval(approval: Approval): Promise<string>;
   dismissApproval(approval: Approval): Promise<void>;
+  /** Read-only authenticated capability probe; false is unsupported, not a failed creation. */
+  canCreateThread?(route: Route): Promise<boolean>;
   createThread(route: Route, title: string, sourceMessageId?: string): Promise<Route>;
   /** null explicitly means no history API; intake recovery belongs to the adapter. */
   fetchAfter(route: Route, messageId: string): Promise<Inbound[] | null>;

@@ -1,21 +1,25 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { configuredPlatforms, credentialEnvNames, hostPaths, loadConfig } from "./config";
+import { configuredPlatforms, credentialEnvNames, hostPaths, loadConfig, requireMessengerCredentials } from "./config";
+import { loadCredentials } from "./credentials";
 import type { Lane } from "./contracts";
-import { gatewayPaths, gatewayStatus, launchGateway, stopGateway } from "./gateway";
-import { connect } from "./host";
+import { setup } from "./setup";
 
+// Lifecycle imports below must stay lazy: static Gateway/Host imports execute
+// OMP's dotenv loader before setup/doctor can select their credential sources.
 const HELP = `omp-superagent — messenger-connected OMP head and independent topic sessions
 
 Usage:
+  omp-superagent setup --config FILE
   omp-superagent start --config FILE
   omp-superagent status --config FILE
   omp-superagent attach [main|LANE_ID] --config FILE [--read-only]
   omp-superagent stop [main|LANE_ID] --config FILE
   omp-superagent doctor --config FILE
 
+setup interactively prepares configuration and a private FILE.env; it never activates accounts or starts services.
 start explicitly launches a detached Gateway and its native head, activating configured messenger connections. No install/autostart is performed.
 stop main stops the supervised Gateway/head service; busy native hosts refuse without being killed or resurrected.
 attach uses the same host, not another --resume writer. Run it in a herdr pane if desired.
@@ -35,18 +39,22 @@ function laneRows(stateDir: string): Lane[] {
 export async function main(args = process.argv.slice(2)): Promise<void> {
   if (!args.length || args.includes("--help") || args[0] === "help") { console.log(HELP); return; }
   const [command] = args;
-  if (!["start", "status", "attach", "stop", "doctor"].includes(command!)) throw new Error(`Unknown command: ${command}`);
+  if (!["setup", "start", "status", "attach", "stop", "doctor"].includes(command!)) throw new Error(`Unknown command: ${command}`);
   const configAt = args.indexOf("--config");
   if (configAt < 0 || !args[configAt + 1]) throw new Error("--config FILE is required");
+  if (command === "setup") { await setup(args[configAt + 1]!); return; }
   const config = await loadConfig(args[configAt + 1]!);
   const target = args[1] && !args[1]!.startsWith("-") ? args[1]! : "main";
   const paths = hostPaths(config, target);
   if (command === "doctor") {
-    const probe = Bun.spawn([...config.command, "--help"], { stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(probe.stdout).text(), new Response(probe.stderr).text(), probe.exited,
+    loadCredentials(config);
+    const probeEnv = { ...process.env };
+    for (const name of credentialEnvNames(config)) delete probeEnv[name];
+    const probe = Bun.spawn([...config.command, "--help"], { env: probeEnv, stdout: "pipe", stderr: "ignore" });
+    const [stdout, code] = await Promise.all([
+      new Response(probe.stdout).text(), probe.exited,
     ]);
-    if (code !== 0) throw new Error(`OMP command failed (${code}): ${stderr}`);
+    if (code !== 0) throw new Error(`OMP command failed (${code}); diagnostic output suppressed to protect credentials`);
     if (!["--rpc-socket", "--session-settings", "--model-preset"].every(flag => stdout.includes(flag)))
       throw new Error("Configured OMP lacks managed socket/session-settings/model-preset support. Apply the current pinned core patch; a normal installed OMP is not enough.");
     console.log(JSON.stringify({
@@ -59,6 +67,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (command === "status") {
+    const { gatewayStatus } = await import("./gateway");
     console.log(JSON.stringify({
       gateway: await gatewayStatus(config),
       main: { socketPath: hostPaths(config, "main").socketPath },
@@ -82,10 +91,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   if (command === "stop") {
     if (target === "main") {
+      const { stopGateway } = await import("./gateway");
       await stopGateway(config);
       console.log("Gateway and supervised main host accepted graceful shutdown.");
       return;
     }
+    const { connect } = await import("./host");
     const host = await connect(paths.socketPath);
     try {
       const response = await host.request({ type: "shutdown_host" });
@@ -95,10 +106,15 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (target !== "main") throw new Error("start only activates the Gateway/main service; lanes remain head-owned");
+  loadCredentials(config);
+  // Resolve required messenger credentials before native imports can populate env
+  // from their own project/provider configuration. Other native settings stay native.
+  requireMessengerCredentials(config);
+  const { gatewayPaths, launchGateway } = await import("./gateway");
   const status = await launchGateway(config);
   console.log(JSON.stringify({ ...status, gatewaySocketPath: gatewayPaths(config).socketPath,
     gatewayLogPath: gatewayPaths(config).logPath,
-    note: "Gateway owns messenger transports. Native head RPC availability and approval-reconciled intake readiness are reported separately." }, null, 2));
+    note: "Gateway owns messenger transports. Explicit start may return while initialization is checking/running or blocked. head.ready requires verified native high/middle/low presets; head.initialization reports setup/recovery state separately from approval-reconciled intake readiness. Ordinary input remains durably queued until initialization completes." }, null, 2));
 }
 
 if (import.meta.main) {

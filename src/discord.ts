@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import {
-  ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client,
-  Events, GatewayIntentBits, MessageFlags, ModalBuilder, Partials, StringSelectMenuBuilder,
+  ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelFlagsBitField, ChannelType, Client,
+  Events, GatewayIntentBits, MessageFlags, ModalBuilder, Partials, PermissionFlagsBits, StringSelectMenuBuilder,
   TextInputBuilder, TextInputStyle,
-  type Interaction, type Message, type MessageCreateOptions, type PartialMessage,
+  type ForumChannel, type Interaction, type MediaChannel, type Message, type MessageCreateOptions, type PartialMessage,
 } from "discord.js";
 import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
@@ -222,13 +222,19 @@ export class DiscordMessenger implements Messenger {
     }
   }
 
-  private async destination(route: Route) {
+  private async channel(route: Route, force = false) {
     this.assertRoute(route);
-    const channel = await this.client.channels.fetch(route.threadId ?? route.channelId);
-    if (!channel || !channel.isSendable()) throw new DeliveryError("Discord destination cannot receive messages", "rejected");
+    const channel = await this.client.channels.fetch(route.threadId ?? route.channelId, { force });
+    if (!channel) throw new DeliveryError("Discord destination cannot receive messages", "rejected");
     const actual = this.route(channel);
     if (!actual || physicalRouteKey(actual) !== physicalRouteKey(route)) throw new DeliveryError("Discord destination identity changed", "rejected");
     if (!route.guildId && (channel.type !== ChannelType.DM || channel.recipientId !== this.options.ownerId)) throw new DeliveryError("Discord DM does not belong to the owner", "rejected");
+    return channel;
+  }
+
+  private async destination(route: Route) {
+    const channel = await this.channel(route);
+    if (!channel.isSendable()) throw new DeliveryError("Discord destination cannot receive messages", "rejected");
     return channel;
   }
 
@@ -518,23 +524,70 @@ export class DiscordMessenger implements Messenger {
     return inputs;
   }
 
+  private async forumThreadAllowed(channel: ForumChannel | MediaChannel): Promise<boolean> {
+    if (channel.flags.has(ChannelFlagsBitField.Flags.RequireTag)) {
+      throw new DeliveryError("Discord forum/media topics require an explicitly selected tag in this channel; this interface cannot select tags", "rejected");
+    }
+    const member = await channel.guild.members.fetchMe({ force: true });
+    const permissions = channel.permissionsFor(member);
+    if (!permissions) throw new DeliveryError("Discord bot channel permissions could not be resolved", "rejected");
+    // Forum/media posts require SEND_MESSAGES, not CREATE_PUBLIC_THREADS.
+    // Reading and replying must also work for the resulting native topic.
+    // https://docs.discord.com/developers/topics/threads#creating-threads-in-forum-and-media-channels
+    return permissions.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.SendMessages, PermissionFlagsBits.SendMessagesInThreads]);
+  }
+
+  /** Read-only capability checks never enable features or choose forum tags. */
+  async canCreateThread(route: Route): Promise<boolean> {
+    this.assertRoute(route);
+    if (!route.guildId || route.threadId !== null) return false;
+    try {
+      const channel = await this.channel(route, true);
+      if (channel.type === ChannelType.GuildForum || channel.type === ChannelType.GuildMedia) return await this.forumThreadAllowed(channel);
+      if (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) return false;
+      const member = await channel.guild.members.fetchMe({ force: true });
+      const permissions = channel.permissionsFor(member);
+      if (!permissions) throw new DeliveryError("Discord bot channel permissions could not be resolved", "rejected");
+      // A new announcement thread needs a starter message; both destinations
+      // must also allow the bot to participate in the thread it creates.
+      // https://docs.discord.com/developers/topics/threads#permissions
+      return permissions.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.SendMessagesInThreads]);
+    } catch (error) { throw deliveryError(error); }
+  }
+
   async createThread(route: Route, title: string, sourceMessageId?: string): Promise<Route> {
     this.assertRoute(route);
     if (!route.guildId) throw new DeliveryError("Discord DMs cannot create threads; provide an explicit authorized guild target", "rejected");
     if (route.threadId) throw new DeliveryError("Discord cannot nest threads; provide an explicit parent-channel target", "rejected");
     if (!title.trim() || title.length > 100) throw new DeliveryError("Discord thread title must contain 1–100 characters", "rejected");
     try {
-      const channel = await this.destination(route);
+      // Forum/media roots cannot receive ordinary messages, but can create
+      // native starter-message posts within this same authorized destination.
+      const channel = await this.channel(route, true);
       let thread;
-      if (sourceMessageId) {
+      if (channel.type === ChannelType.GuildForum || channel.type === ChannelType.GuildMedia) {
+        if (sourceMessageId !== undefined) throw new DeliveryError("Discord forum/media topics cannot reuse a source message; provide the authorized parent without a source", "rejected");
+        if (!await this.forumThreadAllowed(channel)) throw new DeliveryError("Discord bot lacks permissions to create and use a forum/media topic", "rejected");
+        thread = await channel.threads.create({ name: title, message: { content: title, allowedMentions: NO_MENTIONS } });
+      } else if (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) {
+        throw new DeliveryError("This guild channel cannot create a public conversation thread", "rejected");
+      } else if (sourceMessageId) {
         if (!/^[0-9]{1,20}$/.test(sourceMessageId)) throw new DeliveryError("Invalid thread source message ID", "rejected");
-        thread = await (await channel.messages.fetch(sourceMessageId)).startThread({ name: title });
+        const source = await channel.messages.fetch(sourceMessageId);
+        if (source.id !== sourceMessageId || source.channelId !== route.channelId || source.guildId !== route.guildId) throw new DeliveryError("Discord thread source does not belong to this destination", "rejected");
+        thread = await source.startThread({ name: title });
+      } else if (channel.type === ChannelType.GuildAnnouncement) {
+        // Announcement threads can only be started from a real message.
+        const starter = await channel.send({ content: title, allowedMentions: NO_MENTIONS });
+        if (starter.channelId !== route.channelId || starter.guildId !== route.guildId || starter.author.id !== this.client.user?.id) throw new DeliveryError("Discord thread starter had an unexpected destination", "uncertain");
+        thread = await starter.startThread({ name: title });
       } else {
-        if (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) throw new DeliveryError("This guild channel cannot create a public conversation thread", "rejected");
-        thread = await channel.threads.create({ name: title });
+        thread = await channel.threads.create({ name: title, type: ChannelType.PublicThread });
       }
       const created = this.route(thread);
-      if (!created || created.guildId !== route.guildId || created.channelId !== route.channelId) throw new DeliveryError("Created Discord thread had an unexpected destination", "uncertain");
+      if (!created || created.threadId === null || created.guildId !== route.guildId || created.channelId !== route.channelId) throw new DeliveryError("Created Discord thread had an unexpected destination", "uncertain");
       return created;
     } catch (error) { throw deliveryError(error); }
   }

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { LogLevel, WebClient, type WebClientOptions } from "@slack/web-api";
 import { SocketModeClient } from "@slack/socket-mode";
-import { physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
 import { DeliveryError } from "./delivery.ts";
 import { compareMessageIds } from "./message-order.ts";
@@ -45,8 +45,11 @@ const hash = (value: string): string => createHash("sha256").update(value).diges
 const plain = (value: string) => ({ type: "plain_text", text: value || "(empty)", emoji: false });
 const escapeText = (value: string): string => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 // Slack reserves leading slash commands in its composer. These are ordinary
-// authenticated owner messages, sharing the runtime's existing command parser.
-const controlText = (value: string): string => value.replace(/^!(new|main|stop|resume)(?=$|\s)/, "/$1");
+// authenticated owner messages, sharing the runtime's existing command parser,
+// including the head's bare query and argument forms of /model, /effort, /stop,
+// /compact, and the rest of the ordinary-text command surface.
+// Only an exact first token converts; lookalikes such as "!models" stay plain text.
+const controlText = (value: string): string => value.replace(/^!(new|main|stop|resume|model|effort|help|status|context|compact|usage)(?=$|\s)/, "/$1");
 const tokenFor = (approval: Approval): string => hash(JSON.stringify([approval.id, approval.generation, approval.target, approval.requestId, routeKey(approval.route)]));
 const compare = (left: string, right: string): number => {
   const result = compareMessageIds("slack", left, right);
@@ -633,6 +636,14 @@ export class SlackMessenger implements Messenger {
     return [...inputs.values()].sort((left, right) => compare(left.messageId, right.messageId));
   }
 
+  /** Slack roots in an authenticated channel or owner DM support thread_ts. */
+  async canCreateThread(route: Route): Promise<boolean> {
+    this.assertRoute(route);
+    if (route.threadId !== null) return false;
+    await this.destination(route);
+    return true;
+  }
+
   async createThread(route: Route, title: string, sourceMessageId?: string): Promise<Route> {
     await this.destination(route);
     if (route.threadId) throw new DeliveryError("Slack cannot nest conversation threads", "rejected");
@@ -642,10 +653,12 @@ export class SlackMessenger implements Messenger {
       if (source.type !== "message" || source.user !== this.options.ownerId || source.bot_id || source.app_id ||
         (source.subtype !== undefined && source.subtype !== "file_share") ||
         (source.thread_ts !== undefined && source.thread_ts !== source.ts) ||
-        (source.team !== undefined && source.team !== this.options.teamId)) throw new DeliveryError("Slack thread source is not an authorized owner root message", "rejected");
-      return { ...route, threadId: sourceMessageId };
+        (source.team !== undefined && source.team !== this.options.teamId) ||
+        (source.user_team !== undefined && source.user_team !== this.options.teamId) ||
+        (source.source_team !== undefined && source.source_team !== this.options.teamId)) throw new DeliveryError("Slack thread source is not an authorized owner root message", "rejected");
+      return { ...physicalRoute(route), threadId: sourceMessageId };
     }
-    return { ...route, threadId: await this.post(route, title) };
+    return { ...physicalRoute(route), threadId: await this.post(route, title) };
   }
 
   async openAttachment(route: Route, attachment: Attachment, signal: AbortSignal): Promise<Response> {

@@ -7,11 +7,13 @@ or briefing decision. The head remains the decision maker. Use the existing nati
 `eval` helpers `judge`/`judge_batch`, not a new evaluator, supervisor, provider client,
 or model watchdog. Clear tiny main-context work stays direct without a comparison.
 
-## 0. Initialize missing native presets on the first real head turn
+## 0. Initialize missing native presets in the explicit-start bootstrap turn
 
-This guidance is present from the first inference and on subsequent head turns;
-perform first-deployment bootstrap on the first real head turn, not through an idle
-LLM wake, polling loop, or separate setup model. Call `lane_models({})`
+This guidance remains present on subsequent head turns, but ordinary user messages
+are not bootstrap triggers. Explicit service start inspects the native presets and,
+when initial setup is needed, submits one dedicated bootstrap turn in this same head.
+Do not create a separate setup model, idle LLM wake, or polling loop. Terminal setup
+and doctor do not run models. During the dedicated bootstrap turn, call `lane_models({})`
 to inspect the user's native preset status, safe configured model roles/thinking,
 bootstrap need, and available chat-model facts. OMP's actual preset mechanism stores
 `modelPresets.<name> = {modelRoles: {...}, defaultThinkingLevel?}` and is visible in
@@ -33,8 +35,14 @@ their evidence and ask the owner only for a real unresolved decision.
 
 This deliberate first-setup creation is the sole intended persistent preset-write
 exception. It is not a global preset editor or a restart/resume recovery loop. Read
-back actual native status before claiming initialization; a setup request or policy
-text is not proof. Routine lane selection/change must never persist OMP-wide
+back actual native status before claiming initialization; a setup request, accepted
+prompt, ordinary answer, or policy text is not proof. The controller checks successful
+native execution and complete preset readback before releasing ordinary user work.
+The bootstrap turn is not a user conversation: do not create lanes, modify project
+files, or send external replies. Conflicts, unavailable models, or incomplete creation
+must be reported honestly, not hidden with a success answer. An interrupted or failed
+bootstrap is not permission to retry itself or to recreate presets later deleted by
+the operator. Routine lane selection/change must never persist OMP-wide
 model/preset settings. Do not change judge roles/fallbacks/timeouts to obtain advice.
 
 ## 1. Gather requirements and an available shortlist

@@ -114,7 +114,13 @@ export function authorizeRoute(config: Config, route: Route): boolean {
 
 export async function loadConfig(path: string): Promise<Config> {
   const absolute = resolve(path);
-  const raw = record(await Bun.file(absolute).json(), "config");
+  return parseConfig(await Bun.file(absolute).json(), absolute);
+}
+
+/** Validate an in-memory setup candidate with exactly the same policy as a saved config. */
+export function parseConfig(value: unknown, path: string): Config {
+  const absolute = resolve(path);
+  const raw = record(value, "config");
   if (raw.modelPresets !== undefined)
     throw new Error("modelPresets belong to native OMP settings; initialize them through the head, not this application config");
   const discord = raw.discord === undefined ? undefined : record(raw.discord, "discord");

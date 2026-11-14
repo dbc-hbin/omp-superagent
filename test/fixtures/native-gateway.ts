@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { parseSessionEntries, type FileEntry } from "@oh-my-pi/pi-coding-agent";
 import { type Config, hostPaths, privateDirectory } from "../../src/config";
 import type { Approval, Inbound, Lane, Messenger, OutputRecord, Route } from "../../src/contracts";
-import { startGateway, gatewayPaths, type GatewayService } from "../../src/gateway";
+import { startGateway, gatewayPaths, type GatewayService, type GatewayStatus } from "../../src/gateway";
 import { HostConnection } from "../../src/host";
 import { nativeDisabledProviders } from "./native-extension";
 import { runNativeUlwProof } from "./native-ulw-proof";
@@ -105,6 +105,8 @@ function nativeToolResults(entries: readonly FileEntry[], name: string) {
 
 const root = process.env.OMP_NATIVE_GATEWAY_ROOT;
 assert(root && path.isAbsolute(root), "Native Gateway proof needs a private absolute root");
+const presetScenario = process.env.OMP_NATIVE_GATEWAY_PRESETS ?? "create";
+assert(["create", "valid", "failed", "skipped", "interrupted"].includes(presetScenario));
 assert.equal(process.env.HOME, path.join(root, "home"));
 const parsed: unknown = JSON.parse(process.env.OMP_TEST_COMMAND ?? "null");
 assert(Array.isArray(parsed) && parsed.length && parsed.every(value => typeof value === "string" && value), "OMP_TEST_COMMAND must explicitly name the patched native CLI argv");
@@ -130,7 +132,9 @@ const settings = {
   // Explicitly grant only the native keyword settings this proof exercises;
   // native task capability requirements still control orchestration notices.
   ...(ulwEntrypoint ? { magicKeywords: { enabled: true, ultrathink: true, orchestrate: true } } : {}),
-  modelPresets: Object.fromEntries(["high", "middle", "low"].map(name => [name, { modelRoles: { default: model, judge: model } }])),
+  ...(presetScenario === "valid" || ulwEntrypoint ? {
+    modelPresets: Object.fromEntries(["high", "middle", "low"].map(name => [name, { modelRoles: { default: model, judge: model } }])),
+  } : {}),
 };
 await fs.writeFile(path.join(agent, "config.yml"), JSON.stringify(settings), { mode: 0o600 });
 await fs.writeFile(path.join(agent, "models.yml"), "providers: {}\n", { mode: 0o600 });
@@ -143,6 +147,25 @@ const config: Config = {
   discord: { tokenEnv: "ISOLATED_GATEWAY_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4"] },
 };
 await fs.writeFile(config.path, JSON.stringify(config), { mode: 0o600 });
+async function readCliStatus(): Promise<GatewayStatus> {
+  const child = Bun.spawn([process.execPath, "--no-env-file", path.resolve(import.meta.dir, "../../src/cli.ts"),
+    "status", "--config", config.path], {
+    cwd: config.stateDir, env: { ...process.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  });
+  try {
+    const [stdout, stderr, code] = await within(Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]), 10_000, "Isolated actual CLI status did not exit");
+    assert.equal(code, 0, stderr);
+    assert.equal(stderr, "");
+    const result = JSON.parse(stdout) as { gateway: GatewayStatus | null };
+    assert(result.gateway, "Actual CLI must read the live private Gateway");
+    return result.gateway;
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await child.exited;
+  }
+}
 const messenger = new RecordingMessenger();
 const errors: unknown[] = [];
 const connections = new Set<HostConnection>();
@@ -168,6 +191,7 @@ function cleanup(): Promise<void> {
       stoppedPid = undefined;
     }
     await fs.writeFile(path.join(root!, "release-207"), "cleanup", { mode: 0o600 });
+    await fs.writeFile(path.join(root!, "release-bootstrap"), "cleanup", { mode: 0o600 });
     if (starting) {
       try { gateway = await within(starting, 40_000, "Native Gateway startup exceeded signal cleanup deadline"); }
       catch (error) { console.error(String(error)); }
@@ -233,16 +257,92 @@ try {
   gateway = await starting;
   starting = undefined;
   interrupted.signal.throwIfAborted();
-  await until(() => gateway!.status().head.ready, "production head Gateway handshake");
-  assert.equal((await fs.lstat(gatewayPaths(config).socketPath)).mode & 0o777, 0o600);
   ledger = new Database(path.join(root, "coordination.sqlite"), { readonly: true, strict: true });
   const db = ledger;
-  if (ulwEntrypoint) {
+  const bootstrapEntries = async () => parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8")).filter(entry =>
+    entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message.content).includes("Native preset startup initialization"));
+  if (!ulwEntrypoint && ["create", "interrupted"].includes(presetScenario)) {
+    await until(() => existsSync(path.join(root, "entered-bootstrap")), "actual same-head startup initialization model boundary");
+    await messenger.deliver(inputs[0]!);
+    await until(() => !!db.query("SELECT id FROM inputs WHERE id='201' AND state='pending'").get(), "durable ordinary input held behind initialization");
+    const initializing = gateway.status();
+    assert.equal(initializing.head.ready, false);
+    assert.equal(initializing.head.initialization?.state, "running");
+    assert.equal(initializing.gateway.admissionReady, true);
+    assert.equal(messenger.sent.length, 0);
+    assert.equal((await bootstrapEntries()).length, 1);
+    assert.deepEqual(requestIds(parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"))), []);
+    if (presetScenario === "create") {
+      const operator = await readCliStatus();
+      assert.equal(operator.head.initialization?.state, "running");
+      assert.equal(operator.head.ready, false);
+      assert.equal(operator.head.pid, initializing.head.pid);
+      assert.equal(operator.head.initialization?.requestId, initializing.head.initialization?.requestId);
+    }
+    if (presetScenario === "interrupted") {
+      const originalPid = initializing.head.pid;
+      assert(originalPid);
+      const originalRequest = initializing.head.initialization!.requestId;
+      process.kill(originalPid, "SIGKILL");
+      await until(() => {
+        const status = gateway!.status();
+        return status.head.pid !== originalPid && status.head.connected && status.head.initialization?.state === "uncertain";
+      }, "replacement head preserves ambiguous startup intent without replay");
+      assert.equal(gateway.status().head.initialization?.requestId, originalRequest);
+    } else await fs.writeFile(path.join(root, "release-bootstrap"), "create presets", { mode: 0o600 });
+  }
+  if (!ulwEntrypoint && ["failed", "skipped"].includes(presetScenario)) {
+    await until(() => gateway!.status().head.initialization?.state === "failed", "observable unsuccessful initializer");
+    await messenger.deliver(inputs[0]!);
+    await until(() => !!db.query("SELECT id FROM inputs WHERE id='201' AND state='pending'").get(), "input retained after failed setup");
+  } else if (presetScenario !== "interrupted") await until(() => gateway!.status().head.ready, "production head Gateway handshake and verified native presets");
+  assert.equal((await fs.lstat(gatewayPaths(config).socketPath)).mode & 0o777, 0o600);
+  if (!ulwEntrypoint && presetScenario !== "create") {
+    const status = gateway.status();
+    assert.equal(status.head.ready, presetScenario === "valid");
+    assert.equal(status.gateway.admissionReady, true);
+    assert.equal(messenger.sent.length, 0, "Bootstrap results are not externally delivered as user answers");
+    assert.equal((await bootstrapEntries()).length, ["valid", "skipped"].includes(presetScenario) ? 0 : 1);
+    for (const [name, bytes] of settingsBytes) assert.deepEqual(await fs.readFile(path.join(agent, name)), bytes);
+    // A Gateway reconnect/adoption must not turn a failed or interrupted
+    // lifecycle into a new initialization prompt in the live native head.
+    const before = await fs.readFile(mainPaths.sessionFile, "utf8");
+    await gateway.close();
+    gateway = undefined;
+    gateway = await startGateway(config, { messenger, managedUlwPath, onError: error => errors.push(error) });
+    await until(() => {
+      const adopted = gateway!.status();
+      return adopted.head.connected && adopted.gateway.admissionReady && (presetScenario !== "valid" || adopted.head.ready);
+    }, "Gateway adoption of the exact existing head and approval-reconciled intake");
+    assert.equal(await fs.readFile(mainPaths.sessionFile, "utf8"), before);
+    assert.equal(gateway.status().head.ready, presetScenario === "valid");
+    assert.deepEqual(errors, []);
+    await gateway.stop();
+    gateway = undefined;
+  } else if (ulwEntrypoint) {
     await runNativeUlwProof({ root, config, db, gateway, messenger, connections, owned, until });
     gateway = undefined;
     for (const [name, bytes] of settingsBytes) assert.deepEqual(await fs.readFile(path.join(agent, name)), bytes);
     assert.deepEqual(errors, []);
   } else {
+  assert.equal(gateway.status().head.initialization?.state, "complete");
+  const operator = await readCliStatus();
+  assert.equal(operator.head.initialization?.state, "complete");
+  assert.equal(operator.head.ready, true);
+  assert.equal(operator.head.pid, gateway.status().head.pid);
+  assert.equal((await bootstrapEntries()).length, 1);
+  const initializedEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+  const initializations = nativeToolResults(initializedEntries, "lane_init_presets");
+  assert.equal(initializations.length, 1, "Only the actual existing head chooses and persists native presets once");
+  assert.notEqual(initializations[0]!.isError, true);
+  const initialized = Bun.YAML.parse(await fs.readFile(path.join(agent, "config.yml"), "utf8")) as {
+    modelRoles: Record<string, string>; modelPresets: Record<string, { modelRoles: Record<string, string> }>;
+  };
+  assert.deepEqual(initialized.modelRoles, settings.modelRoles);
+  assert.deepEqual(Object.keys(initialized.modelPresets).sort(), ["high", "low", "middle"]);
+  for (const preset of Object.values(initialized.modelPresets)) assert.deepEqual(preset.modelRoles, settings.modelRoles);
+  assert.deepEqual(await fs.readFile(path.join(agent, "models.yml")), settingsBytes.get("models.yml"));
+  settingsBytes.set("config.yml", await fs.readFile(path.join(agent, "config.yml")));
   const input = (id: string) => db.query("SELECT target,state,request_id,generation FROM inputs WHERE id=?").get(id) as { target: string; state: string; request_id: string; generation: number } | null;
   const lane = () => {
     const rows = db.query("SELECT data FROM lanes").all() as Array<{ data: string }>;
@@ -261,7 +361,8 @@ try {
     }))).flat();
     throw new Error(`Native request failed before expected progress: ${JSON.stringify({ failed, nativeErrors })}`);
   };
-  const sent = (id: string) => messenger.sent.filter(output => output.text === `HEAD:${id}`);
+  const sent = (id: string) => messenger.sent.flatMap(output => output.text.split("\n")
+    .filter(line => line === `HEAD:${id}`).map(() => output));
   const connect = async (socketPath: string) => {
     const connection = await HostConnection.connect(socketPath);
     connections.add(connection);
@@ -349,17 +450,26 @@ try {
   await until(() => sent("207").length === 1 && input("207")?.state === "done", "busy turn completion");
   await until(() => gateway!.status().gateway.pendingEvents === 0, "final durable admission receipt");
 
-  const expectedHeadRequests = ["201", "202", `report:${firstHandoff}`, "203", `report:${followupHandoff}`,
-    ...inputs.slice(3, 6).map(item => item.id),
-    ...inputs.slice(3, 6).map(item => `report:handoff:${item.id}:${firstLane.id}`), "207"];
+  const reportOwners = new Map<string, string>();
+  const expectedLaneRequests = [firstHandoff, followupHandoff, ...inputs.slice(3, 6).map(item => `handoff:${item.id}:${firstLane.id}`)];
+  for (const handoffId of expectedLaneRequests) {
+    const row = db.query("SELECT value FROM metadata WHERE key=?").get(`steering-owner:${handoffId}`) as { value: string } | null;
+    assert(row, "Every actual lane input must retain its native settlement owner");
+    assert(expectedLaneRequests.includes(row.value), "Consolidated reports may only belong to an admitted lane input");
+    assert(expectedLaneRequests.indexOf(row.value) <= expectedLaneRequests.indexOf(handoffId), "A follow-up cannot own an earlier input");
+    assert.equal(input(handoffId)?.state, "done");
+    reportOwners.set(handoffId, row.value);
+  }
+  const expectedReports = [...new Set(reportOwners.values())].map(owner => `report:${owner}`);
+  const expectedHeadRequests = [...inputs.map(item => item.id), ...expectedReports];
   const headEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
   const headIds = requestIds(headEntries);
   // Concurrent durable inputs and returned reports may interleave, but every
-  // original must occur once and strictly before its corresponding lane report.
+  // original occurs once and precedes the report of its native steering group.
   assert.deepEqual([...headIds].sort(), [...expectedHeadRequests].sort());
   const laneEntries = parseSessionEntries(await fs.readFile(firstLane.sessionFile, "utf8"));
   const laneIds = requestIds(laneEntries);
-  assert.deepEqual(laneIds, [firstHandoff, followupHandoff, ...inputs.slice(3, 6).map(item => `handoff:${item.id}:${firstLane.id}`)]);
+  assert.deepEqual(laneIds, expectedLaneRequests);
   const managementCalls = headEntries.flatMap(entry => entry.type === "message" && entry.message.role === "assistant"
     ? entry.message.content.flatMap(part => {
       if (part.type !== "toolCall") return [];
@@ -382,20 +492,34 @@ try {
   }
   for (const item of inputs.slice(1, 6)) {
     const handoffId: string = item.id === "202" ? firstHandoff : `handoff:${item.id}:${firstLane.id}`;
-    assert(headIds.indexOf(item.id) < headIds.indexOf(`report:${handoffId}`));
+    const owner = reportOwners.get(handoffId)!;
+    const reportId = `report:${owner}`;
+    assert(headIds.indexOf(item.id) < headIds.indexOf(reportId));
     assert.equal(input(item.id)?.target, "main");
+    assert.equal(input(item.id)?.state, "done");
     assert.equal(input(handoffId)?.target, firstLane.id);
-    assert.equal(input(`report:${handoffId}`)?.target, "main");
-    const reportRow = db.query("SELECT data FROM inputs WHERE id=?").get(`report:${handoffId}`) as { data: string };
-    assert(JSON.parse(reportRow.data).text.includes(`sourceId: ${item.id}; laneInputId: ${handoffId}`));
+    const admittedRow = db.query("SELECT data FROM inputs WHERE id=?").get(item.id) as { data: string };
+    const admitted = JSON.parse(admittedRow.data) as Inbound;
+    assert.deepEqual({ id: admitted.id, messageId: admitted.messageId, route: admitted.route, text: admitted.text,
+      receivedAt: admitted.receivedAt, attachments: admitted.attachments }, item, "Native intake preserves the exact original identity and authorized task data");
+    assert.equal(input(reportId)?.target, "main");
+    const ownerSource = db.query("SELECT value FROM metadata WHERE key=?").get(`handoff-source:${owner}`) as { value: string };
+    const reportRow = db.query("SELECT data FROM inputs WHERE id=?").get(reportId) as { data: string };
+    const report = JSON.parse(reportRow.data) as Inbound;
+    assert(report.text.includes(`sourceId: ${ownerSource.value}; laneInputId: ${owner}`));
+    const grouped = expectedLaneRequests.filter(id => reportOwners.get(id) === owner);
+    assert.deepEqual([...report.text.matchAll(/^LANE:([^\r\n]+)$/gm)].map(match => match[1]), grouped,
+      "The actual native lane result must account for every joined handoff exactly once and in order");
     assert.deepEqual(sent(item.id)[0]?.route, item.route);
-    assert.equal(sent(item.id)[0]?.sourceId, `report:${handoffId}`);
+    assert.equal(sent(item.id)[0]?.sourceId, reportId);
   }
-  assert.equal(messenger.sent.length, inputs.length);
-  assert(messenger.sent.every(output => output.text.startsWith("HEAD:") && !output.text.includes("LANE:")));
+  const expectedOutputSources = ["201", ...expectedReports, "207"];
+  assert.deepEqual(messenger.sent.map(output => output.sourceId).sort(), [...expectedOutputSources].sort());
+  assert.deepEqual(messenger.sent.flatMap(output => output.text.split("\n")).sort(), inputs.map(item => `HEAD:${item.id}`).sort(),
+    "Head-only delivery must account for every original input once, whether native work yields one or several outputs");
   for (const item of inputs) assert.equal(sent(item.id).length, 1);
   const outputs = db.query("SELECT source_id,state,remote_id FROM outputs ORDER BY sequence").all() as Array<{ source_id: string; state: string; remote_id: string }>;
-  assert.equal(outputs.length, inputs.length);
+  assert.deepEqual(outputs.map(output => output.source_id).sort(), [...expectedOutputSources].sort());
   assert(outputs.every(output => output.state === "sent" && output.remote_id === `gateway-native-receipt:${output.source_id}:answer`));
   const boardPosts = [...nativeToolResults(headEntries, "board_post"), ...nativeToolResults(laneEntries, "board_post")];
   const posted = boardPosts.map(post => {
@@ -417,7 +541,7 @@ try {
     "Every request-bearing post must originate from one unique native session/tool execution");
   const headReads = nativeToolResults(headEntries, "board_read");
   const laneReads = nativeToolResults(laneEntries, "board_read");
-  assert.equal(headReads.length, laneIds.length);
+  assert.equal(headReads.length, expectedReports.length);
   assert.equal(laneReads.length, laneIds.length);
   for (const [name, bytes] of settingsBytes) assert.deepEqual(await fs.readFile(path.join(agent, name)), bytes);
   assert.deepEqual(errors, []);

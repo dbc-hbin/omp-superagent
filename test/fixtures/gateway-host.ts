@@ -1,22 +1,24 @@
 /** Isolated native-RPC peer for Gateway lifecycle tests; no platform activation. */
-import { appendFile, chmod, mkdir } from "node:fs/promises";
+import { appendFile, chmod, mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { loadConfig } from "../../src/config";
 import { createGatewayMessenger } from "../../src/gateway-client";
+import { Store } from "../../src/store";
 
 const arg = (name: string) => process.argv[process.argv.indexOf(name) + 1]!;
 const config = await loadConfig(process.env.OMP_SUPERAGENT_CONFIG!);
 const socketPath = arg("--rpc-socket");
 const sessionFile = arg("--session");
 await mkdir(dirname(sessionFile), { recursive: true });
-await appendFile(sessionFile, "");
 const sessionId = "gateway-fixture-session";
+if (!existsSync(sessionFile)) await appendFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: config.headCwd })}\n`);
 const messenger = createGatewayMessenger(config);
 await appendFile(join(config.stateDir, "launches.jsonl"), `${JSON.stringify({ pid: process.pid,
-  args: process.argv, credentialPresent: Boolean(process.env.GATEWAY_TEST_BOT_TOKEN) })}\n`);
+  args: process.argv, config: JSON.parse(await readFile(arg("--config"), "utf8")),
+  credentialPresent: Boolean(process.env.GATEWAY_TEST_BOT_TOKEN) })}\n`);
 const server = createServer(peer => {
   peer.on("error", () => {});
   peer.setEncoding("utf8");
@@ -48,6 +50,20 @@ server.once("error", listening.reject);
 server.listen(socketPath, listening.resolve);
 await listening.promise;
 await chmod(socketPath, 0o600);
+// This RPC peer replaces the whole native controller. Model a head whose
+// fixture presets were preverified; actual initialization/readback belongs to
+// native-gateway.test.ts, not these transport/process lifecycle cases.
+const coordination = new Store(join(config.stateDir, "coordination.sqlite"));
+try {
+  const saved = coordination.getMeta("head:preset-bootstrap");
+  if (saved) {
+    const initialization = JSON.parse(saved) as { sessionId: string; state: string };
+    if (initialization.sessionId !== sessionId || initialization.state !== "complete") {
+      throw new Error("Lifecycle peer cannot replace an incomplete or foreign initialization receipt");
+    }
+  } else coordination.setMeta("head:preset-bootstrap", JSON.stringify({ sessionId,
+    state: "complete", replayBlocked: true, detail: "Lifecycle RPC peer: fixture presets were already verified." }));
+} finally { coordination.close(); }
 await messenger.start({
   message: async input => { await appendFile(join(config.stateDir, "received.jsonl"), `${JSON.stringify(input)}\n`); },
   answer: async () => {},

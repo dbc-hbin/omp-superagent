@@ -182,6 +182,21 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
+## Hermes 셋업 — UX 참고, 독립 구현
+
+- 참고 revision: [`NousResearch/hermes-agent` `4b40ffb0ad6d7da5d3260f5e499e1691508dd4d5`](https://github.com/NousResearch/hermes-agent/tree/4b40ffb0ad6d7da5d3260f5e499e1691508dd4d5).
+- 확인한 구현: [`scripts/install.sh`](https://github.com/NousResearch/hermes-agent/blob/4b40ffb0ad6d7da5d3260f5e499e1691508dd4d5/scripts/install.sh)의
+  `/dev/tty` 셋업 인계·`0600` 환경 파일,
+  [`hermes_cli/secret_prompt.py`](https://github.com/NousResearch/hermes-agent/blob/4b40ffb0ad6d7da5d3260f5e499e1691508dd4d5/hermes_cli/secret_prompt.py)의
+  비밀 입력·터미널 복원,
+  [`hermes_cli/setup_platforms.py`](https://github.com/NousResearch/hermes-agent/blob/4b40ffb0ad6d7da5d3260f5e499e1691508dd4d5/hermes_cli/setup_platforms.py)의
+  플랫폼별 자격 증명 질문·기존 구성 유지 흐름.
+- 적용: `scripts/setup.sh`와 CLI setup/credential 로딩의 UX를 이 저장소의 OMP·Gateway 계약에
+  맞춰 독립 작성했다. 해당 Python·설치기 코드는 복사하지 않았다.
+- Bash builtin·Node 표준 `readline`/dotenv parser와 기존 config 검증을 사용한다.
+  Hermes의 자동 봇 생성·로그인·Gateway 서비스 설치/재시작·allow-all 정책은 가져오지 않는다.
+  정확한 호환 범위는 Unix terminal과 이 저장소가 준비한 Bun/패치 OMP이며 Hermes 실행 의존성은 없다.
+
 ## OMP — 상위 소스와 코어 패치
 
 - 원본: [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi/tree/c308970263ae13744ea15ab67302e3dac840e266)

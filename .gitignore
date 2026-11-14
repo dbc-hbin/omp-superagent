@@ -4,7 +4,11 @@ coverage/
 dist/
 .env
 .env.*
+*.env
+*.env.lock
+!*.example.env
 !.env.example
+.setup-*.tmp
 config.local.json
 .state/
 *.tsbuildinfo

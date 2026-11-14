@@ -1,4 +1,5 @@
-import { afterAll, afterEach, expect, test } from "bun:test";
+import { afterAll, afterEach, expect, spyOn, test } from "bun:test";
+import { mkdirSync, renameSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -38,7 +39,7 @@ if (!workerRoot) {
   // directory caches in the parent before the subprocess's private HOME exists.
   const { NativePresetManager } = await import("../src/native-presets");
   const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
-  const { cfgModelPresets } = await import("@oh-my-pi/pi-coding-agent/config/model-settings");
+  const { cfgModelPresets, cfgModelRoles } = await import("@oh-my-pi/pi-coding-agent/config/model-settings");
   const { getModelPreset, acquireModelRoleMutation } = await import("@oh-my-pi/pi-coding-agent/config/model-presets");
   const { resolveModelRoleValue, pickDefaultAvailableModel } = await import("@oh-my-pi/pi-coding-agent/config/model-resolver");
   const { cfgDefaultThinkingLevel } = await import("@oh-my-pi/pi-coding-agent/session/settings");
@@ -191,6 +192,76 @@ if (!workerRoot) {
     expect((await f.manager.resolve("high")).snapshot.defaultThinkingLevel).toBe(Effort.Minimal);
   });
 
+  test("omitted preset thinking freezes the supplied HEAD policy without changing persistent lane defaults", async () => {
+    const f = await fixture({ global: { modelPresets: { high: { modelRoles: { default: selector(opus) } } } } });
+    const before = await f.bytes();
+    const context: Pick<LanePresetSnapshot, "defaultThinkingLevel"> = { defaultThinkingLevel: Effort.Low };
+    const head = await f.manager.resolve("high", context);
+    const lane = await f.manager.resolve("high");
+    expect(head.model).toEqual(id(opus));
+    expect(head.snapshot.defaultThinkingLevel).toBe(Effort.Low);
+    expect(lane.snapshot.defaultThinkingLevel).toBe(Effort.Medium);
+    const nativeHead = f.settings.overlay({ modelPresets: { high: head.snapshot } });
+    const nativeLane = f.settings.overlay({ modelPresets: { high: lane.snapshot } });
+    expect(getModelPreset(nativeHead, "high")).toEqual({ kind: "found",
+      preset: { modelRoles: { default: selector(opus) }, defaultThinkingLevel: Effort.Low } });
+    expect(getModelPreset(nativeLane, "high")).toEqual({ kind: "found",
+      preset: { modelRoles: { default: selector(opus) }, defaultThinkingLevel: Effort.Medium } });
+    context.defaultThinkingLevel = Effort.High;
+    expect(head.snapshot.defaultThinkingLevel).toBe(Effort.Low);
+    expect(cfgDefaultThinkingLevel.get(f.settings)).toBe(Effort.Medium);
+    expect(await f.bytes()).toEqual(before);
+  });
+
+  test("an explicitly undefined HEAD thinking context does not inherit the persistent default", async () => {
+    const f = await fixture({ global: { modelPresets: { high: { modelRoles: { default: selector(opus) } } } } });
+    const before = await f.bytes();
+    expect((await f.manager.resolve("high")).snapshot.defaultThinkingLevel).toBe(Effort.Medium);
+    expect((await f.manager.resolve("high", undefined)).snapshot.defaultThinkingLevel).toBe(Effort.Medium);
+    for (const context of [{}, { defaultThinkingLevel: undefined }]) {
+      const head = await f.manager.resolve("high", context);
+      expect(head.snapshot.defaultThinkingLevel).toBeUndefined();
+      // Native snapshot parsing must retain omission rather than restore the
+      // persistent default before the HEAD applies its current session policy.
+      const nativeSettings = f.settings.overlay({ modelPresets: { high: head.snapshot } });
+      expect(getModelPreset(nativeSettings, "high")).toEqual({ kind: "found", preset: { modelRoles: { default: selector(opus) } } });
+      const native = resolveModelRoleValue(head.snapshot.modelRoles.default, models, { settings: nativeSettings });
+      expect(native.model?.id).toBe(opus.id);
+      expect(native.explicitThinkingLevel).toBe(false);
+      expect(native.thinkingLevel).toBeUndefined();
+    }
+    expect(cfgDefaultThinkingLevel.get(f.settings)).toBe(Effort.Medium);
+    expect(await f.bytes()).toEqual(before);
+  });
+
+  test("explicit preset and selector thinking take precedence over the supplied HEAD context", async () => {
+    const f = await fixture({ global: { modelPresets: {
+      policy: { modelRoles: { default: selector(opus) }, defaultThinkingLevel: Effort.High },
+      selector: { modelRoles: { default: `@slow:${Effort.Medium}`, slow: selector(opus) }, defaultThinkingLevel: Effort.High },
+      selectorOnly: { modelRoles: { default: `${selector(opus)}:${Effort.Medium}` } },
+    } } });
+    const before = await f.bytes();
+    for (const context of [{ defaultThinkingLevel: Effort.Low }, { defaultThinkingLevel: undefined }]) {
+      const policy = await f.manager.resolve("policy", context);
+      expect(policy.snapshot.defaultThinkingLevel).toBe(Effort.High);
+      const nativePolicy = f.settings.overlay({ modelPresets: { policy: policy.snapshot } });
+      expect(getModelPreset(nativePolicy, "policy")).toEqual({ kind: "found",
+        preset: { modelRoles: { default: selector(opus) }, defaultThinkingLevel: Effort.High } });
+      const selected = await f.manager.resolve("selector", context);
+      expect(selected.snapshot.defaultThinkingLevel).toBe(Effort.High);
+      const selectorOnly = await f.manager.resolve("selectorOnly", context);
+      expect(selectorOnly.snapshot.defaultThinkingLevel).toBe(context.defaultThinkingLevel);
+      for (const resolved of [selected, selectorOnly]) {
+        const native = resolveModelRoleValue(resolved.snapshot.modelRoles.default, models, { settings: f.settings });
+        expect(resolved.model).toEqual(id(opus));
+        expect(native.model?.id).toBe(opus.id);
+        expect(native.explicitThinkingLevel).toBe(true);
+        expect(native.thinkingLevel).toBe(Effort.Medium);
+      }
+    }
+    expect(await f.bytes()).toEqual(before);
+  });
+
   test("bootstrap snapshots effective native policy without activating it", async () => {
     const f = await fixture({
       project: { modelRoles: { judge: `${selector(opus)}:low`, plan: "@slow" } },
@@ -263,6 +334,142 @@ if (!workerRoot) {
     const serialized = JSON.stringify(result);
     for (const key of ["baseUrl", "headers", "apiKey", "Authorization"]) expect(serialized).not.toContain(key);
     expect(await f.bytes()).toEqual(before);
+  });
+
+  test("only explicit persistence replaces global defaults while preserving higher layers and unrelated files", async () => {
+    const high: LanePresetSnapshot = { modelRoles: { default: selector(opus), slow: selector(opus), judge: "@slow" },
+      defaultThinkingLevel: Effort.Low };
+    const f = await fixture({
+      global: { modelPresets: { high, other: { modelRoles: { default: selector(sonnet) } } } },
+      project: { modelRoles: { default: selector(sonnet), plan: selector(sonnet) }, defaultThinkingLevel: Effort.Minimal },
+      overlay: { modelRoles: { task: selector(sonnet) } },
+      overrides: { modelRoles: { smol: selector(sonnet) } },
+    });
+    const authPath = path.join(f.agent, "auth.json");
+    const auth = '{"fixture-provider":{"type":"api_key","key":"isolated-fixture-only"}}\n';
+    await fs.writeFile(authPath, auth);
+    const before = await f.persisted();
+    const beforeBytes = await f.bytes();
+    const beforeLayers = f.settings.mirrorState();
+    const selection = await f.manager.resolve("high");
+    await f.manager.inspect();
+    expect(await f.bytes()).toEqual(beforeBytes);
+    expect(await fs.readFile(authPath, "utf8")).toBe(auth);
+
+    const saved = await f.manager.persistSelection(selection);
+    expect(saved).toEqual(selection.snapshot);
+    expect(saved.modelRoles).not.toHaveProperty("task");
+    expect(saved.modelRoles).not.toHaveProperty("smol");
+    const after = await f.persisted();
+    expect(after).toEqual({ ...before, ...selection.snapshot });
+    expect(after.modelRoleStorage).toBe("project");
+    expect(after.modelPresets).toEqual(before.modelPresets);
+    expect((await f.bytes()).slice(1)).toEqual(beforeBytes.slice(1));
+    expect(await fs.readFile(authPath, "utf8")).toBe(auth);
+    const afterLayers = f.settings.mirrorState();
+    for (const layer of ["project", "configOverlay", "overrides"] as const) {
+      expect(afterLayers[layer]).toEqual(beforeLayers[layer]);
+    }
+    // Readback is deliberately global-only: project policy still wins here.
+    expect(f.settings.getModelRole("default")).toBe(selector(sonnet));
+    expect(cfgDefaultThinkingLevel.get(f.settings)).toBe(Effort.Minimal);
+    const authoritative = await Settings.loadIsolated({ cwd: f.cwd, agentDir: f.agent });
+    fixtures.push({ root: path.join(f.root, "unused"), settings: authoritative });
+    expect(authoritative.getGlobalSettings().modelRoles).toEqual(saved.modelRoles);
+    expect(authoritative.getGlobalSettings().defaultThinkingLevel).toBe(saved.defaultThinkingLevel);
+    expect(() => new NativePresetManager(f.settings.overlay(), async () => models, () => true))
+      .toThrow("persistent native base settings");
+  });
+
+  test("global persistence uses the frozen selection even after its named preset and catalog change", async () => {
+    const f = await fixture({ global: { modelPresets: {
+      high: { modelRoles: { default: selector(opus), judge: selector(opus) }, defaultThinkingLevel: Effort.Low },
+    } } });
+    const selection = await f.manager.resolve("high");
+    const replacement: LanePresetSnapshot = { modelRoles: { default: selector(sonnet), task: selector(sonnet) },
+      defaultThinkingLevel: Effort.Minimal };
+    cfgModelPresets.setEntry(f.settings, "high", replacement);
+    await f.settings.flush();
+    const manager = new NativePresetManager(f.settings, async () => {
+      throw new Error("Persistence must not look up current models");
+    }, () => true);
+    const saved = await manager.persistSelection(selection);
+    expect(saved).toEqual(selection.snapshot);
+    expect(saved.modelRoles.default).toBe(selector(opus));
+    expect(saved.defaultThinkingLevel).toBe(Effort.Low);
+    expect(getModelPreset(f.settings, "high")).toEqual({ kind: "found", preset: replacement });
+    expect((await f.persisted()).modelPresets).toEqual({ high: replacement });
+  });
+
+  test("an omitted snapshot thinking policy clears the global key rather than retaining the old default", async () => {
+    const f = await fixture({ global: { modelPresets: { high: { modelRoles: { default: selector(opus) } } } } });
+    const selection = await f.manager.resolve("high");
+    const snapshot: LanePresetSnapshot = { modelRoles: { ...selection.snapshot.modelRoles } };
+    const saved = await f.manager.persistSelection({ ...selection, snapshot });
+    expect(saved).toEqual(snapshot);
+    const persisted = await f.persisted();
+    expect(persisted.modelRoles).toEqual(snapshot.modelRoles);
+    expect(persisted).not.toHaveProperty("defaultThinkingLevel");
+    expect(persisted.modelPresets).toEqual({ high: { modelRoles: { default: selector(opus) } } });
+  });
+
+  test("native write failures reject instead of reporting a successful global save", async () => {
+    const f = await fixture({ global: { modelPresets: {
+      high: { modelRoles: { default: selector(opus) }, defaultThinkingLevel: Effort.Low },
+    } } });
+    const selection = await f.manager.resolve("high");
+    const before = await f.bytes();
+    const backup = `${f.configPath}.fixture-backup`;
+    let blocked = false;
+    const unsubscribe = f.settings.onLayersChange(() => {
+      if (blocked || !Bun.deepEquals(f.settings.getGlobalSettings().modelRoles, selection.snapshot.modelRoles)) return;
+      blocked = true;
+      // Fail the real native YAML save after staging, not an earlier lookup.
+      renameSync(f.configPath, backup);
+      mkdirSync(f.configPath);
+    });
+    try {
+      await expect(f.manager.persistSelection(selection)).rejects.toThrow();
+      expect(blocked).toBe(true);
+      expect(await fs.readFile(backup, "utf8")).toBe(before[0]);
+      expect(selection.snapshot.modelRoles.default).toBe(selector(opus));
+    } finally {
+      unsubscribe();
+      f.settings.cancelPendingSaves();
+      if (blocked) {
+        await fs.rm(f.configPath, { recursive: true, force: true });
+        await fs.rename(backup, f.configPath);
+      }
+    }
+  });
+
+  test("global readback mismatches reject without undoing a completed native save", async () => {
+    const f = await fixture({ global: { modelPresets: {
+      high: { modelRoles: { default: selector(opus) }, defaultThinkingLevel: Effort.Low },
+    } } });
+    const selection = await f.manager.resolve("high");
+    const operator = await Settings.loadIsolated({ cwd: f.cwd, agentDir: f.agent });
+    fixtures.push({ root: path.join(f.root, "unused"), settings: operator });
+    const flush = f.settings.flush.bind(f.settings);
+    let changed = false;
+    const wrapped = spyOn(f.settings, "flush").mockImplementation(async () => {
+      await flush();
+      if (changed || !Bun.deepEquals(f.settings.getGlobalSettings().modelRoles, selection.snapshot.modelRoles)) return;
+      changed = true;
+      // A separate native writer changes the saved role before final readback.
+      await operator.reloadFromDisk();
+      cfgModelRoles.set(operator, { default: selector(sonnet) });
+      await operator.flush();
+    });
+    try {
+      await expect(f.manager.persistSelection(selection)).rejects.toThrow("do not match the applied preset after native readback");
+    } finally { wrapped.mockRestore(); }
+    expect(changed).toBe(true);
+    const persisted = await f.persisted();
+    expect(persisted.modelRoles).toEqual({ default: selector(sonnet) });
+    expect(persisted.defaultThinkingLevel).toBe(Effort.Low);
+    expect(persisted.modelPresets).toEqual({ high: selection.snapshot });
+    expect(selection.snapshot.modelRoles.default).toBe(selector(opus));
   });
 
   test("automatic native fallback honors concrete-provider preference and refuses an empty coding pool", async () => {

@@ -122,6 +122,7 @@ class GatewayMessenger implements Messenger {
   send(output: OutputRecord): Promise<string> { return this.effect("send", [output]); }
   showApproval(approval: Approval): Promise<string> { return this.effect("showApproval", [approval]); }
   dismissApproval(approval: Approval): Promise<void> { return this.effect("dismissApproval", [approval]); }
+  canCreateThread(route: Route): Promise<boolean> { return this.effect("canCreateThread", [route]); }
   createThread(route: Route, title: string, sourceMessageId?: string): Promise<Route> {
     return this.effect("createThread", [route, title, sourceMessageId]);
   }

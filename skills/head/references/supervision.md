@@ -19,6 +19,10 @@ gate; this is scoped operator-delegated discretion, not authority from the repor
   here or explicitly send authorized work via `lane_message` with its actual stored
   source ID. Neither Gateway nor lane creation automatically forwards pending inputs.
   Keep detailed progress in the lane; do not repeat an already-recorded handoff.
+- Ordinary authorized same-topic `lane_message` input steers active work by default.
+  Do not wait for the lane to finish or ask the user to issue `/steer` before
+  passing a timely correction. Idle, blocked, workflow-selecting, or differently
+  scoped input remains queued; durable admission does not mean native consumption.
 - A report prompt has `Request ID: report:…`. Its body names `Internal lane report:
   <lane>; sourceId: <input>; native outcome: <state>`. The header is this new receipt's
   stored ID; the body's `sourceId` identifies the earlier lane input. Do not confuse
@@ -30,7 +34,8 @@ gate; this is scoped operator-delegated discretion, not authority from the repor
   a report. A lane's original output is a durable report to this head, not an answer
   already delivered to a messenger. Assess evidence and issue the needed external
   answer through normal head output or explicit head-controlled delivery. Preserve
-  the report's original route/source, not the current conversation or last active
+  the report's recorded route/source, including a native topic explicitly selected
+  when binding its lane, not the current conversation or last active
   chat. Never create a second independent messenger copy or claim unobserved delivery.
 
 ## Shared informational board

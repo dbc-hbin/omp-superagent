@@ -8,9 +8,18 @@ import { MAX_GATEWAY_ATTACHMENT, readGatewayJson, type GatewayResult } from "./g
 import { GatewayStore } from "./gateway-store";
 import type { ManagedUlwStatus } from "./managed-ulw";
 
+export interface HeadInitialization {
+  sessionId: string;
+  state: "checking" | "running" | "complete" | "blocked" | "failed" | "uncertain";
+  requestId?: string;
+  /** Durable fence survives a crash during a later startup's checking phase. */
+  replayBlocked?: boolean;
+  detail: string;
+}
 export interface GatewayStatus {
   gateway: { pid: number; ready: boolean; admissionReady: boolean; pendingEvents: number; unresolvedEvents?: number; stopping: boolean };
-  head: { pid: number | null; ready: boolean; connected: boolean; socketPath: string; error: string | null };
+  head: { pid: number | null; ready: boolean; connected: boolean; socketPath: string; error: string | null;
+    initialization?: HeadInitialization };
   ulw?: ManagedUlwStatus;
 }
 interface HeadClient { id: string; pid: number; ready: boolean; resumed: boolean; events?: ServerResponse; sequence?: number; reconciliation?: string }
@@ -209,7 +218,7 @@ export class GatewayServer {
     const { id, operation, args } = data;
     if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id) || typeof operation !== "string" || !Array.isArray(args))
       throw new DeliveryError("Invalid Gateway effect", "rejected");
-    const operations: Record<string, number[]> = { send: [1], showApproval: [1], dismissApproval: [1], createThread: [2, 3], fetchAfter: [2] };
+    const operations: Record<string, number[]> = { send: [1], showApproval: [1], dismissApproval: [1], canCreateThread: [1], createThread: [2, 3], fetchAfter: [2] };
     if (!Object.hasOwn(operations, operation) || !operations[operation]!.includes(args.length))
       throw new DeliveryError("Unknown Gateway effect", "rejected");
     const previous = this.options.store.beginEffect(id, operation, args);
@@ -220,6 +229,7 @@ export class GatewayServer {
       const value = operation === "send" ? await messenger.send(args[0] as OutputRecord)
         : operation === "showApproval" ? await messenger.showApproval(args[0] as Approval)
         : operation === "dismissApproval" ? await messenger.dismissApproval(args[0] as Approval)
+        : operation === "canCreateThread" ? await messenger.canCreateThread?.(args[0] as Route) ?? false
         : operation === "createThread" ? await messenger.createThread(args[0] as Route, args[1] as string, args[2] as string | undefined)
         : await messenger.fetchAfter(args[0] as Route, args[1] as string);
       result = { ok: true, value };

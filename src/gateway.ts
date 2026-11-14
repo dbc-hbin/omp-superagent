@@ -5,8 +5,9 @@ import { constants, existsSync } from "node:fs";
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { credentialEnvNames, hostPaths, loadConfig, privateDirectory, requireMessengerCredentials, type Config } from "./config";
-import type { Messenger } from "./contracts";
+import type { LanePresetSnapshot, Messenger } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { gatewayCall, gatewayPaths } from "./gateway-protocol";
 import { GatewayServer, type GatewayStatus } from "./gateway-server";
@@ -125,11 +126,18 @@ export class GatewayService {
 
   status(): GatewayStatus {
     const live = this.head ? alive(this.head.pid) : false;
+    const saved = this.closed ? null : this.store.getMeta("head:preset-bootstrap");
+    const recorded: GatewayStatus["head"]["initialization"] = saved ? JSON.parse(saved) : undefined;
+    const initialization = recorded?.sessionId === this.head?.sessionId ? recorded : this.head ? {
+      sessionId: this.head.sessionId, state: "checking" as const,
+      detail: "Waiting for authoritative native HEAD attachment, approval reconciliation and preset inspection.",
+    } : undefined;
     return {
       gateway: { pid: process.pid, ready: this.transportsReady && !this.closed,
         admissionReady: this.server.ready, pendingEvents: this.closed ? 0 : this.store.pending(), stopping: this.stopping },
-      head: { pid: this.head?.pid ?? null, ready: live && this.server.headReady,
-        connected: live && this.server.connected, socketPath: hostPaths(this.config, "main").socketPath, error: this.error },
+      head: { pid: this.head?.pid ?? null, ready: live && this.server.headReady && initialization?.state === "complete",
+        connected: live && this.server.connected, socketPath: hostPaths(this.config, "main").socketPath, error: this.error,
+        ...(initialization ? { initialization } : {}) },
       ulw: { ...this.ulw },
     };
   }
@@ -201,13 +209,22 @@ export class GatewayService {
     env.OMP_SUPERAGENT_ROLE = "head";
     env.OMP_SUPERAGENT_GATEWAY_TOKEN = this.store.token();
     await mkdir(dirname(paths.sessionFile), { recursive: true, mode: 0o700 });
+    const restoring = existsSync(paths.sessionFile);
+    const sessionId = restoring ? await readSessionHeaderId(paths.sessionFile) : undefined;
+    if (sessionId && this.store.getMeta("main:sessionId") && sessionId !== this.store.getMeta("main:sessionId")) {
+      throw new Error("Stored head settings belong to a different native session; refusing startup");
+    }
+    const settingsRecord = sessionId ? this.store.getMeta(`head:model-settings:${sessionId}`) : null;
+    const savedSettings: { settings: LanePresetSnapshot; clearedRoles: string[] } | undefined =
+      settingsRecord ? JSON.parse(settingsRecord) : undefined;
     this.launching = true;
     try {
       const launched = await startHost({ command: this.config.command, cwd: this.config.headCwd,
         sessionFile: paths.sessionFile, socketPath: paths.socketPath, logPath: paths.logPath,
         extensionPath: this.options.extensionPath ?? fileURLToPath(new URL("./extension.ts", import.meta.url)),
         managedUlwPath: this.options.managedUlwPath,
-        env, model: existsSync(paths.sessionFile) ? undefined : this.config.model,
+        env, model: restoring ? undefined : this.config.model,
+        ...(savedSettings ? { modelSettings: savedSettings.settings, clearedModelRoles: savedSettings.clearedRoles } : {}),
         subagentConcurrency: Math.floor(this.config.maxSubagents / this.config.maxHosts),
       });
       const identity = await this.identifyHead();
