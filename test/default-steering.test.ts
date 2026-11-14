@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import type { Approval, DialogResponse, Inbound, LaneModel, Messenger, OutputRecord, Route } from "../src/contracts";
 import { physicalRoute, physicalRouteKey, routeKey } from "../src/contracts";
 import { type Config, hostPaths } from "../src/config";
-import { Superagent, type RuntimeHost, type RuntimeState } from "../src/runtime";
+import { Superagent, type RuntimeAdapters, type RuntimeHost, type RuntimeState } from "../src/runtime";
 import { Store } from "../src/store";
 
 const model: LaneModel = { provider: "fixture", id: "tracked" };
@@ -109,7 +110,7 @@ afterEach(async () => {
     rmSync(fixture.directory, { recursive: true, force: true });
   }
 });
-function fixture(maxHosts = 1) {
+function fixture(maxHosts = 1, requestRestart?: RuntimeAdapters["requestRestart"]) {
   const directory = realpathSync(mkdtempSync("/tmp/default-steering-"));
   const config: Config = { path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
     command: [process.execPath], maxHosts, maxSubagents: 4, idleMs: 60_000,
@@ -122,6 +123,7 @@ function fixture(maxHosts = 1) {
   const hosts = new Map([[hostPaths(config, "main").socketPath, main]]);
   const errors: unknown[] = [];
   const runtime = new Superagent(config, store, messenger, join(directory, "extension.ts"), error => errors.push(error), {
+    requestRestart,
     connect: async path => {
       const host = hosts.get(path);
       if (!host || host.disconnected) throw new Error("Host is not accepting connections");
@@ -152,6 +154,26 @@ async function drain(runtime: Superagent): Promise<void> {
 }
 
 describe("ordinary tracked steering", () => {
+  test("restart is a priority native refusal, never another steering ticket or an implicit stop", async () => {
+    let restartCalls = 0;
+    const { runtime, main, store, messenger } = fixture(1, async () => {
+      restartCalls++;
+      throw new Error("Busy restart must not reach Gateway");
+    });
+    await runtime.start();
+    await receive(runtime, inbound("restart-active-owner"));
+    await receive(runtime, inbound("restart-active-followup"));
+    const commandsBefore = main.prompts.length;
+    await receive(runtime, inbound("restart-control", route(), "/restart"));
+    expect(restartCalls).toBe(0);
+    expect(main.prompts).toHaveLength(commandsBefore);
+    expect(store.input("restart-active-owner")?.state).toBe("submitted");
+    expect(store.input("restart-active-followup")?.state).toBe("submitted");
+    expect(store.input("restart-control")?.state).toBe("cancelled");
+    expect(messenger.sent.at(-1)?.text).toContain("No process was stopped");
+    expect(messenger.sent.at(-1)?.text).toContain("/stop head is a separate");
+  });
+
   test("explicit local handling completes without a prompt_result or stale assistant output", async () => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
@@ -285,6 +307,53 @@ describe("native topic binding", () => {
   const slackDm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DDIRECT" });
   const telegramDm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
   const source = (id: string, destination: Route) => ({ ...inbound(id, destination), messageId: destination.platform === "slack" ? "1750000000.000001" : id });
+
+  test.each([true, false])("Slack slash /new delegates real work without an invocation-based native thread source, native supported: %s", async supported => {
+    const { runtime, store, messenger, main, select } = fixture();
+    messenger.supported = supported;
+    await runtime.start();
+    const original: Inbound = { ...inbound(`slack-command:${supported}`, slackDm, "/new inspect this repository"),
+      messageId: null, invocationId: createHash("sha256").update(String(supported)).digest("hex") };
+    await receive(runtime, original);
+    expect(main.prompts).toHaveLength(1);
+    expect(main.prompts[0]!.command.message).toContain("inspect this repository");
+    expect(main.prompts[0]!.command.message).not.toContain("/new inspect");
+    const originalRoute = store.input(original.id)!.route;
+    const lane = await runtime.startLane(select(original.id));
+    expect(messenger.creations).toEqual(supported ? [{ route: slackDm, sourceMessageId: undefined }] : []);
+    expect(lane.route.threadId).toBe(supported ? "1750000001.000001" : null);
+    expect(store.input(`handoff:${original.id}:lane`)).toMatchObject({ messageId: null, invocationId: original.invocationId });
+    await runtime.messageLane(lane.id, "Additional bounded work", original.id);
+    expect(store.input(`handoff:${original.id}:${lane.id}`)).toMatchObject({ messageId: null, invocationId: original.invocationId });
+    expect(store.input(original.id)).toMatchObject({ route: originalRoute, messageId: null, invocationId: original.invocationId });
+    expect(store.getMeta(`cursor:${physicalRouteKey(slackDm)}`)).toBeNull();
+    expect(store.getMeta(`cursor:${physicalRouteKey(lane.route)}`)).toBe(supported ? "1750000001.000001" : null);
+  });
+
+  test.each([true, false])("slash /new inputs preserve origin in authorized guild threads or logical owner DM topics, native supported: %s", async supported => {
+    const { runtime, store, messenger, main, select } = fixture();
+    messenger.supported = supported;
+    await runtime.start();
+    const destination = supported ? route(null) : route(null, { guildId: null });
+    const original: Inbound = { ...inbound("discord:2:interaction:1750000000000000001", destination, "/new inspect this repository"),
+      messageId: null, interactionId: "1750000000000000001" };
+    await receive(runtime, original);
+    expect(main.prompts).toHaveLength(supported ? 0 : 1);
+    if (!supported) {
+      expect(main.prompts[0]!.command.message).toContain("inspect this repository");
+      expect(main.prompts[0]!.command.message).not.toContain("/new inspect");
+    }
+    const originalRoute = store.input(original.id)!.route;
+    const lane = await runtime.startLane(select(original.id));
+    expect(messenger.creations).toEqual(supported ? [{ route: destination, sourceMessageId: undefined }] : []);
+    expect(lane.route.threadId).toBe(supported ? "900" : null);
+    expect(store.input(`handoff:${original.id}:lane`)).toMatchObject({ messageId: null, interactionId: original.interactionId });
+    await runtime.messageLane(lane.id, "Explicit additional bounded work", original.id);
+    expect(store.input(`handoff:${original.id}:${lane.id}`)).toMatchObject({ messageId: null, interactionId: original.interactionId });
+    expect(store.input(original.id)).toMatchObject({ messageId: null, interactionId: original.interactionId, route: originalRoute });
+    expect(store.getMeta(`cursor:${physicalRouteKey(destination)}`)).toBeNull();
+    expect(JSON.parse(store.getMeta("messenger:routes")!).some((known: Route) => physicalRouteKey(known) === physicalRouteKey(destination))).toBe(true);
+  });
 
   test.each([slackDm, telegramDm])("creates supported private native topics once, with durable source and destination notices", async destination => {
     const { runtime, store, messenger, select } = fixture();

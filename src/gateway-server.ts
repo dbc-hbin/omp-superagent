@@ -2,7 +2,7 @@ import { once } from "node:events";
 import { chmod, lstat, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import type { Approval, Attachment, Inbound, Messenger, OutputRecord, Route } from "./contracts";
+import type { Approval, Attachment, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageReference, Messenger, OutputRecord, Route } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { MAX_GATEWAY_ATTACHMENT, readGatewayJson, type GatewayResult } from "./gateway-protocol";
 import { GatewayStore } from "./gateway-store";
@@ -21,6 +21,7 @@ export interface GatewayStatus {
   head: { pid: number | null; ready: boolean; connected: boolean; socketPath: string; error: string | null;
     initialization?: HeadInitialization };
   ulw?: ManagedUlwStatus;
+  restart?: Omit<GatewayRestartRecord, "sessionFile">;
 }
 interface HeadClient { id: string; pid: number; ready: boolean; resumed: boolean; events?: ServerResponse; sequence?: number; reconciliation?: string }
 interface ServerOptions {
@@ -30,6 +31,8 @@ interface ServerOptions {
   authorizeHead(pid: number): Promise<void>;
   status(): GatewayStatus;
   stop(): Promise<void>;
+  restart?(request: GatewayRestartRequest): Promise<GatewayRestartRecord>;
+  runRestart?(requestId: string): void;
   onError(error: unknown): void;
 }
 
@@ -59,6 +62,8 @@ export class GatewayServer {
   });
   private readonly peers = new Set<Socket>();
   private readonly effects = new Set<Promise<void>>();
+  private readonly restartRequests = new Map<string, { request: GatewayRestartRequest; result: Promise<GatewayRestartRecord> }>();
+  private readonly restartRuns = new Set<string>();
   private client?: HeadClient;
   private admissionReady = false;
   private socketIdentity?: { dev: number; ino: number };
@@ -78,7 +83,7 @@ export class GatewayServer {
 
   admitMessage(input: Inbound): void {
     const fresh = this.options.store.admit({ kind: "message", input });
-    if (fresh && this.options.messenger.setActivity) {
+    if (fresh && input.messageId !== null && this.options.messenger.setActivity) {
       const message = { route: input.route, messageId: input.messageId };
       const operation = Promise.resolve().then(() => this.options.messenger.setActivity?.(message, "received"));
       this.effects.add(operation);
@@ -123,7 +128,9 @@ export class GatewayServer {
     const endpoint = request.url;
     if (endpoint === "/status" && request.method === "GET") {
       const status = this.options.status();
-      json(response, { ok: true, value: { ...status, gateway: { ...status.gateway, unresolvedEvents: this.options.store.unresolved() } } });
+      const latest = this.options.store.getRestart();
+      const { sessionFile: _, ...restart } = latest ?? {};
+      json(response, { ok: true, value: { ...status, ...(latest ? { restart } : {}), gateway: { ...status.gateway, unresolvedEvents: this.options.store.unresolved() } } });
       return;
     }
     if (endpoint === "/stop" && request.method === "POST") {
@@ -160,6 +167,14 @@ export class GatewayServer {
       return;
     }
     if (request.method !== "POST") throw new DeliveryError("Unknown Gateway operation", "rejected");
+    if (endpoint === "/restart") {
+      // Recheck supervised process authority before reading any caller body.
+      try { await this.options.authorizeHead(client.pid); }
+      catch { throw new DeliveryError("Gateway head authorization rejected", "rejected"); }
+      if (!this.headReady) throw new DeliveryError("Gateway head is not ready for restart", "rejected");
+      await this.restart(record(await readGatewayJson(request)), response);
+      return;
+    }
     const data = record(await readGatewayJson(request));
     if (endpoint === "/ready") {
       const wasReady = client.ready;
@@ -214,6 +229,54 @@ export class GatewayServer {
     } else throw new DeliveryError("Unknown Gateway operation", "rejected");
   }
 
+  private async restart(data: Record<string, unknown>, response: ServerResponse): Promise<void> {
+    const { requestId, inputId, ackOutputId } = data;
+    if (typeof requestId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(requestId)
+      || typeof inputId !== "string" || !inputId.trim() || inputId.length > 1024
+      || typeof ackOutputId !== "string" || !ackOutputId.trim() || ackOutputId.length > 1024)
+      throw new DeliveryError("Invalid Gateway restart request", "rejected");
+    if (!this.options.restart || !this.options.runRestart) throw new DeliveryError("Gateway restart is unavailable", "rejected");
+    const request = { requestId, inputId, ackOutputId };
+    const prior = this.options.store.getRestart(requestId);
+    const pending = this.restartRequests.get(requestId);
+    const identity = prior ?? pending?.request;
+    const source = this.options.store.getMeta(`gateway:restart-source:${inputId}`);
+    if (identity && (identity.inputId !== inputId || identity.ackOutputId !== ackOutputId) || source !== null && source !== requestId)
+      throw new DeliveryError("Gateway restart identity conflict", "rejected");
+    for (const entry of this.restartRequests.values()) {
+      if (entry.request.inputId === inputId && entry.request.requestId !== requestId)
+        throw new DeliveryError("Gateway restart identity conflict", "rejected");
+    }
+    let result: GatewayRestartRecord;
+    try {
+      if (prior) result = prior;
+      else {
+        if (!pending) {
+          this.options.store.validateRestart(request);
+          const operation = Promise.resolve().then(() => this.options.restart!(request));
+          this.restartRequests.set(requestId, { request, result: operation });
+        }
+        try { result = await this.restartRequests.get(requestId)!.result; }
+        finally { this.restartRequests.delete(requestId); }
+      }
+    } catch (error) {
+      throw new DeliveryError("Gateway restart request failed", error instanceof DeliveryError ? error.certainty : "uncertain");
+    }
+    const persisted = this.options.store.getRestart(requestId);
+    if (result.requestId !== requestId || result.inputId !== inputId || result.ackOutputId !== ackOutputId
+      || !persisted || persisted.inputId !== inputId || persisted.ackOutputId !== ackOutputId)
+      throw new DeliveryError("Gateway restart acceptance was not persisted", "uncertain");
+    result = persisted;
+    if (response.destroyed) return;
+    if (result.state === "accepted") response.once("finish", () => {
+      if (this.restartRuns.has(requestId) || this.options.store.getRestart(requestId)?.state !== "accepted") return;
+      this.restartRuns.add(requestId);
+      try { this.options.runRestart!(requestId); }
+      catch { this.options.onError(new Error("Gateway restart execution failed")); }
+    });
+    json(response, { ok: true, value: result });
+  }
+
   deliver(): void {
     const client = this.client;
     if (!client?.ready || !client.events || client.events.destroyed || client.sequence !== undefined) return;
@@ -240,8 +303,10 @@ export class GatewayServer {
       const messenger = this.options.messenger;
       if (operation === "setActivity" && args[1] !== "received" && args[1] !== "thinking" && args[1] !== "idle")
         throw new DeliveryError("Invalid message activity", "rejected");
+      if (operation === "setActivity" && (typeof record(args[0]).messageId !== "string" || !record(args[0]).messageId))
+        throw new DeliveryError("Message activity requires a real message ID", "rejected");
       const value = operation === "send" ? await messenger.send(args[0] as OutputRecord)
-        : operation === "setActivity" ? await messenger.setActivity?.(args[0] as Pick<Inbound, "route" | "messageId">, args[1] as "received" | "thinking" | "idle")
+        : operation === "setActivity" ? await messenger.setActivity?.(args[0] as MessageReference, args[1] as "received" | "thinking" | "idle")
         : operation === "showApproval" ? await messenger.showApproval(args[0] as Approval)
         : operation === "dismissApproval" ? await messenger.dismissApproval(args[0] as Approval)
         : operation === "canCreateThread" ? await messenger.canCreateThread?.(args[0] as Route) ?? false

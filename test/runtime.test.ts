@@ -4,12 +4,16 @@ import { Effort } from "../.upstream/omp/packages/catalog/src/effort";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { Approval, DialogResponse, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, Messenger, OutputRecord, Route } from "../src/contracts";
+import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, MessageReference, Messenger, OutputRecord, Route } from "../src/contracts";
 import { physicalRouteKey, routeKey, WORKFLOW_NAMES } from "../src/contracts";
 import { containsMagicKeyword } from "../.upstream/omp/packages/tui/src/prompt/magic-keywords";
 import { type Config, hostPaths } from "../src/config";
 import type { HostOptions } from "../src/host";
 import { DeliveryError } from "../src/delivery";
+import { createGatewayMessenger, type GatewayHeadMessenger } from "../src/gateway-client";
+import { gatewayPaths } from "../src/gateway-protocol";
+import { GatewayServer } from "../src/gateway-server";
+import { GatewayStore } from "../src/gateway-store";
 import { compareMessageIds } from "../src/message-order";
 import { Superagent, type RuntimeAdapters, type RuntimeHost, type RuntimeState } from "../src/runtime";
 import { Store } from "../src/store";
@@ -197,11 +201,13 @@ class MessengerTransport implements Messenger {
   readonly shown = new Map<string, Approval>();
   readonly dismissed: string[] = [];
   readonly fetched: Array<{ route: Route; cursor: string }> = [];
-  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
+  readonly activities: Array<{ message: MessageReference; activity: MessageActivity }> = [];
   activityFailure = false;
   private readonly activityWaiters: Array<{ count: number; resolve(): void }> = [];
   readonly backlog = new Map<string, Inbound[] | null>();
   readonly threads: Route[] = [];
+  readonly threadSources: Array<string | undefined> = [];
+  canCreateThread?: Messenger["canCreateThread"];
   private sendWaiters: Array<{ count: number; resolve: () => void }> = [];
   private approvalWaiters: Array<() => void> = [];
   threadFails = false;
@@ -219,7 +225,7 @@ class MessengerTransport implements Messenger {
     for (const waiter of this.sendWaiters) if (this.sent.length >= waiter.count) waiter.resolve();
     return `remote-${output.id}`;
   }
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+  async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     if (this.activityFailure) throw new DeliveryError("Reaction rejected", "rejected");
     this.activities.push({ message: { route: message.route, messageId: message.messageId }, activity });
     for (const waiter of this.activityWaiters) if (this.activities.length >= waiter.count) waiter.resolve();
@@ -240,7 +246,8 @@ class MessengerTransport implements Messenger {
     if (!this.handlers) throw new Error("Messenger must start before dismiss");
     this.dismissed.push(approval.id);
   }
-  async createThread(route: Route): Promise<Route> {
+  async createThread(route: Route, _title: string, sourceMessageId?: string): Promise<Route> {
+    this.threadSources.push(sourceMessageId);
     if (this.threadFails) throw new Error("ambiguous remote thread creation");
     const created = { ...route, threadId: String(900 + this.threads.length) };
     this.threads.push(created);
@@ -275,8 +282,15 @@ afterEach(async () => {
 const route = (threadId: string | null = "10", patch: Partial<Route> = {}): Route => ({
   platform: "discord", accountId: "2", authorityId: "1", guildId: "3", channelId: "4", threadId, ...patch,
 });
-const message = (id: string, destination = route(), text = `task ${id}`): Inbound => ({
+const message = (id: string, destination = route(), text = `task ${id}`): Inbound & MessageReference => ({
   id, route: destination, messageId: id, text, receivedAt: 100, attachments: [],
+});
+const applicationCommand = (interactionId: string, destination = route(), text = "/status"): Inbound => ({
+  ...message(`interaction:${interactionId}`, destination, text), messageId: null, interactionId,
+});
+const slackCommand = (identity: string, destination: Route, text = "/status"): Inbound => ({
+  ...message(`slack-command:${identity}`, destination, text), messageId: null,
+  invocationId: createHash("sha256").update(identity).digest("hex"),
 });
 async function admit(runtime: Superagent, input: Inbound): Promise<void> {
   await runtime.receive(input);
@@ -299,7 +313,7 @@ function delegated(store: Store, sourceId: string) {
   return store.input(`handoff:${sourceId}:${lane.id}`);
 }
 
-function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], presetAdapters: Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset"> = {}) {
+function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], presetAdapters: Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset" | "requestRestart"> = {}) {
   const directory = realpathSync(mkdtempSync("/tmp/sa-runtime-"));
   const config: Config = {
     path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
@@ -364,6 +378,34 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], pre
 }
 
 describe("original-message processing reactions", () => {
+  test("slash DM requests and their logical lane handoff/report never react or attempt native DM thread creation", async () => {
+    const { runtime, main, messenger, directory, hosts, store } = fixture();
+    messenger.canCreateThread = async () => false;
+    await runtime.start();
+    const dm = route(null, { guildId: null });
+    const original = applicationCommand("1750000000000000001", dm, "/new inspect this repository");
+    await admit(runtime, original);
+    expect(main.prompts[0]!.command.message).toContain("inspect this repository");
+    expect(main.prompts[0]!.command.message).not.toContain("/new inspect");
+    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Slash work", kickoff: "I will inspect the repository and report the verified result in this topic.", cwd: directory });
+    await runtime.kick();
+    expect(messenger.threadSources).toEqual([]);
+    expect(store.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBeNull();
+    const handoffId = `handoff:${original.id}:lane`;
+    expect(store.input(handoffId)).toMatchObject({ messageId: null, interactionId: original.interactionId, target: lane.id });
+    main.complete("");
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected active slash-created lane");
+    worker.complete("lane result");
+    await main.whenPrompts(2);
+    expect(store.input(`report:${handoffId}`)).toMatchObject({ messageId: null, interactionId: original.interactionId, state: "submitted" });
+    main.complete("verified slash answer");
+    await runtime.kick();
+    expect(messenger.sent.some(output => output.text === "verified slash answer")).toBe(true);
+    expect(messenger.activities).toEqual([]);
+  });
+
   test("native work and joined edits retain thinking through a nonterminal yield, then clear on settlement", async () => {
     const { runtime, main, messenger } = fixture();
     await runtime.start();
@@ -769,6 +811,433 @@ function modelChangeSource(store: Store, id: string): string {
   return id;
 }
 
+function restartFixture() {
+  const requests: GatewayRestartRequest[] = [];
+  const handoff: { respond?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord> } = {};
+  let sessionFile = "";
+  const instance = fixture(3, undefined, { requestRestart: async request => {
+    requests.push(structuredClone(request));
+    if (handoff.respond) return handoff.respond(request);
+    return { ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main", sessionFile, state: "accepted" };
+  } });
+  sessionFile = hostPaths(instance.config, "main").sessionFile;
+  return { ...instance, requests, handoff };
+}
+
+function savedRestart(instance: Pick<Superagent, "store" | "config">, state: GatewayRestartRecord["state"] = "started", oldOwnerPid = 2_000_000_001) {
+  const input = applicationCommand("1750000000000000700", route("original-restart-route"), "/restart");
+  instance.store.receive(input, "main", { [`user-source:${input.id}`]: "true" });
+  const restart = { requestId: crypto.randomUUID(),
+    inputId: input.id, ackOutputId: `${input.id}:restart-ack`, ownerPid: oldOwnerPid,
+    sessionId: "session-main", sessionFile: hostPaths(instance.config, "main").sessionFile, state: "accepted" };
+  instance.store.settle(input.id, "done", { id: restart.ackOutputId, text: "Original restart ACK" });
+  instance.store.claimOutput(restart.ackOutputId);
+  instance.store.finishOutput(restart.ackOutputId, "sent", "original-ack-receipt");
+  instance.store.setMeta(`head:restart:${input.id}`, JSON.stringify(restart));
+  instance.store.setMeta("head:restart-fence", JSON.stringify(restart));
+  const receipt: GatewayRestartRecord = { requestId: restart.requestId, inputId: input.id, ackOutputId: restart.ackOutputId,
+    headPid: oldOwnerPid, gatewayPid: 2_000_000_002, sessionId: restart.sessionId, sessionFile: restart.sessionFile,
+    state, successorPid: process.pid, replacementPid: process.pid };
+  instance.store.setMeta(`gateway:restart:${restart.requestId}`, JSON.stringify(receipt));
+  instance.store.setMeta("gateway:restart", JSON.stringify(receipt));
+  instance.store.setMeta("gateway:head", JSON.stringify({ pid: process.pid, sessionId: restart.sessionId, sessionFile: restart.sessionFile }));
+  instance.store.setMeta("gateway:socket", JSON.stringify({ pid: process.pid }));
+  return { input, restart, receipt };
+}
+
+describe("idle-only Gateway AND HEAD restart", () => {
+  test("the runtime-generated request crosses authenticated Gateway RPC and persists actual acceptance once", async () => {
+    let client: GatewayHeadMessenger;
+    const { runtime, config, store, messenger, main } = fixture(3, undefined, {
+      requestRestart: request => client.requestRestart(request),
+    });
+    mkdirSync(join(config.stateDir, "run"), { recursive: true, mode: 0o700 });
+    const gatewayStore = new GatewayStore(config.stateDir);
+    const accepted: GatewayRestartRequest[] = [];
+    const executed: string[] = [];
+    const server = new GatewayServer({ socketPath: gatewayPaths(config).socketPath, store: gatewayStore, messenger,
+      authorizeHead: async pid => { if (pid !== process.pid) throw new DeliveryError("Foreign head", "rejected"); },
+      status: () => ({ gateway: { pid: process.pid, ready: true, admissionReady: true, pendingEvents: 0, stopping: false },
+        head: { pid: process.pid, ready: true, connected: true, socketPath: hostPaths(config, "main").socketPath, error: null } }),
+      stop: async () => { throw new Error("This acceptance regression must not stop a process"); },
+      restart: async request => {
+        accepted.push(structuredClone(request));
+        const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
+          sessionId: "session-main", sessionFile: hostPaths(config, "main").sessionFile, state: "accepted" };
+        gatewayStore.setRestart(receipt);
+        return receipt;
+      },
+      runRestart: requestId => { executed.push(requestId); }, onError: () => {},
+    });
+    const savedToken = process.env.OMP_SUPERAGENT_GATEWAY_TOKEN;
+    process.env.OMP_SUPERAGENT_GATEWAY_TOKEN = gatewayStore.token();
+    try { client = createGatewayMessenger(config); }
+    finally {
+      if (savedToken === undefined) delete process.env.OMP_SUPERAGENT_GATEWAY_TOKEN;
+      else process.env.OMP_SUPERAGENT_GATEWAY_TOKEN = savedToken;
+    }
+    try {
+      await server.listen();
+      await client.start({ message: async () => {}, answer: async () => {} });
+      await server.initialReady.promise;
+      await runtime.start();
+      const original = applicationCommand("1750000000000000699", route("gateway-rpc-restart"), "/restart");
+      await admit(runtime, original);
+      const request = accepted[0]!;
+      expect(accepted).toHaveLength(1);
+      expect(gatewayStore.getRestart(request.requestId)).toMatchObject({ ...request, state: "accepted" });
+      expect(store.output(request.ackOutputId)?.state).toBe("sent");
+      expect(JSON.parse(store.getMeta(`head:restart:${original.id}`)!)).toMatchObject({ ...request, state: "accepted" });
+      expect(gatewayStore.getMeta(`gateway:restart-source:${original.id}`)).toBe(request.requestId);
+      expect(executed).toEqual([request.requestId]);
+      await admit(runtime, original);
+      expect(accepted).toHaveLength(1);
+      expect(executed).toEqual([request.requestId]);
+      expect(main.prompts).toEqual([]);
+      expect(main.commands.some(command => command.type === "shutdown_host")).toBe(false);
+    } finally {
+      await runtime.stop();
+      await client.stop();
+      await server.close();
+      gatewayStore.close();
+    }
+  });
+
+  test.each(["discord", "telegram", "slack"] as const)("%s restart acknowledges natively, hands off once and never mistakes acceptance for readiness", async platform => {
+    const { runtime, config, main, store, messenger, requests } = restartFixture();
+    config.telegram = { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: ["3"] };
+    config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "1", teamId: "TTEAM", allowedChannelIds: ["4"] };
+    const destination = route("10", { platform, ...(platform === "telegram" ? { channelId: "3" }
+      : platform === "slack" ? { accountId: "TTEAM:UBOT", guildId: "TTEAM" } : {}) });
+    const original = { ...message("restart-owner", destination, "/restart"), messageId: platform === "slack" ? "1750000000.000070" : "700" };
+    await runtime.start();
+    await admit(runtime, original);
+    const ack = store.output(`${original.id}:restart-ack`)!;
+    expect(ack).toMatchObject({ sourceId: original.id, route: destination, state: "sent" });
+    expect(ack.text).toContain("Gateway AND HEAD");
+    expect(ack.text).toContain("same native session");
+    expect(ack.text).not.toContain("HEAD session only");
+    expect(store.input(original.id)).toMatchObject({ state: "done", messageId: original.messageId, route: destination });
+    expect(requests).toEqual([{ requestId: expect.any(String), inputId: original.id, ackOutputId: ack.id }]);
+    expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("accepted");
+    await admit(runtime, original);
+    await runtime.kick();
+    expect(requests).toHaveLength(1);
+    expect(messenger.sent).toHaveLength(1);
+    expect(store.output(`${original.id}:restart-result`)).toBeNull();
+    expect(main.prompts).toEqual([]);
+    expect(main.abortCount).toBe(0);
+    expect(main.commands.some(command => command.type === "shutdown_host")).toBe(false);
+  });
+
+  test.each(["main", "lane"] as const)("%s native work, async, service, goal, approval and identity guards refuse without stopping processes", async target => {
+    const cases: Partial<RuntimeState>[] = [
+      { isSettled: false }, { isStreaming: true }, { isCompacting: true }, { queuedMessageCount: 1 },
+      { hasPendingAsyncWork: true }, { hasOwnedRunningWork: true }, { goal: { enabled: true } },
+      { pendingUiRequests: [{ id: "approval-held", method: "confirm", token: "secret-native-token" }] },
+      { hasPendingAsyncWork: undefined }, { hostPid: undefined }, { hostPid: 2_000_000_003 }, { sessionId: "wrong-session" },
+    ];
+    for (const [index, patch] of cases.entries()) {
+      const { runtime, main, store, config, hosts, messenger, requests } = restartFixture();
+      const lane = savedLane(store, config, `restart-guard-${index}`, route(`guard-${index}`), process.pid);
+      const laneHost = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+      hosts.set(lane.socketPath, laneHost);
+      await runtime.start();
+      Object.assign(target === "main" ? main.state : laneHost.state, patch);
+      await admit(runtime, message(`restart-guard-owner-${index}`, route(), "/restart"));
+      expect(requests).toEqual([]);
+      expect(store.getMeta("head:restart-fence")).toBe("");
+      expect(messenger.sent.at(-1)?.text).toContain("No process was stopped");
+      expect(messenger.sent.at(-1)?.text).toContain("/stop head is a separate");
+      expect(messenger.sent.at(-1)?.text).not.toContain("secret-native-token");
+      expect(main.prompts).toEqual([]);
+      expect(laneHost.prompts).toEqual([]);
+      expect(main.abortCount + laneHost.abortCount).toBe(0);
+      expect([...main.commands, ...laneHost.commands].some(command => command.type === "shutdown_host")).toBe(false);
+    }
+  });
+
+  test.each(["pending", "submitted", "uncertain"] as const)("durable %s work in either HEAD or a lane is not settled by restart refusal", async state => {
+    for (const target of ["main", "lane"] as const) {
+      const { runtime, store, config, requests } = restartFixture();
+      const lane = savedLane(store, config, `durable-${state}`, route(`durable-${state}`));
+      await runtime.start();
+      const other = message(`unrelated-${state}-${target}`, target === "main" ? route() : lane.route);
+      store.receive(other, target === "main" ? "main" : lane.id);
+      if (state !== "pending") store.submit(other.id, "original-native-ticket", 0);
+      if (state === "uncertain") store.settle(other.id, "uncertain");
+      await runtime.receive(message(`restart-durable-${state}-${target}`, route(), "/restart"));
+      expect(store.input(other.id)?.state).toBe(state);
+      expect(store.input(`restart-durable-${state}-${target}`)?.state).toBe("cancelled");
+      expect(requests).toEqual([]);
+    }
+  });
+
+  test("durable approvals and active lane runs refuse even when the native HEAD is idle", async () => {
+    const { runtime, store, config, hosts, main, requests } = restartFixture();
+    const lane = savedLane(store, config, "restart-active-lane", route("restart-active-lane"), process.pid);
+    const laneHost = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, laneHost);
+    await runtime.start();
+    store.putApproval({ id: "durable-restart-approval", target: lane.id, generation: 0, requestId: "original-ui", route: lane.route,
+      request: { method: "confirm" }, state: "pending", remoteId: "original-card" });
+    await admit(runtime, message("restart-with-approval", route(), "/restart"));
+    expect(store.approval("durable-restart-approval")?.state).toBe("pending");
+    store.resolveApproval("durable-restart-approval", 0, "answered");
+    await delegate(runtime, message("active-lane-request", lane.route));
+    await admit(runtime, message("restart-with-active-lane", route(), "/restart"));
+    expect(requests).toEqual([]);
+    expect(laneHost.prompts).toHaveLength(1);
+    expect(main.prompts).toEqual([]);
+    expect(laneHost.abortCount).toBe(0);
+  });
+
+  test("a delayed ACK holds handoff and fences direct/lane dispatch and every public lane mutation", async () => {
+    const { runtime, store, main, config, hosts, messenger, directory, requests } = restartFixture();
+    const lane = savedLane(store, config, "restart-fenced-lane", route("restart-fenced-lane"), process.pid);
+    const laneHost = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, laneHost);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => { if (output.id === "restart-delayed:restart-ack") { started.resolve(); await release.promise; } };
+    await runtime.start();
+    await runtime.receive(message("restart-delayed", route(), "/restart"));
+    await started.promise;
+    expect(store.output("restart-delayed:restart-ack")?.state).toBe("sending");
+    expect(requests).toEqual([]);
+    expect(store.getMeta("head:restart-fence")).toBeTruthy();
+    await expect(runtime.startLane({ sourceId: `source-${lane.id}`, title: "No new lane", cwd: directory, kickoff: "No kickoff", ...selection })).rejects.toThrow("fenced");
+    await expect(runtime.messageLane(lane.id, "No message", `source-${lane.id}`)).rejects.toThrow("fenced");
+    await expect(runtime.changeModel({ id: lane.id, sourceId: `source-${lane.id}`, model: otherModel, modelReason: "No switch" })).rejects.toThrow("fenced");
+    await expect(runtime.pause(lane.id)).rejects.toThrow("fenced");
+    await expect(runtime.resume(lane.id)).rejects.toThrow("fenced");
+    await expect(runtime.closeLane(lane.id, "completed", "No close")).rejects.toThrow("fenced");
+    release.resolve();
+    await runtime.kick();
+    expect(requests).toHaveLength(1);
+    await runtime.receive(message("later-direct"));
+    store.receive(message("later-lane", lane.route), lane.id);
+    await runtime.kick();
+    expect(store.input("later-direct")?.state).toBe("pending");
+    expect(store.input("later-lane")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+    expect(laneHost.prompts).toEqual([]);
+    await admit(runtime, message("restart-fenced-stop", route(), "/stop head"));
+    expect(main.abortCount).toBe(0);
+    expect(store.input("later-direct")?.state).toBe("pending");
+  });
+
+  test.each(["rejected", "uncertain"] as const)("%s ACK delivery never hands off or retries the original restart", async certainty => {
+    const { runtime, store, messenger, requests } = restartFixture();
+    messenger.sendError = new DeliveryError("secret transport response", certainty);
+    await runtime.start();
+    const original = message(`restart-ack-${certainty}`, route(), "/restart");
+    await admit(runtime, original);
+    expect(store.output(`${original.id}:restart-ack`)?.state).toBe(certainty === "rejected" ? "failed" : "uncertain");
+    messenger.sendError = undefined;
+    await admit(runtime, original);
+    await runtime.kick();
+    expect(requests).toEqual([]);
+    expect(messenger.attempted.filter(output => output.id === `${original.id}:restart-ack`)).toHaveLength(1);
+    if (certainty === "uncertain") expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("uncertain");
+    else expect(store.getMeta("head:restart-fence")).toBe("");
+  });
+
+  test("an ACK queued during another output drain still requires its own durable sent receipt", async () => {
+    const { runtime, store, messenger, requests, handoff, config } = restartFixture();
+    await runtime.start();
+    const sourceId = modelChangeSource(store, "restart-drain-source");
+    store.queueOutput({ id: "existing-drain", sourceId, route: store.input(sourceId)!.route, text: "Earlier output" });
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => { if (output.id === "existing-drain") { started.resolve(); await release.promise; } };
+    handoff.respond = async request => {
+      expect(store.output(request.ackOutputId)?.state).toBe("sent");
+      return { ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main",
+        sessionFile: hostPaths(config, "main").sessionFile, state: "accepted" };
+    };
+    const draining = runtime.kick();
+    await started.promise;
+    await runtime.receive(message("restart-shared-drain", route(), "/restart"));
+    const admitted = Promise.withResolvers<void>();
+    setImmediate(admitted.resolve);
+    await admitted.promise;
+    expect(store.output("restart-shared-drain:restart-ack")?.state).toBe("pending");
+    expect(requests).toEqual([]);
+    release.resolve();
+    await draining;
+    await runtime.kick();
+    expect(requests).toHaveLength(1);
+    expect(store.output("restart-shared-drain:restart-ack")?.state).toBe("sent");
+  });
+
+  test("RPC response loss stays uncertain, holds the whole service and never authorizes retry", async () => {
+    const { runtime, main, store, messenger, requests, handoff } = restartFixture();
+    handoff.respond = async () => { throw new Error("secret-token lost HTTP response"); };
+    await runtime.start();
+    const original = applicationCommand("1750000000000000800", route(), "/restart");
+    await admit(runtime, original);
+    expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("uncertain");
+    expect(store.input(original.id)?.state).toBe("done");
+    await admit(runtime, original);
+    await admit(runtime, message("restart-after-rpc-loss", route(), "/restart"));
+    await runtime.receive(message("work-after-rpc-loss"));
+    await runtime.kick();
+    expect(requests).toHaveLength(1);
+    expect(main.prompts).toEqual([]);
+    expect(store.input("work-after-rpc-loss")?.state).toBe("pending");
+    expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("secret-token");
+    expect(messenger.sent.filter(output => output.id === `${original.id}:restart-uncertain`)).toHaveLength(1);
+  });
+
+  test("a definitive preacceptance RPC rejection refuses and clears the fence without retrying the original request", async () => {
+    const { runtime, store, main, messenger, requests, handoff } = restartFixture();
+    handoff.respond = async () => { throw new DeliveryError("secret rejected response", "rejected"); };
+    await runtime.start();
+    const original = applicationCommand("1750000000000000801", route(), "/restart");
+    await admit(runtime, original);
+    const request = requests[0]!;
+    expect(store.getMeta(`gateway:restart:${request.requestId}`)).toBeNull();
+    expect(store.getMeta("head:restart-fence")).toBe("");
+    expect(JSON.parse(store.getMeta(`head:restart:${original.id}`)!).state).toBe("refused");
+    expect(store.output(`${original.id}:restart-result`)?.text).toContain("No process was stopped");
+    expect(store.output(`${original.id}:restart-result`)?.text).not.toContain("secret rejected response");
+    await admit(runtime, original);
+    await admit(runtime, message("work-after-definitive-rejection"));
+    expect(requests).toHaveLength(1);
+    expect(main.prompts).toHaveLength(1);
+    expect(messenger.sent.filter(output => output.id === `${original.id}:restart-result`)).toHaveLength(1);
+  });
+
+  test("a rejection cannot release a restart that already has durable Gateway acceptance", async () => {
+    const { runtime, store, requests, handoff, config } = restartFixture();
+    handoff.respond = async request => {
+      const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
+        sessionId: "session-main", sessionFile: hostPaths(config, "main").sessionFile, state: "accepted" };
+      store.setMeta(`gateway:restart:${request.requestId}`, JSON.stringify(receipt));
+      throw new DeliveryError("A rejected response is not authority to undo prior acceptance", "rejected");
+    };
+    await runtime.start();
+    const original = applicationCommand("1750000000000000802", route(), "/restart");
+    await admit(runtime, original);
+    expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("uncertain");
+    await admit(runtime, original);
+    expect(requests).toHaveLength(1);
+    expect(store.output(`${original.id}:restart-result`)).toBeNull();
+    expect(store.output(`${original.id}:restart-uncertain`)).not.toBeNull();
+  });
+
+  test("owned refusal notices clear only their exact fence and send one result to the original route", async () => {
+    const { runtime, store, messenger, requests } = restartFixture();
+    await runtime.start();
+    const original = applicationCommand("1750000000000000900", route("restart-original"), "/restart");
+    await admit(runtime, original);
+    const request = requests[0]!;
+    const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
+      sessionId: "session-main", sessionFile: hostPaths(runtime.config, "main").sessionFile, state: "refused" };
+    store.setMeta(`gateway:restart:${request.requestId}`, JSON.stringify(receipt));
+    await messenger.handlers!.restart!({ requestId: "other-request", outcome: "refused", reason: "not this owner" });
+    expect(store.getMeta("head:restart-fence")).toBeTruthy();
+    const notice = { requestId: request.requestId, outcome: "refused" as const, reason: "secret native refusal" };
+    await messenger.handlers!.restart!(notice);
+    await messenger.handlers!.restart!(notice);
+    expect(store.getMeta("head:restart-fence")).toBe("");
+    expect(messenger.sent.filter(output => output.id === `${original.id}:restart-result`)).toMatchObject([{ route: original.route, sourceId: original.id }]);
+    expect(store.output(`${original.id}:restart-result`)?.text).not.toContain("secret native refusal");
+    expect(requests).toHaveLength(1);
+  });
+
+  test("uncertain lifecycle notices remain held and deduplicate their original-route result", async () => {
+    const { runtime, store, messenger, requests, main } = restartFixture();
+    await runtime.start();
+    const original = applicationCommand("1750000000000000901", route("uncertain-original"), "/restart");
+    await admit(runtime, original);
+    const request = requests[0]!;
+    const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
+      sessionId: "session-main", sessionFile: hostPaths(runtime.config, "main").sessionFile, state: "uncertain" };
+    store.setMeta(`gateway:restart:${request.requestId}`, JSON.stringify(receipt));
+    const notice = { requestId: request.requestId, outcome: "uncertain" as const, reason: "secret shutdown response" };
+    await messenger.handlers!.restart!(notice);
+    await messenger.handlers!.restart!(notice);
+    await runtime.receive(message("held-after-notice"));
+    await runtime.kick();
+    expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("uncertain");
+    expect(messenger.sent.filter(output => output.id === `${original.id}:restart-uncertain`)).toMatchObject([{ route: original.route, sourceId: original.id }]);
+    expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("secret shutdown response");
+    expect(store.input("held-after-notice")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+    expect(requests).toHaveLength(1);
+  });
+
+  test("replacement startup proves both owners and initialization, restores the original slash route and emits readiness once", async () => {
+    const instance = restartFixture();
+    const { input, restart } = savedRestart(instance);
+    await instance.runtime.start();
+    await instance.runtime.kick();
+    await admit(instance.runtime, input);
+    await instance.messenger.handlers!.restart!({ requestId: restart.requestId, outcome: "uncertain", reason: "late notice" });
+    expect(instance.store.getMeta("head:restart-fence")).toBe("");
+    expect(instance.messenger.sent).toMatchObject([{ id: `${input.id}:restart-result`, sourceId: input.id, route: input.route }]);
+    expect(instance.messenger.sent[0]!.text).toContain("initialized and ready");
+    expect(instance.store.input(input.id)).toMatchObject({ interactionId: input.interactionId, messageId: null, state: "done", route: input.route });
+    expect(instance.requests).toEqual([]);
+    expect(instance.main.prompts).toEqual([]);
+  });
+
+  test.each(["refused", "failed"] as const)("startup sends one original-route %s lifecycle result without replaying any handoff", async state => {
+    const instance = restartFixture();
+    const { input } = savedRestart(instance, state);
+    await instance.runtime.start();
+    await instance.runtime.kick();
+    await instance.runtime.kick();
+    expect(instance.messenger.sent).toMatchObject([{ id: `${input.id}:restart-result`, sourceId: input.id, route: input.route }]);
+    expect(instance.messenger.sent[0]!.text).toContain(state === "refused" ? "restart refused" : "readiness failed");
+    if (state === "refused") expect(instance.store.getMeta("head:restart-fence")).toBe("");
+    else expect(instance.store.getMeta("head:restart-fence")).toBeTruthy();
+    expect(instance.requests).toEqual([]);
+    expect(instance.main.prompts).toEqual([]);
+  });
+
+  test.each(["accepted", "uncertain", "missing-receipt", "wrong-request", "wrong-replacement", "old-owner-alive"] as const)("startup does not clear a %s fence without exact completed ownership evidence", async scenario => {
+    const instance = restartFixture();
+    const { restart, receipt, input } = savedRestart(instance,
+      scenario === "accepted" || scenario === "uncertain" ? scenario : "started", scenario === "old-owner-alive" ? process.pid : undefined);
+    if (scenario === "wrong-request") receipt.inputId = "unrelated-owner";
+    if (scenario === "wrong-replacement") receipt.replacementPid = 2_000_000_003;
+    instance.store.setMeta(`gateway:restart:${restart.requestId}`, scenario === "missing-receipt" ? "" : JSON.stringify(receipt));
+    await instance.runtime.start();
+    await instance.runtime.kick();
+    expect(instance.store.getMeta("head:restart-fence")).toBeTruthy();
+    expect(instance.store.output(`${input.id}:restart-result`)).toBeNull();
+    expect(instance.main.prompts).toEqual([]);
+    expect(instance.requests).toEqual([]);
+  });
+
+  test("replacement initialization failure sends a fixed original-route failure without a model turn or unsafe fence release", async () => {
+    const instance = fixture(3, undefined, { inspectPresets: async () => ({ settings: { modelRoles: {} },
+      configuredDefault: { available: true }, availableModels: [executionModel], presets: [],
+      bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }) });
+    const { input } = savedRestart(instance);
+    await instance.runtime.start();
+    await instance.runtime.kick();
+    expect(instance.main.prompts).toEqual([]);
+    expect(instance.store.getMeta("head:restart-fence")).toBeTruthy();
+    expect(instance.messenger.sent).toMatchObject([{ id: `${input.id}:restart-result`, sourceId: input.id, route: input.route }]);
+    expect(instance.messenger.sent[0]!.text).toContain("readiness failed");
+  });
+
+  test("invalid restart arguments and command lookalikes never acquire restart authority", async () => {
+    const { runtime, main, requests, store } = restartFixture();
+    await runtime.start();
+    await admit(runtime, message("invalid-restart", route(), "/restart force"));
+    expect(store.input("invalid-restart")?.state).toBe("cancelled");
+    expect(store.getMeta("head:restart-fence")).toBeNull();
+    await admit(runtime, message("restart-lookalike", route(), "/restarting"));
+    expect(main.prompts).toHaveLength(1);
+    expect(requests).toEqual([]);
+  });
+});
+
 describe("messenger head session controls", () => {
   test("busy queries bypass prompt dispatch and expose only safe native model identities and effort", async () => {
     const { runtime, main, store, messenger } = fixture();
@@ -1085,6 +1554,75 @@ describe("messenger head session controls", () => {
 });
 
 describe("priority native head commands", () => {
+  test("busy Slack slash diagnostics and mutation refusals never prompt, react, or advance message cursors", async () => {
+    const { runtime, config, main, store, messenger } = fixture();
+    config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+    const destination = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" });
+    await runtime.start();
+    await admit(runtime, { ...message("slack-active", destination), messageId: "1750000000.000001" });
+    const activities = structuredClone(messenger.activities);
+    for (const text of ["/status", "/help", "/context", "/usage"]) {
+      const input = slackCommand(`busy-${text}`, destination, text);
+      await admit(runtime, input);
+      expect(store.input(input.id)).toMatchObject({ messageId: null, invocationId: input.invocationId, state: "done" });
+      expect(messenger.sent.some(output => output.sourceId === input.id && output.text.includes("HEAD"))).toBe(true);
+    }
+    for (const text of ["/model fixture/efficient", "/effort high", "/compact inspect"]) {
+      const input = slackCommand(`busy-${text}`, destination, text);
+      await admit(runtime, input);
+      expect(store.input(input.id)?.state).toBe("cancelled");
+    }
+    expect(main.prompts).toHaveLength(1);
+    expect(main.commands.some(command => ["set_model", "set_thinking_level", "compact"].includes(String(command.type)))).toBe(false);
+    expect(messenger.activities).toEqual(activities);
+    expect(store.getMeta(`cursor:${physicalRouteKey(destination)}`)).toBe("1750000000.000001");
+  });
+
+  test("busy slash diagnostics send native output without model admission or interaction reactions/cursors", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    const destination = route();
+    const current = message("1750000000000000000", destination, "Active owner work");
+    await admit(runtime, current);
+    const beforeActivities = structuredClone(messenger.activities);
+    for (const [index, text] of ["/status", "/help", "/context", "/usage"].entries()) {
+      const command = applicationCommand(`175000000000000000${index + 1}`, destination, text);
+      await admit(runtime, command);
+      expect(store.input(command.id)).toMatchObject({ messageId: null, interactionId: command.interactionId, state: "done" });
+      expect(messenger.sent.some(output => output.sourceId === command.id && output.text.includes("HEAD"))).toBe(true);
+    }
+    for (const [index, text] of ["/model fixture/efficient", "/effort high", "/compact inspect"].entries()) {
+      const command = applicationCommand(`175000000000000001${index + 1}`, destination, text);
+      await admit(runtime, command);
+      expect(store.input(command.id)?.state).toBe("cancelled");
+    }
+    expect(main.prompts).toHaveLength(1);
+    expect(main.commands.some(command => ["set_model", "set_thinking_level", "compact"].includes(String(command.type)))).toBe(false);
+    expect(messenger.activities).toEqual(beforeActivities);
+    expect(store.getMeta(`cursor:${physicalRouteKey(destination)}`)).toBe(current.messageId);
+  });
+
+  test("unbound slash resume responds honestly while idle, busy, and recovering pending admission", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    const recovered = applicationCommand("1750000000000000100", route(), "/resume");
+    store.receive(recovered, "main", { [`user-source:${recovered.id}`]: "true" });
+    await runtime.start();
+    await runtime.kick();
+    expect(store.input(recovered.id)?.state).toBe("done");
+    expect(main.prompts).toEqual([]);
+    const idle = applicationCommand("1750000000000000101", route(), "/resume");
+    await admit(runtime, idle);
+    expect(main.prompts).toEqual([]);
+    await admit(runtime, message("1750000000000000102"));
+    const busy = applicationCommand("1750000000000000103", route(), "/resume");
+    await admit(runtime, busy);
+    expect(main.prompts).toHaveLength(1);
+    for (const command of [recovered, idle, busy]) {
+      expect(store.input(command.id)?.state).toBe("done");
+      expect(messenger.sent.find(output => output.sourceId === command.id)?.text).toContain("연결된 레인이 없습니다");
+    }
+  });
+
   test("busy help status context usage and preset lists are native read-only safe projections", async () => {
     const { runtime, main, store, messenger, config } = fixture();
     const lane = savedLane(store, config, "query-bound", route("query-bound"));
@@ -2491,6 +3029,168 @@ describe("exact platform message clocks", () => {
 });
 
 describe("real Store runtime coordination", () => {
+  test("Slack slash boundaries use durable real-message anchors, insertion order, and immutable first revisions", async () => {
+    const { runtime, config, store, main, messenger } = fixture();
+    config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: [] };
+    const dm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DPRIVATE" });
+    const actual = (suffix: string, text = "/status", revision = "original"): Inbound => ({
+      ...message(`slack:${suffix}:${revision}`, dm, text), messageId: `1750000000.${suffix}`,
+    });
+    await runtime.start();
+    await admit(runtime, actual("000100"));
+    store.setMeta(`cursor:${physicalRouteKey(dm)}`, "9999999999.999999"); // Cursor is not admission authority.
+    const first = slackCommand("anchored-first", dm, "/new");
+    await admit(runtime, first);
+    const firstTopic = store.input(first.id)!.route.topicId!;
+    await admit(runtime, actual("000099"));
+    expect(store.input("slack:000099:original")!.route).toEqual(dm);
+    await admit(runtime, actual("000100", "/new edited old request", "edit"));
+    expect(store.input("slack:000100:edit")).toMatchObject({ state: "done", route: dm });
+    await admit(runtime, actual("000101"));
+    expect(store.input("slack:000101:original")!.route.topicId).toBe(firstTopic);
+    const second = slackCommand("anchored-second", dm, "/new");
+    const back = slackCommand("anchored-main", dm, "/main");
+    const third = slackCommand("anchored-third", dm, "/new");
+    await admit(runtime, second);
+    await admit(runtime, back);
+    await admit(runtime, third);
+    const thirdTopic = store.input(third.id)!.route.topicId!;
+    expect(store.input(back.id)!.route).toEqual(dm);
+    await admit(runtime, actual("000101", "/help", "edit"));
+    expect(store.input("slack:000101:edit")!.route.topicId).toBe(firstTopic);
+    await admit(runtime, actual("000102"));
+    expect(store.input("slack:000102:original")!.route.topicId).toBe(thirdTopic);
+    await admit(runtime, { ...first, receivedAt: 9999 });
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe(thirdTopic);
+    const boundaries = JSON.parse(store.getMeta(`dm:command-boundaries:${physicalRouteKey(dm)}`)!);
+    expect(boundaries.map((boundary: { anchorMessageId: string }) => boundary.anchorMessageId)).toEqual([
+      "1750000000.000100", "1750000000.000101", "1750000000.000101", "1750000000.000101",
+    ]);
+    expect(boundaries.map((boundary: { insertionOrder: number }) => boundary.insertionOrder)).toEqual([1, 2, 3, 4]);
+    expect(boundaries.every((boundary: Record<string, unknown>) => !("messageId" in boundary))).toBe(true);
+    expect(store.getMeta(`dm:boundaries:${physicalRouteKey(dm)}`)).toBeNull();
+    await admit(runtime, actual("000103", "/new"));
+    const messageTopic = store.input("slack:000103:original")!.route.topicId!;
+    await admit(runtime, slackCommand("after-message-boundary", dm, "/main"));
+    await admit(runtime, actual("000103", "/new revised task", "control-edit"));
+    expect(store.input("slack:000103:control-edit")).toMatchObject({ state: "done", route: { ...dm, topicId: messageTopic } });
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
+    await admit(runtime, first);
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
+    expect(main.prompts).toEqual([]);
+    expect(messenger.threads).toEqual([]);
+    await expect(runtime.receive({ ...third, text: "/main" })).rejects.toThrow("Inbound identity conflict");
+    await expect(runtime.receive({ ...slackCommand("forged-thread", { ...dm, threadId: "1750000000.000001" }), text: "/new" })).rejects.toThrow("requires a real message ID");
+  });
+
+  test("Slack null-anchor commands and new-request work survive reopen without resetting topics or inventing cursors", async () => {
+    const { runtime, config, directory, store, main, messenger } = fixture();
+    config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: [] };
+    const dm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DPRIVATE" });
+    await runtime.start();
+    const first = slackCommand("null-first", dm, "/new");
+    await admit(runtime, first);
+    const originalRoute = store.input(first.id)!.route;
+    await admit(runtime, slackCommand("null-second", dm, "/new"));
+    await admit(runtime, slackCommand("null-main", dm, "/main"));
+    expect(main.prompts).toEqual([]);
+    expect(messenger.activities).toEqual([]);
+    expect(store.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBeNull();
+    expect(JSON.parse(store.getMeta(`dm:command-boundaries:${physicalRouteKey(dm)}`)!).map((boundary: { anchorMessageId: null }) => boundary.anchorMessageId)).toEqual([null, null, null]);
+    await runtime.stop();
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const transport = new MessengerTransport();
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
+    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => {}, {
+      connect: async path => {
+        if (path !== hostPaths(config, "main").socketPath) throw new Error("Unexpected lane adoption");
+        return head;
+      }, startHost: async () => { throw new Error("No lane launch is authorized"); },
+    });
+    fixtures.find(entry => entry.runtime === runtime)!.runtime = restarted;
+    await restarted.start();
+    await admit(restarted, { ...first, receivedAt: 12345 });
+    expect(reopened.input(first.id)).toMatchObject({ messageId: null, invocationId: first.invocationId, receivedAt: first.receivedAt, route: originalRoute });
+    expect(reopened.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
+    expect(head.prompts).toEqual([]);
+    const request = slackCommand("null-request", dm, "/new inspect this repository");
+    await admit(restarted, request);
+    expect(reopened.input(request.id)).toMatchObject({ state: "submitted", messageId: null });
+    expect(reopened.input(request.id)!.route.topicId).toMatch(/^topic-/);
+    expect(head.prompts).toHaveLength(1);
+    expect(head.prompts[0]!.command.message).toContain("inspect this repository");
+    expect(head.prompts[0]!.command.message).not.toContain("/new inspect");
+    expect(transport.activities).toEqual([]);
+    expect(transport.fetched).toEqual([]);
+    expect(reopened.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBeNull();
+    await expect(restarted.receive({ ...first, invocationId: "a".repeat(64) })).rejects.toThrow("Inbound identity conflict");
+  });
+
+  test("Discord DM command boundaries use interaction snowflakes, not synthetic event IDs or arrival clocks", async () => {
+    const { runtime, store, main } = fixture();
+    const dm = route(null, { guildId: null });
+    await runtime.start();
+    const first = { ...applicationCommand("9007199254740993", dm, "/new"), id: "z-synthetic-event", receivedAt: 999 };
+    await admit(runtime, first);
+    const topic = store.input(first.id)!.route.topicId!;
+    const returned = { ...applicationCommand("9007199254740995", dm, "/main"), id: "a-synthetic-event", receivedAt: 1 };
+    await admit(runtime, returned);
+    const late = { ...message("9007199254740994", dm, "/status"), receivedAt: 5000 };
+    await admit(runtime, late);
+    expect(store.input(late.id)?.route).toEqual({ ...dm, topicId: topic });
+    await admit(runtime, message("9007199254740992", dm, "/help"));
+    expect(store.input("9007199254740992")?.route).toEqual(dm);
+    await admit(runtime, applicationCommand("9007199254740996", dm, "/context"));
+    expect(store.input("interaction:9007199254740996")?.route).toEqual(dm);
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
+    expect(store.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBe(late.messageId);
+    await admit(runtime, first);
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
+    expect(store.input(first.id)?.route).toEqual({ ...dm, topicId: topic });
+    expect(main.prompts).toEqual([]);
+    for (const interactionId of [undefined, "synthetic-command-id", ""]) {
+      const invalid = { ...applicationCommand("9007199254740997", dm, "/new"), id: "missing-identity", interactionId };
+      await expect(runtime.receive(invalid)).rejects.toThrow("requires a real message ID");
+      expect(store.input(invalid.id)).toBeNull();
+    }
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
+  });
+
+  test("slash origin and original DM binding survive controller reopen and conflicting redelivery is rejected", async () => {
+    const { runtime, config, directory, store, main, messenger } = fixture();
+    const dm = route(null, { guildId: null });
+    const original = applicationCommand("1750000000000000200", dm, "/new");
+    await runtime.start();
+    await admit(runtime, original);
+    const originalRoute = store.input(original.id)!.route;
+    await admit(runtime, message("1750000000000000201", dm, "/help"));
+    await admit(runtime, applicationCommand("1750000000000000202", dm, "/main"));
+    expect(main.prompts).toEqual([]);
+    expect(messenger.activities).toEqual([]);
+    await runtime.stop();
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const transport = new MessengerTransport();
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
+    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => {}, {
+      connect: async path => {
+        if (path !== hostPaths(config, "main").socketPath) throw new Error("Unexpected native adoption");
+        return head;
+      },
+      startHost: async () => { throw new Error("No lane launch is authorized"); },
+    });
+    fixtures.find(entry => entry.runtime === runtime)!.runtime = restarted;
+    await restarted.start();
+    await admit(restarted, original);
+    expect(reopened.input(original.id)).toMatchObject({ route: originalRoute, messageId: null, interactionId: original.interactionId, state: "done" });
+    expect(reopened.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
+    expect(reopened.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBe("1750000000000000201");
+    await expect(restarted.receive({ ...original, interactionId: "1750000000000000203" })).rejects.toThrow("Inbound identity conflict");
+    await expect(restarted.receive({ ...original, messageId: original.interactionId!, interactionId: undefined })).rejects.toThrow("Inbound identity conflict");
+    expect(head.prompts).toEqual([]);
+    expect(transport.activities).toEqual([]);
+  });
+
   test("Slack DM boundaries follow exact timestamps across late intake, edits, and immutable command replay", async () => {
     const { runtime, config, store, directory } = fixture();
     delete config.discord;

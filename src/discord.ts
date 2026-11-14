@@ -3,11 +3,12 @@ import {
   ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelFlagsBitField, ChannelType, Client,
   Events, GatewayIntentBits, MessageFlags, ModalBuilder, Partials, PermissionFlagsBits, StringSelectMenuBuilder,
   Routes, TextInputBuilder, TextInputStyle,
-  type ForumChannel, type Interaction, type MediaChannel, type Message, type MessageCreateOptions, type PartialMessage,
+  type ChatInputCommandInteraction, type ForumChannel, type Interaction, type MediaChannel, type Message, type MessageCreateOptions, type PartialMessage,
 } from "discord.js";
-import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
 import { DeliveryError } from "./delivery.ts";
+import { parseDiscordCommand } from "./discord-commands.ts";
 
 // Reference (not copied): gimso2x/ompbot @ 4d2eb28d0bf66644892dc0fc333580d0eb7e7780,
 // src/discord/{adapter,attachments,channel,transport}.ts (MIT, ompbot contributors).
@@ -26,6 +27,7 @@ interface Pending {
 }
 interface Admission {
   ready: Promise<boolean>;
+  resolvedReady: boolean;
   stopped: boolean;
   stop(): void;
 }
@@ -146,9 +148,12 @@ export class DiscordMessenger implements Messenger {
         }),
         stopped.promise,
       ]),
+      resolvedReady: handlers.ready === undefined,
       stopped: false,
       stop: () => { stopped.resolve(false); },
     };
+    const admission = this.admission;
+    void admission.ready.then(ready => { admission.resolvedReady = ready; });
     this.client.on(Events.MessageCreate, this.onMessage);
     this.client.on(Events.MessageUpdate, this.onEdit);
     this.client.on(Events.InteractionCreate, this.onInteraction);
@@ -274,7 +279,7 @@ export class DiscordMessenger implements Messenger {
     } catch (error) { throw deliveryError(error); }
   }
 
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+  async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     try {
       if (!/^[0-9]{1,20}$/.test(message.messageId)) throw new DeliveryError("Activity requires a Discord message snowflake", "rejected");
       const channel = await this.destination(message.route);
@@ -446,7 +451,71 @@ export class DiscordMessenger implements Messenger {
     finally { await this.dismissApproval(pending.approval); }
   }
 
+  private async commandReply(interaction: ChatInputCommandInteraction, content: string): Promise<void> {
+    try { await interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS }); }
+    catch {
+      // SDK errors can contain the interaction response URL and its secret token.
+      // A failed/expired ACK never replays admission or falls back to a followup.
+      this.report(new Error("Discord command acknowledgement failed; admission was not retried"));
+    }
+  }
+
+  private async command(interaction: ChatInputCommandInteraction): Promise<void> {
+    const handlers = this.handlers;
+    const admission = this.admission;
+    const deny = (content: string) => this.commandReply(interaction, content);
+    if (!this.client.application?.id || interaction.applicationId !== this.client.application.id || !this.client.user?.id) {
+      await deny("This command does not belong to the connected Superagent application."); return;
+    }
+    if (interaction.user.bot || interaction.user.id !== this.options.ownerId) {
+      await deny("Only the configured owner can use Superagent commands."); return;
+    }
+    const text = parseDiscordCommand(interaction.commandName, interaction.options.data);
+    if (text === null) {
+      await deny("This Superagent command or its options are unsupported or stale; nothing was admitted."); return;
+    }
+    // Commands have a three-second initial response deadline. Unlike ordinary
+    // messages/components, never wait for readiness or the serialized intake.
+    if (!this.connected || !handlers || !admission?.resolvedReady || admission.stopped) {
+      await deny("Superagent is not ready to accept commands; nothing was admitted."); return;
+    }
+    if (!/^[0-9]{1,20}$/.test(interaction.id) || !Number.isFinite(interaction.createdTimestamp) || !interaction.channelId ||
+      (interaction.guildId !== null && !this.guilds.has(interaction.guildId))) {
+      await deny("This conversation is not authorized for Superagent commands."); return;
+    }
+    let route: Route | null;
+    try {
+      // This resolves a channel, never a command's interaction ID as a message.
+      const channel = interaction.channel ?? await this.client.channels.fetch(interaction.channelId);
+      route = channel ? this.route(channel) : null;
+      if (!channel || channel.id !== interaction.channelId || !route || route.guildId !== interaction.guildId ||
+        !channel.isSendable() || (!route.guildId && (channel.type !== ChannelType.DM || channel.recipientId !== this.options.ownerId))) {
+        await deny("This conversation is not authorized for Superagent commands."); return;
+      }
+    } catch {
+      this.report(new Error("Discord command destination verification failed; nothing was admitted"));
+      await deny("Superagent could not verify this conversation; nothing was admitted."); return;
+    }
+    if (!this.connected || this.handlers !== handlers || this.admission !== admission || admission.stopped || !admission.resolvedReady) {
+      await deny("Superagent is not ready to accept commands; nothing was admitted."); return;
+    }
+    try {
+      // The captured handler resolves only after durable admission. Do not
+      // defer an apparent success before this boundary or persist response tokens.
+      await handlers.message({
+        id: `discord:${route.accountId}:interaction:${interaction.id}`, route, messageId: null,
+        interactionId: interaction.id, text, receivedAt: interaction.createdTimestamp, attachments: [],
+      });
+    } catch {
+      this.report(new Error("Discord command durable admission could not be confirmed; admission was not retried"));
+      await deny("Superagent could not confirm acceptance. This command may already have been recorded; no automatic retry was made. Check this conversation and service status before taking further action.");
+      return;
+    }
+    await this.commandReply(interaction, "Superagent accepted this command. Its result will be sent to this conversation.");
+  }
+
   private async interact(interaction: Interaction): Promise<void> {
+    if (interaction.isChatInputCommand()) { await this.command(interaction); return; }
     if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
     const parsed = parseDiscordControl(interaction.customId);
     if (!parsed) return;

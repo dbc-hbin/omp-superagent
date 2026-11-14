@@ -31,14 +31,22 @@ const server = createServer(peer => {
       const frame = JSON.parse(pending.slice(0, newline)) as Record<string, unknown>;
       pending = pending.slice(newline + 1);
       if (frame.type === "shutdown_host") {
-        const busy = existsSync(join(config.stateDir, "busy"));
+        void appendFile(join(config.stateDir, "shutdowns.jsonl"), `${JSON.stringify({ pid: process.pid })}\n`);
+        if (existsSync(join(config.stateDir, "ambiguous-shutdown"))) { peer.destroy(); continue; }
+        const busy = existsSync(join(config.stateDir, "busy")) || existsSync(join(config.stateDir, "busy-shutdown"));
         send({ type: "response", id: frame.id, command: frame.type, success: !busy,
           ...(busy ? { error: "Host is busy" } : { data: {} }) });
         if (!busy) void messenger.stop().finally(() => { server.close(); setTimeout(() => process.exit(0), 50); });
+      } else if (frame.type === "fixture_restart") {
+        void messenger.requestRestart(frame.request as { requestId: string; inputId: string; ackOutputId: string }).then(
+          data => send({ type: "response", id: frame.id, command: frame.type, success: true, data }),
+          () => send({ type: "response", id: frame.id, command: frame.type, success: false, error: "Fixture restart failed" }));
       } else {
         send({ type: "response", id: frame.id, command: frame.type, success: true,
           data: frame.type === "negotiate_protocol" ? { protocolVersion: 2 }
-            : { sessionId, sessionFile, hostPid: process.pid } });
+            : { sessionId, sessionFile, hostPid: process.pid, settingsScope: "session",
+              isSettled: !existsSync(join(config.stateDir, "busy")), isStreaming: false, isCompacting: false,
+              queuedMessageCount: 0, hasPendingAsyncWork: false, hasOwnedRunningWork: false, pendingUiRequests: [], goal: null } });
       }
     }
   });
@@ -67,4 +75,5 @@ try {
 await messenger.start({
   message: async input => { await appendFile(join(config.stateDir, "received.jsonl"), `${JSON.stringify(input)}\n`); },
   answer: async () => {},
+  restart: async notice => { await appendFile(join(config.stateDir, "restart-notices.jsonl"), `${JSON.stringify(notice)}\n`); },
 });

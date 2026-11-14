@@ -45,10 +45,21 @@ export interface Attachment {
 export interface Inbound {
   id: string;
   route: Route;
-  messageId: string;
+  /** Actual platform message ID; application commands have no source message. */
+  messageId: string | null;
+  /** Discord's actual interaction snowflake, never its response token. */
+  interactionId?: string;
+  /** Slack's scoped SHA256 trigger fingerprint, never a message timestamp or capability. */
+  invocationId?: string;
   text: string;
   receivedAt: number;
   attachments: Attachment[];
+}
+
+/** A real platform message that can be fetched, reacted to, or used as a thread source. */
+export interface MessageReference {
+  route: Route;
+  messageId: string;
 }
 
 export type WorkState = "open" | "paused" | "completed" | "cancelled";
@@ -141,6 +152,8 @@ export interface StorePort {
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   inputs(target?: string): InputRecord[];
+  /** Actual authorized user messages, including settled records, in durable admission order. */
+  admittedMessages(route: Route): InputRecord[];
   bindInput(id: string, target: string): void;
   submit(id: string, requestId: string, generation: number): boolean;
   settle(id: string, state: "done" | "uncertain" | "cancelled", output?: { id: string; text: string }): boolean;
@@ -180,6 +193,34 @@ export interface DialogResponse {
 
 export type MessageActivity = "received" | "thinking" | "idle";
 
+export interface GatewayRestartRequest {
+  /** Persisted UUID, shared by controller and authenticated Gateway protocol. */
+  requestId: string;
+  inputId: string;
+  ackOutputId: string;
+}
+
+/** Durable lifecycle receipt, bound to the original owner input and owned processes. */
+export interface GatewayRestartRecord extends GatewayRestartRequest {
+  /** Original Gateway and native HEAD, never the one-shot runner. */
+  gatewayPid: number;
+  headPid: number;
+  sessionId: string;
+  sessionFile: string;
+  state: "accepted" | "head-stopped" | "started" | "refused" | "uncertain" | "failed";
+  /** Replacement Gateway PID. The detached runner has a separate private plan identity. */
+  successorPid?: number;
+  /** Replacement native HEAD PID. */
+  replacementPid?: number;
+  reason?: string;
+}
+
+export interface GatewayRestartNotice {
+  requestId: string;
+  outcome: "refused" | "uncertain";
+  reason: string;
+}
+
 export interface Messenger {
   start(handlers: {
     /** Authenticate first; do not consume inbound events until native approvals are reconciled. */
@@ -189,10 +230,12 @@ export interface Messenger {
     /** Reconcile a previously attempted answer before retrying its native effect. */
     reconcileAnswer?(approvalId: string, route: Route): Promise<"retry" | "accepted" | "rejected" | "unresolved">;
     reconnect?(): Promise<void>;
+    /** Owned Gateway lifecycle outcome; never a user instruction or model turn. */
+    restart?(notice: GatewayRestartNotice): Promise<void>;
   }): Promise<void>;
   send(output: OutputRecord): Promise<string>;
   /** Cosmetic own reactions on the original message; never an admission or completion receipt. */
-  setActivity?(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void>;
+  setActivity?(message: MessageReference, activity: MessageActivity): Promise<void>;
   showApproval(approval: Approval): Promise<string>;
   dismissApproval(approval: Approval): Promise<void>;
   /** Read-only authenticated capability probe; false is unsupported, not a failed creation. */

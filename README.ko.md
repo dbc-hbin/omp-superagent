@@ -120,6 +120,22 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
   `/compact [보존할 내용]`으로 유휴 헤드 맥락을 압축합니다. `/model preset`으로 목록을 보고
   `/model preset <name>`으로 native 프리셋을 적용합니다. `/stop head`는 Gateway 종료 없이 헤드 작업을 중단합니다.
   Slack에서는 같은 명령에 `!`를 씁니다.
+- **서비스 재시작:** `/restart`는 유휴 상태에서 Gateway와 헤드 프로세스를 모두 교체하며
+  기존 세션·작업 기록을 유지합니다. 작업·비동기 실행·승인 등이 있으면 강제 종료하지 않고 거절합니다.
+  Slack은 `!restart` 또는 등록된 `/superagent-restart`입니다.
+- **Discord 자동완성:** 등록된 슬래시 명령도 같은 제어 경로를 사용합니다.
+  `bun --no-env-file src/cli.ts discord-commands --config config.local.json`으로 변경을 확인하고,
+  `--apply`를 붙이면 봇의 전역 명령 목록을 지원되는 Superagent 명령으로 교체합니다.
+  기존 Hermes 전용 명령은 제거되며 setup·doctor·start는 자동 등록하지 않습니다.
+  인수는 선택적인 `text` 필드에 입력합니다. 비공개 알림은 접수 확인이며 실제 결과는 원래 대화에 전달됩니다.
+- **Telegram 명령 메뉴:** 같은 명령을 사용하며 그룹의 `/status@봇이름`도 처리합니다.
+  같은 CLI의 `telegram-commands --config config.local.json`으로 확인하고 `--apply`로
+  소유자 범위 메뉴를 갱신합니다. 언어별 목록은 `--language CODE`로 선택합니다.
+- **Slack 자동완성:** 기본 명령과 충돌하지 않는 `/superagent-status`·`/superagent-model` 등
+  `/superagent-*`를 사용합니다. 기존 `!` 일반 메시지도 유지합니다.
+  같은 CLI의 `slack-commands --config config.local.json --manifest-token-env NAME [--apply]`로
+  등록합니다. `NAME`은 별도 앱 구성 토큰의 환경변수 이름이며 bot/app 연결 토큰으로 대체할 수 없습니다.
+  등록 결과에 재설치·재승인이 필요하다고 나오면 그 절차까지 완료해야 합니다.
 - **명시적 전역 저장:** `/model preset <name> --global`만 native 기본 역할·effort도 저장합니다.
   옵션이 없으면 이번 헤드 세션 전용이며, 변경 알림에 실제 모델·effort와 적용 범위를 표시합니다.
 

@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseSessionEntries, type FileEntry } from "@oh-my-pi/pi-coding-agent";
 import { type Config, hostPaths, privateDirectory } from "../../src/config";
-import type { Approval, Inbound, Lane, MessageActivity, Messenger, OutputRecord, Route } from "../../src/contracts";
+import type { Approval, Inbound, Lane, MessageActivity, MessageReference, Messenger, OutputRecord, Route } from "../../src/contracts";
 import { startGateway, gatewayPaths, type GatewayService, type GatewayStatus } from "../../src/gateway";
 import { HostConnection } from "../../src/host";
 import { nativeDisabledProviders } from "./native-extension";
@@ -17,7 +17,7 @@ const interrupted = new AbortController();
 let detectNativeFailure: (() => Promise<void>) | undefined;
 class RecordingMessenger implements Messenger {
   readonly sent: OutputRecord[] = [];
-  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
+  readonly activities: Array<{ message: MessageReference; activity: MessageActivity }> = [];
   handlers?: Handlers;
   async start(handlers: Handlers): Promise<void> { this.handlers = handlers; }
   async deliver(input: Inbound): Promise<void> {
@@ -28,7 +28,7 @@ class RecordingMessenger implements Messenger {
     this.sent.push(structuredClone(output));
     return `gateway-native-receipt:${output.id}`;
   }
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+  async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     this.activities.push({ message: { route: structuredClone(message.route), messageId: message.messageId }, activity });
   }
   async showApproval(_approval: Approval): Promise<string> { throw new Error("Unexpected native Gateway approval"); }

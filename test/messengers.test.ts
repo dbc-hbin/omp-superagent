@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { Approval, Attachment, DialogResponse, Inbound, MessageActivity, Messenger, OutputRecord, Platform, Route } from "../src/contracts";
+import type { Approval, Attachment, DialogResponse, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Platform, Route } from "../src/contracts";
 import { MessengerHub } from "../src/messengers";
 
 class Transport implements Messenger {
@@ -7,7 +7,7 @@ class Transport implements Messenger {
   readonly sent: OutputRecord[] = [];
   readonly shown: Approval[] = [];
   readonly opened: Attachment[] = [];
-  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
+  readonly activities: Array<{ message: MessageReference; activity: MessageActivity }> = [];
   beforeActivity?: () => Promise<void>;
   stops = 0;
   constructor(readonly platform: Platform, readonly failStart = false) {}
@@ -17,7 +17,7 @@ class Transport implements Messenger {
   }
   async stop() { this.stops++; }
   async send(output: OutputRecord) { this.sent.push(output); return `${this.platform}:receipt`; }
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity) {
+  async setActivity(message: MessageReference, activity: MessageActivity) {
     await this.beforeActivity?.();
     this.activities.push({ message, activity });
   }

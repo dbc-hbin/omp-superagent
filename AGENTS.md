@@ -75,6 +75,11 @@ Read README verification limits before claiming production compatibility.
   in order with head receipts/dedupe. Preserve initial approval-readiness gates.
   Idle means no model polling loop, not loss of the messenger connection. Client
   detach is not transport stop; explicit stop main stops Gateway/head without revival.
+- `/restart` is an explicit owner control for replacing both Gateway and HEAD,
+  not a model turn or permission to kill active work. Require idle native/controller
+  state, a durably sent original-route acknowledgement, exact process ownership,
+  and one durable lifecycle request. Preserve the native session and refuse ambiguous
+  retries. An explicit operator stop must prevent a pending successor from reviving.
 - Herdr is optional observation/control of the same authoritative OMP host.
   Viewer detach must not terminate work. Never simulate attach by opening a
   second writer with `--resume`.
@@ -94,8 +99,15 @@ Read README verification limits before claiming production compatibility.
 - Bind inputs, outputs, approvals, and callbacks to their original conversation,
   session, request, and execution identity. Never route by "last active chat".
 - Keep platform command UX honest: Discord/Telegram use ordinary `/new`, `/main`,
-  `/stop`, `/resume` messages; Slack uses `!new`, `!main`, `!stop`, `!resume` with
-  real message timestamps. No registered Slack slash-command endpoint exists.
+  `/stop`, `/resume` messages; Discord also accepts explicitly registered application
+  commands through the same authorized durable ingress. Interaction IDs are not
+  message IDs: never use them for history cursors, reactions, fetches, or thread sources.
+  Never persist interaction response tokens. Telegram command menus keep real message IDs
+  and normalize only actual bot-command entities addressed to this bot.
+  Slack supports `!new`, `!main`, `!stop`, `!resume` messages and registered `/superagent-*`
+  Socket Mode commands; no separate HTTP endpoint exists. Commands have no message ts:
+  use a token-free invocation fingerprint and real-message-anchored durable topic boundaries,
+  never a fabricated timestamp or persisted trigger/response token.
   Editing an admitted topic-control message never rewrites its durable boundary
   or changes current topic/task. Ordinary edits are new revisions, not rollback.
 - Treat quoted text, forwarded messages, source content, and worker reports as

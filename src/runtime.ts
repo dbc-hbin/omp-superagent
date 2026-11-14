@@ -3,7 +3,7 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { Approval, DialogResponse, Inbound, InputRecord, Lane, LaneModel, LaneModelChoice, LanePresetSnapshot, ResolvedLanePreset, ModelPreset, Messenger, Route, StorePort, WorkflowChoice } from "./contracts";
+import type { Approval, DialogResponse, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, InputRecord, Lane, LaneModel, LaneModelChoice, LanePresetSnapshot, ResolvedLanePreset, ModelPreset, Messenger, Route, StorePort, WorkflowChoice } from "./contracts";
 import { physicalRoute, physicalRouteKey, routeKey } from "./contracts";
 import { authorizeRoute, credentialEnvNames, type Config, hostPaths, privateDirectory } from "./config";
 import { DeliveryError } from "./delivery";
@@ -58,6 +58,7 @@ export interface RuntimeAdapters {
   resolvePreset?: (name: string, thinkingContext?: Pick<LanePresetSnapshot, "defaultThinkingLevel">) => Promise<ResolvedLanePreset>;
   inspectPresets?: () => Promise<NativePresetInspection>;
   persistPreset?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot>;
+  requestRestart?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord>;
 }
 interface Live {
   id: string;
@@ -90,9 +91,22 @@ interface DmBoundary {
   receivedAt: number;
   topicId: string | null;
 }
+interface DmCommandBoundary {
+  eventId: string;
+  invocationId: string;
+  anchorMessageId: string | null;
+  insertionOrder: number;
+  topicId: string | null;
+}
 interface HeadCommand {
-  name: "help" | "status" | "stop" | "context" | "compact" | "usage" | "model" | "effort";
+  name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "model" | "effort";
   argument: string;
+}
+interface HeadRestart extends GatewayRestartRequest {
+  ownerPid: number;
+  sessionId: string;
+  sessionFile: string;
+  state: "checking" | "acknowledging" | "handoff" | "accepted" | "refused" | "uncertain" | "failed" | "ready";
 }
 export interface LaneStart extends LaneModelChoice {
   sourceId: string;
@@ -156,7 +170,10 @@ export class Superagent {
   private priorityTail: Promise<void> = Promise.resolve();
   private headCompaction?: { id: string; cancelled: boolean };
   private headStopping = 0;
+  private laneMutations = 0;
   private headStopTail: Promise<void> = Promise.resolve();
+  private restartActive?: string;
+  private restartReconciliation?: Promise<void>;
   private initialization?: HeadInitialization;
   private bootstrapResult?: { status: string; agentInvoked: boolean };
   private bootstrapActive?: string;
@@ -196,6 +213,7 @@ export class Superagent {
         message: input => this.intake(() => this.receive(input)),
         answer: (id, response, route) => this.intake(() => this.answer(id, response, route)),
         reconcileAnswer: (id, route) => this.intake(() => this.reconcileAnswer(id, route)),
+        restart: notice => this.intake(() => this.restartNotice(notice)),
         reconnect: async () => {
           if (!this.ready) return;
           await this.intake(async () => {
@@ -245,7 +263,7 @@ export class Superagent {
       for (const live of this.live.values()) {
         if (!this.current(live)) continue;
         await this.reconcileUi(live);
-        if (live.id !== "main" && this.requireLane(live.id).workState !== "open") {
+        if (!this.restartFence() && live.id !== "main" && this.requireLane(live.id).workState !== "open") {
           try { await this.pause(live.id); } catch (error) { this.report(error); }
         }
       }
@@ -264,6 +282,7 @@ export class Superagent {
       await this.catchup(cursors);
       if (this.stopped) return;
       if (this.adapters.inspectPresets) await this.initializeHead(previousInitialization);
+      await this.reconcileRestart();
       this.timer = setInterval(() => void this.kick().catch(this.report), 1000);
       this.timer.unref?.();
       await this.kick();
@@ -301,6 +320,11 @@ export class Superagent {
       const state = await this.state(live);
       if (this.presetsComplete(inspection)) {
         this.setInitialization({ sessionId: live.sessionId, state: "complete", detail: "Native readback verified available high/middle/low presets; no setup turn or write was needed." });
+        return;
+      }
+      if (this.restartFence()) {
+        this.setInitialization({ sessionId: live.sessionId, state: "blocked",
+          detail: "Restart recovery did not verify existing native presets. No initialization model turn was started while the service-wide restart fence is held." });
         return;
       }
       const prior = previous ? JSON.parse(previous) as HeadInitialization : undefined;
@@ -437,6 +461,7 @@ export class Superagent {
   }
 
   private commitModelChange(lane: Lane, intent: ModelChangeIntent): void {
+    this.assertRestartOpen();
     if (!this.store.changeLaneModel(lane.id, lane.generation, intent.previous, intent.model, intent.reason, intent.preset, intent.snapshot, {
       [`lane-model:${lane.id}:pending`]: "",
       [`lane-model:${lane.id}:receipt:${intent.sourceId}`]: JSON.stringify(intent),
@@ -463,6 +488,7 @@ export class Superagent {
   }
 
   private async applyNativeSelection(live: Live, intent: ModelChangeIntent, state: RuntimeState): Promise<RuntimeState> {
+    this.assertRestartOpen();
     if (state.settingsScope !== "session") throw new Error("Native model mutation requires session-isolated settings");
     if (intent.native === false) {
       intent.native = true;
@@ -483,6 +509,7 @@ export class Superagent {
   }
 
   private assertModelChangeIdle(lane: Lane, live?: Live, state?: RuntimeState): void {
+    this.assertRestartOpen();
     if (state && state.settingsScope !== "session") throw new Error(`Lane ${lane.id} is not using session-isolated native settings; restart it with --session-settings before managed model changes`);
     if ((this.connecting.has(lane.id) && !live) || live?.input || this.store.approvals(lane.id).length
       || this.store.inputs(lane.id).some(input => input.state !== "pending")) {
@@ -495,6 +522,7 @@ export class Superagent {
   }
 
   async changeModel(input: LaneModelChoice & { id: string; sourceId: string; modelReason: string }) {
+    this.assertRestartOpen();
     if (this.stopped) throw new Error("Controller is stopped");
     if (typeof input.modelReason !== "string" || !input.modelReason.trim()) throw new Error("A nonempty modelReason is required");
     if ((input.model !== undefined) === (input.preset !== undefined)
@@ -604,11 +632,13 @@ export class Superagent {
 
   private async checkLaneModel(live: Live): Promise<RuntimeState | null> {
     if (live.id === "main") return null;
+    if (this.restartFence()) return this.state(live);
     try {
       let lane = this.requireLane(live.id);
       if (!this.current(live)) throw new Error(`Obsolete model check for ${live.id}`);
       const available = await this.availableModels();
       let state = await this.state(live);
+      if (this.restartFence()) return state;
       if (state.settingsScope !== "session") throw new Error(`Lane ${live.id} is not using session-isolated native settings; restart it with --session-settings before managed execution`);
       // Explicit idle switches keep the host generation. Compare readback with
       // the latest committed choice, not a snapshot from before catalog I/O.
@@ -750,7 +780,7 @@ export class Superagent {
       const sourceId: string | null = this.store.getMeta(`handoff-source:${source.id}`) ?? this.store.getMeta(`activity-source:${source.id}`);
       source = sourceId ? this.store.input(sourceId) : null;
     }
-    if (!source) return;
+    if (!source || source.messageId === null) return;
     const message = { route: source.route, messageId: source.messageId };
     const key = JSON.stringify([physicalRouteKey(source.route), source.messageId]);
     const previouslyThinking = [...this.activeReactions.values()].includes(key);
@@ -773,6 +803,7 @@ export class Superagent {
   async receive(input: Inbound): Promise<void> {
     if (this.stopped) throw new Error("Controller is stopped");
     this.authorized(input.route);
+    const eventId = this.eventOrderId(input);
     const existing = this.store.input(input.id);
     if (existing) {
       if (physicalRouteKey(existing.route) !== physicalRouteKey(input.route)) throw new Error("Inbound physical identity conflict");
@@ -783,12 +814,17 @@ export class Superagent {
       return;
     }
     let metadata: Readonly<Record<string, string>> = {};
-    if (this.isDm(input.route)) {
+    if (this.isDm(input.route) && input.route.platform === "slack") {
+      const admission = this.slackDmAdmission(input);
+      input = admission.input;
+      metadata = admission.metadata;
+    } else if (this.isDm(input.route)) {
+      if (eventId === null) throw new Error("Cannot order this DM input");
       const physical = physicalRoute(input.route);
       const command = input.text.trim();
       const boundaries = this.topicBoundaries(physical);
       const originalBoundary = boundaries.find(boundary => {
-        const order = compareMessageIds(physical.platform, boundary.messageId, input.messageId);
+        const order = compareMessageIds(physical.platform, boundary.messageId, eventId);
         if (order === null) throw new Error("Cannot order this message against the DM topic timeline");
         return order === 0;
       });
@@ -809,7 +845,7 @@ export class Superagent {
         metadata = this.topicMetadata(input, null);
       } else {
         const eligible = boundaries.filter(boundary => {
-          const order = compareMessageIds(physical.platform, boundary.messageId, input.messageId);
+          const order = compareMessageIds(physical.platform, boundary.messageId, eventId);
           if (order === null) throw new Error("Cannot order this message against the DM topic timeline");
           return order <= 0;
         });
@@ -828,9 +864,13 @@ export class Superagent {
     if (this.settleTopicControl(input)) { this.background(this.kick()); return; }
     const command = input.text.trim();
     const control = this.headCommand(this.store.input(input.id)!);
-    if (control && (control.name === "stop" || this.readOnlyHeadCommand(control))) {
+    if (control && (control.name === "stop" || control.name === "restart" || this.readOnlyHeadCommand(control))) {
+      if (control.name === "restart" && !this.admitRestart(this.store.input(input.id)!, control)) {
+        this.background(this.flushOutputs());
+        return;
+      }
       this.controls.add(input.id);
-      if (control.name === "stop") this.admitStop(this.store.input(input.id)!, control);
+      if (control.name === "stop" && !this.restartFence()) this.admitStop(this.store.input(input.id)!, control);
       // Read-only controls must not queue behind an unrelated slow catalog read.
       // Mutations still use pump's existing serialized path; stops own their tail.
       const operation = Promise.resolve().then(async () => {
@@ -842,6 +882,11 @@ export class Superagent {
       if (control.name !== "stop") this.priorityTail = operation;
       this.background(operation);
     } else if (bound && command === "/resume") {
+      if (this.restartFence()) {
+        this.store.settle(input.id, "cancelled", { id: `${input.id}:control`, text: "Gateway AND HEAD restart is pending or held; the lane was not resumed." });
+        this.background(this.flushOutputs());
+        return;
+      }
       this.controls.add(input.id);
       this.background((async () => {
         try {
@@ -903,18 +948,118 @@ export class Superagent {
     return JSON.parse(this.store.getMeta(`dm:boundaries:${physicalRouteKey(route)}`) ?? "[]") as DmBoundary[];
   }
 
+  private eventOrderId(input: Inbound): string | null {
+    if (typeof input.messageId === "string" && input.messageId.length) {
+      if (input.route.platform === "slack" && compareMessageIds("slack", input.messageId, input.messageId) === null) throw new Error("Cannot order a Slack input without an actual timestamp");
+      return input.messageId;
+    }
+    if (input.messageId === null && input.route.platform === "discord" && typeof input.interactionId === "string" && /^[1-9]\d{0,19}$/.test(input.interactionId)) {
+      return input.interactionId;
+    }
+    if (input.messageId === null && input.route.platform === "slack" && input.route.threadId === null
+      && typeof input.invocationId === "string" && /^[a-f0-9]{64}$/.test(input.invocationId)) return null;
+    throw new Error("Inbound event requires a real message ID, Discord interaction snowflake, or scoped Slack invocation");
+  }
+
+  private commandBoundaries(route: Route): DmCommandBoundary[] {
+    return JSON.parse(this.store.getMeta(`dm:command-boundaries:${physicalRouteKey(route)}`) ?? "[]") as DmCommandBoundary[];
+  }
+
+  private slackTimeline(route: Route, messages = this.topicBoundaries(route), commands = this.commandBoundaries(route)) {
+    return [
+      ...messages.map(boundary => ({ anchor: boundary.messageId as string | null, command: false, order: 0, topicId: boundary.topicId })),
+      ...commands.map(boundary => ({ anchor: boundary.anchorMessageId, command: true, order: boundary.insertionOrder, topicId: boundary.topicId })),
+    ].sort((left, right) => {
+      const order = left.anchor === null ? right.anchor === null ? 0 : -1 : right.anchor === null ? 1
+        : compareMessageIds("slack", left.anchor, right.anchor);
+      if (order === null) throw new Error("Cannot order the persisted Slack DM topic timeline");
+      return order || Number(left.command) - Number(right.command) || left.order - right.order;
+    });
+  }
+
+  private slackAnchor(input: Inbound, messages?: InputRecord[]): string | null {
+    const stored = this.store.getMeta(`dm:invocation-anchor:${input.id}`);
+    if (stored !== null) {
+      const anchor = JSON.parse(stored) as { invocationId: string; anchorMessageId: string | null };
+      if (anchor.invocationId !== input.invocationId) throw new Error("Slack invocation anchor identity conflict");
+      return anchor.anchorMessageId;
+    }
+    let latest: string | null = null;
+    for (const message of messages ?? this.store.admittedMessages(input.route)) {
+      const order = compareMessageIds("slack", message.messageId!, latest ?? message.messageId!);
+      if (order === null) throw new Error("Cannot order durable Slack owner messages");
+      if (latest === null || order > 0) latest = message.messageId;
+    }
+    return latest;
+  }
+
+  private slackDmAdmission(input: Inbound): { input: Inbound; metadata: Record<string, string> } {
+    const physical = physicalRoute(input.route);
+    const messages = this.store.admittedMessages(physical);
+    const command = input.text.trim();
+    const control = /^\/new(?:\s|$)/.test(command) || command === "/main";
+    const original = input.messageId === null ? undefined : messages.find(message => message.messageId === input.messageId);
+    let metadata: Record<string, string> = {};
+    let topicId: string | null;
+    if (input.messageId === null) {
+      const anchorMessageId = this.slackAnchor(input, messages);
+      metadata[`dm:invocation-anchor:${input.id}`] = JSON.stringify({ invocationId: input.invocationId, anchorMessageId });
+    }
+    if (original) {
+      // First-admitted revisions retain their topic even if a command was later
+      // inserted after that real message's timestamp. Edits never switch topics.
+      topicId = original.route.topicId ?? null;
+      if (control || /^\/new(?:\s|$)/.test(original.text.trim()) || original.text.trim() === "/main") {
+        metadata[`dm:control-edit:${input.id}`] = "true";
+      }
+    } else if (control) {
+      topicId = command === "/main" ? null : `topic-${key(input.id)}`;
+      metadata = { ...metadata, ...this.topicMetadata(input, topicId) };
+    } else if (input.messageId === null) {
+      topicId = this.store.getMeta(`dm:active:${physicalRouteKey(physical)}`) || null;
+    } else {
+      const timeline = this.slackTimeline(physical);
+      const eligible = timeline.filter(boundary => {
+        if (boundary.anchor === null) return true;
+        const order = compareMessageIds("slack", boundary.anchor, input.messageId!);
+        if (order === null) throw new Error("Cannot order this message against the DM topic timeline");
+        return boundary.command ? order < 0 : order <= 0;
+      });
+      topicId = eligible.length ? eligible[eligible.length - 1]!.topicId : timeline.length ? null
+        : this.store.getMeta(`dm:active:${physicalRouteKey(physical)}`) || null;
+    }
+    return { input: { ...input, route: topicId ? { ...physical, topicId } : physical }, metadata };
+  }
+
   private topicMetadata(input: Inbound, topicId: string | null): Record<string, string> {
-    if (compareMessageIds(input.route.platform, input.messageId, input.messageId) === null) {
-      throw new Error("A DM topic boundary requires an authoritative platform message ID");
+    const eventId = this.eventOrderId(input);
+    if (eventId === null) {
+      const boundaries = this.commandBoundaries(input.route);
+      const existing = boundaries.find(boundary => boundary.invocationId === input.invocationId);
+      if (existing) {
+        if (existing.eventId !== input.id || existing.topicId !== topicId) throw new Error("Slack command boundary identity conflict");
+        return {}; // Reusing an invocation never resets the active selection.
+      }
+      // Slack has no slash clock. This is observed-admission order after the
+      // latest durable real owner message, not cross-connection chronology.
+      boundaries.push({ eventId: input.id, invocationId: input.invocationId!, anchorMessageId: this.slackAnchor(input),
+        insertionOrder: (boundaries[boundaries.length - 1]?.insertionOrder ?? 0) + 1, topicId });
+      const timeline = this.slackTimeline(input.route, undefined, boundaries);
+      const identity = physicalRouteKey(input.route);
+      return { [`dm:command-boundaries:${identity}`]: JSON.stringify(boundaries),
+        [`dm:active:${identity}`]: timeline[timeline.length - 1]!.topicId ?? "" };
+    }
+    if (compareMessageIds(input.route.platform, eventId, eventId) === null) {
+      throw new Error("A DM topic boundary requires an authoritative platform event ID");
     }
     const boundaries = this.topicBoundaries(input.route);
     for (const boundary of boundaries) {
-      const order = compareMessageIds(input.route.platform, boundary.messageId, input.messageId);
+      const order = compareMessageIds(input.route.platform, boundary.messageId, eventId);
       if (order === null) throw new Error("Cannot order the persisted DM topic timeline");
       if (order === 0 && boundary.topicId !== topicId) throw new Error("A message cannot establish conflicting DM topic boundaries");
     }
     if (!boundaries.some(boundary => boundary.eventId === input.id)) boundaries.push({
-      eventId: input.id, messageId: input.messageId, receivedAt: input.receivedAt, topicId,
+      eventId: input.id, messageId: eventId, receivedAt: input.receivedAt, topicId,
     });
     boundaries.sort((left, right) => {
       const order = compareMessageIds(input.route.platform, left.messageId, right.messageId);
@@ -922,9 +1067,11 @@ export class Superagent {
       return order;
     });
     const identity = physicalRouteKey(input.route);
+    const active = input.route.platform === "slack" ? this.slackTimeline(input.route, boundaries).at(-1)!.topicId
+      : boundaries[boundaries.length - 1]!.topicId;
     return {
       [`dm:boundaries:${identity}`]: JSON.stringify(boundaries),
-      [`dm:active:${identity}`]: boundaries[boundaries.length - 1]!.topicId ?? "",
+      [`dm:active:${identity}`]: active ?? "",
     };
   }
 
@@ -941,6 +1088,12 @@ export class Superagent {
       return true;
     }
     const command = input.text.trim();
+    if (command === "/resume" && this.store.getMeta(`user-source:${input.id}`) === "true" && !this.boundLane(input.route)) {
+      this.store.settle(input.id, "done", {
+        id: `${input.id}:control`, text: "이 대화에 연결된 레인이 없습니다. 재개할 레인의 대화에서 /resume을 사용해 주세요.",
+      });
+      return true;
+    }
     const isNew = /^\/new(?:\s|$)/.test(command);
     if (!isNew && command !== "/main") return false;
     if (isNew && this.isDm(input.route) && this.requestText(input)) return false;
@@ -959,6 +1112,7 @@ export class Superagent {
       routes.push(destination);
       this.store.setMeta("messenger:routes", JSON.stringify(routes));
     }
+    if (input.messageId === null) return;
     const cursor = `cursor:${physicalRouteKey(destination)}`;
     const previous = this.store.getMeta(cursor);
     const order = compareMessageIds(destination.platform, input.messageId, previous ?? input.messageId);
@@ -1003,10 +1157,11 @@ export class Superagent {
           if (history === null) continue;
           const ordered = history.map(input => {
             if (physicalRouteKey(input.route) !== physicalRouteKey(route)) throw new Error("Catchup crossed conversation routes");
+            if (input.messageId === null) throw new Error("Catchup returned an event without a real message ID");
             const order = compareMessageIds(route.platform, input.messageId, cursor);
             if (order === null) throw new Error("Catchup returned an unsupported platform message ID");
-            return { input, order };
-          }).filter(item => item.order > 0).sort((left, right) => compareMessageIds(route.platform, left.input.messageId, right.input.messageId)!);
+            return { input, messageId: input.messageId, order };
+          }).filter(item => item.order > 0).sort((left, right) => compareMessageIds(route.platform, left.messageId, right.messageId)!);
           for (const { input } of ordered) {
             await this.receive(input);
           }
@@ -1017,6 +1172,7 @@ export class Superagent {
   }
 
   async startLane(input: LaneStart): Promise<Lane> {
+    this.assertRestartOpen();
     if (typeof input.modelReason !== "string" || !input.modelReason.trim()) {
       throw new Error("lane_start requires a nonempty modelReason");
     }
@@ -1030,6 +1186,7 @@ export class Superagent {
       ? async () => ({ model: { ...bound.model! }, preset: bound.modelPreset!, snapshot: structuredClone(bound.modelPresetSnapshot!) })
       : this.adapters.resolvePreset;
     const resolved = await resolveLaneModelChoice(input, resolvePreset);
+    this.assertRestartOpen();
     const selected: ResolvedLaneStart = { ...input, workflow: selectedWorkflow ?? undefined, model: resolved.model, modelPreset: resolved.preset, modelPresetSnapshot: resolved.snapshot };
     const inFlight = this.operations.get(input.sourceId);
     if (inFlight) {
@@ -1052,6 +1209,7 @@ export class Superagent {
   }
 
   private async createLane(input: ResolvedLaneStart): Promise<Lane> {
+    this.assertRestartOpen();
     if (!isAbsolute(input.cwd)) throw new Error("cwd must be absolute");
     const cwd = realpathSync(input.cwd);
     if (!statSync(cwd).isDirectory()) throw new Error("cwd must be an existing directory");
@@ -1064,6 +1222,7 @@ export class Superagent {
       throw new Error("Workflow selection requires an original authorized user source, not internal data");
     }
     await this.requireAvailableModel(input.model);
+    this.assertRestartOpen();
     if (this.store.input(original.id)?.state === "cancelled") throw new Error("A cancelled main request cannot create new delegated work");
     let source = original;
     let handoff: Inbound | undefined;
@@ -1104,12 +1263,13 @@ export class Superagent {
           else {
             const parent = physicalRoute(requestedParent ?? original.route);
             const supported = this.messenger.canCreateThread ? await this.messenger.canCreateThread(parent) : !this.isDm(parent);
+            this.assertRestartOpen();
             if (this.store.input(original.id)?.state === "cancelled") throw new Error("A cancelled main request cannot create new delegated work");
             if (supported) {
               this.store.setMeta(destinationKey, "uncertain"); // Persist before the first remote effect; never replay ambiguity.
               this.store.setMeta(nativeKey, "true");
               const sourceMessageId = original.route.threadId === null && physicalRouteKey(parent) === physicalRouteKey(original.route)
-                ? original.messageId : undefined;
+                ? original.messageId ?? undefined : undefined;
               destination = await this.messenger.createThread(parent, input.title, sourceMessageId);
               this.store.setMeta(`handoff-route-result:${original.id}`, JSON.stringify(destination));
               if (!this.sameConversation(parent, destination) || !destination.threadId || destination.topicId) {
@@ -1140,6 +1300,7 @@ export class Superagent {
     const git = Bun.spawn(["git", "-C", cwd, "rev-parse", "--show-toplevel"], { stdout: "pipe", stderr: "ignore" });
     const gitRoot = (await new Response(git.stdout).text()).trim();
     const repoRoot = await git.exited === 0 ? realpathSync(gitRoot) : null;
+    this.assertRestartOpen();
     const id = `lane-${key(source.id)}`;
     const paths = hostPaths(this.config, id);
     const now = Date.now();
@@ -1191,6 +1352,7 @@ export class Superagent {
   }
 
   async messageLane(id: string, text: string, sourceId: string, choice?: WorkflowChoice): Promise<void> {
+    this.assertRestartOpen();
     const lane = this.requireLane(id);
     if (lane.workState !== "open") throw new Error("Lane is not open; explicitly resume it first");
     const original = this.store.input(sourceId);
@@ -1205,6 +1367,8 @@ export class Superagent {
     const handoffId = `handoff:${sourceId}:${id}`;
     this.store.receive({
       id: handoffId, route: lane.route, messageId: original.messageId,
+      ...(original.interactionId === undefined ? {} : { interactionId: original.interactionId }),
+      ...(original.invocationId === undefined ? {} : { invocationId: original.invocationId }),
       text, receivedAt: original.receivedAt,
       attachments: original.attachments,
     }, id, { [`handoff-source:${handoffId}`]: sourceId }, workflow);
@@ -1218,87 +1382,101 @@ export class Superagent {
   }
 
   async pause(id: string): Promise<void> {
-    const lane = this.requireLane(id);
-    if (lane.workState === "open" || lane.workState === "paused") this.store.updateLane(id, lane.generation, { workState: "paused" });
-    const live = this.live.get(id);
-    const failures: unknown[] = [];
-    if (live) {
-      for (const { input } of live.admitted.values()) {
-        this.activity(input, false);
-        this.store.settle(input.id, "cancelled");
-      }
-      live.admitted.clear();
-      live.input = undefined;
-      live.result = undefined;
-      live.running = false;
-      live.assistantOutcome = undefined;
-      live.text = "";
-    }
-    for (const approval of this.store.approvals(id)) {
-      if (this.store.resolveApproval(approval.id, approval.generation, "cancelled")) {
-        try {
-          if (live?.generation === approval.generation) live.connection.uiResponse(approval.requestId, { cancelled: true });
-          await this.messenger.dismissApproval(approval);
-        } catch (error) { failures.push(error); }
-      }
-    }
-    if (!live) { if (failures.length) throw new AggregateError(failures, "Approval dismissal incomplete; lane remains paused"); return; }
-    const state = await this.state(live);
-    if (state.goal?.enabled) {
-      try { successful(await live.connection.request({ type: "goal", op: "pause" }), "pause goal"); }
-      catch (error) { failures.push(error); }
-    }
-    try { await live.connection.client.abortAndRestoreQueue(); } catch (error) { failures.push(error); }
+    this.assertRestartOpen();
+    this.laneMutations++;
     try {
-      for (const child of await live.connection.client.getSubagents()) {
-        try { await live.connection.client.cancelSubagent(child.id); } catch (error) { failures.push(error); }
+      const lane = this.requireLane(id);
+      if (lane.workState === "open" || lane.workState === "paused") this.store.updateLane(id, lane.generation, { workState: "paused" });
+      const live = this.live.get(id);
+      const failures: unknown[] = [];
+      if (live) {
+        for (const { input } of live.admitted.values()) {
+          this.activity(input, false);
+          this.store.settle(input.id, "cancelled");
+        }
+        live.admitted.clear();
+        live.input = undefined;
+        live.result = undefined;
+        live.running = false;
+        live.assistantOutcome = undefined;
+        live.text = "";
       }
-    } catch (error) { failures.push(error); }
-    const paused = await this.state(live);
-    live.busy = !paused.isSettled;
-    this.store.updateLane(id, live.generation, { runtimeState: paused.isSettled ? "idle" : "running", lastActivityAt: Date.now() });
-    if (paused.isStreaming || !paused.isSettled || paused.hasOwnedRunningWork) throw new Error("Lane is paused durably, but native work has not fully stopped");
-    if (failures.length) throw new AggregateError(failures, "Pause cleanup incomplete; lane remains paused");
+      for (const approval of this.store.approvals(id)) {
+        if (this.store.resolveApproval(approval.id, approval.generation, "cancelled")) {
+          try {
+            if (live?.generation === approval.generation) live.connection.uiResponse(approval.requestId, { cancelled: true });
+            await this.messenger.dismissApproval(approval);
+          } catch (error) { failures.push(error); }
+        }
+      }
+      if (!live) { if (failures.length) throw new AggregateError(failures, "Approval dismissal incomplete; lane remains paused"); return; }
+      const state = await this.state(live);
+      if (state.goal?.enabled) {
+        try { successful(await live.connection.request({ type: "goal", op: "pause" }), "pause goal"); }
+        catch (error) { failures.push(error); }
+      }
+      try { await live.connection.client.abortAndRestoreQueue(); } catch (error) { failures.push(error); }
+      try {
+        for (const child of await live.connection.client.getSubagents()) {
+          try { await live.connection.client.cancelSubagent(child.id); } catch (error) { failures.push(error); }
+        }
+      } catch (error) { failures.push(error); }
+      const paused = await this.state(live);
+      live.busy = !paused.isSettled;
+      this.store.updateLane(id, live.generation, { runtimeState: paused.isSettled ? "idle" : "running", lastActivityAt: Date.now() });
+      if (paused.isStreaming || !paused.isSettled || paused.hasOwnedRunningWork) throw new Error("Lane is paused durably, but native work has not fully stopped");
+      if (failures.length) throw new AggregateError(failures, "Pause cleanup incomplete; lane remains paused");
+    } finally { this.laneMutations--; }
   }
 
   async resume(id: string): Promise<void> {
-    const lane = this.requireLane(id);
-    if (lane.workState === "cancelled") throw new Error("Cancelled work requires an explicit new/reopened request");
-    if (this.blocked.has(id)) {
-      if (this.residentHosts().size > this.config.maxHosts) throw new Error("Existing native ownership exceeds the host budget; reconcile it before resuming");
-      if (this.live.has(id) || lane.pid !== null || existsSync(lane.socketPath)) {
-        const live = await this.attach(id, lane.generation, lane.socketPath);
-        await this.reconcileUi(live);
+    this.assertRestartOpen();
+    this.laneMutations++;
+    try {
+      const lane = this.requireLane(id);
+      if (lane.workState === "cancelled") throw new Error("Cancelled work requires an explicit new/reopened request");
+      if (this.blocked.has(id)) {
+        if (this.residentHosts().size > this.config.maxHosts) throw new Error("Existing native ownership exceeds the host budget; reconcile it before resuming");
+        if (this.live.has(id) || lane.pid !== null || existsSync(lane.socketPath)) {
+          const live = await this.attach(id, lane.generation, lane.socketPath);
+          await this.reconcileUi(live);
+        }
       }
-    }
-    const live = this.live.get(id);
-    if (live) await this.checkLaneModel(live);
-    else if (this.modelIntent(id)) await this.requireAvailableModel(this.modelIntent(id)!.model);
-    else if (lane.model !== null) await this.requireAvailableModel(lane.model);
-    this.blocked.delete(id);
-    this.modelHolds.delete(id);
-    this.store.updateLane(id, lane.generation, { workState: "open" });
-    const intent = this.modelIntent(id);
-    if (!live && intent?.native === false) this.commitModelChange(this.requireLane(id), intent);
-    if (!live && this.modelIntent(id)) {
-      const restored = await this.ensureLane(this.requireLane(id));
-      if (!restored || this.modelIntent(id)) throw new Error(`Lane ${id} model-change intent remains held; inspect native state and retry its exact source`);
-    }
-    await this.kick();
+      const live = this.live.get(id);
+      if (live) await this.checkLaneModel(live);
+      else if (this.modelIntent(id)) await this.requireAvailableModel(this.modelIntent(id)!.model);
+      else if (lane.model !== null) await this.requireAvailableModel(lane.model);
+      this.assertRestartOpen();
+      this.blocked.delete(id);
+      this.modelHolds.delete(id);
+      this.store.updateLane(id, lane.generation, { workState: "open" });
+      const intent = this.modelIntent(id);
+      if (!live && intent?.native === false) this.commitModelChange(this.requireLane(id), intent);
+      if (!live && this.modelIntent(id)) {
+        const restored = await this.ensureLane(this.requireLane(id));
+        if (!restored || this.modelIntent(id)) throw new Error(`Lane ${id} model-change intent remains held; inspect native state and retry its exact source`);
+      }
+      await this.kick();
+    } finally { this.laneMutations--; }
   }
 
   async closeLane(id: string, outcome: "completed" | "cancelled", evidence: string): Promise<void> {
-    const lane = this.requireLane(id);
-    if (!evidence.trim()) throw new Error("Observed completion evidence or a cancellation reason is required");
-    if (outcome === "cancelled") await this.pause(id);
-    const live = this.live.get(id);
-    if (!live && (lane.pid !== null || existsSync(lane.socketPath))) throw new Error("Cannot close a lane whose native ownership/state is unresolved");
-    if (live && (!(await this.state(live)).isSettled || live.input)) throw new Error("Lane still owns unresolved native work");
-    if (this.store.approvals(id).length) throw new Error("Lane has unresolved approvals");
-    if (outcome === "cancelled") for (const input of this.store.inputs(id)) this.store.settle(input.id, "cancelled");
-    if (this.store.inputs(id).length) throw new Error("Resolve queued or uncertain lane inputs before completing work");
-    this.store.updateLane(id, lane.generation, { workState: outcome, result: evidence });
-    if (live) await this.release(live);
+    this.assertRestartOpen();
+    this.laneMutations++;
+    try {
+      const lane = this.requireLane(id);
+      if (!evidence.trim()) throw new Error("Observed completion evidence or a cancellation reason is required");
+      if (outcome === "cancelled") await this.pause(id);
+      const live = this.live.get(id);
+      if (!live && (lane.pid !== null || existsSync(lane.socketPath))) throw new Error("Cannot close a lane whose native ownership/state is unresolved");
+      if (live && (!(await this.state(live)).isSettled || live.input)) throw new Error("Lane still owns unresolved native work");
+      this.assertRestartOpen();
+      if (this.store.approvals(id).length) throw new Error("Lane has unresolved approvals");
+      if (outcome === "cancelled") for (const input of this.store.inputs(id)) this.store.settle(input.id, "cancelled");
+      if (this.store.inputs(id).length) throw new Error("Resolve queued or uncertain lane inputs before completing work");
+      this.store.updateLane(id, lane.generation, { workState: outcome, result: evidence });
+      if (live) await this.release(live);
+    } finally { this.laneMutations--; }
   }
 
   async inspect(id?: string) {
@@ -1322,6 +1500,7 @@ export class Superagent {
   }
 
   private async ensureLane(lane: Lane, explicitRetry?: ModelChangeIntent): Promise<Live | null> {
+    if (this.restartFence()) return null;
     if (this.modelChanges.has(lane.id) && !explicitRetry) return null;
     const existing = this.live.get(lane.id);
     if (existing) return existing.releasing ? null : existing;
@@ -1377,7 +1556,7 @@ export class Superagent {
       lane = this.store.nextGeneration(lane.id);
       await mkdir(dirname(lane.sessionFile), { recursive: true, mode: 0o700 });
       const beforeLaunch = this.requireLane(lane.id);
-      if (this.stopped || beforeLaunch.generation !== lane.generation || (beforeLaunch.workState !== "open" && !explicitRetry)) return null;
+      if (this.stopped || this.restartFence() || beforeLaunch.generation !== lane.generation || (beforeLaunch.workState !== "open" && !explicitRetry)) return null;
       const presetLaunch = explicitRetry?.preset && explicitRetry.snapshot
         ? { model: explicitRetry.model, name: explicitRetry.preset, snapshot: explicitRetry.snapshot }
         : !pendingModelChange && lane.model && lane.modelPreset && lane.modelPresetSnapshot
@@ -1428,6 +1607,7 @@ export class Superagent {
   }
 
   private async release(live: Live): Promise<boolean> {
+    if (this.restartFence()) return false;
     if (live.releasing) {
       const lane = this.requireLane(live.id);
       // RPC shutdown acceptance precedes native disposal. A disconnected client
@@ -1458,8 +1638,236 @@ export class Superagent {
   private headCommand(input: InputRecord): HeadCommand | null {
     if (input.target !== "main" || this.store.getMeta(`user-source:${input.id}`) !== "true"
       || this.store.getMeta(`handoff-source:${input.id}`)) return null;
-    const match = /^\/(help|status|stop|context|compact|usage|model|effort)(?:\s+([\s\S]*))?$/.exec(input.text.trim());
+    const match = /^\/(help|status|stop|restart|context|compact|usage|model|effort)(?:\s+([\s\S]*))?$/.exec(input.text.trim());
     return match ? { name: match[1] as HeadCommand["name"], argument: (match[2] ?? "").trim() } : null;
+  }
+
+  private restartFence(): HeadRestart | null {
+    const value = this.store.getMeta("head:restart-fence");
+    if (!value) return null;
+    const restart = JSON.parse(value) as HeadRestart;
+    if (!restart.inputId || !restart.requestId || !restart.ackOutputId || !Number.isSafeInteger(restart.ownerPid)
+      || restart.ownerPid <= 0 || !restart.sessionId || restart.sessionFile !== hostPaths(this.config, "main").sessionFile) {
+      throw new Error("Invalid durable service restart fence; reconcile the original request before dispatching work");
+    }
+    return restart;
+  }
+
+  private saveRestart(restart: HeadRestart, hold = true): void {
+    this.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(restart));
+    const fence = this.restartFence();
+    if (hold && (!fence || fence.requestId === restart.requestId)) this.store.setMeta("head:restart-fence", JSON.stringify(restart));
+    else if (!hold && fence?.requestId === restart.requestId) this.store.setMeta("head:restart-fence", "");
+  }
+
+  private assertRestartOpen(): void {
+    if (this.restartFence()) throw new Error("Gateway AND HEAD restart is held or pending; lane and native mutations are fenced");
+  }
+
+  private restartResult(restart: HeadRestart, text: string, uncertain = false): void {
+    const input = this.store.input(restart.inputId);
+    if (!input || this.headCommand(input)?.name !== "restart" || this.store.getMeta(`user-source:${input.id}`) !== "true") {
+      throw new Error("Restart result has no original authorized owner input");
+    }
+    const id = `${input.id}:restart-${uncertain ? "uncertain" : "result"}`;
+    // The first durable result owns this ID, even after reconnect/startup replay.
+    if (!this.store.output(id)) this.store.queueOutput({ id, sourceId: input.id, route: input.route, text });
+  }
+
+  private refuseRestart(restart: HeadRestart, text: string): void {
+    this.store.settle(restart.inputId, "cancelled");
+    this.restartResult(restart, `Gateway AND HEAD restart refused. ${text} No process was stopped. /stop head is a separate, deliberate interruption, not part of /restart.`);
+    this.saveRestart({ ...restart, state: "refused" }, false);
+  }
+
+  private restartControllerBusy(inputId: string): boolean {
+    return this.initializationHoldsHead() || !!this.bootstrapActive || this.headStopping > 0 || !!this.headCompaction
+      || !!this.store.getMeta("head:stop-boundary") || this.connecting.size > 0 || this.operations.size > 0
+      || this.laneMutations > 0 || this.modelChanges.size > 0 || this.blocked.size > 0 || this.modelHolds.size > 0 || this.callbacks.size > 0
+      || this.store.approvals().length > 0 || this.store.inputs().some(input => input.id !== inputId)
+      || this.store.lanes().some(lane => !!this.modelIntent(lane.id) || !!this.modelIntent(lane.id, "apply"))
+      || [...this.live.values()].some(live => !!live.input || live.admitted.size > 0 || live.running || live.busy
+        || live.preparing > 0 || !!live.releasing || !!live.finishing);
+  }
+
+  private admitRestart(input: InputRecord, command: HeadCommand): boolean {
+    if (this.store.getMeta(`head:restart:${input.id}`)) return false;
+    if (command.argument || !this.adapters.requestRestart || this.restartFence()) {
+      this.controlReply(input, `Gateway AND HEAD restart refused. ${command.argument ? "Use /restart with no arguments."
+        : !this.adapters.requestRestart ? "The managed Gateway restart transport is unavailable." : "An earlier restart is still held; it was not retried."} No process was stopped. /stop head is a separate, deliberate interruption.`, "cancelled");
+      return false;
+    }
+    const live = this.live.get("main");
+    if (!live || !this.current(live)) {
+      this.controlReply(input, "Gateway AND HEAD restart refused: native HEAD ownership is unavailable. No process was stopped. /stop head is a separate, deliberate interruption.", "cancelled");
+      return false;
+    }
+    const restart: HeadRestart = { requestId: crypto.randomUUID(), inputId: input.id,
+      ackOutputId: `${input.id}:restart-ack`, ownerPid: process.pid, sessionId: live.sessionId,
+      sessionFile: hostPaths(this.config, "main").sessionFile, state: "checking" };
+    // Reserve the entire service synchronously, before native reads, deliveries,
+    // lane dispatch or a second owner command can cross an asynchronous boundary.
+    this.saveRestart(restart);
+    if (this.restartControllerBusy(input.id)) {
+      this.refuseRestart(restart, "Native/controller work, approvals or durable unresolved inputs are still present.");
+      return false;
+    }
+    this.restartActive = input.id;
+    return true;
+  }
+
+  private async restartIdle(restart: HeadRestart): Promise<boolean> {
+    if (this.restartFence()?.requestId !== restart.requestId || this.restartControllerBusy(restart.inputId)) return false;
+    const residents = this.residentHosts();
+    for (const id of residents) {
+      const live = this.live.get(id);
+      if (!live || !this.current(live)) return false;
+      const state = await this.state(live);
+      if (!state.isSettled || state.isStreaming || state.isCompacting !== false || state.queuedMessageCount !== 0
+        || state.hasPendingAsyncWork !== false || state.hasOwnedRunningWork !== false
+        || !Array.isArray(state.pendingUiRequests) || state.pendingUiRequests.length
+        || state.goal !== null && state.goal?.enabled !== false
+        || !Number.isSafeInteger(state.hostPid) || state.hostPid! <= 0
+        || id !== "main" && state.hostPid !== this.requireLane(id).pid
+        || id === "main" && (state.hostPid !== restart.ownerPid || state.sessionId !== restart.sessionId
+          || state.sessionFile !== restart.sessionFile)) return false;
+    }
+    return this.restartFence()?.requestId === restart.requestId && !this.restartControllerBusy(restart.inputId)
+      && isDeepStrictEqual([...residents].sort(), [...this.residentHosts()].sort());
+  }
+
+  private matchingRestart(restart: HeadRestart, receipt: GatewayRestartRecord): boolean {
+    return receipt.requestId === restart.requestId && receipt.inputId === restart.inputId
+      && receipt.ackOutputId === restart.ackOutputId && receipt.headPid === restart.ownerPid
+      && receipt.sessionId === restart.sessionId && receipt.sessionFile === restart.sessionFile;
+  }
+
+  private async runHeadRestart(input: InputRecord): Promise<void> {
+    if (this.restartActive !== input.id) return; // Recovery and duplicate intake never replay a handoff.
+    let restart = this.restartFence();
+    if (!restart || restart.inputId !== input.id) return;
+    let handedOff = false;
+    try {
+      if (!await this.restartIdle(restart)) {
+        this.refuseRestart(restart, "HEAD or a resident lane is busy, asynchronous, approval-held, or cannot be verified idle.");
+        return;
+      }
+      restart = { ...restart, state: "acknowledging" };
+      this.saveRestart(restart);
+      this.store.settle(input.id, "done", { id: restart.ackOutputId,
+        text: "Preparing to replace Gateway AND HEAD and restore the same native session, transcript and lane board. This is an ACK, not restart completion; new work is held until replacement readiness is verified." });
+      // Joining an already-finishing drain is not proof this newly queued ACK
+      // was included. Only a durable sent receipt authorizes the Gateway RPC.
+      do { await this.flushOutputs(); }
+      while (!this.stopped && this.store.output(restart.ackOutputId)?.state === "pending");
+      const ack = this.store.output(restart.ackOutputId);
+      if (ack?.state !== "sent") {
+        if (ack?.state === "failed") this.refuseRestart(restart, "The required ACK was rejected; no restart handoff was attempted.");
+        else {
+          this.saveRestart({ ...restart, state: "uncertain" });
+          this.restartResult(restart, "Gateway AND HEAD were not handed off for restart because ACK delivery is unconfirmed. The service remains held; neither the ACK nor the restart will be blindly retried.", true);
+        }
+        return;
+      }
+      if (this.stopped) return;
+      if (!await this.restartIdle(restart)) {
+        this.refuseRestart(restart, "Native/controller ownership changed or new unresolved work arrived before handoff.");
+        return;
+      }
+      restart = { ...restart, state: "handoff" };
+      this.saveRestart(restart);
+      handedOff = true;
+      const receipt = await this.adapters.requestRestart!({ requestId: restart.requestId, inputId: restart.inputId, ackOutputId: restart.ackOutputId });
+      if (!this.matchingRestart(restart, receipt)) throw new Error("Restart lifecycle receipt identity mismatch");
+      // A notice can arrive before the HTTP response; never overwrite its
+      // terminal refusal or uncertainty with a late acceptance response.
+      const current = this.restartFence();
+      if (current?.requestId !== restart.requestId || current.state === "uncertain") return;
+      if (receipt.state === "refused") this.refuseRestart(restart, "Gateway refused the idle/ownership check; no restart was performed.");
+      else if (["accepted", "head-stopped", "started"].includes(receipt.state)) this.saveRestart({ ...restart, state: "accepted" });
+      else {
+        this.saveRestart({ ...restart, state: "uncertain" });
+        this.restartResult(restart, "Gateway AND HEAD restart outcome is unconfirmed. The service remains held; acceptance is not completion and no restart will be blindly retried.", true);
+      }
+    } catch (error) {
+      if (handedOff) {
+        if (this.restartFence()?.requestId === restart.requestId) {
+          const persisted = this.store.getMeta(`gateway:restart:${restart.requestId}`);
+          if (error instanceof DeliveryError && error.certainty === "rejected" && !persisted) {
+            this.refuseRestart(restart, "Gateway definitively rejected the request before lifecycle acceptance; no restart handoff was accepted.");
+          } else {
+            this.saveRestart({ ...restart, state: "uncertain" });
+            this.restartResult(restart, "Gateway AND HEAD restart acknowledgement was lost or could not be verified. The service remains held; the request was not repeated and completion is not claimed.", true);
+          }
+        }
+      } else this.refuseRestart(restart, "Native idle state or required ACK delivery could not be verified; no restart handoff was attempted.");
+    } finally {
+      if (this.restartActive === input.id) this.restartActive = undefined;
+    }
+  }
+
+  private async restartNotice(notice: GatewayRestartNotice): Promise<void> {
+    const restart = this.restartFence();
+    if (!restart || restart.requestId !== notice.requestId) return;
+    const saved = this.store.getMeta(`gateway:restart:${restart.requestId}`);
+    const receipt = saved ? JSON.parse(saved) as GatewayRestartRecord : null;
+    if (!receipt || !this.matchingRestart(restart, receipt) || receipt.state !== notice.outcome) return;
+    if (notice.outcome === "refused") {
+      const live = this.live.get("main");
+      if (!live) return;
+      const actual = await this.state(live);
+      const owner = JSON.parse(this.store.getMeta("gateway:head") ?? "null") as { pid: number; sessionId: string; sessionFile: string } | null;
+      const ownsOriginal = actual.hostPid === restart.ownerPid;
+      const ownsRestored = !this.pidAlive(restart.ownerPid) && actual.hostPid === owner?.pid
+        && owner?.sessionId === restart.sessionId && owner.sessionFile === restart.sessionFile;
+      if ((!ownsOriginal && !ownsRestored) || actual.sessionId !== restart.sessionId || actual.sessionFile !== restart.sessionFile) return;
+      this.refuseRestart(restart, "Gateway refused the idle/ownership check; no restart was performed.");
+    } else {
+      this.saveRestart({ ...restart, state: "uncertain" });
+      this.restartResult(restart, "Gateway AND HEAD restart outcome is uncertain. The service remains held, no completion is claimed and no shutdown/restart will be blindly retried.", true);
+    }
+    await this.flushOutputs();
+    void this.kick().catch(this.report);
+  }
+
+  private async reconcileRestart(): Promise<void> {
+    if (this.restartReconciliation) return this.restartReconciliation;
+    this.restartReconciliation = (async () => {
+      const restart = this.restartFence();
+      if (!restart || this.restartActive === restart.inputId) return;
+      const saved = this.store.getMeta(`head:restart:${restart.inputId}`);
+      const original = saved ? JSON.parse(saved) as HeadRestart : null;
+      if (!original || !isDeepStrictEqual(original, restart)) throw new Error("Restart fence does not match its original durable request");
+      const gateway = this.store.getMeta(`gateway:restart:${restart.requestId}`);
+      const receipt = gateway ? JSON.parse(gateway) as GatewayRestartRecord : null;
+      if (!receipt || !this.matchingRestart(restart, receipt)) return;
+      if (receipt.state === "refused") {
+        await this.restartNotice({ requestId: restart.requestId, outcome: "refused", reason: "Gateway refused restart" });
+        return;
+      }
+      const live = this.live.get("main");
+      if (!live || this.pidAlive(restart.ownerPid)) return;
+      const actual = await this.state(live);
+      const owner = JSON.parse(this.store.getMeta("gateway:head") ?? "null") as { pid: number; sessionId: string; sessionFile: string } | null;
+      const socket = JSON.parse(this.store.getMeta("gateway:socket") ?? "null") as { pid: number } | null;
+      const replacement = actual.hostPid === process.pid && actual.hostPid !== restart.ownerPid && actual.hostPid === receipt.replacementPid
+        && actual.hostPid === owner?.pid && actual.sessionId === restart.sessionId && actual.sessionFile === restart.sessionFile
+        && owner?.sessionId === restart.sessionId && owner.sessionFile === restart.sessionFile
+        && Number.isSafeInteger(receipt.successorPid) && receipt.successorPid! > 0
+        && receipt.successorPid !== receipt.gatewayPid && socket?.pid === receipt.successorPid
+        && !this.pidAlive(receipt.gatewayPid);
+      if (!replacement) return;
+      if (receipt.state === "started" && this.initialization?.state === "complete" && this.initialization.sessionId === actual.sessionId) {
+        this.store.settle(restart.inputId, "done");
+        this.restartResult(restart, "Gateway AND HEAD were replaced and the replacement HEAD is initialized and ready. The same native session, transcript, original conversation route and lane board were restored; no model turn was used for /restart.");
+        this.saveRestart({ ...restart, state: "ready" }, false);
+      } else if (receipt.state === "failed" || receipt.state === "started" && this.initialization
+        && !["checking", "running", "complete"].includes(this.initialization.state)) {
+        this.saveRestart({ ...restart, state: "failed" });
+        this.restartResult(restart, "Gateway AND HEAD replacement readiness failed. The original session and request remain recorded; the service-wide restart fence stays held. Inspect native initialization/ownership; no restart or model turn was automatically replayed.");
+      }
+    })().finally(() => { this.restartReconciliation = undefined; });
+    await this.restartReconciliation;
   }
 
   private headPresetCommand(command: HeadCommand): { name?: string; global: boolean; error?: string } | undefined {
@@ -1515,6 +1923,7 @@ export class Superagent {
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
         "/stop [head|lane-id] — head aborts current/admitted ordinary HEAD work and earlier pending changes, not historical uncertain effects or unrelated lanes; an actual managed lane-id pauses that lane. Bare /stop pauses this conversation's bound lane, otherwise HEAD.",
+        "/restart — replace BOTH Gateway AND HEAD only when HEAD, every resident lane, native async work/services/goals/approvals and durable inputs are idle and unambiguous; restore the same native session/transcript/board. Busy restart stops no process. /stop head is a separate deliberate interruption. ACK/acceptance is not completion; no forced kill or automatic retry.",
         "/resume — resume this conversation's bound lane only (no head resume mode).",
         "/new [request]; /main — logical DM topic selection; threads/forum topics already supply independent topics. Topic selection does not create a separate HEAD session.",
       ].join("\n")); return true;
@@ -1694,6 +2103,14 @@ export class Superagent {
   }
 
   private async headControl(input: InputRecord, command: HeadCommand, earlierMain: boolean): Promise<void> {
+    if (command.name === "restart") {
+      if (this.restartActive === input.id || this.admitRestart(input, command)) await this.runHeadRestart(input);
+      return;
+    }
+    if (!this.readOnlyHeadCommand(command) && this.restartFence()) {
+      this.controlReply(input, "Gateway AND HEAD restart is pending or held; no native/lane mutation was performed.", "cancelled");
+      return;
+    }
     const presetCommand = this.headPresetCommand(command);
     const reply = (text: string, outcome: "done" | "cancelled" | "uncertain" = "done") => {
       const scope = presetCommand?.global ? "HEAD preset command (existing lanes unchanged)." : "HEAD session only (not lanes or global defaults).";
@@ -1722,7 +2139,7 @@ export class Superagent {
         } else reply(this.headStatus(state));
         return;
       }
-      const busy = (current: RuntimeState) => earlierMain || this.initializationHoldsHead() || this.headStopping > 0 || !!this.headCompaction || this.blocked.has("main") || !!live.input || live.busy
+      const busy = (current: RuntimeState) => !!this.restartFence() || earlierMain || this.initializationHoldsHead() || this.headStopping > 0 || !!this.headCompaction || this.blocked.has("main") || !!live.input || live.busy
         || !current.isSettled || current.isStreaming || current.hasPendingAsyncWork || current.hasOwnedRunningWork
         || !!current.pendingUiRequests?.length || !!this.store.approvals("main").length || current.goal?.enabled || current.isCompacting
         || !!current.queuedMessageCount;
@@ -1850,6 +2267,7 @@ export class Superagent {
 
   async kick(): Promise<void> {
     if (!this.ready || this.stopped) return;
+    await this.reconcileRestart();
     await this.priorityTail.catch(this.report);
     await this.headStopTail.catch(this.report);
     if (!this.ready || this.stopped) return;
@@ -1875,6 +2293,7 @@ export class Superagent {
     try {
       do {
         this.repeat = false;
+        if (this.restartFence()) return;
         for (const live of this.live.values()) if (live.releasing) await this.release(live);
         for (const input of this.store.inputs()) {
           if (input.state !== "pending") continue;
@@ -2013,7 +2432,7 @@ export class Superagent {
 
   private canSteer(live: Live, input: InputRecord): boolean {
     const owner = live.input;
-    if (!owner || !live.running || live.releasing || !this.current(live)
+    if (this.restartFence() || !owner || !live.running || live.releasing || !this.current(live)
       || input.state !== "pending" || input.target !== live.id || owner.workflow || input.workflow
       || routeKey(owner.route) !== routeKey(input.route) || this.headCommand(input)
       || input.text.trimStart().startsWith("/") || this.store.approvals(live.id).length
@@ -2040,6 +2459,7 @@ export class Superagent {
   }
 
   private async dispatch(live: Live, input: InputRecord, steering = false): Promise<void> {
+    if (this.restartFence()) return;
     const owner = live.input;
     if (steering && !this.canSteer(live, input)) return;
     live.preparing++;
@@ -2089,6 +2509,7 @@ export class Superagent {
       return;
     }
     const actual = modelState ?? await this.state(live);
+    if (this.restartFence()) return;
     if (!this.current(live) || live.input !== owner || this.store.input(input.id)?.state !== "pending") return;
     if (this.modelChanges.has(live.id) || live.id === "main" && (this.headStopping > 0 || this.headCompaction)
       || live.id !== "main" && this.requireLane(live.id).workState !== "open") return;
@@ -2369,6 +2790,7 @@ export class Superagent {
 
   private async answer(id: string, response: DialogResponse, route: Route): Promise<void> {
     if (this.stopped) throw new Error("Controller is stopped");
+    if (this.restartFence()) throw new DeliveryError("Gateway AND HEAD restart is held; no approval response was submitted", "rejected");
     try { this.authorized(route); }
     catch (error) { throw new DeliveryError("Unauthorized approval route", "rejected", undefined, { cause: error }); }
     const approval = this.store.approval(id);

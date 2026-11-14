@@ -70,6 +70,97 @@ function storedOutput(path: string, id: string): { state: string; remote_id: str
 }
 
 describe("durable coordination store", () => {
+  test("Slack invocation origins survive handoffs, reports, and reopen without a source timestamp", () => {
+    const { store, path } = fixture();
+    const destination = route({ platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DOWNER", threadId: null, topicId: "topic-slash" });
+    const managed = admitLane(store, "slack-lane", destination);
+    const original: Inbound = { ...inbound("slack-command:stable-fingerprint", destination), messageId: null,
+      invocationId: "a".repeat(64), text: "/new inspect this repository" };
+    expect(store.receive(original, "main", { [`user-source:${original.id}`]: "true" })).toBe(true);
+    const handoff = { ...original, id: `handoff:${original.id}:${managed.id}` };
+    store.receive(handoff, managed.id, { [`handoff-source:${handoff.id}`]: original.id });
+    store.submit(handoff.id, "native-slash-request", managed.generation);
+    store.settle(handoff.id, "done", { id: "slack-result", text: "Verified work result" });
+    const reportId = `report:${handoff.id}`;
+    for (const id of [original.id, handoff.id, reportId]) expect(store.input(id)).toMatchObject({ messageId: null, invocationId: original.invocationId });
+    store.close();
+    const reopened = open(path);
+    expect(reopened.receive({ ...original, receivedAt: 999 }, "main")).toBe(false);
+    expect(reopened.input(original.id)?.receivedAt).toBe(original.receivedAt);
+    for (const changed of [{ ...original, text: "/main" }, { ...original, invocationId: "b".repeat(64) },
+      { ...original, route: { ...destination, topicId: "other-topic" } }]) {
+      expect(() => reopened.receive(changed, "main")).toThrow("Inbound identity conflict");
+    }
+    expect(() => reopened.receive({ ...original, messageId: "1750000000.000001" }, "main")).toThrow("requires a real message ID");
+    expect(() => reopened.receive({ ...original, invocationId: "opaque-trigger-capability" }, "main")).toThrow("requires a real message ID");
+    expect(reopened.admittedMessages(destination)).toEqual([]);
+    for (const id of [original.id, handoff.id, reportId]) expect(reopened.input(id)).toMatchObject({ messageId: null, invocationId: original.invocationId });
+  });
+
+  test("durable actual user messages include settled first revisions and exclude unrelated routes and synthetic inputs", () => {
+    const { store } = fixture();
+    const physical = route({ platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DOWNER", threadId: null });
+    const first = { ...inbound("first-actual", { ...physical, topicId: "first-topic" }), messageId: "1750000000.000001" };
+    const edit = { ...first, id: "edit-actual", route: physical, text: "edited" };
+    for (const input of [first, edit]) {
+      store.receive(input, "main", { [`user-source:${input.id}`]: "true" });
+      store.settle(input.id, "done");
+    }
+    store.receive({ ...first, id: "internal-handoff" }, "main");
+    for (const [index, patch] of [{ accountId: "OTHER:UBOT" }, { authorityId: "UOTHER" }, { channelId: "DOTHER" }, { threadId: "1750000000.000001" }, { guildId: "TTEAM" }].entries()) {
+      const input = { ...first, id: `unrelated-${index}`, route: { ...physical, ...patch } };
+      store.receive(input, "main", { [`user-source:${input.id}`]: "true" });
+    }
+    expect(store.admittedMessages(physical).map(input => input.id)).toEqual([first.id, edit.id]);
+    expect(store.admittedMessages({ ...physical, topicId: "another-logical-topic" }).map(input => input.id)).toEqual([first.id, edit.id]);
+  });
+
+  test("interaction origin survives handoffs, reports and reopen and participates in dedupe identity", () => {
+    const { store, path } = fixture();
+    const managed = admitLane(store);
+    const original: Inbound = { ...inbound("interaction:1750000000000000001"), messageId: null,
+      interactionId: "1750000000000000001", text: "/new inspect this repository" };
+    expect(store.receive(original, "main", { [`user-source:${original.id}`]: "true" })).toBe(true);
+    const handoff = { ...original, id: `handoff:${original.id}:${managed.id}`, route: managed.route };
+    store.receive(handoff, managed.id, { [`handoff-source:${handoff.id}`]: original.id });
+    store.submit(handoff.id, "native-interaction-request", managed.generation);
+    store.settle(handoff.id, "done", { id: "lane-result", text: "Inspected repository" });
+    const reportId = `report:${handoff.id}`;
+    for (const id of [original.id, handoff.id, reportId]) {
+      expect(store.input(id)).toMatchObject({ messageId: null, interactionId: original.interactionId });
+    }
+    store.close();
+    const reopened = open(path);
+    expect(reopened.receive(original, "main")).toBe(false);
+    for (const changed of [
+      { ...original, interactionId: "1750000000000000002" },
+      { ...original, messageId: "1750000000000000001", interactionId: undefined },
+      { ...original, messageId: "1750000000000000001" },
+    ]) expect(() => reopened.receive(changed, "main")).toThrow("Inbound identity conflict");
+    for (const id of [original.id, handoff.id, reportId]) {
+      expect(reopened.input(id)).toMatchObject({ messageId: null, interactionId: original.interactionId });
+    }
+    const legacy = inbound("legacy-message-without-interaction");
+    expect(reopened.receive(legacy, "main")).toBe(true);
+    expect(reopened.input(legacy.id)?.interactionId).toBeUndefined();
+    expect(() => reopened.receive({ ...legacy, interactionId: "1750000000000000003" }, "main")).toThrow("Inbound identity conflict");
+  });
+
+  test("an event without a real message or valid Discord interaction identity is not admitted", () => {
+    const { store } = fixture();
+    for (const identity of [
+      { messageId: null },
+      { messageId: null, interactionId: "synthetic-command-id" },
+      { messageId: null, interactionId: "" },
+      { messageId: undefined },
+    ]) {
+      expect(() => store.receive({ ...inbound("invalid-origin"), ...identity } as Inbound, "main")).toThrow("requires a real message ID");
+      expect(store.input("invalid-origin")).toBeNull();
+    }
+    expect(() => store.receive({ ...inbound("foreign-interaction", route({ platform: "slack" })),
+      messageId: null, interactionId: "1750000000000000001" }, "main")).toThrow("requires a real message ID");
+  });
+
   test("workflow choices commit atomically with original source and exact immutable handoff", () => {
     const { store, path } = fixture();
     const managed = admitLane(store);

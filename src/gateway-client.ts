@@ -1,13 +1,17 @@
 import type { IncomingMessage } from "node:http";
 import { Readable, Transform } from "node:stream";
 import type { Config } from "./config";
-import type { Approval, Attachment, Inbound, MessageActivity, Messenger, OutputRecord, Route } from "./contracts";
+import type { Approval, Attachment, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Route } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { gatewayCall, gatewayPaths, gatewayRequest, MAX_GATEWAY_ATTACHMENT, MAX_GATEWAY_FRAME, readGatewayJson, type GatewayResult } from "./gateway-protocol";
 import type { GatewayReceipt, QueuedEvent } from "./gateway-store";
 
+export interface GatewayHeadMessenger extends Messenger {
+  requestRestart(request: GatewayRestartRequest): Promise<GatewayRestartRecord>;
+}
+
 /** Transport-only head adapter. Detaching never logs out the actual accounts. */
-class GatewayMessenger implements Messenger {
+class GatewayMessenger implements GatewayHeadMessenger {
   private readonly clientId = crypto.randomUUID();
   private readonly socketPath: string;
   private readonly token: string;
@@ -102,6 +106,11 @@ class GatewayMessenger implements Messenger {
               if (reconciled === "retry") await this.handlers.answer(event.approvalId, event.response, event.route);
               else outcome = reconciled;
             }
+            else if (event.kind === "restart") {
+              if (!this.handlers.restart) throw new Error("Gateway restart outcome handler is unavailable");
+              const { kind: _, ...notice } = event;
+              await this.handlers.restart(notice);
+            }
             else await this.handlers.reconnect?.();
           } catch (error) {
             outcome = error instanceof DeliveryError && error.certainty === "rejected" ? "rejected" : "unresolved";
@@ -119,8 +128,9 @@ class GatewayMessenger implements Messenger {
   private effect<T>(operation: string, args: unknown[]): Promise<T> {
     return this.call<T>("/effect", { id: crypto.randomUUID(), operation, args });
   }
+  requestRestart(request: GatewayRestartRequest): Promise<GatewayRestartRecord> { return this.call("/restart", request); }
   send(output: OutputRecord): Promise<string> { return this.effect("send", [output]); }
-  setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+  setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     return this.effect("setActivity", [{ route: message.route, messageId: message.messageId }, activity]);
   }
   showApproval(approval: Approval): Promise<string> { return this.effect("showApproval", [approval]); }
@@ -201,4 +211,4 @@ class GatewayMessenger implements Messenger {
   }
 }
 
-export function createGatewayMessenger(config: Config): Messenger { return new GatewayMessenger(config); }
+export function createGatewayMessenger(config: Config): GatewayHeadMessenger { return new GatewayMessenger(config); }

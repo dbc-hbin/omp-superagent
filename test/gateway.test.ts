@@ -1,19 +1,21 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
+import { request as httpRequest, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { Config } from "../src/config";
-import type { Approval, Attachment, Inbound, MessageActivity, Messenger, OutputRecord, Route } from "../src/contracts";
+import type { Approval, Attachment, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Route } from "../src/contracts";
 import { DeliveryError } from "../src/delivery";
 import { createGatewayMessenger } from "../src/gateway-client";
-import { gatewayCall, gatewayPaths, gatewayRequest } from "../src/gateway-protocol";
+import { gatewayCall, gatewayPaths, gatewayRequest, readGatewayJson, type GatewayResult } from "../src/gateway-protocol";
 import { GatewayServer, type GatewayStatus } from "../src/gateway-server";
 import { GatewayStore } from "../src/gateway-store";
+import { Store } from "../src/store";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 const route: Route = { platform: "slack", accountId: "B1", authorityId: "T1", guildId: null, channelId: "D1", threadId: null };
-function input(id: string): Inbound {
+function input(id: string): Inbound & MessageReference {
   return { id, route, messageId: id, text: `message ${id}`, receivedAt: 123, attachments: [] };
 }
 async function eventually(predicate: () => boolean): Promise<void> {
@@ -27,7 +29,7 @@ async function eventually(predicate: () => boolean): Promise<void> {
 class FakeMessenger implements Messenger {
   handlers?: Parameters<Messenger["start"]>[0];
   readonly sends: OutputRecord[] = [];
-  readonly activities: Array<{ message: Pick<Inbound, "route" | "messageId">; activity: MessageActivity }> = [];
+  readonly activities: Array<{ message: MessageReference; activity: MessageActivity }> = [];
   beforeActivity?: () => Promise<void> | void;
   readonly approvals = new Set<string>();
   stopped = false;
@@ -39,7 +41,7 @@ class FakeMessenger implements Messenger {
     if (this.sendFailure) throw this.sendFailure;
     return "remote-message";
   }
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity) {
+  async setActivity(message: MessageReference, activity: MessageActivity) {
     await this.beforeActivity?.();
     this.activities.push({ message: structuredClone(message), activity });
   }
@@ -62,7 +64,11 @@ class FakeMessenger implements Messenger {
   }
 }
 
-async function fixture() {
+async function fixture(options: {
+  restart?(request: GatewayRestartRequest, store: GatewayStore): Promise<GatewayRestartRecord>;
+  runRestart?(requestId: string): void;
+  authorizeHead?(pid: number): Promise<void>;
+} = {}) {
   const root = await mkdtemp(join(await realpath("/tmp"), "ogw-"));
   await mkdir(join(root, "run"), { mode: 0o700 });
   cleanups.push(() => rm(root, { recursive: true, force: true }));
@@ -73,11 +79,13 @@ async function fixture() {
   const messenger = new FakeMessenger();
   let stopRequests = 0;
   const server = new GatewayServer({ socketPath: gatewayPaths(config).socketPath, store, messenger,
-    authorizeHead: async pid => { if (pid !== process.pid) throw new DeliveryError("Foreign native owner", "rejected"); },
+    authorizeHead: options.authorizeHead ?? (async pid => { if (pid !== process.pid) throw new DeliveryError("Foreign native owner", "rejected"); }),
     status: (): GatewayStatus => ({ gateway: { pid: process.pid, ready: true, admissionReady: server.ready,
       pendingEvents: store.pending(), stopping: false }, head: { pid: process.pid, ready: server.headReady,
       connected: server.connected, socketPath: join(root, "run", "main.sock"), error: null } }),
     stop: async () => { stopRequests++; }, onError: () => {},
+    ...(options.restart ? { restart: (request: GatewayRestartRequest) => options.restart!(request, store) } : {}),
+    ...(options.runRestart ? { runRestart: options.runRestart } : {}),
   });
   await server.listen();
   cleanups.push(() => server.close());
@@ -85,7 +93,7 @@ async function fixture() {
     message: async message => { server.admitMessage(message); },
     answer: async (approvalId, response, source) => { store.admit({ kind: "answer", approvalId, response, route: source }); server.deliver(); },
   });
-  function client(): Messenger {
+  function client() {
     const saved = process.env.OMP_SUPERAGENT_GATEWAY_TOKEN;
     process.env.OMP_SUPERAGENT_GATEWAY_TOKEN = store.token();
     const result = createGatewayMessenger(config);
@@ -95,6 +103,19 @@ async function fixture() {
     return result;
   }
   return { config, store, server, messenger, client, get stopRequests() { return stopRequests; } };
+}
+
+function restartSource(f: { config: Config }, source: Inbound = { ...input("restart-source"), text: " \n/restart\t" }) {
+  const headStore = new Store(join(f.config.stateDir, "coordination.sqlite"));
+  cleanups.push(async () => headStore.close());
+  const request: GatewayRestartRequest = { requestId: crypto.randomUUID(), inputId: source.id, ackOutputId: `${source.id}:restart:ack` };
+  headStore.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  headStore.settle(source.id, "done", { id: request.ackOutputId, text: "Restart accepted; waiting for owned processes." });
+  headStore.claimOutput(request.ackOutputId);
+  headStore.finishOutput(request.ackOutputId, "sent", "remote-restart-ack");
+  const record: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
+    sessionId: "existing-session", sessionFile: join(f.config.stateDir, "existing-session.jsonl"), state: "accepted" };
+  return { headStore, request, record, source };
 }
 
 test("receipt reactions follow durable admission without delaying ACK or requiring a resident head", async () => {
@@ -129,7 +150,7 @@ test("reaction failures never reject durable input or a later answer and activit
   await client.start({
     message: async message => {
       try {
-        await client.setActivity?.(message, "thinking");
+        if (message.messageId !== null) await client.setActivity?.({ route: message.route, messageId: message.messageId }, "thinking");
       } catch { /* Cosmetic API failure only. */ }
       await client.send({ id: "reply", sourceId: message.id, route: message.route, text: "answer",
         state: "sending", remoteId: null, error: null });
@@ -143,6 +164,30 @@ test("reaction failures never reject durable input or a later answer and activit
   f.messenger.beforeActivity = undefined;
   await client.setActivity?.(input("reaction-denied"), "idle");
   expect(f.messenger.activities).toEqual([{ message: { route, messageId: "reaction-denied" }, activity: "idle" }]);
+});
+
+test("slash commands cross durable Gateway IPC without receipt reactions or nullable message effects", async () => {
+  const f = await fixture();
+  const first = f.client();
+  await first.start({ message: async () => {}, answer: async () => {} });
+  await f.server.initialReady.promise;
+  await first.stop();
+  const original: Inbound = { ...input("discord:2:interaction:1750000000000000001"),
+    route: { platform: "discord", accountId: "2", authorityId: "1", guildId: null, channelId: "4", threadId: null },
+    messageId: null, interactionId: "1750000000000000001", text: "/status" };
+  await f.messenger.emit(original);
+  await f.messenger.emit(original);
+  expect(f.store.next()?.event).toEqual({ kind: "message", input: original });
+  expect(f.store.pending()).toBe(1);
+  expect(f.messenger.activities).toEqual([]);
+  const accepted: Inbound[] = [];
+  const replacement = f.client();
+  await replacement.start({ message: async command => { accepted.push(command); }, answer: async () => {} });
+  await eventually(() => accepted.length === 1 && f.store.pending() === 0);
+  expect(accepted).toEqual([original]);
+  await expect(replacement.setActivity!({ route: original.route, messageId: null } as unknown as MessageReference, "thinking"))
+    .rejects.toMatchObject({ certainty: "rejected" });
+  expect(f.messenger.activities).toEqual([]);
 });
 
 test("initial native approval readiness gates admission, while head detach preserves durable intake and dedup", async () => {
@@ -380,6 +425,9 @@ test("Gateway ingress and mutation journal survive restart without using the hea
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const store = new GatewayStore(root);
   store.admit({ kind: "message", input: input("durable") });
+  const command: Inbound = { ...input("durable-command"), route: { ...route, platform: "discord" },
+    messageId: null, interactionId: "1750000000000000001", text: "/status" };
+  store.admit({ kind: "message", input: command });
   const id = crypto.randomUUID();
   expect(store.beginEffect(id, "send", [input("durable")]).fresh).toBe(true);
   store.close();
@@ -389,6 +437,11 @@ test("Gateway ingress and mutation journal survive restart without using the hea
   expect(recovered.beginEffect(id, "send", [input("durable")])).toMatchObject({ fresh: false,
     result: { ok: false, certainty: "uncertain" } });
   expect(() => recovered.admit({ kind: "message", input: { ...input("durable"), text: "changed" } })).toThrow("identity conflict");
+  recovered.receipt(recovered.next()!.sequence, "accepted");
+  expect(recovered.next()?.event).toEqual({ kind: "message", input: command });
+  expect(recovered.admit({ kind: "message", input: command })).toBe(false);
+  expect(() => recovered.admit({ kind: "message", input: { ...command, interactionId: "1750000000000000002" } })).toThrow("identity conflict");
+  expect(() => recovered.admit({ kind: "message", input: { ...command, messageId: command.interactionId!, interactionId: undefined } })).toThrow("identity conflict");
 });
 
 test("answer attempt ambiguity and pending-answer route identity survive Gateway store restart", async () => {
@@ -519,4 +572,309 @@ test("only supervised head may attach and explicit stop is a service request, no
   await gatewayCall(socket, "/stop", {});
   expect(f.stopRequests).toBe(1);
   expect(f.messenger.stopped).toBe(false);
+});
+
+test("restart authenticates and rechecks managed-head authority before consuming its body", async () => {
+  let revoked = false;
+  let authorizations = 0;
+  const secret = "private-response-token-never-expose";
+  const f = await fixture({ authorizeHead: async () => {
+    authorizations++;
+    if (revoked) throw new DeliveryError(secret, "rejected");
+  } });
+  const socket = gatewayPaths(f.config).socketPath;
+  async function partial(headers: Record<string, string>) {
+    const received = Promise.withResolvers<GatewayResult>();
+    const request = httpRequest({ socketPath: socket, path: "/restart", method: "POST",
+      headers: { ...headers, "content-length": "4096" }, signal: AbortSignal.timeout(2000) }, response => {
+      void readGatewayJson(response).then(value => received.resolve(value as GatewayResult), received.reject);
+    });
+    request.on("error", received.reject);
+    request.write("{"); // Deliberately never complete the JSON body.
+    try { return await received.promise; }
+    finally { request.destroy(); }
+  }
+  expect(await partial({})).toMatchObject({ ok: false, error: "Gateway head authorization required", certainty: "rejected" });
+  const options = { token: f.store.token(), clientId: crypto.randomUUID() };
+  const headers = { authorization: `Bearer ${options.token}`, "x-gateway-client": options.clientId };
+  expect(await partial(headers)).toMatchObject({ error: "Gateway client is detached" });
+  expect(authorizations).toBe(0);
+  await gatewayCall(socket, "/attach", { pid: process.pid }, options);
+  const events = await gatewayRequest(socket, "/events", undefined, options);
+  cleanups.push(async () => { events.destroy(); });
+  await gatewayCall(socket, "/ready", {}, options);
+  revoked = true;
+  const result = await partial(headers);
+  expect(result).toMatchObject({ ok: false, error: "Gateway head authorization rejected", certainty: "rejected" });
+  expect(JSON.stringify(result)).not.toContain(secret);
+  expect(authorizations).toBe(2);
+});
+
+test("restart RPC waits for head readiness and validates bounded identities", async () => {
+  let accepts = 0;
+  const f = await fixture({ restart: async () => { accepts++; throw new Error("must not accept"); }, runRestart: () => {} });
+  const source = restartSource(f);
+  const client = f.client();
+  const ready = Promise.withResolvers<void>();
+  await client.start({ ready: ready.promise, message: async () => {}, answer: async () => {} });
+  await expect(client.requestRestart(source.request)).rejects.toMatchObject({ certainty: "rejected", message: "Gateway head is not ready for restart" });
+  ready.resolve();
+  await eventually(() => f.server.headReady);
+  for (const patch of [
+    { requestId: "-------------------invalid-uuid------" },
+    { requestId: "00000000-0000-0000-0000-000000000000" },
+    { inputId: "" }, { inputId: "x".repeat(1025) }, { ackOutputId: " " }, { ackOutputId: "x".repeat(1025) },
+  ]) await expect(client.requestRestart({ ...source.request, ...patch })).rejects.toMatchObject({ certainty: "rejected" });
+  expect(accepts).toBe(0);
+});
+
+test("restart acceptance is durable, deduplicated while in flight, and runs only after successful response finish", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let original!: GatewayRestartRecord;
+  let accepts = 0;
+  let runs = 0;
+  let finished = 0;
+  const f = await fixture({
+    restart: async (request, store) => {
+      accepts++;
+      entered.resolve();
+      await release.promise;
+      const record = { ...original, ...request };
+      store.setRestart(record);
+      return record;
+    },
+    runRestart: requestId => {
+      expect(finished).toBeGreaterThan(0);
+      expect(f.store.getRestart(requestId)?.state).toBe("accepted");
+      runs++;
+    },
+  });
+  const source = restartSource(f);
+  original = source.record;
+  const client = f.client();
+  await client.start({ message: async () => {}, answer: async () => {} });
+  await eventually(() => f.server.headReady);
+  // Inspect the existing HTTP server only to observe the real response finish boundary.
+  const internal = f.server as unknown as { server: Server };
+  internal.server.on("request", (request, response) => {
+    if (request.url === "/restart") response.once("finish", () => { if (response.statusCode === 200) finished++; });
+  });
+  const first = client.requestRestart(source.request);
+  await entered.promise;
+  expect(runs).toBe(0);
+  expect(f.store.getRestart()).toBeNull();
+  const duplicate = client.requestRestart(source.request);
+  await expect(client.requestRestart({ ...source.request, requestId: crypto.randomUUID() })).rejects.toMatchObject({ certainty: "rejected" });
+  await expect(client.requestRestart({ ...source.request, ackOutputId: "different-ack" })).rejects.toMatchObject({ certainty: "rejected" });
+  release.resolve();
+  expect(await first).toEqual(original);
+  expect(await duplicate).toEqual(original);
+  expect(await client.requestRestart(source.request)).toEqual(original);
+  expect(accepts).toBe(1);
+  expect(runs).toBe(1);
+  await expect(client.requestRestart({ ...source.request, requestId: crypto.randomUUID() })).rejects.toMatchObject({ certainty: "rejected" });
+  await expect(client.requestRestart({ ...source.request, inputId: "another-source" })).rejects.toMatchObject({ certainty: "rejected" });
+  const status = await gatewayCall<GatewayStatus>(gatewayPaths(f.config).socketPath, "/status");
+  expect(status.restart).toMatchObject({ requestId: original.requestId, state: "accepted", sessionId: original.sessionId });
+  expect(status.restart).not.toHaveProperty("sessionFile");
+  expect(JSON.stringify(status)).not.toContain(f.store.token());
+});
+
+test("a lost restart acceptance response cannot trigger shutdown until a later successful receipt", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const closed = Promise.withResolvers<void>();
+  let original!: GatewayRestartRecord;
+  let accepts = 0;
+  let runs = 0;
+  const f = await fixture({ restart: async (request, store) => {
+    accepts++;
+    entered.resolve();
+    await release.promise;
+    store.setRestart({ ...original, ...request });
+    return store.getRestart(request.requestId)!;
+  }, runRestart: () => { runs++; } });
+  const source = restartSource(f);
+  original = source.record;
+  const client = f.client();
+  await client.start({ message: async () => {}, answer: async () => {} });
+  await eventually(() => f.server.headReady);
+  // Observe the response socket without adding any production-only test endpoint.
+  const internal = f.server as unknown as { server: Server };
+  let response: ServerResponse | undefined;
+  internal.server.once("request", (_request, accepted) => { response = accepted; accepted.once("close", closed.resolve); });
+  const first = client.requestRestart(source.request).catch(error => error);
+  await entered.promise;
+  response!.destroy();
+  await closed.promise;
+  release.resolve();
+  expect(await first).toBeInstanceOf(DeliveryError);
+  await eventually(() => f.store.getRestart() !== null);
+  expect(runs).toBe(0);
+  expect(await client.requestRestart(source.request)).toEqual(original);
+  expect(accepts).toBe(1);
+  expect(runs).toBe(1);
+});
+
+test.each(["refused", "uncertain", "failed", "head-stopped", "started"] as const)("persisted %s restart receipts never run the lifecycle again", async state => {
+  let runs = 0;
+  const f = await fixture({ restart: async () => { throw new Error("must use persisted receipt"); }, runRestart: () => { runs++; } });
+  const source = restartSource(f);
+  f.store.setRestart({ ...source.record, state, reason: "Owned restart remains fenced." });
+  const client = f.client();
+  await client.start({ message: async () => {}, answer: async () => {} });
+  await eventually(() => f.server.headReady);
+  expect(await client.requestRestart(source.request)).toMatchObject({ state });
+  expect(runs).toBe(0);
+});
+
+test("restart RPC requires persisted acceptance and redacts thrown delivery details", async () => {
+  const secret = "response-url-with-private-credentials";
+  let original!: GatewayRestartRecord;
+  let mode: "delivery" | "error" | "unpersisted" = "delivery";
+  let runs = 0;
+  const f = await fixture({ restart: async () => {
+    if (mode === "delivery") throw new DeliveryError(secret, "rejected");
+    if (mode === "error") throw new Error(secret);
+    return original;
+  }, runRestart: () => { runs++; } });
+  const source = restartSource(f);
+  original = source.record;
+  const client = f.client();
+  await client.start({ message: async () => {}, answer: async () => {} });
+  await eventually(() => f.server.headReady);
+  for (const next of ["delivery", "error", "unpersisted"] as const) {
+    mode = next;
+    const error = await client.requestRestart(source.request).catch(value => value);
+    expect(error).toBeInstanceOf(DeliveryError);
+    expect(error.certainty).toBe(next === "delivery" ? "rejected" : "uncertain");
+    expect(error.message).not.toContain(secret);
+  }
+  expect(runs).toBe(0);
+});
+
+test.each(["user-source", "command", "arguments", "pending-input", "wrong-target", "ack-source", "ack-route", "ack-pending", "ack-sending", "ack-uncertain", "ack-failed", "ack-remote"])("restart authority rejects invalid durable %s", async invalid => {
+  let accepts = 0;
+  const f = await fixture({ restart: async () => { accepts++; throw new Error("Invalid authority must never reach lifecycle acceptance"); }, runRestart: () => {} });
+  const source = restartSource(f);
+  const db = new Database(join(f.config.stateDir, "coordination.sqlite"), { strict: true });
+  cleanups.push(async () => db.close());
+  if (invalid === "user-source") source.headStore.setMeta(`user-source:${source.request.inputId}`, "false");
+  else if (invalid === "command" || invalid === "arguments") db.query("UPDATE inputs SET data=? WHERE id=?")
+    .run(JSON.stringify({ ...source.source, text: invalid === "command" ? "/status" : "/restart now" }), source.request.inputId);
+  else if (invalid === "pending-input") db.query("UPDATE inputs SET state='pending' WHERE id=?").run(source.request.inputId);
+  else if (invalid === "wrong-target") db.query("UPDATE inputs SET target='lane' WHERE id=?").run(source.request.inputId);
+  else if (invalid === "ack-source") db.query("UPDATE outputs SET source_id='status-command' WHERE id=?").run(source.request.ackOutputId);
+  else if (invalid === "ack-route") db.query("UPDATE outputs SET route=? WHERE id=?").run(JSON.stringify({ ...route, topicId: "different-topic" }), source.request.ackOutputId);
+  else if (invalid === "ack-remote") db.query("UPDATE outputs SET remote_id=NULL WHERE id=?").run(source.request.ackOutputId);
+  else db.query("UPDATE outputs SET state=? WHERE id=?").run(invalid.slice(4), source.request.ackOutputId);
+  expect(() => f.store.validateRestart(source.request)).toThrow(DeliveryError);
+  expect(() => f.store.setRestart(source.record)).toThrow(DeliveryError);
+  expect(f.store.getRestart()).toBeNull();
+  expect(f.store.getMeta(`gateway:restart-source:${source.request.inputId}`)).toBeNull();
+  const client = f.client();
+  await client.start({ message: async () => {}, answer: async () => {} });
+  await eventually(() => f.server.headReady);
+  await expect(client.requestRestart(source.request)).rejects.toMatchObject({ certainty: "rejected" });
+  expect(accepts).toBe(0);
+});
+
+test.each(["discord", "telegram", "slack"] as const)("%s restart authority uses the original durable route and sent ACK", async platform => {
+  const f = await fixture();
+  const source = restartSource(f, { ...input(`restart-${platform}`), route: { ...route, platform }, text: " /restart \n" });
+  const validated = f.store.validateRestart(source.request);
+  expect(validated).toMatchObject(source.source);
+  expect(validated.route).toEqual(source.source.route);
+  f.store.setRestart(source.record);
+  expect(f.store.getRestart(source.request.requestId)).toEqual(source.record);
+  expect(f.store.getRestart()).toEqual(source.record);
+  expect(f.store.getMeta(`gateway:restart-source:${source.request.inputId}`)).toBe(source.request.requestId);
+});
+
+test("restart receipts atomically retain source identity across store reopening", async () => {
+  const f = await fixture();
+  const source = restartSource(f);
+  f.store.setRestart(source.record);
+  f.store.setRestart({ ...source.record, state: "uncertain", reason: "Shutdown receipt is ambiguous." });
+  for (const patch of [
+    { requestId: crypto.randomUUID() }, { inputId: "different-source" }, { ackOutputId: "different-ack" },
+    { gatewayPid: 1 }, { headPid: 1 }, { sessionId: "different-session" }, { sessionFile: "different-session.jsonl" },
+  ]) expect(() => f.store.setRestart({ ...source.record, ...patch })).toThrow("identity conflict");
+  expect(f.store.getRestart()?.state).toBe("uncertain");
+  expect(f.store.getMeta(`gateway:restart-source:${source.request.inputId}`)).toBe(source.request.requestId);
+  f.store.close();
+  const recovered = new GatewayStore(f.config.stateDir);
+  cleanups.push(async () => recovered.close());
+  expect(recovered.getRestart(source.request.requestId)).toMatchObject({ ...source.request, state: "uncertain" });
+  expect(recovered.getRestart()).toEqual(recovered.getRestart(source.request.requestId));
+  expect(() => recovered.setRestart({ ...source.record, requestId: crypto.randomUUID() })).toThrow("identity conflict");
+});
+
+test("historical restart updates do not displace a newer active latest receipt", async () => {
+  const f = await fixture();
+  const first = restartSource(f);
+  f.store.setRestart(first.record);
+  f.store.setRestart({ ...first.record, state: "started" });
+  const inputB = { ...input("restart-newer"), text: "/restart" };
+  const requestB: GatewayRestartRequest = { requestId: crypto.randomUUID(), inputId: inputB.id, ackOutputId: `${inputB.id}:restart:ack` };
+  first.headStore.receive(inputB, "main", { [`user-source:${inputB.id}`]: "true" });
+  first.headStore.settle(inputB.id, "done", { id: requestB.ackOutputId, text: "New restart acknowledgement." });
+  first.headStore.claimOutput(requestB.ackOutputId);
+  first.headStore.finishOutput(requestB.ackOutputId, "sent", "remote-newer-ack");
+  const recordB: GatewayRestartRecord = { ...first.record, ...requestB };
+  f.store.setRestart(recordB);
+  const lateA: GatewayRestartRecord = { ...first.record, state: "started", reason: "Late completion receipt for the earlier restart." };
+  f.store.setRestart(lateA);
+  expect(f.store.getRestart(first.request.requestId)).toEqual(lateA);
+  expect(f.store.getRestart(requestB.requestId)).toEqual(recordB);
+  expect(f.store.getRestart()).toEqual(recordB);
+  expect(f.store.getMeta(`gateway:restart-source:${first.request.inputId}`)).toBe(first.request.requestId);
+  expect(f.store.getMeta(`gateway:restart-source:${requestB.inputId}`)).toBe(requestB.requestId);
+  const status = await gatewayCall<GatewayStatus>(gatewayPaths(f.config).socketPath, "/status");
+  expect(status.restart).toMatchObject({ ...requestB, state: "accepted" });
+  expect(() => f.store.setRestart({ ...lateA, ackOutputId: requestB.ackOutputId })).toThrow("identity conflict");
+  expect(f.store.getRestart()).toEqual(recordB);
+  f.store.setRestart({ ...recordB, state: "head-stopped" });
+  expect(f.store.getRestart()).toEqual({ ...recordB, state: "head-stopped" });
+});
+
+test("refused and uncertain restart events have distinct durable receipts and never become model inputs", async () => {
+  const f = await fixture();
+  const requestId = crypto.randomUUID();
+  const refused: GatewayRestartNotice = { requestId, outcome: "refused", reason: "Native work is active." };
+  const uncertain: GatewayRestartNotice = { requestId, outcome: "uncertain", reason: "Shutdown receipt is ambiguous." };
+  expect(f.store.admit({ kind: "restart", ...refused })).toBe(true);
+  expect(f.store.admit({ kind: "restart", ...refused })).toBe(false);
+  expect(f.store.admit({ kind: "restart", ...uncertain })).toBe(true);
+  const notices: GatewayRestartNotice[] = [];
+  let messages = 0;
+  let reconnects = 0;
+  const client = f.client();
+  await client.start({ message: async () => { messages++; }, answer: async () => {}, reconnect: async () => { reconnects++; },
+    restart: async notice => { notices.push(notice); } });
+  await eventually(() => f.store.pending() === 0);
+  expect(notices).toEqual([refused, uncertain]);
+  expect(f.store.admit({ kind: "restart", ...refused })).toBe(false);
+  expect(f.store.admit({ kind: "restart", ...uncertain })).toBe(false);
+  expect(() => f.store.admit({ kind: "restart", ...uncertain, reason: "Changed original identity" })).toThrow("identity conflict");
+  expect(messages).toBe(0);
+  expect(reconnects).toBe(0);
+});
+
+test("unhandled restart outcome delivery remains durable until a replacement handler accepts it", async () => {
+  const f = await fixture();
+  const notice: GatewayRestartNotice = { requestId: crypto.randomUUID(), outcome: "uncertain", reason: "Lifecycle remains fenced." };
+  f.store.admit({ kind: "restart", ...notice });
+  const first = f.client();
+  await first.start({ message: async () => { throw new Error("must not become input"); }, answer: async () => {} });
+  await eventually(() => f.store.unresolved() === 1);
+  expect(f.store.pending()).toBe(1);
+  await first.stop();
+  const second = f.client();
+  const accepted: GatewayRestartNotice[] = [];
+  await second.start({ message: async () => { throw new Error("must not become input"); }, answer: async () => {},
+    restart: async value => { accepted.push(value); } });
+  await eventually(() => f.store.pending() === 0);
+  expect(accepted).toEqual([notice]);
 });

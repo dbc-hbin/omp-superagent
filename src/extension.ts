@@ -224,6 +224,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
           resolvePreset: async (name, thinkingContext) => (await nativePresets(ctx)).resolve(name, thinkingContext),
           inspectPresets: async () => (await nativePresets(ctx)).inspect(),
           persistPreset: async selection => (await nativePresets(ctx)).persistSelection(selection),
+          requestRestart: request => messenger.requestRestart(request),
         });
         try {
           runtime = candidate;

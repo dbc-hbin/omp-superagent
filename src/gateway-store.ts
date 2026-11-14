@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import { chmodSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { DialogResponse, Inbound, Route } from "./contracts";
+import type { DialogResponse, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, Route } from "./contracts";
 import { routeKey } from "./contracts";
+import { DeliveryError } from "./delivery";
 
 export type GatewayEvent =
   | { kind: "message"; input: Inbound }
   | { kind: "answer"; approvalId: string; response: DialogResponse; route: Route }
+  | ({ kind: "restart" } & GatewayRestartNotice)
   | { kind: "reconnect"; barrier?: string };
 export type GatewayReceipt = "accepted" | "rejected" | "unresolved";
 export interface QueuedEvent { sequence: number; event: GatewayEvent; reconciliation?: true }
@@ -89,9 +91,53 @@ export class GatewayStore {
     this.db.query("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, value);
   }
 
+  getRestart(requestId?: string): GatewayRestartRecord | null {
+    const value = this.getMeta(requestId === undefined ? "gateway:restart" : `gateway:restart:${requestId}`);
+    return value === null ? null : JSON.parse(value) as GatewayRestartRecord;
+  }
+
+  /** Read only the head's durable authorized source and its delivered ACK. */
+  validateRestart(request: GatewayRestartRequest): Inbound {
+    const reject = () => new DeliveryError("Gateway restart requires its original completed owner command and sent acknowledgement", "rejected");
+    if (this.getMeta(`user-source:${request.inputId}`) !== "true") throw reject();
+    const row = this.db.query("SELECT data,target,state FROM inputs WHERE id=?").get(request.inputId) as {
+      data: string; target: string | null; state: string;
+    } | null;
+    if (!row || row.target !== "main" || row.state !== "done") throw reject();
+    const input = JSON.parse(row.data) as Inbound;
+    if (input.id !== request.inputId || input.text.trim() !== "/restart") throw reject();
+    const ack = this.db.query("SELECT source_id,route,state,remote_id FROM outputs WHERE id=?").get(request.ackOutputId) as {
+      source_id: string; route: string; state: string; remote_id: string | null;
+    } | null;
+    if (!ack || ack.source_id !== input.id || ack.state !== "sent" || !ack.remote_id?.trim()
+      || !isDeepStrictEqual(JSON.parse(ack.route), input.route)) throw reject();
+    return input;
+  }
+
+  setRestart(record: GatewayRestartRecord): void {
+    this.db.transaction(() => {
+      const previous = this.getRestart(record.requestId);
+      const latest = this.getRestart();
+      const source = this.getMeta(`gateway:restart-source:${record.inputId}`);
+      if (source !== null && source !== record.requestId || previous && (
+        previous.inputId !== record.inputId || previous.ackOutputId !== record.ackOutputId
+        || previous.gatewayPid !== record.gatewayPid || previous.headPid !== record.headPid
+        || previous.sessionId !== record.sessionId || previous.sessionFile !== record.sessionFile)) {
+        throw new DeliveryError("Gateway restart identity conflict", "rejected");
+      }
+      if (!previous) this.validateRestart(record);
+      const serialized = JSON.stringify(record);
+      this.setMeta(`gateway:restart:${record.requestId}`, serialized);
+      // New receipts advance latest; late updates belong only to their own request.
+      if (!previous || !latest || latest.requestId === record.requestId) this.setMeta("gateway:restart", serialized);
+      this.setMeta(`gateway:restart-source:${record.inputId}`, record.requestId);
+    }).immediate();
+  }
+
   admit(event: GatewayEvent): boolean {
     const key = event.kind === "message" ? `message:${event.input.id}`
       : event.kind === "answer" ? `answer:${event.approvalId}`
+      : event.kind === "restart" ? `restart:${event.requestId}:${event.outcome}`
       : `reconnect:${crypto.randomUUID()}`;
     return this.db.transaction(() => {
       // Repeated unresolved admissions must not grow a reconnect poison queue.

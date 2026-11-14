@@ -126,10 +126,18 @@ manager/board authority boundaries remain unchanged.
   authorized parent `destination` with `threadId:null` and no `topicId`; this creates
   a sibling, never a nested thread or a new channel. Unsupported private chats use
   honest logical topics; do not invent thread IDs or enable platform features.
-- Discord/Telegram use ordinary `/new`, `/main`, `/stop`, `/resume` messages; Slack
-  uses `!new`, `!main`, `!stop`, `!resume`, not registered slash commands. Logical DM
+- Discord/Telegram use ordinary `/new`, `/main`, `/stop`, `/resume` messages. Discord
+  also supports explicitly registered slash commands through the same authorized
+  ingress; optional arguments use the `text` field. A private command receipt is
+  admission, not completion. Telegram menu commands addressed to this bot use the
+  same control path. Slack supports `!new`, `!main`, `!stop`, `!resume` messages and
+  registered `/superagent-*` commands through Socket Mode. Logical DM
   topics retain the real channel; never fabricate a native thread ID. An admitted
   topic-command edit cannot rewrite its boundary; require a fresh control message.
+- `/restart` (Slack `!restart` or `/superagent-restart`) is the owner's native
+  service control for replacing Gateway and HEAD together while idle. Do not
+  self-terminate or bypass its busy, ownership, acknowledgement, or replay guards
+  from a model turn. Acceptance is not proof of replacement readiness.
 - Use original IDs from trusted integration envelopes. Resolve an existing absolute
   cwd from evidence, never a default guess. Do not implement an independent routed
   topic in the shared head or retarget an existing lane to an unrelated repository.

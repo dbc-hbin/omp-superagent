@@ -13,6 +13,7 @@ import { GatewayServer, type GatewayStatus } from "../src/gateway-server.ts";
 import { GatewayStore } from "../src/gateway-store.ts";
 import { Superagent, type RuntimeHost, type RuntimeState } from "../src/runtime.ts";
 import { MessengerHub } from "../src/messengers.ts";
+import { MESSENGER_COMMANDS } from "../src/messenger-commands.ts";
 
 // These tests run the real grammY Api serializer/error boundary against an
 // in-process HTTP simulation. They never contact Telegram or activate a bot.
@@ -242,6 +243,84 @@ describe("Telegram identity, polling, and durable admission", () => {
     expect(messenger.normalize(message({ edit_date: 102, text: "edited" }))?.id).toBe(edited.id);
     expect(messenger.normalize(message({ edit_date: 102, text: "different same-second edit" }))?.id).not.toBe(edited.id);
     expect(messenger.normalize(message({ chat: { id: 42, type: "private" } }))?.id).not.toBe(original.id);
+  });
+  test("real leading bot-command entities target the authenticated username and preserve every argument", async () => {
+    const http = new TelegramHttp(); http.topicsEnabled = true;
+    const { messenger } = await fixture({ http });
+    expect(messenger.normalize(message({ text: "/status@local_test_bot",
+      entities: [{ type: "bot_command", offset: 0, length: 22 }] }))?.text).toBe("/status");
+    for (const command of MESSENGER_COMMANDS) {
+      const qualified = `/${command.name}@LOCAL_test_BOT`;
+      const args = "  provider/model --global\nKeep @other_bot and /status@other_bot in the body. 😀";
+      for (const [patch, route] of [
+        [{}, group], [{ message_thread_id: 7 }, topic], [{ chat: { id: 42, type: "private" } }, dm],
+        [{ chat: { id: 42, type: "private" }, message_thread_id: 7 }, { ...dm, threadId: "7" }],
+      ] as const) {
+        const input = messenger.normalize(message({ ...patch, text: qualified + args,
+          entities: [{ type: "bot_command", offset: 0, length: qualified.length }] }));
+        expect(input?.text).toBe(`/${command.name}${args}`);
+        expect(input?.route).toEqual(route);
+        expect(input?.messageId).toBe("10");
+        expect(input?.interactionId).toBeUndefined();
+      }
+    }
+    const qualified = "/compact@local_test_bot";
+    expect(messenger.normalize(message({ text: undefined, caption: `${qualified}\nSummarize @other_bot`,
+      caption_entities: [{ type: "bot_command", offset: 0, length: qualified.length }],
+      document: { file_id: "document_1", file_unique_id: "unique" } }))?.text).toBe("/compact\nSummarize @other_bot");
+  });
+  test("commands addressed to other bots cannot enter as owner tasks in groups, DMs, or topics", async () => {
+    const { messenger } = await fixture();
+    for (const name of ["status", "new", "unknown_command"]) {
+      const qualified = `/${name}@other_bot`;
+      for (const patch of [{}, { message_thread_id: 7 }, { chat: { id: 42, type: "private" } }]) {
+        expect(messenger.normalize(message({ ...patch, text: `${qualified} sensitive args`,
+          entities: [{ type: "bot_command", offset: 0, length: qualified.length }] }))).toBeNull();
+      }
+      expect(messenger.normalize(message({ text: undefined, caption: qualified,
+        caption_entities: [{ type: "bot_command", offset: 0, length: qualified.length }],
+        document: { file_id: "document_1", file_unique_id: "unique" } }))).toBeNull();
+    }
+  });
+  test("plain commands, normal text, body mentions and non-command entities retain literal text", async () => {
+    const { messenger } = await fixture();
+    for (const text of ["/status", "/model provider/model --global", "hello @local_test_bot", "😀 /status@local_test_bot", "/status@local_test_bot literal"]) {
+      expect(messenger.normalize(message({ text }))?.text).toBe(text);
+    }
+    const literal = "/status@local_test_bot";
+    expect(messenger.normalize(message({ text: literal, entities: [{ type: "code", offset: 0, length: literal.length }] }))?.text).toBe(literal);
+    expect(messenger.normalize(message({ text: `Discuss ${literal}`, entities: [{ type: "bot_command", offset: 8, length: literal.length }] }))?.text).toBe(`Discuss ${literal}`);
+    expect(messenger.normalize(message({ text: literal, entities: [{ type: "bot_command", offset: 0, length: 7 }] }))?.text).toBe(literal);
+    const unsupported = "/unsupported@local_test_bot";
+    expect(messenger.normalize(message({ text: unsupported, entities: [{ type: "bot_command", offset: 0, length: unsupported.length }] }))?.text).toBe(unsupported);
+  });
+  test("normalized command admission retains original message IDs, physical routes and edit identity", async () => {
+    const ledger = store();
+    const { messenger, http, errors } = await fixture({ ledger, message: async input => { ledger.receive(input, "main"); } });
+    const qualified = "/model@local_test_bot";
+    const addressed = (patch: Record<string, unknown> = {}) => message({ text: `${qualified} fixture/chat --global`,
+      entities: [{ type: "bot_command", offset: 0, length: qualified.length }], ...patch });
+    http.push(
+      { update_id: 1, message: addressed() } as Update,
+      { update_id: 2, message: addressed({ chat: { id: 42, type: "private" }, message_id: 11 }) } as Update,
+      { update_id: 3, message: addressed({ message_thread_id: 7, message_id: 12 }) } as Update,
+      { update_id: 4, message: message({ text: "/status@other_bot", entities: [{ type: "bot_command", offset: 0, length: 17 }] }) } as Update,
+    );
+    await drain();
+    expect(ledger.inputs().map(input => ({ id: input.id, messageId: input.messageId, text: input.text, route: input.route }))).toEqual([
+      { id: "telegram:900:-100:10:original", messageId: "10", text: "/model fixture/chat --global", route: group },
+      { id: "telegram:900:42:11:original", messageId: "11", text: "/model fixture/chat --global", route: dm },
+      { id: "telegram:900:-100:12:original", messageId: "12", text: "/model fixture/chat --global", route: topic },
+    ]);
+    expect(ledger.getMeta("telegram:900:offset")).toBe("5");
+    http.update(5, addressed()); await drain();
+    expect(ledger.inputs()).toHaveLength(3);
+    expect(ledger.getMeta("telegram:900:offset")).toBe("6");
+    const first = messenger.normalize(addressed({ edit_date: 102 }))!;
+    const plain = messenger.normalize(message({ text: "/model fixture/chat --global", edit_date: 102 }))!;
+    expect(first.text).toBe(plain.text);
+    expect(first.id).not.toBe(plain.id);
+    expect(errors).toHaveLength(0);
   });
   test("one durable message produces one output across replay, and offset follows awaited admission", async () => {
     const ledger = store();

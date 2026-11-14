@@ -2,9 +2,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { Api, InputFile } from "grammy";
 import type { CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, UserFromGetMe } from "grammy/types";
-import { physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type Messenger, type OutputRecord, type Route, type StorePort } from "./contracts.ts";
+import { physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type Route, type StorePort } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
 import { DeliveryError } from "./delivery.ts";
+import { MESSENGER_COMMANDS } from "./messenger-commands.ts";
 
 // grammY Api has no retry transformer installed. Only getUpdates is retried.
 // Bot API: https://core.telegram.org/bots/api#getupdates (24-hour retention),
@@ -17,6 +18,7 @@ const DOWNLOAD_LIMIT = 20 * 1024 * 1024;
 // unnecessary after that idle interval; dropping it also safely precedes the
 // documented random update_id reset after at least a week without updates.
 const CURSOR_IDLE_MS = 24 * 60 * 60 * 1000;
+const COMMAND_NAMES = new Set<string>(MESSENGER_COMMANDS.map(command => command.name));
 type Handlers = Parameters<Messenger["start"]>[0];
 type Answer = NonNullable<DialogResponse["answers"]>[number];
 interface Progress {
@@ -207,9 +209,22 @@ export class TelegramMessenger implements Messenger {
     if (message.video) add(message.video, `video-${message.video.file_unique_id}.mp4`, "video/mp4");
     if (message.voice) add(message.voice, `voice-${message.voice.file_unique_id}.ogg`, "audio/ogg");
     if (message.video_note) add(message.video_note, `video-note-${message.video_note.file_unique_id}.mp4`, "video/mp4");
-    const text = message.text ?? message.caption ?? "";
+    const originalText = message.text ?? message.caption ?? "";
+    let text = originalText;
+    const entities = message.text === undefined ? message.caption_entities : message.entities;
+    // Telegram offsets/lengths are UTF-16, matching JS slice. Only an actual
+    // leading bot_command entity may address this bot; body mentions are text.
+    const entity = entities?.find(value => value.type === "bot_command" && value.offset === 0);
+    if (entity && Number.isSafeInteger(entity.length) && entity.length > 0 && entity.length <= text.length &&
+      (entity.length === text.length || /\s/.test(text[entity.length]!))) {
+      const qualified = /^\/([a-z0-9_]{1,32})@([a-z0-9_]+)$/i.exec(text.slice(0, entity.length));
+      if (qualified) {
+        if (!this.me?.username || qualified[2]!.toLowerCase() !== this.me.username.toLowerCase()) return null;
+        if (COMMAND_NAMES.has(qualified[1]!)) text = `/${qualified[1]}${text.slice(entity.length)}`;
+      }
+    }
     if (!text && files.length === 0) return null;
-    const revision = message.edit_date === undefined ? "original" : `edit:${message.edit_date}:${hash(JSON.stringify([text, files]))}`;
+    const revision = message.edit_date === undefined ? "original" : `edit:${message.edit_date}:${hash(JSON.stringify([originalText, files]))}`;
     return { id: `telegram:${route.accountId}:${route.channelId}:${message.message_id}:${revision}`, route,
       messageId: String(message.message_id), text, receivedAt: (message.edit_date ?? message.date) * 1000, attachments: files };
   }
@@ -295,7 +310,7 @@ export class TelegramMessenger implements Messenger {
     } catch (error) { throw telegramDeliveryError(error); }
   }
 
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+  async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     try {
       const messageId = this.messageId(message.messageId);
       await this.destination(message.route);

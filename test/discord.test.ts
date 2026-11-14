@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { ChannelType, Collection, Events, type Client, type Message, type MessageCreateOptions } from "discord.js";
+import { ApplicationCommandOptionType, ChannelType, Collection, Events, MessageFlags, type Client, type Message, type MessageCreateOptions } from "discord.js";
 import { DiscordMessenger, deliveryError, discordAttachmentAllowed, discordNonce, parseDiscordControl, type DiscordMessengerOptions } from "../src/discord.ts";
 import { DeliveryError } from "../src/delivery.ts";
 import { parseDialog } from "../src/dialog.ts";
@@ -60,6 +60,7 @@ class Channel {
 
 class Gateway extends EventEmitter {
   user = { id: bot };
+  application = { id: "application" };
   reactions = new Map<string, Set<string>>();
   reactionCalls: { method: "PUT" | "DELETE"; path: string }[] = [];
   reactionFailure: unknown;
@@ -115,11 +116,26 @@ async function drain() {
 function interaction(message: RemoteMessage, customId: string, kind: "button" | "select" | "modal" = "button", patch: Record<string, unknown> = {}) {
   const result = {
     customId, message, channelId: message.channelId, guildId: message.guildId, user: { id: owner },
+    isChatInputCommand: () => false,
     isButton: () => kind === "button", isStringSelectMenu: () => kind === "select", isModalSubmit: () => kind === "modal", isFromMessage: () => true,
     values: ["0"], fields: { getTextInputValue: () => "typed answer" }, replies: [] as unknown[], ack: 0, modals: [] as unknown[],
     async reply(value: unknown) { result.replies.push(value); },
     async deferUpdate() { result.ack++; },
     async showModal(value: unknown) { result.modals.push(value); },
+    ...patch,
+  };
+  return result;
+}
+function commandInteraction(channel: Channel | null, patch: Record<string, unknown> = {}) {
+  const result = {
+    id: "200", applicationId: "application", user: { id: owner, bot: false },
+    channel, channelId: channel?.id ?? "parent", guildId: channel ? channel.guildId : "guild",
+    commandName: "status", options: { data: [] }, createdTimestamp: 2000,
+    token: "secret-interaction-token", isChatInputCommand: () => true,
+    replies: [] as { content: string; flags: number; allowedMentions: unknown }[], deferred: 0, followups: 0,
+    async reply(value: { content: string; flags: number; allowedMentions: unknown }) { result.replies.push(value); },
+    async deferReply() { result.deferred++; },
+    async followUp() { result.followups++; },
     ...patch,
   };
   return result;
@@ -238,6 +254,281 @@ describe("Discord routing and parsing", () => {
     gate.resolve();
     await drain();
     expect(order).toEqual(["start:first", "done:first", "start:second", "done:second"]);
+    await messenger.stop();
+  });
+});
+
+describe("Discord application commands", () => {
+  test("normalizes supported options and preserves the original channel, thread, or owner DM route", async () => {
+    const { messenger, gateway, channel, received } = await fixture();
+    const thread = new Channel("thread", "guild", "parent");
+    const dm = new Channel("dm", null);
+    const cases = [
+      { channel, name: "help", text: undefined, expected: "/help", target: route },
+      { channel: thread, name: "model", text: " preset exact-name --global ", expected: "/model preset exact-name --global", target: { ...route, threadId: thread.id } },
+      { channel: dm, name: "compact", text: " keep decisions\nand open questions ", expected: "/compact keep decisions\nand open questions", target: { ...route, guildId: null, channelId: dm.id } },
+      { channel, name: "effort", text: "high", expected: "/effort high", target: route },
+      { channel, name: "stop", text: "head", expected: "/stop head", target: route },
+      { channel: dm, name: "new", text: "investigate the issue", expected: "/new investigate the issue", target: { ...route, guildId: null, channelId: dm.id } },
+    ];
+    for (const [index, entry] of cases.entries()) {
+      const command = commandInteraction(entry.channel, {
+        id: String(200 + index), commandName: entry.name,
+        options: { data: entry.text === undefined ? [] : [{ name: "text", type: ApplicationCommandOptionType.String, value: entry.text }] },
+      });
+      gateway.emit(Events.InteractionCreate, command);
+      await drain();
+      expect(received[index]).toEqual({
+        id: `discord:bot:interaction:${200 + index}`, route: entry.target, messageId: null, interactionId: String(200 + index),
+        text: entry.expected, receivedAt: 2000, attachments: [],
+      });
+      expect(command.replies).toEqual([{
+        content: "Superagent accepted this command. Its result will be sent to this conversation.",
+        flags: MessageFlags.Ephemeral, allowedMentions: { parse: [], repliedUser: false },
+      }]);
+      expect(command.deferred).toBe(0);
+      expect(command.followups).toBe(0);
+    }
+    expect(gateway.lookups).toEqual([]); // Cached, identity-checked SDK channels suffice.
+    expect(channel.fetched).toEqual([]);
+    expect(thread.fetched).toEqual([]);
+    expect(dm.fetched).toEqual([]);
+    expect(channel.sent).toEqual([]); // Results belong to the existing durable outbox.
+    expect(dm.sent).toEqual([]);
+    expect(JSON.stringify(received)).not.toContain("secret-interaction-token");
+    await messenger.stop();
+  });
+
+  test("bypasses slow ordinary intake but never ACKs before its own durable handler completes", async () => {
+    const gateway = new Gateway();
+    const channel = new Channel();
+    const busy = Promise.withResolvers<void>();
+    const durable = Promise.withResolvers<void>();
+    const order: string[] = [];
+    const messenger = new DiscordMessenger({ token: "unused", ownerId: owner, allowedGuildIds: ["guild"], allowedChannelIds: ["parent"], client: gateway as unknown as Client });
+    await messenger.start({ message: async input => {
+      order.push(`start:${input.text}`);
+      if (input.text === "busy") await busy.promise;
+      if (input.interactionId) await durable.promise;
+      order.push(`durable:${input.text}`);
+    }, answer: async () => {} });
+    gateway.emit(Events.MessageCreate, inbound(channel, { content: "busy" }));
+    gateway.emit(Events.MessageCreate, inbound(channel, { id: "101", content: "queued" }));
+    await drain();
+    const command = commandInteraction(channel);
+    gateway.emit(Events.InteractionCreate, command);
+    await drain();
+    expect(order).toEqual(["start:busy", "start:/status"]);
+    expect(command.replies).toEqual([]);
+    expect(command.deferred).toBe(0);
+    expect(command.followups).toBe(0);
+    durable.resolve();
+    await drain();
+    expect(order).toEqual(["start:busy", "start:/status", "durable:/status"]);
+    expect(command.replies).toHaveLength(1);
+    busy.resolve();
+    await drain();
+    expect(order).toEqual(["start:busy", "start:/status", "durable:/status", "durable:busy", "start:queued", "durable:queued"]);
+    await messenger.stop();
+  });
+
+  test.each(["pending", "rejected"] as const)("%s readiness immediately refuses commands without intake or waiting", async state => {
+    const gateway = new Gateway();
+    const channel = new Channel();
+    const ready = Promise.withResolvers<void>();
+    const received: Inbound[] = [];
+    const errors: unknown[] = [];
+    const messenger = new DiscordMessenger({ token: "unused", ownerId: owner, allowedGuildIds: ["guild"], allowedChannelIds: ["parent"], client: gateway as unknown as Client, onError: error => errors.push(error) });
+    await messenger.start({ ready: ready.promise, message: async input => { received.push(input); }, answer: async () => {} });
+    if (state === "rejected") { ready.reject(new Error("secret startup failure")); await drain(); }
+    const command = commandInteraction(channel);
+    gateway.emit(Events.InteractionCreate, command);
+    await drain();
+    expect(command.replies).toHaveLength(1);
+    expect(command.replies[0]!.content).toContain("not ready");
+    expect(command.replies[0]!.flags).toBe(MessageFlags.Ephemeral);
+    expect(received).toEqual([]);
+    expect(gateway.lookups).toEqual([]);
+    if (state === "pending") {
+      ready.resolve();
+      await drain();
+      expect(received).toEqual([]); // Refusal was not a deferred submission.
+      gateway.emit(Events.InteractionCreate, commandInteraction(channel, { id: "201" }));
+      await drain();
+      expect(received).toHaveLength(1);
+    } else {
+      expect(errors).toHaveLength(1);
+      expect(String(errors[0])).not.toContain("secret startup failure");
+    }
+    await messenger.stop();
+  });
+
+  test("owner and actual application identity are checked before any channel lookup", async () => {
+    const { messenger, gateway, channel, received } = await fixture();
+    for (const patch of [
+      { user: { id: "stranger", bot: false } }, { user: { id: owner, bot: true } },
+      { applicationId: "foreign-application" }, { applicationId: bot },
+    ]) {
+      const command = commandInteraction(null, patch);
+      gateway.emit(Events.InteractionCreate, command);
+      await drain();
+      expect(command.replies).toHaveLength(1);
+      expect(command.replies[0]!.flags).toBe(MessageFlags.Ephemeral);
+      expect(command.deferred).toBe(0);
+    }
+    gateway.application.id = "";
+    const unidentified = commandInteraction(null);
+    gateway.emit(Events.InteractionCreate, unidentified);
+    await drain();
+    expect(unidentified.replies[0]!.content).toContain("does not belong");
+    expect(received).toEqual([]);
+    expect(gateway.lookups).toEqual([]);
+    expect(channel.fetched).toEqual([]);
+    await messenger.stop();
+  });
+
+  test("guild and parent allowlists, exact source identity, and genuine owner-only DMs are enforced", async () => {
+    const { messenger, gateway, channel, received } = await fixture();
+    const strangerDM = new Channel("dm", null); strangerDM.recipientId = "stranger";
+    const groupDM = new Channel("group", null);
+    Object.defineProperty(groupDM, "type", { value: ChannelType.GroupDM });
+    for (const entry of [
+      { channel: new Channel("parent", "foreign-guild"), patch: {} },
+      { channel: new Channel("other", "guild"), patch: {} },
+      { channel: new Channel("thread", "guild", "other"), patch: {} },
+      { channel, patch: { channelId: "different-channel" } },
+      { channel, patch: { guildId: null } },
+      { channel: new Channel("parent", "foreign-guild"), patch: { guildId: "guild" } },
+      { channel: strangerDM, patch: {} },
+      { channel: groupDM, patch: {} },
+      { channel: new Channel("dm", null), patch: { guildId: "guild" } },
+    ]) {
+      const command = commandInteraction(entry.channel, entry.patch);
+      gateway.emit(Events.InteractionCreate, command);
+      await drain();
+      expect(command.replies).toHaveLength(1);
+      expect(command.replies[0]!.content).toContain("not authorized");
+    }
+    expect(received).toEqual([]);
+    expect(gateway.lookups).toEqual([]);
+    await messenger.stop();
+  });
+
+  test("SDK channel fetch resolves missing cache entries, never interaction IDs as messages", async () => {
+    const { messenger, gateway, channel, received } = await fixture();
+    const command = commandInteraction(null);
+    gateway.emit(Events.InteractionCreate, command);
+    await drain();
+    expect(gateway.lookups).toEqual(["parent"]);
+    expect(received[0]!.route).toEqual(route);
+    expect(channel.fetched).toEqual([]);
+    for (const replacement of [new Channel("wrong-id", "guild"), new Channel("parent", "foreign-guild")]) {
+      gateway.channelMap.set("parent", replacement);
+      const forged = commandInteraction(null, { id: "201" });
+      gateway.emit(Events.InteractionCreate, forged);
+      await drain();
+      expect(forged.replies[0]!.content).toContain("not authorized");
+      expect(replacement.fetched).toEqual([]);
+    }
+    expect(received).toHaveLength(1);
+    await messenger.stop();
+  });
+
+  test("unsupported commands and stale option shapes are refused rather than dropping arguments", async () => {
+    const { messenger, gateway, channel, received } = await fixture();
+    const text = { name: "text", type: ApplicationCommandOptionType.String, value: "high" };
+    for (const patch of [
+      { commandName: "hermes" }, { commandName: "status", options: { data: [text] } },
+      ...[
+        [text, text], [{ ...text, name: "model" }], [{ ...text, type: ApplicationCommandOptionType.Integer, value: 3 }],
+        [{ ...text, options: [] }], [{ ...text, focused: true }], [{ name: "text", type: ApplicationCommandOptionType.String }],
+        [{ name: "subcommand", type: ApplicationCommandOptionType.Subcommand, options: [] }],
+      ].map(data => ({ commandName: "model", options: { data } })),
+    ]) {
+      const command = commandInteraction(channel, patch);
+      gateway.emit(Events.InteractionCreate, command);
+      await drain();
+      expect(command.replies).toHaveLength(1);
+      expect(command.replies[0]!.content).toContain("unsupported or stale");
+      expect(command.deferred).toBe(0);
+    }
+    expect(received).toEqual([]);
+    expect(gateway.lookups).toEqual([]);
+    await messenger.stop();
+  });
+
+  test("duplicate deliveries keep one durable event identity, distinct from real message identity", async () => {
+    const { messenger, gateway, channel, received } = await fixture();
+    for (let index = 0; index < 2; index++) {
+      gateway.emit(Events.InteractionCreate, commandInteraction(channel));
+      await drain();
+    }
+    gateway.emit(Events.MessageCreate, inbound(channel, { id: "200", content: "/status" }));
+    await drain();
+    expect(received).toHaveLength(3);
+    expect(received[0]).toEqual(received[1]);
+    expect(received[0]!.id).toBe("discord:bot:interaction:200");
+    expect(received[0]!.messageId).toBeNull();
+    expect(received[0]!.interactionId).toBe("200");
+    expect(received[2]!.id).toBe("discord:bot:200:original");
+    expect(received[2]!.messageId).toBe("200");
+    expect(received[2]!.interactionId).toBeUndefined();
+    expect(channel.fetched).toEqual([]);
+    await messenger.stop();
+  });
+
+  test("uncertain durable admission is redacted, never reports success, and never replays", async () => {
+    const gateway = new Gateway();
+    const channel = new Channel();
+    const errors: unknown[] = [];
+    let admissions = 0;
+    const messenger = new DiscordMessenger({ token: "unused", ownerId: owner, allowedGuildIds: ["guild"], allowedChannelIds: ["parent"], client: gateway as unknown as Client, onError: error => errors.push(error) });
+    await messenger.start({ message: async () => { admissions++; throw new Error("secret-interaction-token in admission failure"); }, answer: async () => {} });
+    const command = commandInteraction(channel);
+    gateway.emit(Events.InteractionCreate, command);
+    await drain();
+    expect(admissions).toBe(1);
+    expect(command.replies).toHaveLength(1);
+    expect(command.replies[0]!.content).toContain("could not confirm acceptance");
+    expect(command.replies[0]!.content).toContain("may already have been recorded");
+    expect(command.replies[0]!.content).not.toMatch(/accepted this command|resubmit|try again/i);
+    expect(command.deferred).toBe(0);
+    expect(command.followups).toBe(0);
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0])).not.toContain("secret-interaction-token");
+    expect((errors[0] as Error).cause).toBeUndefined();
+    await messenger.stop();
+  });
+
+  test.each(["accepted", "refused"] as const)("%s ACK errors cannot leak tokens, retry admission, or invoke followups", async state => {
+    const { messenger, gateway, channel, received, errors } = await fixture();
+    const command = commandInteraction(channel, state === "refused" ? { user: { id: "stranger", bot: false } } : {});
+    let attempts = 0;
+    command.reply = async () => { attempts++; throw Object.assign(new Error("https://discord.com/api/interactions/200/secret-interaction-token/callback"), { requestBody: { token: "secret-interaction-token" } }); };
+    gateway.emit(Events.InteractionCreate, command);
+    await drain();
+    expect(attempts).toBe(1);
+    expect(received).toHaveLength(state === "accepted" ? 1 : 0);
+    expect(command.followups).toBe(0);
+    expect(command.deferred).toBe(0);
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0])).toContain("acknowledgement failed");
+    expect(String(errors[0])).not.toContain("secret-interaction-token");
+    expect((errors[0] as Error).cause).toBeUndefined();
+    await messenger.stop();
+  });
+
+  test("channel lookup failures are redacted and cannot admit or claim success", async () => {
+    const { messenger, gateway, received, errors } = await fixture();
+    gateway.channels.fetch = async () => { throw new Error("secret-interaction-token from SDK"); };
+    const command = commandInteraction(null);
+    gateway.emit(Events.InteractionCreate, command);
+    await drain();
+    expect(received).toEqual([]);
+    expect(command.replies[0]!.content).toContain("nothing was admitted");
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0])).not.toContain("secret-interaction-token");
+    expect((errors[0] as Error).cause).toBeUndefined();
     await messenger.stop();
   });
 });

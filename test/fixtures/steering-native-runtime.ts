@@ -5,7 +5,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { parseSessionEntries, type FileEntry } from "@oh-my-pi/pi-coding-agent";
 import { type Config, hostPaths, privateDirectory } from "../../src/config";
-import type { Approval, Inbound, Lane, Messenger, OutputRecord, Route } from "../../src/contracts";
+import type { Approval, Inbound, Lane, MessageReference, Messenger, OutputRecord, Route } from "../../src/contracts";
 import { HostConnection, startHost, type HostFrame, type HostOptions } from "../../src/host";
 import { Superagent } from "../../src/runtime";
 import { Store } from "../../src/store";
@@ -208,7 +208,7 @@ export async function nativeSteeringRuntime(): Promise<void> {
   let succeeded = false;
   const route: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: "3", channelId: "4", threadId: null };
   const otherRoute: Route = { ...route, threadId: "7001" };
-  const inbound = (id: string, destination: Route, text: string): Inbound => ({ id, messageId: id, route: destination,
+  const inbound = (id: string, destination: Route, text: string): Inbound & MessageReference => ({ id, messageId: id, route: destination,
     text, receivedAt: Date.now(), attachments: [] });
   const entries = async (sessionFile = mainPaths.sessionFile) => parseSessionEntries(await fs.readFile(sessionFile, "utf8"));
   const healthy = () => { if (errors.length) throw new AggregateError(errors, "Native steering runtime reported an error"); };

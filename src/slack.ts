@@ -1,16 +1,17 @@
 import { createHash } from "node:crypto";
 import { LogLevel, WebClient, type WebClientOptions } from "@slack/web-api";
 import { SocketModeClient } from "@slack/socket-mode";
-import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type Route } from "./contracts.ts";
 import { parseDialog, type Dialog } from "./dialog.ts";
 import { DeliveryError } from "./delivery.ts";
 import { compareMessageIds } from "./message-order.ts";
+import { parseSlackCommand } from "./slack-commands.ts";
 
 type RecordValue = Record<string, unknown>;
 type Handlers = Parameters<Messenger["start"]>[0];
 type Socket = Pick<SocketModeClient, "on" | "off" | "start" | "disconnect">;
 type Http = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-type Envelope = { type: string; envelope_id?: string; body: RecordValue; ack(response?: unknown): Promise<void> };
+type Envelope = { type: string; envelope_id?: string; body: RecordValue; accepts_response_payload?: boolean; ack(response?: unknown): Promise<void> };
 type Block = RecordValue;
 type Answer = NonNullable<DialogResponse["answers"]>[number];
 interface Pending {
@@ -49,7 +50,7 @@ const escapeText = (value: string): string => value.replaceAll("&", "&amp;").rep
 // including the head's bare query and argument forms of /model, /effort, /stop,
 // /compact, and the rest of the ordinary-text command surface.
 // Only an exact first token converts; lookalikes such as "!models" stay plain text.
-const controlText = (value: string): string => value.replace(/^!(new|main|stop|resume|model|effort|help|status|context|compact|usage)(?=$|\s)/, "/$1");
+const controlText = (value: string): string => value.replace(/^!(new|main|stop|restart|resume|model|effort|help|status|context|compact|usage)(?=$|\s)/, "/$1");
 const tokenFor = (approval: Approval): string => hash(JSON.stringify([approval.id, approval.generation, approval.target, approval.requestId, routeKey(approval.route)]));
 const compare = (left: string, right: string): number => {
   const result = compareMessageIds("slack", left, right);
@@ -92,6 +93,8 @@ export class SlackMessenger implements Messenger {
   private accountId: string | null = null;
   private botUserId: string | null = null;
   private botId: string | null = null;
+  private appId: string | null = null;
+  private socketAppId: string | null = null;
   private handlers: Handlers | null = null;
   private connected = false;
   private intake: Promise<void> = Promise.resolve();
@@ -105,6 +108,7 @@ export class SlackMessenger implements Messenger {
   private readonly http: Http;
   private readonly report: (error: unknown) => void;
   private readonly onEnvelope = (envelope: Envelope) => {
+    if (!this.appId || this.socketAppId !== this.appId) return;
     if (envelope.type === "interactive") {
       const task = this.queueInteraction(envelope).catch(error => this.report(failure(error)));
       this.interactions.add(task);
@@ -115,8 +119,17 @@ export class SlackMessenger implements Messenger {
   };
   private readonly onConnected = () => {
     if (!this.connected) return;
-    this.intake = this.intake.then(async () => { if (await this.ready) await this.handlers?.reconnect?.(); }).catch(error => this.report(failure(error)));
+    this.intake = this.intake.then(async () => { if (await this.ready && this.socketAppId === this.appId) await this.handlers?.reconnect?.(); }).catch(error => this.report(failure(error)));
   };
+  private readonly onWireMessage = (data: unknown, isBinary: boolean) => {
+    if (isBinary || !string(data)) return;
+    let value: unknown;
+    try { value = JSON.parse(data); } catch { return; }
+    if (!object(value) || value.type !== "hello") return;
+    this.socketAppId = object(value.connection_info) && slackId(value.connection_info.app_id) ? value.connection_info.app_id : null;
+    if (this.socketAppId !== this.appId) this.report(new Error("Slack Socket Mode application does not match the authenticated bot"));
+  };
+  private readonly onConnecting = () => { this.socketAppId = null; };
   private readonly onSocketError = () => { this.report(new Error("Slack Socket Mode transport failed")); };
 
   constructor(private readonly options: SlackMessengerOptions) {
@@ -153,23 +166,37 @@ export class SlackMessenger implements Messenger {
     try {
       const identity = await this.api("auth.test");
       if (identity.team_id !== this.options.teamId || !slackId(identity.user_id) || !slackId(identity.bot_id)) throw new DeliveryError("Slack bot authentication does not match the configured workspace", "rejected");
+      const botResult = await this.api("bots.info", { bot: identity.bot_id });
+      const bot = botResult.bot;
+      if (!object(bot) || bot.id !== identity.bot_id || bot.user_id !== identity.user_id || !slackId(bot.app_id)
+        || (bot.team_id !== undefined && bot.team_id !== this.options.teamId)) throw new DeliveryError("Slack bot application identity could not be verified", "rejected");
       const ownerResult = await this.api("users.info", { user: this.options.ownerId });
       const owner = ownerResult.user;
       if (!object(owner) || owner.id !== this.options.ownerId || owner.team_id !== this.options.teamId || owner.is_bot !== false || owner.deleted === true || owner.is_app_user === true) throw new DeliveryError("Slack owner must be an active human in the configured workspace", "rejected");
       this.botUserId = identity.user_id;
       this.botId = identity.bot_id;
+      this.appId = bot.app_id;
       this.accountId = `${this.options.teamId}:${this.botUserId}`;
       this.handlers = handlers;
       this.stopSignal = Promise.withResolvers<void>();
+      const authenticatedSocket = Promise.withResolvers<void>();
       this.ready = Promise.race([
-        (handlers.ready ?? Promise.resolve()).then(() => true),
+        Promise.all([handlers.ready ?? Promise.resolve(), authenticatedSocket.promise]).then(() => true),
         this.stopSignal.promise.then(() => false),
       ]).catch(error => { this.report(failure(error)); return false; });
       this.socket.on("slack_event", this.onEnvelope);
+      this.socket.on("ws_message", this.onWireMessage);
+      this.socket.on("connecting", this.onConnecting);
+      this.socket.on("reconnecting", this.onConnecting);
+      this.socket.on("disconnected", this.onConnecting);
       this.socket.on("connected", this.onConnected);
       this.socket.on("error", this.onSocketError);
       await this.socket.start();
+      // apps.connections.open does not promise app_id. The SDK's public raw
+      // event exposes hello.connection_info.app_id without private-field access.
+      if (this.socketAppId !== this.appId) throw new DeliveryError("Slack Socket Mode application does not match the authenticated bot", "rejected");
       this.connected = true;
+      authenticatedSocket.resolve();
     } catch (error) { await this.stop(); throw failure(error); }
   }
 
@@ -199,7 +226,7 @@ export class SlackMessenger implements Messenger {
     return route;
   }
 
-  private normalize(message: RecordValue, route: Route): Inbound | null {
+  private normalize(message: RecordValue, route: Route): (Inbound & MessageReference) | null {
     if (message.type !== "message" || message.user !== this.options.ownerId || message.bot_id || message.app_id ||
       (message.subtype !== undefined && message.subtype !== "file_share") || !timestamp(message.ts) ||
       (message.team !== undefined && message.team !== this.options.teamId) ||
@@ -228,8 +255,10 @@ export class SlackMessenger implements Messenger {
   }
 
   private async receive(envelope: Envelope): Promise<void> {
+    if (!this.appId || this.socketAppId !== this.appId) throw new DeliveryError("Slack Socket Mode application is not authorized", "rejected");
     const body = envelope.body;
-    if (envelope.type !== "events_api" || body.team_id !== this.options.teamId || !object(body.event)) { await envelope.ack(); return; }
+    if (envelope.type === "slash_commands") { await this.receiveCommand(envelope); return; }
+    if (envelope.type !== "events_api" || body.team_id !== this.options.teamId || (body.api_app_id !== undefined && body.api_app_id !== this.appId) || !object(body.event)) { await envelope.ack(); return; }
     const event = body.event;
     if (event.type !== "message" || !slackId(event.channel) || (event.channel_type !== undefined && !["im", "channel", "group"].includes(String(event.channel_type)))) { await envelope.ack(); return; }
     let message = event;
@@ -243,6 +272,34 @@ export class SlackMessenger implements Messenger {
     if (input) await this.handlers!.message(input);
     // A failed durable admission deliberately leaves the envelope unacknowledged.
     await envelope.ack();
+  }
+
+  private async receiveCommand(envelope: Envelope): Promise<void> {
+    const body = envelope.body;
+    const refuse = async () => envelope.ack({ response_type: "ephemeral", text: "Superagent refused this command: use a configured command as the authorized owner in this app's workspace and an allowed channel or owner DM. Slash commands cannot target threads." });
+    // Real Slack slash commands carry no message/thread identity. Neither the
+    // opaque trigger nor a claimed channel name can supply those identities.
+    if (body.team_id !== this.options.teamId || body.user_id !== this.options.ownerId || !this.appId
+      || (body.api_app_id !== undefined && body.api_app_id !== this.appId)
+      || (body.app_id !== undefined && body.app_id !== this.appId)
+      || (body.bot_id !== undefined && body.bot_id !== this.botId)
+      || !slackId(body.channel_id) || !string(body.trigger_id) || !body.trigger_id.length
+      || !string(body.command) || !string(body.text)
+      || ["ts", "message_ts", "thread_ts", "thread_id", "message", "container"].some(field => field in body)) { await refuse(); return; }
+    const text = parseSlackCommand(body.command, body.text);
+    if (text === null) { await refuse(); return; }
+    let route: Route | null;
+    try { route = await this.incomingRoute(body.channel_id, null); }
+    catch { await refuse(); return; }
+    if (!route) { await refuse(); return; }
+    const invocationId = createHash("sha256").update(JSON.stringify([this.appId, this.options.teamId, this.options.ownerId, body.channel_id, body.trigger_id])).digest("hex");
+    await this.handlers!.message({
+      id: `slack:${this.accountId}:${body.channel_id}:invocation:${invocationId}`,
+      route, messageId: null, invocationId, text, receivedAt: Date.now(), attachments: [],
+    });
+    // The receipt admits only. Results always use the ordinary durable outbox;
+    // response_url, token, and trigger_id never cross the adapter boundary.
+    await envelope.ack(envelope.accepts_response_payload ? { response_type: "ephemeral", text: "Superagent command admitted. The result will appear in this conversation." } : undefined);
   }
 
   private messagePayload(text: string, blocks = sections(text)): RecordValue {
@@ -285,7 +342,7 @@ export class SlackMessenger implements Messenger {
     return `file:${ticket.file_id}`;
   }
 
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+  async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     if (!timestamp(message.messageId)) throw new DeliveryError("Activity requires a Slack message timestamp", "rejected");
     await this.destination(message.route);
     const args = { channel: message.route.channelId, timestamp: message.messageId, name: activity === "received" ? "eyes" : "thought_balloon" };
@@ -641,7 +698,7 @@ export class SlackMessenger implements Messenger {
         latest = nextLatest;
       }
     }
-    const inputs = new Map<string, Inbound>();
+    const inputs = new Map<string, Inbound & MessageReference>();
     for (const message of messages) {
       if (compare(message.ts as string, messageId) <= 0) continue;
       const input = this.normalize(message, route);
@@ -699,6 +756,10 @@ export class SlackMessenger implements Messenger {
     this.connected = false;
     this.stopSignal.resolve();
     this.socket.off("slack_event", this.onEnvelope);
+    this.socket.off("ws_message", this.onWireMessage);
+    this.socket.off("connecting", this.onConnecting);
+    this.socket.off("reconnecting", this.onConnecting);
+    this.socket.off("disconnected", this.onConnecting);
     this.socket.off("connected", this.onConnected);
     this.socket.off("error", this.onSocketError);
     await this.intake;
@@ -708,7 +769,7 @@ export class SlackMessenger implements Messenger {
     for (const pending of this.pending.values()) pending.active = false;
     this.pending.clear();
     this.handlers = null;
-    this.accountId = this.botUserId = this.botId = null;
+    this.accountId = this.botUserId = this.botId = this.appId = this.socketAppId = null;
     try { await this.socket.disconnect(); } catch { this.onSocketError(); }
   }
 }

@@ -1,6 +1,6 @@
 import type { Config } from "./config";
 import { requireMessengerCredentials } from "./config";
-import type { Approval, Attachment, Inbound, MessageActivity, Messenger, OutputRecord, Platform, Route, StorePort } from "./contracts";
+import type { Approval, Attachment, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Platform, Route, StorePort } from "./contracts";
 import { physicalRouteKey } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { DiscordMessenger } from "./discord";
@@ -54,7 +54,7 @@ export class MessengerHub implements Messenger {
   send(output: OutputRecord): Promise<string> {
     return this.adapter(output.route).send(output);
   }
-  async setActivity(message: Pick<Inbound, "route" | "messageId">, activity: MessageActivity): Promise<void> {
+  async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     const key = JSON.stringify([physicalRouteKey(message.route), message.messageId]);
     const apply = async () => {
       // An edit is fresh ingress, but Telegram's single reaction must stay thinking.

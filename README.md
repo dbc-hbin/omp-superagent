@@ -140,6 +140,23 @@ bun --no-env-file src/cli.ts attach main --config config.local.json --read-only
   compacts the idle head. `/model preset` lists native presets and `/model preset <name>`
   applies one to the head session. `/stop head` interrupts head work without stopping the Gateway.
   Slack uses the same commands with `!`.
+- `/restart` replaces both the Gateway and HEAD when idle, preserving the native session
+  and durable coordination state. Active work or approvals cause refusal, not a forced kill.
+  Slack supports `!restart` and the registered `/superagent-restart`.
+- Discord also supports the registered slash-command picker. Preview registration with
+  `bun --no-env-file src/cli.ts discord-commands --config config.local.json`; add `--apply`
+  to replace this bot's global command list with supported Superagent commands.
+  This removes obsolete Hermes commands; setup, doctor, and start never register implicitly.
+  Commands with arguments use the optional `text` field. The private receipt confirms admission;
+  the actual result is delivered to the original conversation through the normal outbox.
+- Telegram command menus use the same controls, including `/status@BotUsername` in groups.
+  Preview with `telegram-commands --config config.local.json` and add `--apply` to update
+  owner-scoped menus; `--language CODE` selects a language-specific list.
+- Slack's registered picker uses `/superagent-status`, `/superagent-model`, and the other
+  `/superagent-*` controls to avoid built-in command collisions. Existing `!` messages remain valid.
+  Register with `slack-commands --config config.local.json --manifest-token-env NAME [--apply]`
+  through the same CLI. `NAME` identifies a separate Slack app-configuration credential;
+  bot/app connection tokens are not substitutes. Review any reported reinstall requirement.
 - Add `--global` only to `/model preset <name>` when you explicitly want to save native
   default roles and effort too. The change reply reports the actual model/effort and scope.
 

@@ -243,6 +243,24 @@ pending 순서를 보존하고 최대 30초의 capped reconnect backoff로 복�
 재시작에는 `config.model`을 다시 전달해 native 저장 모델을 덮지 않는다. status의 `head.ready`는
 controller-ready이며 native PID 생존·정확한 identity·Gateway adapter-ready와 각각 다른 사실이다.
 
+### 명시적 메신저 재시작
+
+`/restart`(Slack `!restart` 또는 `/superagent-restart`)는 모델 턴이 아닌 우선 제어 명령이다.
+Gateway와 지정 헤드 프로세스를 **모두 교체**하되 동일 native session file·session ID·모델 설정·
+입출력/승인/레인 기록을 보존한다. 실행·비동기 작업·서비스·승인·미해결 입력 및 레인의 활동이
+있으면 거절하며 강제 종료하거나 암묵적으로 취소하지 않는다.
+
+헤드는 서비스 전체의 새 dispatch를 막고 원래 명령을 완료 처리한 뒤 기존 outbox로 접수
+응답을 보낸다. 그 출력이 실제 `sent`임을 확인한 경우에만 인증된 Gateway 재시작 요청을 보낸다.
+Gateway는 원래 소유자 입력·정확한 응답·현재 프로세스 신원을 대조하고 요청 ID별 수명 기록을
+영속화한다. 재전달은 같은 기록을 반환하며 두 번째 교체를 시작하지 않는다.
+Gateway가 소유한 정상 shutdown 경로와 일회성 일반 코드 successor가 기존 수명 lock 해제 뒤
+새 Gateway를 시작한다. 헤드는 자신을 종료하지 않으며 새 AI supervisor나 실행 backend를 만들지 않는다.
+
+새 헤드는 원래 세션과 실제 초기화 상태를 확인하고 원래 대화의 outbox에 결과를 알린다.
+접수·프로세스 시작·준비 완료를 구분하고 불확실한 종료/발송/기동을 자동 재시도하지 않는다.
+명시적 운영자 `stop main`이 재시작을 취소한 뒤 successor가 서비스를 되살려서는 안 된다.
+
 ### 플랫폼 인증·운영 설정
 
 설치·권한·토큰 입력 절차와 공식 API 문서 링크는 [운영·설치 가이드의 플랫폼별 설정](docs/OPERATIONS.md#2-플랫폼별-앱과-접근-범위)을 따른다.
@@ -299,7 +317,8 @@ Slack은 Socket Mode·Interactivity·`message.channels/groups/im` 구독으로 �
 동작한다. bot scopes는 `chat:write`, `users:read`, `files:read/write`와 사용하는 대화 유형별
 `channels:read/groups:read/im:read`, `channels:history/groups:history/im:history`다.
 `conversations.replies`는 현재 공식 문서의 bot history scope를 따른다. 폐기된 bot-thread
-조회 제한이나 `files.upload`에 의존하지 않으며 별도 Slack slash-command handler는 없다.
+조회 제한이나 `files.upload`에 의존하지 않는다. 등록된 `/superagent-*` 명령도 같은
+Socket Mode 연결로 수신하며 별도 공개 HTTP endpoint를 만들지 않는다.
 
 ## 3. 요청 라우팅과 맥락 경계
 
@@ -334,9 +353,18 @@ runtime은 해당 목적지로 이 메시지가 발송됐다는 영수증을 확
 스레드 없는 private/DM의 논리 주제는 실제 플랫폼 thread로 위장하지 않는다. `Route.topicId`는
 선택적인 논리 연결 키이며 실제 channelId와 null인 threadId는 그대로 둔다. 주제가 없는 기존
 물리 연결 키는 바뀌지 않는다. 아래 `/` 제어는 Discord·Telegram의 일반 메시지 표기이며
+Discord는 명시적으로 등록한 application command도 같은 제어 경로로 정규화한다.
 Slack은 같은 의미의 **`!new [요청]`, `!main`, `!stop`, `!resume`** 일반 메시지를 정규화한다.
+등록된 `/superagent-new`·`/superagent-main` 등도 같은 제어 경로로 연결한다.
 Slack client가 가로챌 수 있는 `/new`를 등록된 slash command처럼 안내하지 않는다.
-실제 메시지 ID/ts로 순서를 보존하며 가짜 slash-command timestamp를 만들지 않는다.
+실제 메시지 ID/ts와 Discord interaction snowflake로 순서를 보존하며 가짜 timestamp를 만들지 않는다.
+Discord 명령 입력은 `messageId: null`과 실제 `interactionId`를 구분한다. interaction ID를
+메시지 fetch·반응·history cursor·스레드 원본으로 사용하지 않으며 응답 token은 영속화하지 않는다.
+Slack 명령에는 실제 메시지 `ts`가 없으므로 `messageId: null`과 소유 범위에 묶인
+비가역 호출 fingerprint를 저장한다. `trigger_id`·`response_url`은 저장하지 않는다.
+DM 명령 경계는 마지막으로 영속 접수한 실제 소유자 메시지 뒤에 놓고 같은 anchor에서는
+영속 접수 순서를 따른다. 이는 관측한 접수 순서이지 여러 연결 사이의 전역 송신 시각 보장이 아니다.
+기존 메시지 timestamp 경계와 이미 접수한 수정본의 원래 주제 바인딩은 유지한다.
 
 ### 기본 steer와 자동 native 주제 연결
 
@@ -415,6 +443,22 @@ UX를 참고하되 OMP 공개 RPC를 사용한 독립 구현이다
 ([참고 revision](https://github.com/NousResearch/hermes-agent/blob/0d2dec897ff8e2dfba853c313f05cdd2624d6200/gateway/slash_commands_model.py)).
 
 ### 메신저 운영 명령
+
+Discord 자동완성은 일반 텍스트 명령과 동일한 소유자·계정·채널·DM 경계를 검사한다.
+Gateway가 입력을 영속 접수한 뒤에만 비공개 접수 확인을 보내며, 실제 결과는 기존 outbox로
+원래 대화에 전달한다. 시작 준비 전·미지원·권한 밖 명령은 접수하지 않고 명시적으로 거절한다.
+Discord의 최초 응답 제한은 3초이며 모델 실행이나 일반 메시지 fetch 뒤에 접수를 대기시키지 않는다.
+접수·응답 결과가 불확실해도 명령을 자동 재실행하지 않는다.
+`discord-commands --config FILE`은 등록 변경을 조회하고, 명시적 `--apply`만 전역 명령 목록을
+지원 명령으로 교체한다. 세 플랫폼의 명령·설명·인수는 `src/messenger-commands.ts`를 단일 원본으로 사용한다.
+다른 guild 등록은 몰래 삭제하지 않으며 충돌은 보고한다. setup·doctor·start는 등록하지 않는다.
+Telegram은 `telegram-commands`의 명시적 apply로 소유자 DM·허용 그룹의 소유자 메뉴만
+갱신하고 실제 `bot_command` entity와 현재 봇 username으로 `/명령@봇이름`을 정규화한다.
+다른 봇 대상 명령은 업무로 받아들이지 않는다. 언어별 목록은 선택한 language code만 다룬다.
+Slack은 `slack-commands`와 별도 앱 구성 token으로 현재 앱 manifest의 명령만 바꾼다.
+bot/workspace/app 신원을 확인하고 무관한 manifest 필드는 보존한다. `commands` 권한의
+실제 grant·재설치 필요 여부는 manifest 저장 성공과 구분한다. 실제 실행은 기존 Socket Mode
+영속 접수와 outbox를 사용하며, 앱·팀·소유자·대화 인증과 접수 후 ACK 원칙은 유지한다.
 
 `/help`, `/status`, `/context`, `/usage`는 확정적인 head runtime 조회이며 모델 턴 없이
 처리한다. 상태는 현재 주제·연결 레인과 공유 헤드의 native 실행 상태·대기·승인·불확실성을

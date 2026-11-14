@@ -419,7 +419,7 @@ Git 추적 파일에 쓰지 않는다. 아래 셋업은 별도 소유자 전용 
 1. [Discord Developer Portal](https://discord.com/developers/applications)에서 앱과 Bot을 만든다.
    Bot 설정의 **Privileged Gateway Intents → Message Content Intent**를 켠다.
    서버 메시지 본문을 수신하려면 코드의 intent 요청과 포털 설정이 모두 필요하다.
-2. 운영할 서버에 bot을 초대한다. 필요한 채널에 View Channel, Read Message History,
+2. 운영할 서버에 `bot`과 `applications.commands` 범위로 초대한다. 필요한 채널에 View Channel, Read Message History,
    Send Messages, Send Messages in Threads, Create Public Threads, Attach Files, Add Reactions 권한을 부여한다.
    비공개 스레드 등은 봇이 실제로 접근할 수 있어야 한다. 관리자 권한은 요구하지 않는다.
 3. Discord 개발자 모드로 소유자 **사용자 ID**, 서버 ID, 허용할 **부모 채널 ID**를 복사한다.
@@ -436,6 +436,29 @@ export DISCORD_BOT_TOKEN
 
 위 입력은 Bash에서 토큰이 화면과 명령 이력에 노출되지 않게 받는 예다.
 프로세스는 현재 사용자 권한과 환경을 사용한다. 레인과 worktree는 보안 샌드박스가 아니다.
+
+Discord 자동완성 목록은 명시적으로 등록한다. 먼저 새 interaction 처리 코드가 실행되는
+Gateway를 사용해야 한다. 작업 중인 헤드를 강제 종료해서 업데이트하지 않는다.
+
+```sh
+bun --no-env-file src/cli.ts discord-commands --config config.local.json
+bun --no-env-file src/cli.ts discord-commands --config config.local.json --apply
+```
+
+첫 명령은 읽기 전용 변경 확인이다. `--apply`는 **이 봇의 전역 명령 목록 전체를 교체**하므로
+전용 Superagent 앱에서만 사용한다. Hermes 전용 명령은 제거하고 지원되는
+`help/status/restart/context/usage/model/effort/compact/stop/resume/new/main`만 등록한다.
+별도 guild 명령이 전역 명령을 가리는 경우 몰래 삭제하지 않고 충돌을 알린다.
+등록은 모델·메신저 연결을 시작하지 않으며 setup·doctor·start의 부수 효과로 실행되지 않는다.
+인수가 있는 명령은 선택적인 `text` 필드를 사용한다. 예를 들어 `/model`의 `text`에
+`preset high`, `/stop`의 `text`에 `head`를 넣는다. 일반 `/status` 메시지도 계속 지원한다.
+
+명령은 기존 소유자와 허용 채널·스레드·1:1 DM 경계를 그대로 따른다. 영속 접수 뒤 비공개
+접수 확인을 보내고 실제 결과는 기존 outbox로 원래 대화에 보낸다. interaction ID는 실제
+메시지 ID가 아니므로 history cursor·반응·메시지 fetch·스레드 원본으로 사용하지 않는다.
+interaction token은 저장하거나 헤드에 넘기지 않는다. Discord는 최초 응답을 3초 안에
+요구한다. 접수/ACK가 불확실하면 자동 재실행하지 않으며 상태를 확인하기 전 같은 변경 명령을
+반복하지 않는다. API 계약은 [Discord interactions 문서](https://docs.discord.com/developers/interactions/receiving-and-responding)를 따른다.
 
 ### 2.2 Telegram
 
@@ -478,6 +501,21 @@ export TELEGRAM_BOT_TOKEN
 대비한 처리이지 history 복원이 아니다. 유휴 구간을 넘어 update_id가 계속 증가한다고 가정하지
 않으며, 재전달은 안정적인 메시지 ID와 callback-query ID로 구분한다.
 
+Telegram 명령 메뉴는 다음 명령으로 확인·적용한다. 실제 polling이나 webhook 변경은 하지 않는다.
+
+```sh
+bun --no-env-file src/cli.ts telegram-commands --config config.local.json
+bun --no-env-file src/cli.ts telegram-commands --config config.local.json --apply
+```
+
+소유자 1:1 DM과 검증된 허용 그룹의 소유자 전용 범위만 갱신한다. 다른 사용자·scope는 보존한다.
+그룹 메뉴가 보내는 `/status@봇이름`은 실제 command entity와 봇 username을 확인한 뒤
+`/status`로 처리하고, 다른 봇 대상 명령은 무시한다. 메시지 ID·topic·영속 offset 경계는 그대로다.
+언어별 목록은 `--language ko`처럼 선택할 수 있다. Telegram API는 모든 기존 언어 override를
+열거할 수 없으므로 선택하지 않은 언어별 목록까지 정리됐다고 보장하지 않는다.
+공식 API는 [setMyCommands](https://core.telegram.org/bots/api/methods/setmycommands)와
+[getMyCommands](https://core.telegram.org/bots/api/methods/getmycommands)를 사용한다.
+
 ### 2.3 Slack
 
 1. [Slack 앱](https://api.slack.com/apps)을 만들고
@@ -496,8 +534,8 @@ export TELEGRAM_BOT_TOKEN
    | 첨부 확인·다운로드, 긴 출력 업로드 | `files:read`, `files:write` |
 
 3. Event Subscriptions를 켜고 bot events **`message.channels`**, **`message.groups`**, **`message.im`**을
-   구독한다. Interactivity도 켠다. 이벤트와 Block Kit 버튼·모달은 Socket Mode로 받아
-   public Request URL/웹 서버가 필요 없다. **Slack Slash Commands는 등록하지 않는다.**
+   구독한다. Interactivity도 켠다. 이벤트·Block Kit 버튼·모달과 등록된 명령은 Socket Mode로 받아
+   public Request URL/웹 서버가 필요 없다. 명령에는 bot OAuth `commands` 권한도 필요하다.
 4. `teamId`는 `T…` workspace ID, `ownerId`는 그 workspace의 활성 인간 사용자 `U…`/`W…` ID,
    `allowedChannelIds`는 `C…`/`G…` 채널 ID 문자열이다. 앱을 허용 채널에 초대한다.
    시작 시 `auth.test`의 bot/workspace와 `users.info`의 소유자를 확인한다.
@@ -506,6 +544,31 @@ export TELEGRAM_BOT_TOKEN
 5. Slack 일반 메시지에서는 **`!new [요청]`, `!main`, `!stop`, `!resume`**을 사용한다.
    어댑터가 공통 runtime 제어로 정규화한다. Slack composer가 `/new` 등을 가로챌 수 있으므로
    Discord·Telegram의 `/` 표기를 Slack 명령으로 안내하지 않는다.
+   등록된 선택기는 `/superagent-new`, `/superagent-main`, `/superagent-status`처럼
+   **`/superagent-<명령>`**을 사용해 Slack 기본 명령과 충돌하지 않는다.
+
+명령 등록에는 bot token이나 `connections:write` app token과 별도로 **앱 구성 token**이 필요하다.
+해당 token은 환경변수 또는 private 자격 증명 파일에 넣고, 아래 `NAME`에는 값이 아닌 변수 이름을
+전달한다. 첫 호출은 읽기 전용이고 `--apply`만 manifest의 명령 목록을 교체한다.
+
+```sh
+bun --no-env-file src/cli.ts slack-commands --config config.local.json --manifest-token-env NAME
+bun --no-env-file src/cli.ts slack-commands --config config.local.json --manifest-token-env NAME --apply
+```
+
+현재 bot·workspace·app 신원과 manifest를 조회해 같은 앱에만 적용하며 다른 설정은 보존한다.
+실행 시에는 `bots.info`의 app ID와 공식 Socket Mode SDK가 받은 `hello.connection_info.app_id`를
+대조한다. 재연결의 app 신원이 아직 확인되지 않았거나 다르면 명령을 접수하지 않는다.
+`commandsGrant`·`requiresReinstall`·`permissionsUpdated`를 확인한다. manifest 저장만으로
+현재 설치의 OAuth grant가 바뀌었다고 가정하지 않으며, 필요한 재설치/승인은 별도로 완료한다.
+공식 [manifest API](https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests)와
+[Socket Mode 명령](https://docs.slack.dev/apis/events-api/using-socket-mode#command)을 사용한다.
+API 실패·불확실한 갱신은 자동 재시도하지 않으며 token·`response_url`은 로그나 조율 DB에 남기지 않는다.
+
+Slack 슬래시 명령은 메시지가 아니며 원본 `ts`·스레드가 없다. 명령 호출의 token-free fingerprint로
+중복을 제거하고, 결과는 원래 허용 대화의 outbox로 보낸다. DM 주제 경계는 마지막으로 영속
+접수한 실제 소유자 메시지 뒤에 두며 같은 anchor의 명령은 접수 순서를 따른다. 이를 가짜 Slack
+timestamp나 플랫폼 전체 송신 순서로 표현하지 않는다. 기존 메시지 수정은 원래 주제에 남는다.
 
 ```sh
 read -r -s SLACK_BOT_TOKEN
@@ -764,8 +827,9 @@ LLM 분류나 lane 실행을 하지 않는다.
 새 채널·서버를 임의로 만들거나 권한·BotFather 설정을 바꾸지 않는다. 권한/네트워크 실패는
 미지원으로 숨기지 않으며 불확실한 생성·발송은 재전달 때 자동 반복하지 않는다.
 
-별도 슬래시 명령 등록은 하지 않는다. 다음은 Discord·Telegram에 보내는 **일반 텍스트 명령**이며
-Slack에서는 같은 위치에 `!new`·`!main`을 사용한다.
+다음은 Discord·Telegram에 보내는 **일반 텍스트 명령**이며 Discord는 등록된 슬래시 명령도
+같은 의미로 처리한다. Slack에서는 같은 위치에 `!new`·`!main` 또는 등록된
+`/superagent-new`·`/superagent-main`을 사용한다.
 
 | DM 입력 | 동작 |
 | --- | --- |
@@ -788,8 +852,9 @@ OMP 자체 `/new`로 전달하지 않는다. 연결된 레인 대화의 `/stop`,
 ### 헤드의 모델·effort
 
 다음 명령은 DM·허용 채널·스레드에서 **현재 메인 헤드 세션**에 적용된다. 레인에 연결된
-스레드에서도 그 레인이 아니라 헤드를 제어한다. Discord·Telegram은 일반 `/` 텍스트,
-Slack은 일반 `!model`·`!effort` 텍스트를 사용하며 native slash-command 등록은 필요 없다.
+스레드에서도 그 레인이 아니라 헤드를 제어한다. Discord·Telegram은 일반 `/` 텍스트를,
+Discord는 등록된 슬래시 명령을 함께 지원한다. Slack은 일반 `!model`·`!effort` 텍스트와
+등록된 `/superagent-model`·`/superagent-effort`를 지원하며 별도 HTTP endpoint는 없다.
 
 | 명령 | 동작 |
 | --- | --- |
@@ -840,12 +905,20 @@ native transcript에서 복원하므로 과거 프리셋의 기본값으로 덮�
 | --- | --- |
 | `/help` | 실제 지원 명령과 적용 대상 안내 |
 | `/status` | 공유 헤드의 실행 상태, 현재 주제·연결 레인, 대기·미해결 입력과 승인 확인 |
+| `/restart` | 유휴 상태에서 Gateway와 헤드 프로세스를 모두 교체. 같은 세션·기록 보존. 실행·비동기 작업·서비스·승인·미해결 입력이 있으면 거절 |
 | `/context` | 헤드 native 컨텍스트 사용량·한도 조회. 추정치·미상은 그대로 표시 |
 | `/usage` | 헤드 native 세션 토큰·캐시·비용 기록 조회. 계정 전체 청구액이나 제공자 잔액은 아님 |
 | `/compact [보존할 내용]` | 유휴 헤드의 native 컨텍스트 압축. 여러 줄 보존 지시 전달 가능 |
 | `/stop` | 연결된 레인이 있으면 그 레인 일시정지, 없으면 헤드 작업 중단 |
 | `/stop head` | 현재 주제와 무관하게 공유 헤드 작업 중단 |
 | `/stop <lane-id>` | 해당 instance에 등록되고 허가된 레인만 일시정지 |
+
+`/restart`는 인수가 없다. Slack의 선택기는 `/superagent-restart`, 일반 메시지는 `!restart`다.
+접수 응답이 실제 전송된 뒤 Gateway가 정상 종료와 일회성 successor 기동을 맡고,
+새 헤드가 동일 세션·실제 준비 상태를 확인한 결과를 원래 대화에 알린다. 접수 알림만 보고
+재시작 완료로 간주하지 않는다. 작업 중 거절되면 어느 프로세스도 강제 종료하지 않았다는 뜻이다.
+작업을 중단할지 여부는 별도로 결정하며 `/stop head`와 재시작을 혼동하지 않는다.
+불확실한 발송·종료·기동은 같은 요청으로 자동 반복하지 않고 상태와 원래 receipt를 확인한다.
 
 조회와 중단은 일반 모델 답변을 기다리지 않는다. 압축은 native 요약 모델을 호출할 수 있으며,
 일반 대화 실행·세션 초기화가 아니다. 실행·승인·goal·소유 서비스·미해결 제출이 있으면
@@ -1013,6 +1086,9 @@ managed extension 중복/disabled 처리, 비차단 updater startup과 native bi
 
 | 검증 항목 | 현재 결과 |
 | --- | --- |
+| 2026-11-14 `/restart` 리뷰·회귀·실계정 | 요청 UUID 규약 불일치, 확정 거절 뒤 fence 유지, 과거 receipt 갱신의 최신 상태 덮어쓰기를 수정했다. runtime/Gateway/lifecycle/default-steering 전체 4파일 286개·2,415 assertion 통과·11.28초. 마지막 fixture receipt 타입 수정 뒤 `tsc --noEmit` 및 lifecycle 전체 10개·78 assertion 통과·5.83초. Discord에 restart 포함 12개 명령을 적용·GET 검증하고 실제 자동완성에서 `/restart` 실행: Gateway 72353→72522, HEAD 72371→72526, 세션 `01a1d829-0eca-7323-8e3d-400f15811a55` 유지. 실제 접수 응답 `1571084170149757019`·준비 완료 응답 `1571084188050919425`의 UI 표시와 durable `sent`를 확인했다. 최종 두 프로세스 ready, 초기화 complete, 대기/미해결 이벤트 0, restart fence 해제. Telegram/Slack은 같은 경로의 회귀·SDK 검증 범위이며 실계정은 미설정 |
+| 2026-11-14 Discord 명령 실계정·UI | 유휴·미처리 입력/출력 없음 확인 후 정상 stop/start로 Gateway 64050·HEAD 64055 기동, 같은 세션 `01a1d829-0eca-7323-8e3d-400f15811a55` 보존. 당시 11개 명령의 이름·Superagent 설명·옵션·범위를 실제 API에 적용하고 GET readback 일치 확인. Discord 브라우저 자동완성에서 `/status`를 선택·실행해 비공개 접수 확인과 실제 상태 답변을 확인했다. 입력 `1571074536387121294`는 `messageId:null`인 interaction으로 `done`, 응답 `1571074537733230604`는 `sent`; native 초기화 complete·유휴 상태 확인. 이후 추가한 `/restart` 자체의 검증과 Telegram/Slack 실계정 검증은 이 행의 범위가 아님 |
+| 2026-11-14 세 메신저 명령 메뉴·실행 | 관련 14파일 전체 480개·4,981 assertion 통과·12.94초. 실제 Slack SocketModeClient의 로컬 WebSocket ACK·재전달, 명령 신원·비밀 비저장·토픽 경계·busy 상태 조회·기존 플랫폼 경로를 포함한다. 이후 SDK 타입 수정 뒤 `tsc --noEmit` 통과 및 Telegram/Slack 등록 2파일 전체 32개·843 assertion 통과·67ms. Discord·Telegram·Slack 등록 경계와 새 ingress에 대한 독립 정적 리뷰에서 추가 결함 없음. 실제 Discord 등록 dry-run은 bot/app 신원과 기존 Hermes 목록·guild 충돌 없음까지 확인했다. 운영 등록·재시작·실제 명령 UI 결과는 별도 기록하며 Telegram/Slack은 현재 운영 config에 없어 실계정 검증하지 않음 |
 | 2026-11-14 최초 셋업의 native judge 권장·리뷰 수정 | `tsc --noEmit` 통과. setup와 실제 setup PTY 2파일 전체에서 47개·46,488 assertion 통과·59.83초. 새 구성 저장 후의 미설정 권장, 전역/프로젝트/overlay·별칭/선택자 체인·null/빈 값·쉼표/공백뿐인 체인·판독 실패 구분, 미이관 legacy JSON/DB의 확인 불가 처리와 현행 설정/상위 layer 우선순위, Mnemopi 동의와 독립된 안내, 기존 구성 갱신·취소·출판 실패의 검사 생략과 native 설정/계정 파일 무변경을 확인했다. 일반 OMP의 `/models` → Roles → Judge 경로로 안내하며 모델 가용성·인증·실제 judge 호출은 검증하거나 변경하지 않음 |
 | 2026-11-14 최종 프리셋·Mnemopi·완료 이벤트 통합 | `tsc --noEmit` 통과. native-presets/runtime/Gateway/Gateway lifecycle/setup/실제 setup PTY 6파일 전체에서 210개·4,986 assertion 통과·16.20초. 최초 생성의 Mnemopi 명시적 yes·거절·Enter·취소·출판 실패·기존 구성 갱신·shadowed 설정·동시 변경·비밀 오류 비노출을 확인했다. terminal receipt가 완료 drain 종료 경계에 도착해도 유실되지 않는 결정적 회귀 포함. 운영 Gateway와 사용자 설정은 변경하지 않음 |
 | 2026-11-14 최종 native 초기화·복구·effort | native-gateway와 native-model-selection 전체 2파일에서 6개·436 assertion 통과·28.38초. 생성/기존 유효/실패/미실행/중단 5개 Gateway 시나리오, 초기화 중 영속 입력 보존·정확한 head 소유권·재시작 무재실행·실제 CLI `status`의 running/complete 및 ready 전환·실제 HEAD effort 상속 확인. 최초 scripted provider의 last-user-wins와 1-input/1-report 가정을 source-aware·실제 steering cohort 계약으로 수정하고 전체 시나리오를 유지했다. mock과 광고 context window는 기존 ULW fixture와 같은 65,536으로 맞췄으며 native compaction은 유지했다. 실제 OMP/RPC·결정적 로컬 제공자·기록용 Messenger 범위이며 운영 봇의 새 코드 재시작 검증은 아님 |

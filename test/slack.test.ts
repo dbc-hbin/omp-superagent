@@ -4,6 +4,8 @@ import type { WebClientOptions } from "@slack/web-api";
 import { SlackMessenger, type SlackMessengerOptions } from "../src/slack.ts";
 import { DeliveryError } from "../src/delivery.ts";
 import type { Approval, DialogResponse, Inbound, Messenger, OutputRecord, Route } from "../src/contracts.ts";
+import { MESSENGER_COMMANDS } from "../src/messenger-commands.ts";
+import { Store } from "../src/store.ts";
 
 type Data = Record<string, any>;
 type Handlers = Parameters<Messenger["start"]>[0];
@@ -11,6 +13,7 @@ const team = "TOWN";
 const owner = "UOWNER";
 const bot = "UBOT";
 const botId = "BBOT";
+const appId = "AAPP";
 const route: Route = { platform: "slack", accountId: `${team}:${bot}`, authorityId: owner, guildId: team, channelId: "CALLOWED", threadId: null };
 const dm: Route = { ...route, guildId: null, channelId: "DOWNER" };
 const output = (text: string, destination = route): OutputRecord => ({ id: "output", sourceId: "input", route: destination, text, state: "sending", remoteId: null, error: null });
@@ -51,6 +54,7 @@ class SlackHTTP {
     let result: Data | Response;
     if (custom) result = await custom(args);
     else if (method === "auth.test") result = { team_id: team, user_id: bot, bot_id: botId };
+    else if (method === "bots.info") result = { bot: { id: botId, user_id: bot, app_id: appId, team_id: team } };
     else if (method === "users.info") result = { user: { id: owner, team_id: team, is_bot: false, deleted: false } };
     else if (method === "conversations.info") result = { channel: this.channels.get(args.channel) };
     else if (method === "chat.postMessage") {
@@ -91,7 +95,7 @@ class SlackHTTP {
 class SocketBoundary extends EventEmitter {
   starts = 0;
   stops = 0;
-  async start() { this.starts++; this.emit("connected"); return { ok: true }; }
+  async start() { this.starts++; this.emit("ws_message", JSON.stringify({ type: "hello", connection_info: { app_id: appId } }), false); this.emit("connected"); return { ok: true }; }
   async disconnect() { this.stops++; }
 }
 
@@ -102,6 +106,10 @@ function envelope(type: string, body: Data) {
   return value;
 }
 const incoming = (event: Data, patch: Data = {}) => envelope("events_api", { type: "event_callback", team_id: team, event_id: "envelope-independent", event: { ...event, channel: "CALLOWED" }, ...patch });
+const slash = (patch: Data = {}) => ({ ...envelope("slash_commands", {
+  team_id: team, api_app_id: appId, user_id: owner, channel_id: "CALLOWED", command: "/superagent-status", text: "",
+  trigger_id: "opaque.trigger-capability", response_url: "https://hooks.slack.com/commands/secret-capability", token: "legacy-secret", ...patch,
+}), accepts_response_payload: true });
 
 async function fixture(http = new SlackHTTP(), custom: Partial<Handlers> = {}) {
   const socket = new SocketBoundary();
@@ -142,6 +150,128 @@ function selection(remote: Data, action: string, values: string[], multi = false
 }
 
 describe("Slack authenticated intake and durable ACK", () => {
+  test("reconnecting sockets cannot reuse a previous successful app identity or erase an admitted input", async () => {
+    const durable = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const received: Inbound[] = [];
+    const f = await fixture(new SlackHTTP(), { message: async input => { received.push(input); entered.resolve(); await durable.promise; } });
+    const admitted = slash();
+    f.socket.emit("slack_event", admitted);
+    await entered.promise;
+    f.socket.emit("reconnecting");
+    const unverified = slash({ trigger_id: "unverified-connection" });
+    f.socket.emit("slack_event", unverified);
+    f.socket.emit("ws_message", JSON.stringify({ type: "hello", connection_info: { app_id: "AOTHER" } }), false);
+    const mismatched = slash({ trigger_id: "wrong-app-connection" });
+    f.socket.emit("slack_event", mismatched);
+    durable.resolve();
+    await admitted.done;
+    await drain();
+    expect(received).toHaveLength(1);
+    expect(unverified.acks).toEqual([]);
+    expect(mismatched.acks).toEqual([]);
+    expect(f.errors.map(String)).toEqual(["Error: Slack Socket Mode application does not match the authenticated bot"]);
+    f.socket.emit("ws_message", JSON.stringify({ type: "hello", connection_info: { app_id: appId } }), false);
+    const verified = slash({ trigger_id: "verified-connection" });
+    f.socket.emit("slack_event", verified);
+    await verified.done;
+    expect(received).toHaveLength(2);
+    await f.messenger.stop();
+  });
+
+  test("bot application metadata and public socket app identity must match before intake", async () => {
+    for (const patch of [{ app_id: undefined }, { id: "BOTHER" }, { user_id: "UOTHER" }, { team_id: "TOTHER" }, { app_id: "AOTHER" }]) {
+      const http = new SlackHTTP();
+      http.behavior.set("bots.info", () => ({ bot: { id: botId, user_id: bot, app_id: appId, team_id: team, ...patch } }));
+      await expect(fixture(http)).rejects.toThrow("application");
+    }
+  });
+
+  test("all registered slash commands normalize without source messages or bearer persistence", async () => {
+    const f = await fixture();
+    for (const command of MESSENGER_COMMANDS) {
+      const argument = "text" in command ? "exact argument\nsecond line" : "";
+      const event = slash({ command: `/superagent-${command.name}`, text: argument, trigger_id: `opaque-${command.name}` });
+      f.socket.emit("slack_event", event);
+      await event.done;
+      expect(f.received.at(-1)).toMatchObject({ messageId: null, text: `/${command.name}${argument ? ` ${argument}` : ""}`, route });
+      expect(f.received.at(-1)!.invocationId).toMatch(/^[a-f0-9]{64}$/);
+      expect(event.acks).toEqual([{ response_type: "ephemeral", text: expect.stringContaining("admitted") }]);
+    }
+    expect(f.received).toHaveLength(MESSENGER_COMMANDS.length);
+    const serialized = JSON.stringify(f.received);
+    for (const secret of ["opaque-", "trigger_id", "response_url", "secret-capability", "legacy-secret", "token"]) expect(serialized).not.toContain(secret);
+    expect(f.http.calls.some(call => /history|replies|reactions/.test(call.method))).toBe(false);
+    await f.messenger.stop();
+  });
+
+  test("slash authorization rejects wrong owner, workspace, app, bot, channel, DM, and forged thread identity explicitly", async () => {
+    const f = await fixture();
+    const cases = [
+      { team_id: "TOTHER" }, { user_id: "UOTHER" }, { api_app_id: "AOTHER" }, { bot_id: "BOTHER" },
+      { channel_id: "CDENIED" }, { channel_id: "DOTHER" }, { channel_id: "GMPIM" },
+      { thread_ts: "1000.000001" }, { ts: "1000.000001" }, { message_ts: "1000.000001" }, { thread_id: "1000.000001" },
+      { command: "/superagent-unknown" }, { command: "/status" }, { text: "not accepted by status" }, { trigger_id: "" },
+    ];
+    for (const patch of cases) {
+      const event = slash(patch);
+      f.socket.emit("slack_event", event);
+      await event.done;
+      expect(event.acks).toEqual([{ response_type: "ephemeral", text: expect.stringContaining("refused") }]);
+    }
+    expect(f.received).toEqual([]);
+    const dmCommand = slash({ channel_id: "DOWNER" });
+    f.socket.emit("slack_event", dmCommand);
+    await dmCommand.done;
+    expect(f.received[0]!.route).toEqual(dm);
+    const socketIdentified = slash({ api_app_id: undefined, trigger_id: "no-payload-app-id" });
+    f.socket.emit("slack_event", socketIdentified);
+    await socketIdentified.done;
+    expect(f.received[1]!.route).toEqual(route);
+    expect(f.errors).toEqual([]);
+    await f.messenger.stop();
+  });
+
+  test("slash admission waits for readiness and durable commit, stays serial with messages, and dedupes new envelopes", async () => {
+    const ready = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const commit = Promise.withResolvers<void>();
+    const store = new Store(":memory:");
+    const admissions: boolean[] = [];
+    const observed: Inbound[] = [];
+    const f = await fixture(new SlackHTTP(), { ready: ready.promise, message: async input => {
+      observed.push(input);
+      if (input.messageId === null) { entered.resolve(); await commit.promise; }
+      admissions.push(store.receive(input, "main"));
+    } });
+    const command = slash();
+    const later = incoming(message("1001.000001"));
+    f.socket.emit("slack_event", command);
+    f.socket.emit("slack_event", later);
+    await drain();
+    expect(observed).toEqual([]);
+    ready.resolve();
+    await entered.promise;
+    expect(command.acks).toEqual([]);
+    expect(observed).toHaveLength(1);
+    commit.resolve();
+    await Promise.all([command.done, later.done]);
+    const retry = slash();
+    f.socket.emit("slack_event", retry);
+    await retry.done;
+    expect(retry.envelope_id).not.toBe(command.envelope_id);
+    expect(admissions).toEqual([true, true, false]);
+    expect(observed[0]!.id).toBe(observed[2]!.id);
+    const changed = slash({ command: "/superagent-help" });
+    f.socket.emit("slack_event", changed);
+    await drain();
+    expect(changed.acks).toEqual([]);
+    expect(f.errors).toHaveLength(1);
+    expect(String(f.errors[0])).not.toContain("opaque");
+    await f.messenger.stop();
+    store.close();
+  });
+
   test("real SDK auth is bot-token-only, validates bot workspace and active human owner before Socket Mode", async () => {
     for (const patch of [{ team_id: "TOTHER" }, { bot_id: undefined }, { user_id: undefined }]) {
       const http = new SlackHTTP();

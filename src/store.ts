@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
-  routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
+  physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
   type OutputRecord, type Route, type StorePort, type WorkflowActivation,
 } from "./contracts.ts";
 import { isLaneModel, sameLaneModel } from "./lane-models";
@@ -101,11 +101,16 @@ const toLane = (row: { data: string }): Lane => {
 };
 const inboundData = (input: Inbound): Inbound => ({
   id: input.id, route: input.route, messageId: input.messageId, text: input.text,
+  ...(input.interactionId === undefined ? {} : { interactionId: input.interactionId }),
+  ...(input.invocationId === undefined ? {} : { invocationId: input.invocationId }),
   receivedAt: input.receivedAt, attachments: input.attachments,
 });
 function inboundIdentity(input: Inbound) {
   return {
     ...inboundData(input),
+    // Slack supplies no command timestamp. A transport redelivery has a fresh
+    // local receipt time, but still names the exact same opaque invocation.
+    ...(input.route.platform === "slack" && input.invocationId ? { receivedAt: 0 } : {}),
     attachments: input.attachments.map(file => {
       let location = file.url;
       try {
@@ -166,6 +171,13 @@ export class Store implements StorePort {
   }
 
   receive(input: Inbound, target: string | null, metadata: Readonly<Record<string, string>> = {}, workflow: WorkflowActivation | null = null): boolean {
+    const slackInvocation = input.route.platform === "slack" && typeof input.invocationId === "string" && /^[a-f0-9]{64}$/.test(input.invocationId);
+    if (input.interactionId !== undefined && (input.route.platform !== "discord" || typeof input.interactionId !== "string" || !/^[1-9]\d{0,19}$/.test(input.interactionId))
+      || (input.invocationId !== undefined && !slackInvocation)
+      || (slackInvocation && (input.messageId !== null || input.interactionId !== undefined))
+      || (input.messageId === null ? input.interactionId === undefined && !slackInvocation : typeof input.messageId !== "string" || !input.messageId.length)) {
+      throw new Error("Inbound event requires a real message ID, Discord interaction snowflake, or scoped Slack invocation");
+    }
     return this.db.transaction(() => {
       const existing = this.input(input.id);
       if (existing) {
@@ -221,6 +233,21 @@ export class Store implements StorePort {
     return rows.map(toInput);
   }
 
+  admittedMessages(route: Route): InputRecord[] {
+    const rows = this.db.query(`SELECT inputs.* FROM inputs
+      JOIN metadata ON metadata.key = 'user-source:' || inputs.id AND metadata.value = 'true'
+      WHERE json_type(inputs.data, '$.messageId') = 'text'
+        AND json_extract(inputs.data, '$.route.platform') = ?
+        AND json_extract(inputs.data, '$.route.channelId') = ?
+        AND json_extract(inputs.data, '$.route.accountId') = ?
+        AND json_extract(inputs.data, '$.route.authorityId') = ?
+        AND json_extract(inputs.data, '$.route.guildId') IS ?
+        AND json_extract(inputs.data, '$.route.threadId') IS ?
+      ORDER BY inputs.sequence`).all(route.platform, route.channelId, route.accountId, route.authorityId, route.guildId, route.threadId) as InputRow[];
+    const identity = physicalRouteKey(route);
+    return rows.map(toInput).filter(input => physicalRouteKey(input.route) === identity);
+  }
+
   bindInput(id: string, target: string): void {
     this.db.transaction(() => {
       const input = this.requireInput(id);
@@ -259,6 +286,8 @@ export class Store implements StorePort {
         this.receive({
           id: receiptId,
           route: this.deliveryRoute(source), messageId: source.messageId, receivedAt: source.receivedAt, attachments: [],
+          ...(source.interactionId === undefined ? {} : { interactionId: source.interactionId }),
+          ...(source.invocationId === undefined ? {} : { invocationId: source.invocationId }),
           text: [
             `Internal lane report: ${lane.id}; sourceId: ${source.id}; laneInputId: ${id}; native outcome: ${state}.`,
             `Native session reference: ${JSON.stringify({ sessionId: lane.sessionId, sessionFile: lane.sessionFile, generation: input.generation, requestId: input.requestId })}`,
