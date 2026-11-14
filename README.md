@@ -78,6 +78,11 @@ declining or refreshing credentials leaves it untouched. Existing memory options
 remain unchanged and may involve model processing/downloads when OMP uses memory.
 Setup itself does not start the memory backend.
 
+After a new setup is saved, missing native `judge` role configuration triggers a
+recommendation to configure it through ordinary OMP's `/models` → Roles → Judge UI. Existing
+roles are preserved; setup does not choose a judge, modify its settings, or call a model.
+Unresolved legacy settings and read errors are reported as unknown, not missing.
+
 `doctor` and explicit `start` load only the configured credential names from that file.
 Nonempty shell environment values take precedence. The file is plaintext—not a vault.
 The wrapper and commands below disable Bun's automatic working-directory `.env` loading.

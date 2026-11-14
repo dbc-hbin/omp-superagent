@@ -424,3 +424,200 @@ describe("deferred native Mnemopi preference", () => {
     expect(result.memoryFiles).toEqual([]);
   }, 30_000);
 });
+
+async function nativeJudgeCase(before: string) {
+  const { directory } = fixture();
+  const home = join(directory, "home");
+  mkdirSync(home);
+  const helper = new URL("../src/setup-judge.ts", import.meta.url).href;
+  const nativeSettings = import.meta.resolve("@oh-my-pi/pi-coding-agent/config/settings");
+  const nativeDirs = Bun.resolveSync("@oh-my-pi/pi-utils/dirs", dirname(fileURLToPath(nativeSettings)));
+  const child = Bun.spawn([process.execPath, "--no-env-file", "-e", `
+    import { mkdir, readdir, lstat, readFile, readlink, symlink } from "node:fs/promises";
+    import { dirname, join } from "node:path";
+    import net from "node:net";
+    import tls from "node:tls";
+    import dgram from "node:dgram";
+    import { inspectNativeJudge } from ${JSON.stringify(helper)};
+    import { getAgentDir, getAgentDbPath, getProjectAgentDir, MAIN_CONFIG_FILENAMES }
+      from ${JSON.stringify(nativeDirs)};
+    const deny = () => { throw new Error("Native judge inspection must stay offline"); };
+    net.Socket.prototype.connect = net.Server.prototype.listen = tls.connect = deny;
+    for (const name of ["bind", "connect", "send"]) dgram.Socket.prototype[name] = deny;
+    for (const name of ["connect", "listen", "serve"]) Bun[name] = deny;
+    globalThis.fetch = deny;
+    globalThis.WebSocket = class { constructor() { deny(); } };
+    const cwd = process.cwd();
+    const agentDir = getAgentDir();
+    const configPath = join(agentDir, MAIN_CONFIG_FILENAMES[0]);
+    const projectDir = getProjectAgentDir(cwd);
+    const projectPath = join(projectDir, MAIN_CONFIG_FILENAMES[0]);
+    const overlayPath = join(cwd, "native-override.yml");
+    await mkdir(agentDir, { recursive: true });
+    const writeConfig = value => Bun.write(configPath, JSON.stringify(value));
+    const writeProject = async value => {
+      await mkdir(projectDir, { recursive: true });
+      await Bun.write(projectPath, JSON.stringify(value));
+    };
+    const writeOverlay = async value => {
+      await Bun.write(overlayPath, JSON.stringify(value));
+      process.env.PI_CONFIG_FILES = overlayPath;
+    };
+    // Fresh fixtures have no legacy state. Cases that exercise it explicitly
+    // add opaque bytes, which a real account-store open could not migrate.
+    const writeLegacy = () => Bun.write(join(agentDir, "settings.json"), "private-selector-opaque-legacy-json");
+    const writeDb = () => Bun.write(getAgentDbPath(agentDir), "judge-inspection-must-not-open-account-storage");
+    await Bun.write(join(agentDir, "auth.json"), '{"private":"judge-auth-secret"}\\n');
+    await Bun.write(join(agentDir, "models.yml"), 'providers: {}\\n# preserve model metadata\\n');
+    ${before}
+    async function snapshot(target) {
+      let stat;
+      try { stat = await lstat(target); }
+      catch (error) { if (error.code === "ENOENT") return null; throw error; }
+      if (stat.isSymbolicLink()) return [stat.mode, await readlink(target)];
+      if (!stat.isDirectory()) return [stat.mode, (await readFile(target)).toString("base64")];
+      const entries = [];
+      for (const name of (await readdir(target)).sort()) {
+        entries.push([name, await snapshot(join(target, name))]);
+      }
+      return [stat.mode, entries];
+    }
+    // Observe native configuration/auth inputs, not OMP's separate diagnostic log sink.
+    const inputs = [agentDir, getAgentDbPath(agentDir), projectDir, overlayPath];
+    const original = await Promise.all(inputs.map(snapshot));
+    const result = await inspectNativeJudge(cwd);
+    const unchanged = Bun.deepEquals(original, await Promise.all(inputs.map(snapshot)));
+    console.log(JSON.stringify({ result, unchanged }));
+  `], {
+    cwd: directory, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: directory,
+      PI_CODING_AGENT_DIR: join(directory, "native-agent"),
+      XDG_CONFIG_HOME: join(directory, "xdg-config"), XDG_DATA_HOME: join(directory, "xdg-data"),
+      XDG_STATE_HOME: join(directory, "xdg-state"), XDG_CACHE_HOME: join(directory, "xdg-cache"),
+      NO_COLOR: "1", TERM: "dumb",
+    },
+  });
+  try {
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(stdout).not.toContain("judge-auth-secret");
+    expect(stdout).not.toContain("private-selector");
+    const result = JSON.parse(stdout);
+    expect(result.unchanged).toBe(true);
+    return result.result;
+  } finally {
+    if (child.exitCode === null) child.kill();
+    await child.exited;
+  }
+}
+
+describe("deferred native judge inspection", () => {
+  test("truly fresh installs and modern empty records do not mistake automatic judge fallback for configuration", async () => {
+    expect(await nativeJudgeCase("")).toEqual({ status: "missing", source: "default" });
+    expect(await nativeJudgeCase('await writeConfig({ modelRoles: { default: "private-selector/chat" } });'))
+      .toEqual({ status: "missing", source: "default" });
+  }, 30_000);
+
+  test("unmigrated legacy JSON and account databases leave lower-layer judge configuration unknown", async () => {
+    for (const legacy of ["await writeLegacy();", "await writeDb();", "await writeLegacy(); await writeDb();"]) {
+      for (const higher of ["", "await writeProject({ modelRoles: { judge: null } });",
+        "await writeOverlay({ modelRoles: { default: 'private-selector/chat' } });"]) {
+        expect(await nativeJudgeCase(`${legacy} ${higher}`)).toEqual({ status: "unknown" });
+      }
+    }
+  }, 90_000);
+
+  test("both native modern filenames are authoritative despite opaque legacy JSON and database bytes", async () => {
+    for (const filenameIndex of [0, 1]) {
+      for (const selector of [undefined, "private-selector/judge", " , , ", ["", " "]]) {
+        expect(await nativeJudgeCase(`
+          await writeLegacy(); await writeDb();
+          await Bun.write(join(agentDir, MAIN_CONFIG_FILENAMES[${filenameIndex}]),
+            JSON.stringify({ modelRoles: ${JSON.stringify(selector === undefined ? {} : { judge: selector })} }));
+        `)).toEqual(selector === "private-selector/judge"
+          ? { status: "configured", source: "global" }
+          : { status: "missing", source: selector === undefined ? "default" : "global" });
+      }
+    }
+    expect(await nativeJudgeCase(`
+      await writeLegacy(); await writeDb();
+      await writeConfig({});
+      await Bun.write(join(agentDir, MAIN_CONFIG_FILENAMES[1]),
+        JSON.stringify({ modelRoles: { judge: "private-selector/hidden-fallback" } }));
+    `)).toEqual({ status: "missing", source: "default" });
+  }, 90_000);
+
+  test("legacy presence metadata errors are unknown without opening or changing storage", async () => {
+    for (const target of ['join(agentDir, "settings.json")', "getAgentDbPath(agentDir)"]) {
+      expect(await nativeJudgeCase(`
+        await mkdir(dirname(${target}), { recursive: true });
+        await symlink(${target}, ${target});
+      `)).toEqual({ status: "unknown" });
+    }
+  }, 30_000);
+
+  test("effective higher-layer assignments settle the judge despite unresolved legacy global state", async () => {
+    for (const [layer, write] of [["project", "writeProject"], ["overlay", "writeOverlay"]]) {
+      for (const selector of ["private-selector/judge", "", " , , ", [], ["", " "], null]) {
+        expect(await nativeJudgeCase(`
+          await writeLegacy(); await writeDb();
+          await ${write}({ modelRoles: { judge: ${JSON.stringify(selector)} } });
+        `)).toEqual(selector === null && layer === "project" ? { status: "unknown" }
+          : { status: selector === "private-selector/judge" ? "configured" : "missing", source: layer });
+      }
+    }
+  }, 120_000);
+
+  test("global, project and overlay selectors, aliases and native fallback arrays count without resolution", async () => {
+    for (const [layer, write] of [["global", "writeConfig"], ["project", "writeProject"], ["overlay", "writeOverlay"]]) {
+      for (const selector of ["private-selector/judge", "@private-selector", "pi/private-selector", "*",
+        "@private-selector,private-selector/unavailable", ["@private-selector", "private-selector/unavailable"],
+        " , private-selector/judge, ", ["", "private-selector/judge", " "]]) {
+        expect(await nativeJudgeCase(`await ${write}({ modelRoles: { judge: ${JSON.stringify(selector)} } });`))
+          .toEqual({ status: "configured", source: layer });
+      }
+    }
+  }, 120_000);
+
+  test("delimiter-only strings and arrays contain no configured selector at any native layer", async () => {
+    for (const [layer, write] of [["global", "writeConfig"], ["project", "writeProject"], ["overlay", "writeOverlay"]]) {
+      for (const selector of [",", " , , \t", ["", " "], [",", " , "]]) {
+        expect(await nativeJudgeCase(`await ${write}({ modelRoles: { judge: ${JSON.stringify(selector)} } });`))
+          .toEqual({ status: "missing", source: layer });
+      }
+    }
+  }, 90_000);
+
+  test("overlay null and empty effective values hide lower-layer assignments rather than confirming them", async () => {
+    for (const selector of [null, "", "   ", []]) {
+      expect(await nativeJudgeCase(`
+        await writeConfig({ modelRoles: { judge: "private-selector/global" } });
+        await writeProject({ modelRoles: { judge: "@private-selector" } });
+        await writeOverlay({ modelRoles: { judge: ${JSON.stringify(selector)} } });
+      `)).toEqual({ status: "missing", source: "overlay" });
+    }
+    expect(await nativeJudgeCase(`
+      await writeConfig({ modelRoles: { judge: "private-selector/global" } });
+      await writeProject({ modelRoles: { judge: null } });
+    `)).toEqual({ status: "configured", source: "global" });
+    expect(await nativeJudgeCase('await writeConfig({ modelRoles: { judge: "" } });'))
+      .toEqual({ status: "missing", source: "global" });
+  }, 60_000);
+
+  test("malformed, invalid and unreadable settings are unknown without repair or private diagnostics", async () => {
+    for (const before of [
+      'await Bun.write(configPath, "modelRoles: [\\nprivate: private-selector-malformed\\n");',
+      'await mkdir(projectDir, { recursive: true }); await Bun.write(projectPath, "modelRoles: [\\nprivate: private-selector-project\\n");',
+      'await writeOverlay({}); await Bun.write(overlayPath, "modelRoles: [\\nprivate: private-selector-overlay\\n");',
+      'await writeConfig({ judgment: { attemptTimeoutMs: -1 }, private: "private-selector-invalid" });',
+      'await mkdir(configPath);',
+      'process.env.PI_CONFIG_FILES = overlayPath;',
+    ]) {
+      expect(await nativeJudgeCase(before)).toEqual({ status: "unknown" });
+    }
+  }, 60_000);
+});

@@ -12,6 +12,7 @@ import {
   validateCredential, writeCredentials,
 } from "./credentials";
 import { saveMnemopiPreference } from "./setup-memory";
+import { inspectNativeJudge } from "./setup-judge";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -248,6 +249,19 @@ export async function setup(configPath: string): Promise<void> {
       } else {
         console.log(`Saved native memory.backend=mnemopi in OMP agent settings: ${memory.agentDir}`);
         console.log("Mnemopi is configured for the head workspace on later OMP startup; no service was started by setup.");
+      }
+    }
+    if (createdConfig) {
+      const judge = await inspectNativeJudge(config.headCwd);
+      if (judge.status === "unknown") {
+        console.log("Setup saved, but native OMP judge configuration could not be verified; judge configuration is unknown, not confirmed missing. Native model settings were not changed by this check.");
+      } else if (judge.status === "missing") {
+        console.log("Recommended: configure a native judge model for OMP's judge role; no effective judge selector is configured for the head workspace.");
+        if (judge.source !== "default") {
+          console.log(`The effective judge value is empty or unset in ${judge.source} settings; a hidden lower-layer assignment does not make it effective.`);
+        }
+        console.log("In an ordinary native OMP terminal opened in the head workspace, open /models, choose Roles -> Judge, and assign a native judgment model. Use the intended global/project storage scope and review any overriding native config overlay; do not use a messenger-managed session or read-only attach to persist this setting.");
+        console.log("This is configuration-only advice: selector presence does not prove model or authentication availability. Setup did not select a model, open account storage, or call a model/provider.");
       }
     }
     const cli = `${shellQuote(process.execPath)} --no-env-file ${shellQuote(join(root, "src", "cli.ts"))}`;

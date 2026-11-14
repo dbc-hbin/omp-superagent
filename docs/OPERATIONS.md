@@ -593,6 +593,20 @@ OMP 라이브러리 자체의 프로젝트 dotenv 해석은 Bun의 자동 로딩
 남아 있으면 기존 환경을 가릴 수 있는 새 파일을 만들지 않고 실패를 알린다. 이 경우 먼저
 일반 OMP의 `config set memory.backend mnemopi`로 native 이전·설정을 처리한다.
 
+새 구성 저장에 성공하면 Mnemopi 동의 여부와 별개로 head 작업 디렉터리의 native 설정을
+읽기 전용으로 확인한다. 실효 `modelRoles.judge`가 없으면 **일반 OMP의 `/models` → Roles →
+Judge에서 지정하도록 권장**한다. 기존 전역·프로젝트·overlay 선택과 별칭/선택자 체인은 그대로
+보존하며, 상위 layer가 역할을 지운 경우도 그 실효 상태를 따른다. 설정 판독 실패는 미설정이
+아니라 확인 불가로 안내한다. 역할 존재만 확인하며 모델·인증 가용성이나 실제 judge 호출을
+검증하지 않는다. 모델·fallback·timeout을 자동 변경하거나 계정 DB를 열지 않는다.
+쉼표·공백뿐인 선택자 체인은 미설정으로 분류한다. 현행 전역 설정 파일 없이 legacy
+`settings.json`/`agent.db`만 남아 실효 역할을 판정할 수 없으면 확인 불가로 안내한다.
+legacy 파일은 존재 여부만 확인하고 읽거나 이관하지 않는다. 명시적인 상위 layer의
+역할 선택·해제와 현행 전역 설정의 우선순위는 보존한다.
+메신저 `/model`은 현재 헤드 모델 제어이고 관리 세션의 설정은 세션 전용이므로, 영속적인
+judge 역할 설정을 대신하는 경로로 안내하지 않는다. 기존 구성의 토큰 갱신·취소·저장 실패에는
+이 검사와 권장을 실행하지 않는다.
+
 ### 수동 설정과 필드
 
 수동으로는 `config.example.json`을 `config.local.json`으로 복사하고 **모든 경로와 REPLACE 값**을 바꾼다.
@@ -964,6 +978,7 @@ managed extension 중복/disabled 처리, 비차단 updater startup과 native bi
 
 | 검증 항목 | 현재 결과 |
 | --- | --- |
+| 2026-11-14 최초 셋업의 native judge 권장·리뷰 수정 | `tsc --noEmit` 통과. setup와 실제 setup PTY 2파일 전체에서 47개·46,488 assertion 통과·59.83초. 새 구성 저장 후의 미설정 권장, 전역/프로젝트/overlay·별칭/선택자 체인·null/빈 값·쉼표/공백뿐인 체인·판독 실패 구분, 미이관 legacy JSON/DB의 확인 불가 처리와 현행 설정/상위 layer 우선순위, Mnemopi 동의와 독립된 안내, 기존 구성 갱신·취소·출판 실패의 검사 생략과 native 설정/계정 파일 무변경을 확인했다. 일반 OMP의 `/models` → Roles → Judge 경로로 안내하며 모델 가용성·인증·실제 judge 호출은 검증하거나 변경하지 않음 |
 | 2026-11-14 최종 프리셋·Mnemopi·완료 이벤트 통합 | `tsc --noEmit` 통과. native-presets/runtime/Gateway/Gateway lifecycle/setup/실제 setup PTY 6파일 전체에서 210개·4,986 assertion 통과·16.20초. 최초 생성의 Mnemopi 명시적 yes·거절·Enter·취소·출판 실패·기존 구성 갱신·shadowed 설정·동시 변경·비밀 오류 비노출을 확인했다. terminal receipt가 완료 drain 종료 경계에 도착해도 유실되지 않는 결정적 회귀 포함. 운영 Gateway와 사용자 설정은 변경하지 않음 |
 | 2026-11-14 최종 native 초기화·복구·effort | native-gateway와 native-model-selection 전체 2파일에서 6개·436 assertion 통과·28.38초. 생성/기존 유효/실패/미실행/중단 5개 Gateway 시나리오, 초기화 중 영속 입력 보존·정확한 head 소유권·재시작 무재실행·실제 CLI `status`의 running/complete 및 ready 전환·실제 HEAD effort 상속 확인. 최초 scripted provider의 last-user-wins와 1-input/1-report 가정을 source-aware·실제 steering cohort 계약으로 수정하고 전체 시나리오를 유지했다. mock과 광고 context window는 기존 ULW fixture와 같은 65,536으로 맞췄으며 native compaction은 유지했다. 실제 OMP/RPC·결정적 로컬 제공자·기록용 Messenger 범위이며 운영 봇의 새 코드 재시작 검증은 아님 |
 | 2026-11-14 config-only native 설정 API | native `settings-manager.test.ts` 전체 157개·619 assertion 통과·2.40초. 계정 DB 미생성·기존 계정 바이트 미접근/보존·동시 무관 키 보존·malformed 및 legacy 설정 보호를 확인했다. `0002-config-only-settings.patch`를 변경 전 사본에 적용하여 실행 소스와 테스트의 바이트 일치를 확인했으며 배포 patch 목록과 순서별 결합 digest를 갱신했다 |
