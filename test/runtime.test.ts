@@ -6197,11 +6197,14 @@ describe("real Store runtime coordination", () => {
     expect(launched).toEqual([]);
   });
 
-  test("a settled lane drains after resolve and a transient state read failure without another native event", async () => {
+  test("resolved lane readback recovers without a native event or blocking unrelated lanes", async () => {
     const { runtime, config, store, hosts } = fixture();
     const lane = savedLane(store, config, "lost-admission", route("11"), process.pid);
+    const other = savedLane(store, config, "healthy-sibling", route("12"), process.pid);
     const host = new HostTransport(lane.sessionFile, "session-lost-admission");
+    const otherHost = new HostTransport(other.sessionFile, "session-healthy-sibling");
     hosts.set(lane.socketPath, host);
+    hosts.set(other.socketPath, otherHost);
     await runtime.start();
     host.beforePrompt = () => { throw new Error("Native prompt acknowledgement was lost"); };
     await delegate(runtime, message("lost", lane.route));
@@ -6215,8 +6218,29 @@ describe("real Store runtime coordination", () => {
     expect(delegated(store, "later")?.state).toBe("pending");
     expect(host.prompts).toHaveLength(1);
 
-    host.beforeState = undefined;
-    await runtime.kick();
+    const reading = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    host.beforeState = async () => {
+      reading.resolve();
+      await release.promise;
+    };
+    const wake = runtime.kick();
+    try {
+      await reading.promise;
+      // Use a deadline only to keep a shared-pump regression from hanging teardown.
+      const deadline = new Promise<never>((_, reject) => AbortSignal.timeout(1500).addEventListener("abort",
+        () => reject(new Error("Unrelated lane dispatch waited for the failing Host"))));
+      await Promise.race([delegate(runtime, message("unrelated", other.route)), deadline]);
+      expect(otherHost.prompts.map(prompt => prompt.command.message)).toEqual([
+        expect.stringContaining("Request ID: handoff:unrelated:healthy-sibling"),
+      ]);
+      expect(delegated(store, "later")?.state).toBe("pending");
+    } finally {
+      host.beforeState = undefined;
+      release.resolve();
+    }
+    await wake;
+    await host.whenPrompts(2);
     expect(host.prompts.map(prompt => prompt.command.message)).toEqual([
       expect.stringContaining("Request ID: handoff:lost:lost-admission"),
       expect.stringContaining("Request ID: handoff:later:lost-admission"),

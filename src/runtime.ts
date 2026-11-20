@@ -3467,7 +3467,9 @@ export class Superagent {
               cancelled: this.store.input(receipt.input.id)?.state === "cancelled", result: receipt.result,
             }));
             if (admissions.some(item => item.cancelled) && admissions.every(item => item.cancelled || item.result)) {
-              try { await this.finish(live); } catch (error) { this.report(error); }
+              // finish owns the per-Host readback and wakes dispatch on settlement.
+              // An unresponsive lane must not hold the shared pump open.
+              this.background(this.finish(live));
             }
           }
         }
