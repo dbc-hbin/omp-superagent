@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="430" viewBox="0 0 960 430" role="img" aria-labelledby="architecture-title architecture-desc" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', 'Noto Sans CJK KR', 'Segoe UI', sans-serif">
+  <title id="architecture-title">상시 실행 서비스 하나, OMP 헤드 하나, 독립 레인 세션</title>
+  <desc id="architecture-desc">Discord, Telegram, Slack은 상시 실행되는 Gateway 서비스에 연결됩니다. 모든 입력은 OMP 헤드 에이전트 세션으로 전달되며, 헤드는 직접 판단하고 작업하거나 레인 A와 레인 B의 독립 저장소·주제 세션을 제어합니다. 레인 제어는 헤드만 합니다. 레인 결과는 헤드와 Gateway를 거쳐 메신저로 돌아갑니다. 헤드와 레인은 정보 게시판을 공유하며, 점선 연결은 명령 경로가 아닙니다.</desc>
+  <defs>
+    <linearGradient id="hero" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fc49c6"/><stop offset="0.5" stop-color="#b47cff"/><stop offset="1" stop-color="#57e6fb"/></linearGradient>
+    <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 10 5 0 10Z" fill="#a49bbd"/></marker>
+    <marker id="control-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 10 5 0 10Z" fill="#bb86ff"/></marker>
+  </defs>
+  <rect x="1" y="1" width="958" height="428" rx="20" fill="#0f0d16" stroke="#2c2640"/>
+  <rect x="24" y="24" width="36" height="6" rx="3" fill="url(#hero)"/>
+  <text x="24" y="60" font-size="24" font-weight="700" fill="#efeaf8">서비스 하나, 헤드 하나, 독립 레인</text>
+  <g aria-hidden="true">
+    <path d="M184 170H224" fill="none" stroke="#a49bbd" stroke-width="1.8" stroke-linejoin="round" marker-end="url(#flow-arrow)"/>
+    <path d="M398 170H446" fill="none" stroke="#a49bbd" stroke-width="1.8" stroke-linejoin="round" marker-end="url(#flow-arrow)"/>
+    <path d="M446 242H398" fill="none" stroke="#a49bbd" stroke-width="1.8" stroke-linejoin="round" marker-end="url(#flow-arrow)"/>
+    <path d="M224 242H184" fill="none" stroke="#a49bbd" stroke-width="1.8" stroke-linejoin="round" marker-end="url(#flow-arrow)"/>
+    <path d="M638 164H684V122H754" fill="none" stroke="#bb86ff" stroke-width="2.4" stroke-linejoin="round" marker-end="url(#control-arrow)"/>
+    <path d="M754 162H714V200H638" fill="none" stroke="#a49bbd" stroke-width="1.8" stroke-linejoin="round" marker-end="url(#flow-arrow)"/>
+    <path d="M638 234H714V266H754" fill="none" stroke="#bb86ff" stroke-width="2.4" stroke-linejoin="round" marker-end="url(#control-arrow)"/>
+    <path d="M754 306H684V258H638" fill="none" stroke="#a49bbd" stroke-width="1.8" stroke-linejoin="round" marker-end="url(#flow-arrow)"/>
+    <path d="M542 274V370" fill="none" stroke="#8f86a8" stroke-width="1.6" stroke-dasharray="5 5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M936 122H948V392H936" fill="none" stroke="#8f86a8" stroke-width="1.6" stroke-dasharray="5 5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M846 338V370" fill="none" stroke="#8f86a8" stroke-width="1.6" stroke-dasharray="5 5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <g>
+    <rect x="24" y="132" width="160" height="142" rx="14" fill="#17141f" stroke="#3f3854" stroke-width="1.5"/>
+    <text x="104" y="165" font-size="22" font-weight="700" text-anchor="middle" fill="#efeaf8">메신저</text>
+    <text x="104" y="197" font-size="16" text-anchor="middle" fill="#b7aecb">Discord</text>
+    <text x="104" y="221" font-size="16" text-anchor="middle" fill="#b7aecb">Telegram</text>
+    <text x="104" y="245" font-size="16" text-anchor="middle" fill="#b7aecb">Slack</text>
+  </g>
+  <g>
+    <rect x="224" y="132" width="174" height="142" rx="14" fill="#17141f" stroke="#3f3854" stroke-width="1.5"/>
+    <text x="311" y="171" font-size="22" font-weight="700" text-anchor="middle" fill="#efeaf8">Gateway</text>
+    <text x="311" y="201" font-size="16" text-anchor="middle" fill="#b7aecb">상시 실행 서비스</text>
+    <text x="311" y="231" font-size="16" text-anchor="middle" fill="#b7aecb">수신 · 라우팅 · 응답</text>
+  </g>
+  <g>
+    <rect x="446" y="132" width="192" height="142" rx="14" fill="#24163a" stroke="url(#hero)" stroke-width="2.5"/>
+    <rect x="470" y="129" width="144" height="6" rx="3" fill="url(#hero)"/>
+    <text x="542" y="167" font-size="22" font-weight="700" text-anchor="middle" fill="#d6b2ff">OMP 헤드</text>
+    <text x="542" y="195" font-size="16" text-anchor="middle" fill="#b7aecb">에이전트 세션</text>
+    <text x="542" y="222" font-size="16" text-anchor="middle" fill="#b7aecb">판단 · 작업</text>
+    <text x="542" y="250" font-size="15" font-weight="600" text-anchor="middle" fill="#d6b2ff">레인 제어는 헤드만</text>
+  </g>
+  <g>
+    <rect x="754" y="80" width="182" height="108" rx="14" fill="#17141f" stroke="#3f3854" stroke-width="1.5"/>
+    <rect x="802" y="77" width="86" height="6" rx="3" fill="#57e6fb"/>
+    <text x="845" y="111" font-size="22" font-weight="700" text-anchor="middle" fill="#efeaf8">레인 A</text>
+    <text x="845" y="138" font-size="16" text-anchor="middle" fill="#b7aecb">독립 세션</text>
+    <text x="845" y="165" font-size="16" text-anchor="middle" fill="#b7aecb">저장소 / 주제 A</text>
+  </g>
+  <g>
+    <rect x="754" y="230" width="182" height="108" rx="14" fill="#17141f" stroke="#3f3854" stroke-width="1.5"/>
+    <rect x="802" y="227" width="86" height="6" rx="3" fill="#57e6fb"/>
+    <text x="845" y="261" font-size="22" font-weight="700" text-anchor="middle" fill="#efeaf8">레인 B</text>
+    <text x="845" y="288" font-size="16" text-anchor="middle" fill="#b7aecb">독립 세션</text>
+    <text x="845" y="315" font-size="16" text-anchor="middle" fill="#b7aecb">저장소 / 주제 B</text>
+  </g>
+  <text x="249" y="304" font-size="15" fill="#b7aecb">헤드를 거쳐 응답</text>
+  <text x="650" y="219" font-size="15" fill="#b7aecb">결과</text>
+  <text x="695" y="295" font-size="15" fill="#b7aecb">결과</text>
+  <text x="553" y="325" font-size="15" fill="#b7aecb">상태 / 맥락</text>
+  <g>
+    <rect x="446" y="370" width="490" height="44" rx="12" fill="#1c1828" stroke="#8f86a8" stroke-width="1.2" stroke-dasharray="5 5"/>
+    <text x="466" y="398" font-size="18" font-weight="700" fill="#efeaf8">공유 게시판</text>
+    <text x="586" y="398" font-size="15" fill="#b7aecb">정보 공유 전용 · 제어 아님</text>
+  </g>
+</svg>

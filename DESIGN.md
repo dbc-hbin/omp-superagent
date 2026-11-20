@@ -14,7 +14,11 @@ not a multitenant service or an OS sandbox.
 - [Setup and operations](docs/OPERATIONS.md): configuration, commands, and recovery procedures.
 - [Release records](docs/releases/0.1.0.md#verification-records): dated evidence and its limits.
 
-![One Gateway connects the messengers to the head. The head controls independent lanes and shares an informational board with them.](assets/architecture.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/architecture.svg">
+  <img src="assets/architecture.svg" width="100%" alt="One Gateway connects the messengers to the head. The head controls independent lanes and shares an informational board with them.">
+</picture>
 
 [Mermaid source](assets/architecture.mmd)
 
