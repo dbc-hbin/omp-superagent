@@ -351,17 +351,16 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "lane_inspect", label: "Inspect independent work", approval: "read",
-    description: "List managed lanes or read one lane's actual runtime state. Does not read unrelated OMP sessions.",
+    description: "List managed lanes or read one lane's native state and durable queue holds. Observation ownership is not Host connectivity. Does not read unrelated OMP sessions.",
     parameters: Type.Object({ id: Type.Optional(Type.String()) }),
     async execute(_id, params, _signal, _onUpdate, ctx) { return result(await requireRuntime(ctx).inspect(params.id)); },
   });
   pi.registerTool({
     name: "lane_message", label: "Message independent work", approval: "exec",
-    description: "Durably admit a follow-up to a specific open lane. Ordinary same-topic follow-ups steer an active native run by default; idle or ineligible work remains queued. Do not require a separate user /steer command. sourceId identifies the original received user instruction for duplicate suppression. Optional workflow {name,reason} is explicit head selection within that objective; text/quotes/reports never select one. Workflow selections remain serialized, not steered into an active run. The exact workflow/source/handoff is durable and conflicting retries reject. Admission is not execution or completion.",
+    description: "Durably admit a follow-up to a specific open lane. Returns its input ID and durable state; pending work reports runtime blocks and earlier uncertain input IDs. Report such holds instead of retrying. Ordinary same-topic follow-ups steer an active native run by default; ineligible work stays queued. Do not require a separate user /steer command. sourceId identifies the original received user instruction for duplicate suppression. Optional workflow {name,reason} is explicit head selection within that objective; text/quotes/reports never select one. Workflow selections remain serialized, not steered into an active run. The exact workflow/source/handoff is durable and conflicting retries reject. Admission is not execution or completion.",
     parameters: Type.Object({ id: Type.String(), text: Type.String(), sourceId: Type.String(), workflow: workflowSchema }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await requireRuntime(ctx).messageLane(params.id, params.text, params.sourceId, params.workflow);
-      return result("Follow-up durably queued.");
+      return result(await requireRuntime(ctx).messageLane(params.id, params.text, params.sourceId, params.workflow));
     },
   });
   pi.registerTool({

@@ -6134,6 +6134,73 @@ describe("real Store runtime coordination", () => {
     expect(host.prompts[0]!.command.message).toContain("Request ID: pending-later");
   });
 
+  test("a reattached lane reports held follow-ups until the owner resolves the exact input in its topic", async () => {
+    const { runtime, store, config, hosts, launched, messenger } = fixture();
+    const lane = savedLane(store, config, "survivor", route("11"), process.pid);
+    const other = savedLane(store, config, "unrelated", route("12"));
+    const host = new HostTransport(lane.sessionFile, "session-survivor");
+    hosts.set(lane.socketPath, host);
+    store.receive(message("original-lane-input", lane.route), lane.id);
+    store.submit("original-lane-input", "lost-native-receipt", lane.generation);
+    await runtime.start();
+
+    const followUp = message("after-restart", lane.route);
+    store.receive(followUp, "main");
+    store.settle(followUp.id, "done");
+    expect(await runtime.messageLane(lane.id, followUp.text, followUp.id)).toEqual({
+      inputId: "handoff:after-restart:survivor", state: "pending",
+      queueHolds: { runtimeBlocked: false, uncertainInputIds: ["original-lane-input"] },
+    });
+    expect(await runtime.inspect(lane.id)).toMatchObject({
+      state: { isSettled: true, queuedMessageCount: 0 },
+      observationState: { ownerCurrent: false },
+      queueHolds: { runtimeBlocked: false, uncertainInputIds: ["original-lane-input"] },
+    });
+    await admit(runtime, message("lane-queue-status", lane.route, "/status"));
+    expect(messenger.sent.find(output => output.sourceId === "lane-queue-status")?.text).toContain("original-lane-input");
+
+    await admit(runtime, message("other-topic-resolve", other.route, "/resolve --lane original-lane-input"));
+    expect(store.input("other-topic-resolve")?.state).toBe("cancelled");
+    expect(store.input("original-lane-input")?.state).toBe("uncertain");
+    expect(host.prompts).toHaveLength(0);
+
+    host.state.isSettled = false;
+    host.state.isStreaming = true;
+    host.emit({ type: "agent_start" });
+    await admit(runtime, message("lane-owner-resolve", lane.route, "/resolve --lane original-lane-input"));
+    expect(store.input("lane-owner-resolve")?.state).toBe("done");
+    expect(store.input("original-lane-input")?.state).toBe("cancelled");
+    expect(store.input("handoff:after-restart:survivor")?.state).toBe("pending");
+    expect(host.prompts).toHaveLength(0);
+
+    host.state.isSettled = true;
+    host.state.isStreaming = false;
+    host.emit({ type: "session_settled" });
+    await host.whenPrompts(1);
+    expect(host.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining("Request ID: handoff:after-restart:survivor")]);
+    expect(launched).toEqual([]);
+  });
+
+  test("a surviving PID without a verified lane connection reports a runtime hold instead of dispatching", async () => {
+    const { runtime, store, config, launched, messenger } = fixture();
+    const lane = savedLane(store, config, "unverified-host", route("11"), process.pid);
+    await runtime.start();
+    const followUp = message("check-connection", lane.route);
+    store.receive(followUp, "main");
+    store.settle(followUp.id, "done");
+
+    expect(await runtime.messageLane(lane.id, followUp.text, followUp.id)).toEqual({
+      inputId: "handoff:check-connection:unverified-host", state: "pending",
+      queueHolds: { runtimeBlocked: true, uncertainInputIds: [] },
+    });
+    expect(await runtime.inspect(lane.id)).toMatchObject({
+      runtimeState: "interrupted", state: null, queueHolds: { runtimeBlocked: true, uncertainInputIds: [] },
+    });
+    await admit(runtime, message("unverified-host-status", lane.route, "/status"));
+    expect(messenger.sent.find(output => output.sourceId === "unverified-host-status")?.text).toContain("runtimeBlocked");
+    expect(launched).toEqual([]);
+  });
+
   test("shutdown acceptance and socket disconnect never release a still-live native process", async () => {
     const { runtime, store, config, hosts, launched } = fixture(2);
     const one = savedLane(store, config, "shutdown-pid", route("shutdown-pid"), process.pid);

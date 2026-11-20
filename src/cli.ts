@@ -80,6 +80,7 @@ Owner controls in chat (not shell commands):
                                 or automatic prompt replay. Independent lane Hosts stay running.
   /resolve [INPUT_ID]           Close one uncertain HEAD input without retrying it. Use /status to find its ID;
                                 the ID is required if several are held. This does not establish task success.
+  /resolve --lane INPUT_ID      Close one exact uncertain input in this chat's bound lane, without replay.
 
 Capabilities to request from HEAD in chat (not CLI subcommands):
   Lanes and threads: ask HEAD to start, inspect, steer, pause, resume or close an independent lane,

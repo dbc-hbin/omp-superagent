@@ -6,7 +6,7 @@ export const MESSENGER_COMMANDS = [
   { name: "context", description: "Inspect Superagent HEAD context without starting a model turn." },
   { name: "usage", description: "Inspect Superagent HEAD usage without starting a model turn." },
   { name: "resume", description: "Resume the Superagent lane bound to this conversation." },
-  { name: "resolve", description: "Close an already-uncertain Superagent HEAD input to unblock later HEAD work.", text: "The exact held uncertain input ID; required when more than one is held." },
+  { name: "resolve", description: "Close an uncertain HEAD or bound lane input without replay.", text: "Exact uncertain HEAD input ID, or --lane followed by the bound lane's exact input ID." },
   { name: "main", description: "Select the main Superagent topic in this owner DM." },
   { name: "model", description: "Inspect or change the Superagent HEAD model or named preset.", text: "Query, exact provider/model, or preset selection (including an optional --global)." },
   { name: "effort", description: "Inspect or change the Superagent HEAD thinking effort.", text: "An exact advertised effort level; omit to inspect the current effort." },

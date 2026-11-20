@@ -75,10 +75,13 @@ No polling, duty model, aggregate goal for lanes, or follow-up just for a report
    An enabled paused goal can retain its Host; don't force release or unload.
 2. After interruption, separate what was queued, executed, persisted, and
    delivered. Reconcile native history, workspace, and authoritative external
-   effects before repeating anything. Uncertain lane submissions fence later
-   input; resume cannot clear them. Report the hold; explicit authorized
-   `lane_close` cancellation is not a verified fix. Never replay prompts or
-   ambiguous effects, edit coordination SQLite, unlink sockets, or kill unknown
+   effects before repeating anything. `lane_message` returns the durable input
+   state, and pending follow-ups report earlier uncertain IDs and runtime blocks.
+   Check those holds separately from observation ownership. Resume cannot clear
+   uncertainty. Report the exact held ID and tell the owner to use
+   `/resolve --lane <input-id>` in the bound conversation only after inspecting
+   the original effects; the model cannot resolve it on the owner's behalf.
+   Never replay prompts or ambiguous effects, edit coordination SQLite, unlink sockets, or kill unknown
    owners. Check delivery readback before sending again.
 3. In the isolated same-HEAD recovery turn, use **only** `head_recovery` once with
    the supplied `attemptId`, exact `evidenceEntryIds`, decision, and reason.

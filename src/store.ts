@@ -499,6 +499,19 @@ export class Store implements StorePort {
     }).immediate();
   }
 
+  resolveLaneInput(controlId: string, laneId: string, inputId: string, output: { readonly id: string; readonly text: string }): boolean {
+    return this.db.transaction(() => {
+      const control = this.input(controlId);
+      const input = this.input(inputId);
+      if (control?.target !== "main" || control.state !== "pending"
+        || laneId === "main" || input?.target !== laneId || input.state !== "uncertain") return false;
+      // Cancel the old ledger entry and acknowledge the exact owner command in
+      // one transaction; a restart cannot separate the effect from its reply.
+      this.settle(inputId, "cancelled");
+      return this.settle(controlId, "done", output);
+    }).immediate();
+  }
+
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[] {
     const input = this.requireInput(inputId);
     const related = [inputId, ...this.inputs().filter(candidate =>

@@ -466,7 +466,11 @@ Discord 포럼에서는 “버그 태그로 새 작업 글을 만들어”, 기�
 job/dependency는 명시적인 근거 포함 `resolved`를 사용한다.
 
 `observationState.ownerCurrent`가 false면 저장된 이력이지 현재 연결된 실행의 대기 증거가
-아니다. 경과 시간은 조회 시 계산하며 시계 역행이면 null이다. root lane의 `lane_report`만
+아니다. Host 연결 여부를 뜻하지도 않는다. `lane_inspect`와 `/status`는 별도로 `queueHolds`에
+런타임 차단 여부(`runtimeBlocked`)와 `uncertainInputIds`를 표시한다. `lane_message`는
+영속 입력 ID와 상태를 반환하며, `pending`이면 그 입력보다 앞선 불확실한 ID와 런타임 차단
+여부도 표시한다. `pending`은 native 전달이나 실행을 보장하지 않는다.
+경과 시간은 조회 시 계산하며 시계 역행이면 null이다. root lane의 `lane_report`만
 실제 파일/도구 결과를 선택·해시하고 native journal에 기록한다. eval에서는 보고 cell을
 완료한 뒤 긴 대기에 들어가야 해당 경계에서 헤드가 회수할 수 있다. 재시작 시 같은 원본
 input/request/session/file/generation과 제출 전 cursor를 확인해 미회수 기록을 읽고 중복을
@@ -821,6 +825,7 @@ native transcript에서 복원하므로 과거 프리셋의 기본값으로 덮�
 | `/stop head` | 현재 주제와 무관하게 공유 헤드 작업 중단 |
 | `/stop <lane-id>` | 해당 instance에 등록되고 허가된 레인만 일시정지 |
 | `/resolve [input-id]` | 이미 `uncertain`이 된 헤드 입력 **하나**를 운영자가 취소로 확정해 뒤의 헤드 작업 차단을 해제. 원래 작업을 재실행하지 않으며 실제 수행·완료를 주장하지 않음 |
+| `/resolve --lane <input-id>` | 현재 대화에 연결된 레인의 정확한 `uncertain` 입력 **하나**를 운영자가 취소 처리. 재실행·일시정지 해제·Host 재기동은 하지 않음 |
 
 `/restart`는 인수가 없다. Slack의 선택기는 `/superagent-restart`, 일반 메시지는 `!restart`다.
 접수 응답이 실제 전송된 뒤 Gateway가 정상 종료와 일회성 successor 기동을 맡고,
@@ -851,6 +856,13 @@ native 세션을 변경하지 않으므로 바쁜 헤드나 native 상태 미확
 선택하지 않는다. 저장된 보류 해제와 native 실행 종료는 별개다. 실제 native 유휴가 확인된
 뒤 취소된 접수의 메모리 상태도 정리하고 후속 작업을 실행하며, 다른 접수의 결과는 계속 확인한다.
 Slack 일반 메시지는 `!resolve [input-id]`를 사용한다.
+
+레인의 경우 연결된 대화의 `/status`에서 불확실한 입력 ID를 확인한다. 원래 세션과 외부
+효과를 확인한 뒤 결과를 모르는 상태로 종료하려면 같은 대화에서 `/resolve --lane <input-id>`를
+보낸다(Slack 일반 메시지는 `!resolve --lane <input-id>`). 정확히 일치하는 불확실한 입력만
+취소하며, 원래 작업의 실제 결과를 단정하거나 다시 실행하지 않는다. 다른 불확실한 입력,
+일시정지, 승인 또는 연결/소유권 문제는 그대로 보류된다. 레인이 열려 있고 native 상태를
+확인할 수 있을 때만 후속 입력이 정상 경로로 전달된다.
 
 #### 헤드의 근거 기반 자동 복구
 

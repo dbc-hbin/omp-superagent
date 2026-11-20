@@ -266,6 +266,7 @@ export interface StorePort {
   recordLaneReport(id: string, generation: number, sessionId: string, eventId: string, report: LaneReport, observedAt?: number): boolean;
   resolveLaneWaiting(id: string, generation: number, sessionId: string, kind: "tool" | "approval", nativeId: string): boolean;
   settle(id: string, state: "done" | "uncertain" | "cancelled", output?: { id: string; text: string }, headModel?: HeadModelChange): boolean;
+  resolveLaneInput(controlId: string, laneId: string, inputId: string, output: { readonly id: string; readonly text: string }): boolean;
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[];
   prepareHeadRecovery(attempt: HeadRecoveryAttempt): boolean;
   commitHeadRecovery(expected: HeadRecoveryAttempt, decided: HeadRecoveryAttempt): boolean;

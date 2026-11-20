@@ -779,8 +779,8 @@ bash·eval 상태, 대기 입력, 승인, 비동기 결과가 다른 세션으�
 | `lane_init_presets` | `choices`의 선택적 high/middle/low 각각 `{model:{provider,id},reason}`으로 누락 native 프리셋만 최초 생성. 기존 프리셋·기본/활성 역할·judge 보존. 충돌 덮어쓰기 없음 |
 | `lane_start` | 실제 수신 `sourceId`, 제목, 존재하는 절대 cwd, 정확히 하나의 `model: {provider,id}` 또는 `preset: string`(관측된 임의의 native 프리셋 이름), 필수 비어 있지 않은 `modelReason`, 선택적 brief/acceptance/destination과 `workflow: {name,reason}`으로 생성·동일 선택 재사용 |
 | `lane_set_model` | `id`, 실제 허가 입력 `sourceId`, 정확히 하나의 model/preset, 필수 modelReason으로 명시적 유휴 레인 변경. active input/UI/goal/소유 서비스/불확실성 없이 durable intent/receipt·native readback으로 확인. 자동 interrupt·승격·전역 설정 변경 없음 |
-| `lane_inspect` | ID 생략 시 관리 레인 목록, 지정 시 기록·실제 실행 상태 조회 |
-| `lane_message` | `id`, `text`, 실제 허가 입력 `sourceId`, 선택적 `workflow: {name,reason}`으로 지정 레인에 명시적 지시·후속 맥락 전달 |
+| `lane_inspect` | ID 생략 시 관리 레인 목록, 지정 시 기록·실제 실행 상태·큐 차단 조회 |
+| `lane_message` | `id`, `text`, 실제 허가 입력 `sourceId`, 선택적 `workflow: {name,reason}`으로 지정 레인에 명시적 지시·후속 맥락 접수. 영속 입력 ID·상태와 대기 중인 입력의 큐 차단을 반환 |
 | `lane_pause`, `lane_resume` | 실행과 자동 재개 정책을 함께 제어하고 상태 확인. `lane_resume`는 실제 재개 지시의 `sourceId`로 기존 paused native goal의 결과를 원래 route에 연결 |
 | `lane_close` | 확인한 evidence와 completed/cancelled 결과를 기록. merge·게시·worktree 삭제 권한을 부여하지 않음 |
 | `thread_inspect` | 원본 사용자 sourceId와 선택적 laneId로 Discord 부모 태그·스레드 상태 조회 |
@@ -825,8 +825,10 @@ Gateway 접수 전에 거절하며, HEAD의 최종 검증도 이를 불확실한
 - `skill://superagent-lane/references/workflow.md`: 작업 범위 확인, 직접 구현·부분 위임, 실제 검증, 결과·미검증 항목·인계.
 - 역할 진입점은 `hide: true`로 일반 스킬 목록 광고를 숨기되 native URI와 역할 주입은 유지한다.
   헤드 역할이 자식 세션의 일반 지침으로 섞이지 않게 하고, 자식의 레인 관리 호출도 거부한다.
-- `lane_inspect({})`는 기록된 목록이고 ID 지정 시에만 연결된 실제 상태를 더한다.
-  현재 도구에는 불확실한 제출 기록을 해제하는 API가 없으므로 `lane_resume`를 복구 완료로 설명하지 않는다.
+- `lane_inspect({})`는 기록된 목록이고 ID 지정 시에만 연결된 실제 상태와 큐 차단을 더한다.
+  보고의 `ownerCurrent`는 현재 원본 실행과의 연결 여부이지 Host 연결 여부가 아니다.
+  레인의 불확실한 제출은 모델 도구나 `lane_resume`으로 해제할 수 없다. 운영자가 연결
+  주제에서 `/resolve --lane <input-id>`로 정확히 지정한 입력만 취소한다.
 
 - 헤드 스킬: 이벤트별 진입점에서 라우팅·모델 선택·감독 절차로 이어진다. 한 요청에 여러 작업이 있어도 메시지 수가 아니라
   독립적인 완료 기준, 맥락·저장소·실행 수명 분리의 이점, 선행 결과와 쓰기 충돌을 보고 레인 수를 판단한다.
@@ -1406,6 +1408,10 @@ route와 원래 source를 보존하고 동일 결과를 lane/head 양쪽에서 �
 보류는 자동 재실행 허가가 아니다. 운영자 `/resolve [input-id]`는 결과를 모르는 요청 하나를
 취소로 닫는 수동 경로다. 효과 전에 선택 신원을 영속 고정하고, native 유휴 이후 메모리의
 취소된 접수도 정리한다. Slack `!resolve`도 같은 명령으로 정규화한다.
+
+레인 보류 해제는 운영자의 해당 주제 `/resolve --lane <input-id>`에 한정한다. 지정한 `uncertain`
+입력의 취소와 원래 제어 명령의 응답을 같은 트랜잭션으로 기록한다. 이 작업은 이전 제출을
+재실행하거나 native 실행을 중단하지 않으며, 레인 일시정지·소유권·승인·기타 큐 차단은 유지한다.
 
 자동 복구는 기존 단일 HEAD 안의 별도 내부 판단 턴이다. 일반 입력과 별개인 native RPC
 신원을 사용하며 원래 입력·접수·결과 버퍼를 덮어쓰지 않는다. Gateway나 새 AI가 판단하지 않는다.
