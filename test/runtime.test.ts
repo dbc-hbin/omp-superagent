@@ -1540,7 +1540,11 @@ describe("thread kickoff before execution", () => {
     if (!lane) throw new Error("Expected held work binding");
     const followup = message(`kickoff-later-${certainty}`, original.route, "Also check duplicates");
     await runtime.receive(followup);
-    await runtime.messageLane(lane.id, followup.text, followup.id);
+    const kickoff = { outputId: `${original.id}:kickoff`, state: certainty === "rejected" ? "failed" : "uncertain" };
+    expect(await runtime.messageLane(lane.id, followup.text, followup.id)).toMatchObject({
+      state: "pending", queueHolds: { kickoff },
+    });
+    expect(await runtime.inspect(lane.id)).toMatchObject({ queueHolds: { kickoff } });
     await runtime.kick();
     await expect(runtime.startLane(start)).rejects.toThrow("Kickoff delivery is not confirmed");
     expect(hosts.has(lane.socketPath)).toBe(false);
@@ -6156,6 +6160,14 @@ describe("real Store runtime coordination", () => {
       observationState: { ownerCurrent: false },
       queueHolds: { runtimeBlocked: false, uncertainInputIds: ["original-lane-input"] },
     });
+    host.beforeState = () => { throw new Error("Native connection stopped reporting state"); };
+    expect(await runtime.inspect(lane.id)).toMatchObject({
+      state: null, stateError: expect.any(String),
+      queueHolds: { runtimeBlocked: true, uncertainInputIds: ["original-lane-input"] },
+    });
+    host.beforeState = undefined;
+    // Reconcile the independent runtime block without clearing durable uncertainty.
+    await runtime.resume(lane.id);
     await admit(runtime, message("lane-queue-status", lane.route, "/status"));
     expect(messenger.sent.find(output => output.sourceId === "lane-queue-status")?.text).toContain("original-lane-input");
 
@@ -6197,7 +6209,7 @@ describe("real Store runtime coordination", () => {
       runtimeState: "interrupted", state: null, queueHolds: { runtimeBlocked: true, uncertainInputIds: [] },
     });
     await admit(runtime, message("unverified-host-status", lane.route, "/status"));
-    expect(messenger.sent.find(output => output.sourceId === "unverified-host-status")?.text).toContain("runtimeBlocked");
+    expect(messenger.sent.find(output => output.sourceId === "unverified-host-status")?.text).toContain('"runtimeBlocked":true');
     expect(launched).toEqual([]);
   });
 

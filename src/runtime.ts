@@ -2167,15 +2167,19 @@ export class Superagent {
     let lane = this.requireLane(id);
     const live = this.live.get(id);
     let state: RuntimeState | null = null;
+    let stateError: string | null = null;
     if (live) {
-      try { state = await this.checkLaneModel(live); }
-      catch { /* Return the actionable hold alongside expected/actual identity. */ }
-      state ??= await this.state(live);
+      try {
+        // If only model validation failed, still return the verified native state.
+        state = await this.checkLaneModel(live).catch(() => this.state(live));
+      } catch {
+        stateError = "Native lane state is unavailable or its identity is unverified.";
+      }
       lane = this.requireLane(id);
     }
     const actual = isLaneModel(state?.model) ? { provider: state.model.provider, id: state.model.id } : null;
     return {
-      ...lane, state: state ? { ...state, model: actual } : null,
+      ...lane, state: state ? { ...state, model: actual } : null, stateError,
       queueHolds: this.laneQueueHolds(id),
       observationState: this.observationState(lane, state),
       modelCheck: { expected: lane.model, actual, error: this.modelHolds.get(id) ?? null },
@@ -2186,11 +2190,13 @@ export class Superagent {
 
   private laneQueueHolds(id: string, beforeInputId?: string) {
     const uncertainInputIds: string[] = [];
-    for (const input of this.store.inputs(id)) {
+    const inputs = this.store.inputs(id);
+    for (const input of inputs) {
       if (input.id === beforeInputId) break;
       if (input.state === "uncertain") uncertainInputIds.push(input.id);
     }
-    return { runtimeBlocked: this.blocked.has(id), uncertainInputIds };
+    const kickoff = this.kickoffHold(inputs);
+    return { runtimeBlocked: this.blocked.has(id), uncertainInputIds, ...(kickoff ? { kickoff } : {}) };
   }
 
   private observationState(lane: Lane, state: RuntimeState | null) {
@@ -3415,11 +3421,18 @@ export class Superagent {
     await this.pumping;
   }
 
+  private kickoffHold(inputs: readonly InputRecord[]) {
+    for (const input of inputs) {
+      const outputId = this.store.getMeta(`kickoff-output:${input.id}`);
+      if (outputId === null) continue;
+      const state = this.store.output(outputId)?.state ?? "missing";
+      if (state !== "sent") return { outputId, state };
+    }
+    return null;
+  }
+
   private kickoffHeld(target: string): boolean {
-    return this.store.inputs(target).some(input => {
-      const id = this.store.getMeta(`kickoff-output:${input.id}`);
-      return id !== null && this.store.output(id)?.state !== "sent";
-    });
+    return this.kickoffHold(this.store.inputs(target)) !== null;
   }
 
   private pendingHeadModel(exceptId?: string): InputRecord | undefined {

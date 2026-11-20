@@ -467,9 +467,11 @@ job/dependency는 명시적인 근거 포함 `resolved`를 사용한다.
 
 `observationState.ownerCurrent`가 false면 저장된 이력이지 현재 연결된 실행의 대기 증거가
 아니다. Host 연결 여부를 뜻하지도 않는다. `lane_inspect`와 `/status`는 별도로 `queueHolds`에
-런타임 차단 여부(`runtimeBlocked`)와 `uncertainInputIds`를 표시한다. `lane_message`는
-영속 입력 ID와 상태를 반환하며, `pending`이면 그 입력보다 앞선 불확실한 ID와 런타임 차단
-여부도 표시한다. `pending`은 native 전달이나 실행을 보장하지 않는다.
+런타임 차단 여부(`runtimeBlocked`), `uncertainInputIds`, 미확인 착수 메시지의 발송 ID와
+상태(`kickoff`)를 표시한다. `lane_inspect`는 연결된 Host의 상태를 확인하지 못해도 영속
+차단 정보를 반환한다. `lane_message`는 영속 입력 ID와 상태를 반환하며, `pending`이면
+그 입력보다 앞선 불확실한 ID와 런타임/착수 메시지 차단도 표시한다. `pending`은 native
+전달이나 실행을 보장하지 않는다.
 경과 시간은 조회 시 계산하며 시계 역행이면 null이다. root lane의 `lane_report`만
 실제 파일/도구 결과를 선택·해시하고 native journal에 기록한다. eval에서는 보고 cell을
 완료한 뒤 긴 대기에 들어가야 해당 경계에서 헤드가 회수할 수 있다. 재시작 시 같은 원본
