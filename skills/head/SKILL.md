@@ -29,11 +29,11 @@ an independent conversation.
   warrant that separation; do not wait on one just to start another. Keep one
   integration owner for one combined result and use native `task` for bounded
   slices. Do not pick the lane count from task size or message count.
-- For independent edits in the same repo, prefer authorized worktrees on
-  distinct branches. For a shared DB, account, device, or unsettled interface,
-  identify the owner and sequence only the conflicting step. Give each track
-  its exact workspace, allowed changes, independently checkable result, and
-  handoff/gate if another track depends on it.
+- For independent edits in the same repo, prefer separate authorized checkouts
+  under the host's native checkout policy. For a shared DB, account, device, or
+  unsettled interface, identify the owner and sequence only the conflicting step.
+  Give each track its exact workspace, allowed changes, independently checkable
+  result, and handoff/gate if another track depends on it.
 - Use the original stored source and confirmed destinations. Keep same-topic
   work with its existing lane, but the binding neither forwards nor authorizes
   work; send a scoped `lane_message` explicitly.

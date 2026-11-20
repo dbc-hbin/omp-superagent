@@ -68,24 +68,29 @@ controls Host capacity.
   evidence, project guidance, and applicable skills. Check actual root/worktree,
   branch, and dirty state before mutation. Do not guess from a lane title or
   channel note. Non-Git workspaces are valid. Ask the owner only if a material
-  scope/workspace ambiguity remains; do not clone, switch, or create a worktree
+  scope/workspace ambiguity remains; do not clone, switch, or create a checkout
   to avoid settling it.
 - Before adding an editing lane, use `lane_inspect({})` to check recorded ownership;
   inspect relevant IDs for live state. Compare real paths, common repository,
   worktree, branch, intended files, generated outputs, and shared external targets.
 - **Several editing lanes in one Git repository:** When the tracks can proceed
-  independently, prefer separate authorized worktrees on distinct branches over
-  forcing serial work in one checkout. Check the live branch and dirty state,
-  preserve unrelated work, and assign each lane its verified absolute worktree
-  path and edit scope. Don't add worktrees just for separate reporting or bounded
-  read-only work. Separate repositories already have separate working trees.
-- Worktrees isolate checked-out files, not shared Git refs, outputs outside the
-  worktree, databases/services, or conflicting changes at integration. Sequence
+  independently, prefer separate authorized checkouts over forcing serial work in
+  one checkout. Reuse suitable authorized checkouts. For new checkouts, use the
+  native `ovnfs` route when the host requires it, unless the owner explicitly
+  requests Git worktrees. Where that requirement does not apply, use separate
+  Git worktrees on distinct branches when appropriate. Verify the base, dirty
+  inputs, and absolute directory before passing it as lane `cwd`; give each lane
+  its own edit scope and an integration owner. Do not bypass the native policy
+  if the required checkout cannot be created or cannot preserve the needed base.
+  Don't create checkouts just for separate reporting or bounded read-only work.
+  Separate repositories already have separate working trees.
+- Separate checkouts don't isolate shared Git refs, outputs outside the
+  checkout, databases/services, or conflicting changes at integration. Sequence
   only operations on the same resource; let independent work continue. Name
   the resource's owner and observable release condition (for example, the test
   device is idle after its current run). For integration, settle the shared
-  contract and name one owner and verification boundary. Worktree separation is not
-  permission to merge, delete a worktree, or touch another lane's uncommitted work.
+  contract and name one owner and verification boundary. Checkout separation is not
+  permission to merge, delete a checkout, or touch another lane's uncommitted work.
 - Keep the original route by default. A new topic from inside a bound thread uses
   the exact authorized parent `destination` with `threadId:null` and no `topicId`
   to create a sibling, never a channel or nested thread. Only use an existing
