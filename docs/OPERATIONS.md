@@ -1042,7 +1042,7 @@ Telegram은 인증한 승인 카드의 account·실제 chat/thread·메시지 ID
 Discord의 일반 출력은 원래 사용자 메시지와 같은 물리 대화일 때 그 메시지에 답장한다.
 새 스레드로 보낸 결과나 실제 메시지가 없는 slash interaction에는 reply reference를 넣지 않는다.
 삭제된 원문은 Discord의 단일 전송 요청에서 허용하며 실패 뒤 중복 전송하지 않는다.
-작성자 mention은 끄고 긴 출력은 기존처럼 단일 텍스트 첨부로 보낸다.
+작성자 mention은 끈다. 긴 출력은 최대 10개 메시지로 나눠 보내며 답장 참조는 첫 메시지에만 넣는다.
 
 ```sh
 bun --no-env-file src/cli.ts stop LANE_ID --config config.local.json
@@ -1135,13 +1135,17 @@ bun --no-env-file src/cli.ts uninstall --config config.local.json
   - Slack: 토큰 없는 `slack-file:<file_id>`에서 `files.info`로 소유자의 hosted 파일·workspace·
     원래 대화/thread share를 확인한다. 해당 team/file의 `files.slack.com/files-pri/TEAM-FILE/…`
     HTTPS 경로에만 bot Authorization 헤더로 접근한다. 외부 링크 파일은 받지 않는다.
-- 긴 출력은 아래 단일 텍스트 첨부로 보낸다. 입력 한도와 다르며 여러 조각의 부분 발송으로
-  우회하지 않는다. Telegram·Slack 변경·발송 API의 SDK 자동 재시도는 끈다. 읽기/poll 재연결과 불확실한 외부
-  효과를 재실행하는 것은 다르다.
+- Telegram·Slack의 긴 출력은 아래 단일 텍스트 첨부로 보낸다. Discord의 일반 긴 출력은 표 렌더링 후
+  문단·줄·공백 경계 순으로 나눠 최대 10개의 순서 있는 메시지로 보내고, fenced code block은 조각마다
+  닫았다가 info string과 함께 다시 연다. 답장 참조와 발송 영수증은 첫 메시지이며 조각마다 고정 nonce를
+  쓴다. 앞 조각이 보인 뒤 뒤 조각이 실패하면 거절이 아니라 불확실로 남긴다. 10개를 넘는 출력과
+  수정되는 승인 카드는 단일 첨부를 유지한다. 입력 한도와는 다르다. Telegram·Slack 변경·발송 API의 SDK
+  자동 재시도는 끈다. Discord는 뒤 조각의 확정 429만 제한된 시간 안에 같은 nonce로 다시 보낸다.
+  읽기/poll 재연결과 불확실한 외부 효과를 재실행하는 것은 다르다.
 
   | 플랫폼 | 일반 텍스트 | 긴 출력 |
   | --- | --- | --- |
-  | Discord | 2,000자 이하 | 텍스트 첨부, 최대 8 MiB |
+  | Discord | 2,000 UTF-16 단위 이하 | 최대 10개 메시지로 분할, 초과 시 텍스트 첨부(최대 8 MiB) |
   | Telegram | 4,096 UTF-16 단위 이하 | `sendDocument` 텍스트 파일, 최대 50 MiB. parse_mode 없이 전송하고 preview·paid broadcast 비활성화 |
   | Slack | 3,000자 이하 plain text | 텍스트 파일, 최대 8 MiB. `files.getUploadURLExternal` → HTTPS 업로드 → `files.completeUploadExternal`로 원래 channel/thread에 게시. 폐기된 `files.upload` 미사용 |
 

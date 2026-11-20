@@ -203,9 +203,17 @@ approval.
   follow redirects on private file downloads. Enforce byte limits end to end;
   an unknown size is not zero and a known size must match the bytes received.
   The adapters preserve audio metadata; they do not transcribe attachments.
-- Long outputs use a single bounded text attachment where supported. Slack
+- Telegram and Slack send long outputs as a single bounded text attachment.
+  Discord splits a long ordinary output, after table rendering, into at most
+  ten ordered messages of 2,000 UTF-16 units, preferring paragraph, line and
+  whitespace boundaries and closing/reopening fenced code blocks; only the first
+  carries the reply reference and becomes the output receipt. Each chunk has its
+  own deterministic enforced nonce. A later chunk failing after an earlier one
+  is visible is uncertain, never rejected. Longer outputs and editable approval
+  cards keep one text attachment. Slack
   uses upload URL → bytes → `files.completeUploadExternal`, not `files.upload`.
-  Telegram and Slack do not automatically retry remote mutations. Discord formats
+  Telegram and Slack do not automatically retry remote mutations; Discord resends
+  only a later chunk after a definite 429 within a bounded wait. Discord formats
   pipe tables as fixed-width code blocks at delivery, preserving the stored
   original. [Delivery classification](../../src/delivery.ts) distinguishes
   definite rejection from uncertainty across the IPC boundary.
