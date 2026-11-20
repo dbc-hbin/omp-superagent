@@ -60,7 +60,7 @@ OMP 19 데몬은 이전 브로커의 서비스를 인수하지 않습니다.
 OMP 자체를 설치하려면 [공식 설치 안내](https://github.com/can1357/oh-my-pi#installation)를 참고하세요.
 
 ```sh
-bun add --global --trust omp-superagent@0.1.2
+bun add --global --trust omp-superagent@0.1.3
 omp-sa --help
 ```
 
@@ -68,7 +68,7 @@ omp-sa --help
 `bun pm bin --global`의 출력 경로를 `PATH`에 포함하세요. Bun이 `PATH`에 있다면 npm으로도 설치할 수 있습니다.
 
 ```sh
-npm install --global omp-superagent@0.1.2
+npm install --global omp-superagent@0.1.3
 ```
 
 postinstall이 필수 관리형 ULW 통합을 준비하므로 설치 스크립트를 생략하지 마세요.

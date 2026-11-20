@@ -175,13 +175,13 @@ OMP 19.0.0이며 upstream `v19.0.0` 커밋은
 사용한다. 이 저장소는 OMP를 다운로드하거나 소스에서 빌드하지 않는다.
 
 ```sh
-bun add --global --trust omp-superagent@0.1.2
+bun add --global --trust omp-superagent@0.1.3
 omp-sa --help
 ```
 
 `--trust`는 관리형 ULW 준비 등 패키지 설치 스크립트를 허용한다.
 `bun pm bin --global`의 출력 경로를 PATH에 포함한다. Bun이 PATH에 있으면
-`npm install --global omp-superagent@0.1.2`도 사용할 수 있다.
+`npm install --global omp-superagent@0.1.3`도 사용할 수 있다.
 설정은 설치 디렉터리가 아닌 사용자 작업 디렉터리에
 `omp-sa setup --config ./config.local.json`으로 만든다. 설치만으로 봇을 활성화하지 않는다.
 

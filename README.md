@@ -79,7 +79,7 @@ To install OMP separately, see the
 [upstream instructions](https://github.com/can1357/oh-my-pi#installation).
 
 ```sh
-bun add --global --trust omp-superagent@0.1.2
+bun add --global --trust omp-superagent@0.1.3
 omp-sa --help
 ```
 
@@ -87,7 +87,7 @@ omp-sa --help
 Ensure `bun pm bin --global` is on `PATH`. Alternatively, with Bun on `PATH`:
 
 ```sh
-npm install --global omp-superagent@0.1.2
+npm install --global omp-superagent@0.1.3
 ```
 
 Keep lifecycle scripts enabled for the managed ULW integration.
