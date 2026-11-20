@@ -46,6 +46,7 @@ struct RestFixture {
     socket: String,
     emitted: mpsc::UnboundedSender<(String, Value)>,
     last_card: Arc<SyncMutex<Value>>,
+    throttled: Arc<AtomicBool>,
 }
 
 async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> Response {
@@ -86,8 +87,19 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
         }
         ("POST", "/channels/99/messages") => {
             fixture.emitted.send((path, body.clone())).unwrap();
-            if body["content"] == "ambiguous" {
+            let content = body["content"].as_str().unwrap_or_default();
+            if content == "ambiguous" {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if content.starts_with("rejected") {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            if content.starts_with("throttled") && !fixture.throttled.swap(true, Ordering::SeqCst) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"message":"rate limited","retry_after":0.01,"global":false})),
+                )
+                    .into_response();
             }
             let remote = json!({"id":"700", "channel_id":"99", "author":{"id":"71","bot":true},
                 "components":body.get("components").cloned().unwrap_or_else(|| json!([])) });
@@ -203,6 +215,7 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
         socket: format!("ws://{}/", ws.local_addr().unwrap()),
         emitted,
         last_card: Arc::clone(&last_card),
+        throttled: Arc::default(),
     });
     let server: JoinHandle<()> = tokio::spawn(async move {
         axum::serve(http, router).await.unwrap();
@@ -431,6 +444,47 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
         "ambiguous REST effect must not be retried in the adapter"
     );
 
+    let long = format!("{}\n\nthrottled {}", "a".repeat(1_500), "b".repeat(1_500));
+    let reply = json!({"route":route,"messageId":"205"});
+    let sent = hub
+        .effect(
+            "send",
+            &[json!({"id":"long","route":route,"text":long,"replyTo":reply})],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent, json!("700"), "the first chunk is the output receipt");
+    let first = received(&mut observed, "/channels/99/messages").await;
+    let throttled = received(&mut observed, "/channels/99/messages").await;
+    let second = received(&mut observed, "/channels/99/messages").await;
+    assert!(observed.try_recv().is_err());
+    let key: model::Route = serde_json::from_value(route.clone()).unwrap();
+    assert_eq!(first["content"], "a".repeat(1_500));
+    assert_eq!(first["nonce"], outputs::nonce("long", &key));
+    assert_eq!(first["message_reference"]["message_id"], "205");
+    assert_eq!(second, throttled, "a definite 429 resends the same chunk");
+    assert_eq!(
+        second["content"],
+        format!("throttled {}", "b".repeat(1_500))
+    );
+    assert_eq!(second["nonce"], model::hash(&json!(["long", key.key(), 1])));
+    assert!(second.get("message_reference").is_none());
+    assert_eq!(second["enforce_nonce"], true);
+
+    let partial = format!("{}\n\nrejected", "a".repeat(1_999));
+    let send = hub
+        .effect(
+            "send",
+            &[json!({"id":"partial","route":route,"text":partial})],
+        )
+        .await;
+    let error = send.unwrap_err();
+    assert_eq!(error.certainty, "uncertain", "an earlier chunk is visible");
+    assert!(error.message.contains("1 of 2"));
+    received(&mut observed, "/channels/99/messages").await;
+    received(&mut observed, "/channels/99/messages").await;
+    assert!(observed.try_recv().is_err());
+
     wire(&mut socket, json!({"op":7})).await;
     let (stream, _) = time::timeout(Duration::from_secs(5), ws.accept())
         .await
@@ -470,4 +524,50 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     assert_eq!(event(&hub, &store).await["kind"], "reconnect");
     hub.stop().await.unwrap();
     server.abort();
+}
+
+#[test]
+fn long_output_splits_at_markdown_boundaries_within_discord_limits() {
+    let fits = |chunks: &[String]| chunks.iter().all(|chunk| model::utf16(chunk) <= 2_000);
+    let paragraphs = format!("{}\n\n{}", "a ".repeat(600), "b ".repeat(600));
+    let chunks = markdown::split(&paragraphs, 2_000, 10).unwrap();
+    assert_eq!(chunks, ["a ".repeat(600), "b ".repeat(600)]);
+
+    let lines = vec!["l".repeat(300); 10].join("\n");
+    let chunks = markdown::split(&lines, 2_000, 10).unwrap();
+    assert!(fits(&chunks));
+    assert_eq!(chunks.join("\n"), lines, "line cuts lose only the newline");
+
+    let words = "word ".repeat(1_000);
+    let chunks = markdown::split(&words, 2_000, 10).unwrap();
+    assert!(fits(&chunks) && chunks.len() == 3);
+    assert!(chunks[..2].iter().all(|chunk| chunk.ends_with(' ')));
+    assert_eq!(chunks.concat(), words);
+
+    let emoji = "\u{1F600}".repeat(1_500);
+    let chunks = markdown::split(&emoji, 2_000, 10).unwrap();
+    assert_eq!(chunks, ["\u{1F600}".repeat(1_000), "\u{1F600}".repeat(500)]);
+
+    let code = format!(
+        "intro\n\n```rust\n{}\n```\nafter",
+        vec!["let x = 1;"; 400].join("\n")
+    );
+    let chunks = markdown::split(&code, 2_000, 10).unwrap();
+    assert!(fits(&chunks) && chunks.len() == 3);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let fences = chunk.lines().filter(|line| line.starts_with("```")).count();
+        assert_eq!(fences % 2, 0, "chunk {index} has an unbalanced fence");
+        if index > 0 {
+            assert!(
+                chunk.starts_with("```rust\n"),
+                "the info string is reopened"
+            );
+        }
+    }
+    assert!(chunks[0].ends_with("let x = 1;\n```"));
+    assert!(chunks[2].ends_with("```\nafter"));
+
+    let one_line_fence = format!("```x```\n{}", "c".repeat(2_100));
+    assert!(!markdown::split(&one_line_fence, 2_000, 10).unwrap()[1].starts_with("```"));
+    assert!(markdown::split(&"d".repeat(20_001), 2_000, 10).is_none());
 }
