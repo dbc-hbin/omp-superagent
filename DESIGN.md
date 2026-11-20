@@ -698,6 +698,33 @@ GitHub 본문은 안전한 native context 경계 안의 비신뢰 데이터다.
 병합은 관찰 종료, 미병합 close는 reopen 관찰로 구분한다. API 실패나 head 경합은 cursor를
 진행시키지 않는다. 내부 관측은 레인 배정·재개·외부 효과의 새로운 권한이 아니다.
 
+### 예약 작업
+
+`src/cron-jobs.ts`의 예약은 HEAD runtime의 기존 maintenance wake에서만 계산한다.
+Gateway에는 별도 scheduler, 모델 판단, 레인 제어를 추가하지 않는다. 소유자의 `/cron`
+명령은 모델에 보내지 않고, `coordination.sqlite`에서 명령 완료·결과와 변경을 한 번에
+기록한다. 등록 원본은 실제 메신저 입력에 묶고 같은 계정·대화·주제만 관리할 수 있다.
+편집된 메시지는 예약 권한이 아니다. 자연어로 명시적으로 요청하면 HEAD의 `cron_create`가
+현재 native 턴에 접수된 원본 소유자 입력을 확인하고 기존 예약 장부에 등록한다. 도구는
+native 실행 승인 정책을 따르며 등록과 중복 방지 receipt를 한 번에 기록한다. 원본당
+한 건만 등록하고, 삭제 뒤 같은 도구 호출을 반복해도 되살리지 않는다. 레인·native
+자식·과거 요청·예약 실행은 새 예약을 등록할 권한이 없다.
+
+기한이 된 작업의 새 실행 ID와 다음 시각을 같은 기존 head intake 트랜잭션으로
+기록한다. 예약 입력은 일반 사용자 소스로 승격하지 않으므로 active turn steering,
+native workflow 활성화, 새 레인 배정 권한이나 도구 승인을 상속하지 않는다. 복구한
+중지·예약 관리 명령을 기한 검사나 큐 제출보다 먼저 처리한다. 큐의 제출 직전
+Gateway의 읽기 전용 route 조회로 미처리 ingress가 없고 같은 계정인지 확인하며, 예약
+이전의 구성 정책·등록 원본·승인/재시작 경계를 그대로 적용한다. 하나의 작업에
+미결 실행은 하나만 둔다. 반복 예약의 놓친 여러 회차는 최대 하나로 합치고, 기존 실행이
+불확실하면 자동 재실행하지 않는다. HEAD stop 경계가 바뀌면 명시적인 개별 재개가 필요하다.
+모델 응답·승인·실행 기록과 결과 발송에는 기존 HEAD·native RPC·outbox 경로를 사용한다.
+
+일정 해석은 `cron-parser` 5.10.6의 공개 API를 사용한다. OMP 19.0.0 SDK와 설치된
+19.0.1 CLI에서 범용 예약 관리 API/명령을 확인하지 못했으며, 예약 동작은 OMP의
+세션·도구·권한 구현을 대체하지 않는다. 문법과 멈춤/재개 의미는
+[운영 가이드](docs/OPERATIONS.md#예약-작업-cron)를 따른다.
+
 ### Discord 채널 문맥
 
 `Inbound.discordContext`는 채널 ID/name/topic, 스레드 ID/name/parent와 로컬 owner purpose를

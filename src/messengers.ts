@@ -54,6 +54,11 @@ export class MessengerHub implements Messenger {
   send(output: OutputRecord): Promise<string> {
     return this.adapter(output.route).send(output);
   }
+  assertRoute(route: Route): void | Promise<void> {
+    const adapter = this.adapter(route);
+    if (!this.started || !adapter.assertRoute) throw new DeliveryError("Messenger route cannot be verified", "rejected");
+    return adapter.assertRoute(route);
+  }
   async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     const key = JSON.stringify([physicalRouteKey(message.route), message.messageId]);
     const apply = async () => {

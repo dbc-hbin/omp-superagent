@@ -27,7 +27,7 @@ const extensionPath = path.join(packageRoot, role === "head" ? "src/extension.ts
 const customDirectory = path.join(root, "operator-custom-skills");
 const shadowHead = role === "head" && kind === "main" && selection === "narrow";
 const shadowDirectory = path.join(workspace, ".omp/skills/superagent-head");
-const managerNames = ["head_recovery", "head_set_model", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
+const managerNames = ["head_recovery", "head_set_model", "cron_create", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
   "discord_context", "discord_purpose_list", "discord_purpose_set", "discord_purpose_clear", "pr_watch", "pr_watch_list",
   "decision_list", "decision_inspect", "decision_withdraw"];
 const skillSettings = {
@@ -388,6 +388,11 @@ try {
     // schemas. Exercise the same argument validator and wire-schema lowering
     // that OMP uses, rather than applying TypeBox to its native representation.
     const destination = { platform: "slack", accountId: "T:B", authorityId: "U", guildId: "T", channelId: "C", threadId: "1.2" };
+    check("cron_create", { sourceId: "owner-source", schedule: "in 30m", prompt: "Summarize CI" }, true);
+    check("cron_create", { sourceId: "owner-source", schedule: "in 30m" }, false);
+    assert.equal(runner.getRegisteredTool("cron_create")?.definition.approval, "exec");
+    assert.equal((await runner.emitToolCall({ type: "tool_call", toolName: "cron_create", toolCallId: "child-cron", input: {} },
+      undefined, askChild.agent))?.block, true);
     check("decision_list", {}, true);
     check("decision_list", { state: "all", laneId: "lane" }, true);
     check("decision_list", { state: "closed" }, false);

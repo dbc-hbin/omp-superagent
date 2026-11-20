@@ -1,5 +1,6 @@
 import type { ModelPreset as NativeModelPreset } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import type { LaneEvidence, LaneReport, LaneWaitTarget } from "./lane-report";
+import type { CronUpdate } from "./cron-jobs";
 
 /** Coordination records only. OMP owns transcripts and execution state. */
 export type Platform = "discord" | "telegram" | "slack";
@@ -266,6 +267,7 @@ export interface StorePort {
   recordLaneReport(id: string, generation: number, sessionId: string, eventId: string, report: LaneReport, observedAt?: number): boolean;
   resolveLaneWaiting(id: string, generation: number, sessionId: string, kind: "tool" | "approval", nativeId: string): boolean;
   settle(id: string, state: "done" | "uncertain" | "cancelled", output?: { id: string; text: string }, headModel?: HeadModelChange): boolean;
+  settleCronControl(inputId: string, update: CronUpdate): boolean;
   resolveLaneInput(controlId: string, laneId: string, inputId: string, output: { readonly id: string; readonly text: string }): boolean;
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[];
   prepareHeadRecovery(attempt: HeadRecoveryAttempt): boolean;
@@ -362,6 +364,8 @@ export interface Messenger {
     restart?(notice: GatewayRestartNotice): Promise<void>;
   }): Promise<void>;
   send(output: OutputRecord): Promise<string>;
+  /** Verify against the currently authenticated adapter without sending or fetching messages. */
+  assertRoute?(route: Route): void | Promise<void>;
   /** Cosmetic own reactions on the original message; never an admission or completion receipt. */
   setActivity?(message: MessageReference, activity: MessageActivity): Promise<void>;
   showApproval(approval: Approval): Promise<string>;

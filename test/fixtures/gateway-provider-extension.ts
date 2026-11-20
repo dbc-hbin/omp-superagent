@@ -8,7 +8,7 @@ import { nativeRequestEnvelope } from "./native-request-envelope";
 
 const provider = "gateway-native";
 const model = "local";
-const managers = ["head_recovery", "head_set_model", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close"];
+const managers = ["head_recovery", "head_set_model", "cron_create", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close"];
 
 export default function gatewayProvider(pi: ExtensionAPI): void {
   const root = process.env.OMP_NATIVE_GATEWAY_ROOT;
@@ -120,6 +120,15 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
     }
     if (!requestId) throw new Error("Ordinary native input requires its durable request identity");
     if (role === "head") {
+      if (requestId === "240") {
+        if (!called("cron_create")) return invoke("cron_create", {
+          sourceId: requestId, schedule: "in 1s", prompt: "Return the native scheduled check result in this conversation.",
+        });
+        const receipt = results.flatMap(result => result.content).filter(part => part.type === "text").map(part => part.text).join("\n");
+        const id = /"id":\s*"([0-9a-f-]{36})"/.exec(receipt)?.[1];
+        if (!id) throw new Error("Native cron_create returned no job identity");
+        return { content: [`Cron registered ${id}`] };
+      }
       if (requestId.startsWith("lane-decision-review:")) {
         const id = /Internal review for lane [^,]+, decision (d-[a-f0-9]{24})\./.exec(text)?.[1];
         if (!id) throw new Error("Native HEAD review lost its exact decision identity");

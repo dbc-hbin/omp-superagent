@@ -89,6 +89,16 @@ SOFTWARE.
 - No unlicensed poke code or SUL-covered Dori code was imported. Referencing
   operational concepts does not relicense code or grant permission to copy it.
 
+## Scheduled jobs
+
+- Schedule calculation uses the public `CronExpressionParser` API from the MIT
+  dependency [`cron-parser` 5.10.6](https://github.com/harrisiirak/cron-parser/tree/5c378949a7382d0dec8e9a30474668650df3774a).
+  Its license and those of its locked dependencies remain applicable.
+- The `/cron` command vocabulary and interrupted-run behavior were compared with
+  [Hermes Agent's cron docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)
+  and its [jobs implementation at `9f47677`](https://github.com/NousResearch/hermes-agent/blob/9f47677483d1b4de4d1a88d37b3b7ca18b18b215/cron/jobs.py).
+  No Hermes code was copied. Superagent uses its existing HEAD, SQLite ledger and original messenger route.
+
 ## Operational skills: conceptual references, independently written
 
 `skills/head/` and `skills/lane/` were written for this repository's design and

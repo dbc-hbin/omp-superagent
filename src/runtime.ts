@@ -19,6 +19,7 @@ import { parseLaneReportResult } from "./lane-report";
 import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
 import { headRecoveryEvidence } from "./head-recovery";
 import { PrWatcher, type PrWatchCommand } from "./pr-watch";
+import { CRON_RUN_PREFIX, CronJobs, type CronCreate } from "./cron-jobs";
 import type { readPrSnapshot } from "./pr-github";
 import { acknowledgeDecision, decisionRequestId, decisionViews, validateDecisionResponse, type DecisionView } from "./decisions";
 
@@ -116,7 +117,7 @@ interface DmCommandBoundary {
 }
 const laneDecisionReview = "lane-decision-review:";
 interface HeadCommand {
-  name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "model" | "effort" | "resolve";
+  name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "model" | "effort" | "resolve" | "cron";
   argument: string;
 }
 interface HeadRestart extends GatewayRestartRequest {
@@ -249,6 +250,7 @@ export class Superagent {
   private readonly intakeReady = Promise.withResolvers<void>();
   private timer?: NodeJS.Timeout;
   private readonly prWatcher: PrWatcher;
+  private readonly cronJobs: CronJobs;
   private readonly prAbort = new AbortController();
   private prObservation?: Promise<void>;
   private presetSync?: Promise<void>;
@@ -264,6 +266,7 @@ export class Superagent {
   ) {
     this.adapters = { connect, startHost, ...adapters };
     this.prWatcher = new PrWatcher(store, config, adapters.readPrSnapshot);
+    this.cronJobs = new CronJobs(store, config);
     // Adapters that do not consume the optional gate must not cause an unhandled
     // rejection when startup fails before there is any queued intake.
     void this.intakeReady.promise.catch(() => {});
@@ -748,7 +751,7 @@ export class Superagent {
     return codingModels(data.models);
   }
 
-  requestHeadModel({ sourceId, model }: HeadModelChange) {
+  private currentOwnerSource(sourceId: string, action: string): { source: InputRecord; ownerId: string } {
     this.assertRestartOpen();
     const live = this.live.get("main");
     const owner = live?.input;
@@ -757,12 +760,22 @@ export class Superagent {
       || !owner || source?.target !== "main" || source.state !== "submitted" || !source.requestId
       || live.admitted.get(source.requestId)?.input.id !== source.id || this.store.getMeta(`user-source:${source.id}`) !== "true"
       || this.store.getMeta(`steering-owner:${source.id}`) !== owner.id) {
-      throw new Error("A HEAD model change requires an original owner request admitted to the current HEAD turn");
+      throw new Error(`${action} requires an original owner request admitted to the current HEAD turn`);
     }
     this.authorized(source.route);
+    return { source, ownerId: owner.id };
+  }
+
+  createCronJob(request: CronCreate) {
+    const { source } = this.currentOwnerSource(request.sourceId, "Cron registration");
+    return this.cronJobs.create(source, request, Date.now());
+  }
+
+  requestHeadModel({ sourceId, model }: HeadModelChange) {
+    const { ownerId } = this.currentOwnerSource(sourceId, "A HEAD model change");
     const exact = laneModelArgument(model);
     if (/\s/.test(exact)) throw new Error("Use one exact provider/model identity, not a preset or command");
-    const key = `head:model-request:${owner.id}`;
+    const key = `head:model-request:${ownerId}`;
     const intent = JSON.stringify({ sourceId, model: { provider: model.provider, id: model.id } });
     const previous = this.store.getMeta(key);
     if (previous !== null && previous !== intent) throw new Error("A different HEAD model change is already requested for this turn");
@@ -1243,6 +1256,12 @@ export class Superagent {
     if (this.settleTopicControl(input)) { this.background(this.kick()); return; }
     const command = input.text.trim();
     const control = this.headCommand(this.store.input(input.id)!);
+    if (control?.name === "cron") {
+      this.cronControl(input.id, control.argument);
+      this.background(this.flushOutputs());
+      this.background(this.kick());
+      return;
+    }
     if (control && (control.name === "stop" || control.name === "restart" || this.readOnlyHeadCommand(control))) {
       if (control.name === "restart" && !this.admitRestart(this.store.input(input.id)!, control)) {
         this.background(this.flushOutputs());
@@ -1560,8 +1579,17 @@ export class Superagent {
     try { await this.catchupTask; } finally { this.catchupTask = undefined; }
   }
 
+  private assertCronDelegationOpen(sourceId: string): void {
+    const source = this.store.input(sourceId);
+    if (sourceId.startsWith(CRON_RUN_PREFIX) || this.live.get("main")?.input?.id.startsWith(CRON_RUN_PREFIX)
+      || source && this.headCommand(source)?.name === "cron") {
+      throw new Error("Cron runs and cron controls cannot delegate lane work");
+    }
+  }
+
   async startLane(input: LaneStart): Promise<Lane> {
     this.assertRestartOpen();
+    this.assertCronDelegationOpen(input.sourceId);
     if (input.appliedTags !== undefined && (!Array.isArray(input.appliedTags) || input.appliedTags.length > 5
       || input.appliedTags.some(tag => typeof tag !== "string" || !/^\d{1,20}$/.test(tag))
       || new Set(input.appliedTags).size !== input.appliedTags.length)) {
@@ -1763,6 +1791,7 @@ export class Superagent {
 
   async messageLane(id: string, text: string, sourceId: string, choice?: WorkflowChoice) {
     this.assertRestartOpen();
+    this.assertCronDelegationOpen(sourceId);
     const lane = this.requireLane(id);
     if (lane.workState !== "open") throw new Error("Lane is not open; explicitly resume it first");
     const original = this.store.input(sourceId);
@@ -2368,7 +2397,7 @@ export class Superagent {
     }
     if (this.store.getMeta(`user-source:${input.id}`) !== "true"
       || this.store.getMeta(`handoff-source:${input.id}`)) return null;
-    const match = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve)(?:\s+([\s\S]*))?$/.exec(input.text.trim());
+    const match = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/.exec(input.text.trim());
     return match ? { name: match[1] as HeadCommand["name"], argument: (match[2] ?? "").trim() } : null;
   }
 
@@ -2986,6 +3015,7 @@ export class Superagent {
         "/model; /model list; /model <exact provider/id>; /model preset; /model preset list; /model preset <exact-name>; /effort; /effort <advertised-level> — shared HEAD session only by default; changes require idle, unambiguous state.",
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
+        "/cron [help] — schedule and manage one-time or recurring jobs in this conversation.",
         "/stop [head|lane-id] — head aborts current/admitted ordinary HEAD work and earlier pending changes, not historical uncertain effects or unrelated lanes; an actual managed lane-id pauses that lane. Bare /stop pauses this conversation's bound lane, otherwise HEAD.",
         "/restart — durably fence intake, confirm the original-route ACK, checkpoint/interrupt busy HEAD and cancel its original approval cards, then safely replace BOTH Gateway AND HEAD. Restore the same native session/model/effort/board and resume eligible previously active goals without prompt replay. Independent lanes stay running. Uncertain effects or unreconciled owned resources remain held; no forced kill. ACK/acceptance is not completion; explicit stop wins.",
         "/resolve [input-id] — close ONE already-uncertain HEAD input as cancelled so later HEAD work is no longer held. Requires the exact ID when several are held; never replays the original work and never claims its native outcome. Send a new request if that work is still wanted.",
@@ -3142,7 +3172,7 @@ export class Superagent {
           || actual.goal?.enabled || actual.pendingUiRequests?.length || failures.length) {
           this.controlReply(input, `HEAD stop boundary is durable, but native cleanup is not fully confirmed. ${this.nativeStatus(actual)}. Services/async work may remain; no task completion or historical-effect rollback is claimed.`, "uncertain");
         } else {
-          this.controlReply(input, "HEAD stop confirmed: admitted ordinary work and pending changes through this stop boundary are cancelled, native queue drained, goal paused, native subagent cancellation requests and approval cancellations acknowledged. Already-submitted setting effects are not rolled back. No task completion or rollback is claimed. Gateway and unrelated lanes remain running; later new requests may run.", "cancelled");
+          this.controlReply(input, "HEAD stop confirmed: admitted ordinary work and pending changes through this stop boundary are cancelled, native queue drained, goal paused, native subagent cancellation requests and approval cancellations acknowledged. Already-submitted setting effects are not rolled back. No task completion or rollback is claimed. Gateway and unrelated lanes remain running; later new requests may run. Existing cron schedules are held until individually resumed.", "cancelled");
         }
       } catch {
         this.controlReply(input, "HEAD stop boundary is durable, but native stop readback is uncertain. It was not replayed; later HEAD work remains held. Gateway and unrelated lanes were not stopped.", "uncertain");
@@ -3243,6 +3273,7 @@ export class Superagent {
   }
 
   private async headControl(input: InputRecord, command: HeadCommand, earlierMain: boolean): Promise<void> {
+    if (command.name === "cron") { this.cronControl(input.id, command.argument); return; }
     if (command.name === "restart") {
       if (this.restartActive === input.id || this.admitRestart(input, command)) await this.runHeadRestart(input);
       return;
@@ -3413,6 +3444,12 @@ export class Superagent {
     }
   }
 
+  private cronControl(id: string, argument: string): void {
+    const input = this.store.input(id);
+    if (input?.state !== "pending" || this.headCommand(input)?.name !== "cron") return;
+    this.store.settleCronControl(id, this.cronJobs.control(input, argument, Date.now()));
+  }
+
   async kick(): Promise<void> {
     if (!this.ready || this.stopped) return;
     await this.reconcileRestart();
@@ -3474,7 +3511,7 @@ export class Superagent {
           }
         }
         for (const input of this.store.inputs()) {
-          if (input.state !== "pending") continue;
+          if (this.stopped || input.state !== "pending") continue;
           try { this.authorized(input.route); }
           catch {
             this.store.settle(input.id, "cancelled");
@@ -3487,8 +3524,23 @@ export class Superagent {
             continue;
           }
           if (input.target === "main" && this.settleTopicControl(input)) continue;
+          // On recovery these controls can be durable but not applied. Do not
+          // generate or submit a scheduled run before applying them in order.
+          const control = this.headCommand(input);
+          if (control?.name === "cron") {
+            this.cronControl(input.id, control.argument);
+            continue;
+          }
+          if (control?.name === "stop" && !this.controls.has(input.id) && this.stopTarget(input, control) === "main") {
+            await this.headControl(input, control, false);
+            continue;
+          }
           // Legacy unassigned intake is still user work: migrate only to head.
           if (input.target === null && !this.store.getMeta(`handoff-source:${input.id}`)) this.store.bindInput(input.id, "main");
+        }
+        if (!this.stopped && !this.restartFence() && this.headStopping === 0 && !this.initializationHoldsHead()) {
+          try { this.cronJobs.poll(Date.now()); }
+          catch (error) { this.report(error); }
         }
         const heldTargets = new Set<string>();
         const earlierMain = new Set<string>();
@@ -3740,6 +3792,16 @@ export class Superagent {
       if (!Array.isArray(journal.entries) || journal.leafId !== null && typeof journal.leafId !== "string")
         throw new Error("Native HEAD request owner has no journal cursor");
       const confirmed = await this.state(live);
+      if (input.id.startsWith(CRON_RUN_PREFIX)) {
+        // A stored route is not proof the same bot is still authenticated.
+        if (!this.messenger.assertRoute) return;
+        try { await this.messenger.assertRoute(input.route); }
+        catch (error) {
+          // A socket/response failure is also not proof of the route.
+          if (!(error instanceof Error)) this.report(error);
+          return;
+        }
+      }
       if (!this.current(live) || live.input !== owner || version !== live.nativeVersion
         || !confirmed.isSettled || confirmed.isStreaming || confirmed.isCompacting
         || confirmed.pendingUiRequests?.length || this.store.approvals("main").length

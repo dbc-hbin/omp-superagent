@@ -21,6 +21,7 @@ import type { LaneReport } from "../src/lane-report";
 import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../src/contracts";
 import { headRecoveryEvidence } from "../src/head-recovery";
 import { decisionId } from "../src/decisions";
+import { CronJobs } from "../src/cron-jobs";
 
 test("a delayed durable receipt cannot cancel a later native run", () => {
   const owner = { sessionId: "native-session", sessionFile: "/private/session.jsonl", requestId: "original", cursor: null };
@@ -272,6 +273,7 @@ class MessengerTransport implements Messenger {
   sendError?: Error;
   beforeSend?: (output: OutputRecord) => Promise<void>;
   onStart?: (handlers: Handlers) => void;
+  assertRoute?: Messenger["assertRoute"];
   openAttachment: Messenger["openAttachment"] = async () => { throw new Error("No test attachment is authorized"); };
   async start(handlers: Handlers): Promise<void> { this.handlers = handlers; this.onStart?.(handlers); }
   async send(output: OutputRecord): Promise<string> {
@@ -436,6 +438,140 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], pre
   fixtures.push({ runtime, directory });
   return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
 }
+
+test("cron controls scope job management to the original thread and send one HEAD result after route verification", async () => {
+  const { runtime, messenger, main, store, errors, directory } = fixture();
+  const origin = route("11");
+  const other = route("12");
+  let authenticatedAccount = "other-bot";
+  messenger.assertRoute = destination => {
+    if (destination.accountId !== authenticatedAccount) throw new Error("Gateway socket disconnected before route verification");
+  };
+  await runtime.start();
+  const add = applicationCommand("201", origin, '/cron add "every 2h" "Original text"');
+  await admit(runtime, add);
+  const id = store.output(`${add.id}:head-control`)?.text.match(/[0-9a-f-]{36}/)?.[0];
+  if (!id) throw new Error("Cron registration did not return a job ID");
+  await admit(runtime, add);
+  await admit(runtime, message("202", other, `/cron remove ${id}`));
+  expect(store.input("202")?.state).toBe("cancelled");
+  await admit(runtime, message("203", origin, `/cron edit ${id} prompt Updated text\nSecond line`));
+  await admit(runtime, message("204", origin, `/cron pause ${id}`));
+  await admit(runtime, { ...message("discord:2:204:edit:2040:revision", origin, `/cron resume ${id}`), messageId: "204" });
+  expect(store.input("discord:2:204:edit:2040:revision")?.state).toBe("cancelled");
+  await admit(runtime, message("205", origin, "/cron list"));
+  expect(store.output("205:head-control")?.text).toMatch(new RegExp(`^${id} .+paused`));
+  await admit(runtime, message("206", origin, `/cron run ${id}`));
+  const run = `cron-run:${id}:206`;
+  expect(store.input(run)?.state).toBe("pending");
+  expect(main.prompts).toEqual([]);
+  await admit(runtime, message("216", other, "Answer this ordinary request while the route probe is unavailable"));
+  expect(main.prompts).toHaveLength(1);
+  main.complete("Ordinary result");
+  await messenger.whenSent(8);
+  authenticatedAccount = origin.accountId;
+  await runtime.kick();
+  expect(main.prompts).toHaveLength(2);
+  expect(main.prompts[1]?.command.message).toContain("Updated text\nSecond line");
+  await expect(runtime.startLane({ ...selection, sourceId: run, cwd: directory, title: "Unexpected lane", kickoff: "Do not send" }))
+    .rejects.toThrow("cannot delegate lane work");
+  await expect(runtime.messageLane("other-lane", "Do not dispatch", "216")).rejects.toThrow("cannot delegate lane work");
+  const frame = { type: "extension_ui_request", id: "cron-approval", method: "confirm", title: "Proceed?", message: "Owner approval required" };
+  main.state.pendingUiRequests = [frame];
+  main.emit(frame);
+  await messenger.whenApproval();
+  const card = [...messenger.shown.values()][0];
+  if (!card || !messenger.handlers) throw new Error("Scheduled run did not surface its native approval");
+  expect(card.route).toEqual(origin);
+  await expect(messenger.handlers.answer(card.id, { confirmed: true }, other)).rejects.toThrow("foreign approval");
+  expect(main.responses).toEqual([]);
+  await messenger.handlers.answer(card.id, { confirmed: true }, origin);
+  expect(main.responses).toEqual([{ id: frame.id, response: { confirmed: true } }]);
+  main.complete("Cron result");
+  await messenger.whenSent(9);
+  expect(store.output(`${run}:answer`)).toMatchObject({ sourceId: run, route: origin, text: "Cron result" });
+  expect(store.output(`${run}:answer`)?.replyTo).toBeUndefined();
+  await admit(runtime, message("207", origin, `/cron resume ${id}`));
+  await admit(runtime, message("208", origin, "/stop head"));
+  await admit(runtime, message("209", origin, "/cron list"));
+  expect(store.output("209:head-control")?.text).toContain("held by HEAD stop");
+  await admit(runtime, message("210", origin, `/cron resume ${id}`));
+  await admit(runtime, message("211", origin, `/cron remove ${id}`));
+  await admit(runtime, message("212", origin, "/cron list"));
+  expect(store.output("212:head-control")?.text).toBe("No cron jobs in this conversation.");
+  expect(main.prompts).toHaveLength(2);
+  expect(errors).toEqual([]);
+});
+
+test("pausing a cron job while HEAD is busy cancels its pending execution without interrupting HEAD", async () => {
+  const { runtime, messenger, main, store, errors } = fixture();
+  messenger.assertRoute = () => {};
+  await runtime.start();
+  const origin = route("11");
+  await admit(runtime, message("211", origin, '/cron add "every 30m" Check CI'));
+  const id = store.output("211:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
+  if (!id) throw new Error("Cron registration did not return a job ID");
+  await admit(runtime, message("212", origin, "Investigate this first"));
+  await admit(runtime, message("213", origin, `/cron run ${id}`));
+  const runId = `cron-run:${id}:213`;
+  expect(store.input(runId)?.state).toBe("pending");
+  await admit(runtime, message("214", origin, `/cron pause ${id}`));
+  expect(store.input(runId)?.state).toBe("cancelled");
+  main.complete("Interactive result");
+  await messenger.whenSent(4);
+  await runtime.kick();
+  expect(main.prompts).toHaveLength(1);
+  expect(store.output("212:answer")).toMatchObject({ text: "Interactive result" });
+  expect(errors).toEqual([]);
+});
+
+test("natural-language cron registration is active-owner-bound and cannot recreate a removed job on replay", async () => {
+  const { runtime, messenger, main, store } = fixture();
+  await runtime.start();
+  const origin = route("11");
+  const owner = message("231", origin, "Every day at 09:00 Seoul time, summarize CI here.");
+  const request = { sourceId: owner.id, schedule: "TZ=Asia/Seoul 0 9 * * *", prompt: "Summarize CI" };
+  expect(() => runtime.createCronJob(request)).toThrow("current HEAD turn");
+  await admit(runtime, owner);
+  const created = runtime.createCronJob(request);
+  expect(created).toMatchObject({ status: "created", schedule: request.schedule });
+  expect(runtime.createCronJob(request)).toMatchObject({ id: created.id, status: "already_registered" });
+  expect(() => runtime.createCronJob({ ...request, prompt: "Different work" })).toThrow("already registered a different cron job");
+  await admit(runtime, message("232", origin, `/cron remove ${created.id}`));
+  expect(runtime.createCronJob(request)).toEqual({ id: created.id, status: "removed" });
+  main.complete("Registration receipt");
+  await messenger.whenSent(2);
+  await admit(runtime, message("233", origin, "/cron list"));
+  expect(store.output("233:head-control")?.text).toBe("No cron jobs in this conversation.");
+  expect(() => runtime.createCronJob(request)).toThrow("current HEAD turn");
+});
+
+test.each(["stop", "pause", "remove"] as const)("recovered %s control takes effect before the scheduler can submit a run", async action => {
+  const { runtime, store, config, messenger, main } = fixture();
+  const origin = route("11");
+  messenger.assertRoute = () => {};
+  // Crash window: both the registration and the subsequent operator input
+  // reached SQLite, but the controller did not apply the latter command.
+  const registered = message("221", origin, '/cron add "in 1s" Do not run after stop');
+  store.receive(registered, "main", { "user-source:221": "true" });
+  const source = store.input(registered.id);
+  if (!source) throw new Error("Missing registration input");
+  const cron = new CronJobs(store, config);
+  const now = Date.now();
+  store.settleCronControl(source.id, cron.control(source, 'add "in 1s" Do not run after stop', now - 3000));
+  const jobId = store.output("221:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
+  if (!jobId) throw new Error("Missing cron job ID");
+  if (action !== "stop") cron.poll(now - 1000);
+  const queued = store.inputs("main").find(input => input.id.startsWith("cron-run:"));
+  if (action !== "stop" && !queued) throw new Error("Expected a previously admitted run");
+  const control = message("222", origin, action === "stop" ? "/stop head" : `/cron ${action} ${jobId}`);
+  store.receive(control, "main", { "user-source:222": "true" });
+  await runtime.start();
+  expect(store.input(control.id)?.state).toBe(action === "stop" ? "cancelled" : "done");
+  if (queued) expect(store.input(queued.id)?.state).toBe("cancelled");
+  expect(store.inputs("main")).toEqual([]);
+  expect(main.prompts).toEqual([]);
+});
 
 test("PR feedback after lane closure reaches only HEAD and its registered conversation", async () => {
   let reads = 0;

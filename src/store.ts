@@ -34,6 +34,7 @@ import { isLaneModel, laneModelArgument, sameLaneModel } from "./lane-models";
 import { readLaneRows, toLane } from "./lane-rows";
 import { workflowChoice } from "./workflow";
 import { laneWaitKey, type LaneReport } from "./lane-report";
+import type { CronUpdate } from "./cron-jobs";
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS lanes (
@@ -496,6 +497,17 @@ export class Store implements StorePort {
         }, "main", { [HEAD_MODEL_CONTROL]: controlId, [`activity-source:${controlId}`]: source.id });
       }
       return true;
+    }).immediate();
+  }
+
+  settleCronControl(inputId: string, update: CronUpdate): boolean {
+    return this.db.transaction(() => {
+      const control = this.input(inputId);
+      if (control?.state !== "pending" || control.target !== "main" || this.getMeta(`user-source:${inputId}`) !== "true") return false;
+      if (update.cancelPending && this.input(update.cancelPending)?.state === "pending") this.settle(update.cancelPending, "cancelled");
+      if (update.run) this.receive(update.run, "main");
+      for (const [key, value] of Object.entries(update.metadata ?? {})) this.setMeta(key, value);
+      return this.settle(inputId, update.state ?? "done", { id: `${inputId}:head-control`, text: update.text });
     }).immediate();
   }
 

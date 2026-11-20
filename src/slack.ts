@@ -200,7 +200,7 @@ export class SlackMessenger implements Messenger {
     } catch (error) { await this.stop(); throw failure(error); }
   }
 
-  private assertRoute(route: Route): void {
+  assertRoute(route: Route): void {
     if (!this.accountId || route.platform !== "slack" || route.accountId !== this.accountId || route.authorityId !== this.options.ownerId || !slackId(route.channelId) ||
       (route.threadId !== null && !timestamp(route.threadId)) ||
       (route.guildId !== null && (route.guildId !== this.options.teamId || !this.channels.has(route.channelId)))) throw new DeliveryError("Slack route is not authorized for this workspace, bot, and owner", "rejected");

@@ -7,6 +7,7 @@ import { gatewayCall, gatewayPaths, gatewayRequest, MAX_GATEWAY_ATTACHMENT, MAX_
 import type { GatewayReceipt, QueuedEvent } from "./gateway-store";
 
 export interface GatewayHeadMessenger extends Messenger {
+  assertRoute(route: Route): Promise<void>;
   requestRestart(request: GatewayRestartRequest): Promise<GatewayRestartRecord>;
 }
 
@@ -138,6 +139,7 @@ class GatewayMessenger implements GatewayHeadMessenger {
   }
   requestRestart(request: GatewayRestartRequest): Promise<GatewayRestartRecord> { return this.call("/restart", request); }
   send(output: OutputRecord): Promise<string> { return this.effect("send", [output]); }
+  assertRoute(route: Route): Promise<void> { return this.call("/route", { route }, AbortSignal.timeout(1000)); }
   setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     return this.effect("setActivity", [{ route: message.route, messageId: message.messageId }, activity]);
   }

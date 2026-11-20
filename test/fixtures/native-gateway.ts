@@ -31,6 +31,11 @@ class RecordingMessenger implements Messenger {
     this.sent.push(structuredClone(output));
     return `gateway-native-receipt:${output.id}`;
   }
+  assertRoute(route: Route): void {
+    assert.equal(route.platform, "discord");
+    assert.equal(route.accountId, "2");
+    assert.equal(route.authorityId, "1");
+  }
   async setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     this.activities.push({ message: { route: structuredClone(message.route), messageId: message.messageId }, activity });
   }
@@ -698,6 +703,24 @@ try {
     assert.equal(await fs.readFile(mainPaths.sessionFile, "utf8"), entriesBefore, "Preset refresh must not create a native head turn");
   }
 
+  if (presetScenario === "valid") {
+    const source: Inbound = { id: "240", messageId: "240", route: thread, receivedAt: Date.now(), attachments: [],
+      text: "In one second, run the native scheduled check and send the result back here." };
+    await messenger.deliver(source);
+    await until(() => sent(source.id).some(output => output.text.startsWith("Cron registered ")), "HEAD tool registration receipt");
+    const jobId = /^Cron registered ([0-9a-f-]{36})$/.exec(sent(source.id)[0]?.text ?? "")?.[1];
+    assert(jobId, "The natural-language request must receive the exact registered job ID");
+    const prefix = `cron-run:${jobId}:`;
+    await until(() => messenger.sent.some(output => output.sourceId.startsWith(prefix)), "scheduled native HEAD answer through Gateway");
+    const outputs = messenger.sent.filter(output => output.sourceId.startsWith(prefix));
+    assert.equal(outputs.length, 1);
+    const answer = outputs[0]!;
+    assert.deepEqual(answer.route, thread);
+    assert.equal(answer.text, `HEAD:${answer.sourceId}`);
+    assert.equal(input(answer.sourceId)?.state, "done");
+    const entries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+    assert.deepEqual(requestIds(entries).filter(id => id.startsWith(prefix)), [answer.sourceId]);
+  }
   await gateway.close();
   gateway = undefined;
   assert.equal(messenger.handlers, undefined);

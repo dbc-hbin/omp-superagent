@@ -372,7 +372,7 @@ export class DiscordMessenger implements Messenger {
     }
   }
 
-  private assertRoute(route: Route): void {
+  assertRoute(route: Route): void {
     if (route.platform !== "discord" || route.accountId !== this.client.user?.id || route.authorityId !== this.options.ownerId ||
       !route.channelId || (!route.guildId && route.threadId !== null) ||
       (route.guildId && (!this.guilds.has(route.guildId) || !this.channels.has(route.channelId)))) {

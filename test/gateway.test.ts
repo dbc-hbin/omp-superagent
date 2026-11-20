@@ -40,6 +40,7 @@ class FakeMessenger implements Messenger {
   download?: (signal: AbortSignal) => Response;
   discordPurpose?: Messenger["discordPurpose"];
   inspectDiscordContext?: Messenger["inspectDiscordContext"];
+  assertRoute?: Messenger["assertRoute"];
   async start(handlers: Parameters<Messenger["start"]>[0]) { this.handlers = handlers; }
   async send(output: OutputRecord) {
     this.sends.push(output);
@@ -145,6 +146,30 @@ test("receipt reactions follow durable admission without delaying ACK or requiri
   } finally { release.resolve(); }
   await f.server.close();
   expect(f.messenger.activities).toEqual([{ message: { route, messageId: "offline-reaction" }, activity: "received" }]);
+});
+
+test("read-only route verification requires reconciled HEAD, drained durable intake and the current account", async () => {
+  const f = await fixture();
+  f.messenger.assertRoute = destination => {
+    if (destination.accountId !== route.accountId) throw new DeliveryError("Unrecognized bot account", "rejected");
+  };
+  const client = f.client();
+  const reconcile = Promise.withResolvers<void>();
+  const intake = Promise.withResolvers<void>();
+  const receipt = Promise.withResolvers<void>();
+  await client.start({ ready: reconcile.promise, message: async () => { intake.resolve(); await receipt.promise; }, answer: async () => {} });
+  await expect(client.assertRoute(route)).rejects.toThrow("not ready");
+  reconcile.resolve();
+  await f.server.initialReady.promise;
+  await f.messenger.emit({ ...input("queued-control"), text: "/cron pause id" });
+  try {
+    await intake.promise;
+    await expect(client.assertRoute(route)).rejects.toThrow("intake is still pending");
+  } finally { receipt.resolve(); }
+  await eventually(() => f.store.pending() === 0);
+  await client.assertRoute(route);
+  await expect(client.assertRoute({ ...route, accountId: "retired" })).rejects.toThrow("Unrecognized bot account");
+  expect(f.messenger.sends).toEqual([]);
 });
 
 test("reaction failures never reject durable input or a later answer and activity crosses real Gateway IPC", async () => {

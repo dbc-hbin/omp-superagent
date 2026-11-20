@@ -174,6 +174,8 @@ a rejected subscription call never switches to API billing.
   idle head session, not existing lanes or global defaults. You can also ask the head
   in a normal message to switch its own model after that turn. Global preset changes
   require explicit `--global`. Slack's message commands use `!`.
+- Ask HEAD to summarize CI every two hours, or use `/cron add "every 2h" Summarize CI`, and
+  manage it from the same chat with [`/cron`](docs/OPERATIONS.md#예약-작업-cron).
 - `/stop` pauses the bound lane; `/resume` authorizes continuation. Approvals,
   cancellations, tool exclusions, and uncertain-effect holds remain binding.
   Neither progress reports nor recovery prove task completion or undo external effects.

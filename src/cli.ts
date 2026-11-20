@@ -72,6 +72,7 @@ Owner controls in chat (not shell commands):
   /model preset [list|NAME]     Inspect or select a preset. Only NAME --global also saves future defaults.
   /effort [LEVEL]               Inspect or change HEAD thinking effort; existing lanes keep their settings.
   /compact [instructions]       Compact idle HEAD context, optionally with multiline instructions.
+  /cron [help]                  Schedule and manage one-time or recurring jobs in this conversation.
   /new [request], /main         Start a topic or return to the main topic in the owner's DM.
   /stop [head|LANE_ID]          Stop HEAD work or pause a lane, NOT the service. With no argument, pause
                                 the lane bound to this chat, or stop HEAD work if there is no bound lane.
@@ -87,6 +88,7 @@ Capabilities to request from HEAD in chat (not CLI subcommands):
     select its model/preset, or inspect and update its Discord thread or forum tags.
   PR monitoring: give HEAD a GitHub PR URL and check interval to watch reviews and CI; ask to list or stop watches.
     Requires gh with read access. A change notification does not authorize a merge or a new task.
+  Scheduled jobs: explicitly ask HEAD in plain language to schedule a task; manage it with /cron in the same chat.
   Decisions: ask HEAD to request an owner decision, list pending decisions, inspect one or withdraw it.
   Discord channel context: ask HEAD to inspect channel/thread context or set, list or clear a local purpose
     note. Notes do not edit Discord's channel description or authorize work.

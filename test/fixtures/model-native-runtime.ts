@@ -34,6 +34,11 @@ class RecordingMessenger implements Messenger {
     this.sent.push(structuredClone(output));
     return `native-receipt:${output.id}`;
   }
+  assertRoute(route: Route): void {
+    if (route.platform !== "discord" || route.accountId !== "2" || route.authorityId !== "1") {
+      throw new Error("Unexpected native fixture route");
+    }
+  }
   async showApproval(_approval: Approval): Promise<string> { throw new Error("Unexpected native dialog"); }
   async dismissApproval(_approval: Approval): Promise<void> { throw new Error("Unexpected native dialog dismissal"); }
   async createThread(_route: Route, _title: string): Promise<Route> { throw new Error("The independent thread already exists"); }
@@ -835,6 +840,24 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
         model: modelFixtureModels.changedDefault, thinkingLevel: Effort.Minimal });
     }
 
+    let cronResultId: string | undefined;
+    if (!modelSelection) {
+      const scheduled = inbound("250", threadRoute, '/cron add "in 1s" Deliver the scheduled fixture result.');
+      await messenger.deliver(scheduled);
+      await until(() => delivered(scheduled.id), "scheduled registration acknowledgement");
+      const answer = () => messenger.sent.find(output => output.sourceId.startsWith("cron-run:"));
+      await until(() => {
+        const result = answer();
+        return result !== undefined && delivered(result.sourceId);
+      }, "one-shot native cron run and original-route outbox receipt");
+      const result = answer();
+      if (!result) throw new Error("No scheduled cron result was delivered");
+      cronResultId = result.sourceId;
+      expect(result).toMatchObject({ route: threadRoute, text: reply });
+      await messenger.deliver(scheduled);
+      await runtime.kick();
+      expect(messenger.sent.filter(output => output.sourceId.startsWith("cron-run:")).map(output => output.sourceId)).toEqual([cronResultId]);
+    }
     // stop() detaches rather than killing OMP. Inspect and explicitly shut down
     // only the native processes whose identities belong to this test's ledger.
     await runtime.stop();
@@ -890,7 +913,8 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     const headRequestIds = requestIds(headEntries);
     const laneRequestIds = requestIds(laneEntries);
     expect(headRequestIds).toEqual([ordinary.id, topic.id, report(firstHandoff), followup.id, report(followupHandoff),
-      ...(modelSelection ? [modelChangeSource.id, changedFollowup.id, report(`handoff:${changedFollowup.id}:${created.id}`), "301", "303"] : [])]);
+      ...(modelSelection ? [modelChangeSource.id, changedFollowup.id, report(`handoff:${changedFollowup.id}:${created.id}`), "301", "303"] : []),
+      ...(cronResultId ? [cronResultId] : [])]);
     expect(laneRequestIds).toEqual([firstHandoff, followupHandoff, ...(modelSelection ? [`handoff:${changedFollowup.id}:${created.id}`] : [])]);
     expect(new Set(headRequestIds).size).toBe(headRequestIds.length);
     expect(new Set(laneRequestIds).size).toBe(laneRequestIds.length);

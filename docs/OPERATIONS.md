@@ -291,7 +291,7 @@ bun --no-env-file src/cli.ts discord-commands --config config.local.json --apply
 
 첫 명령은 읽기 전용 변경 확인이다. `--apply`는 **이 봇의 전역 명령 목록 전체를 교체**하므로
 전용 Superagent 앱에서만 사용한다. Hermes 전용 명령은 제거하고 지원되는
-`help/status/restart/context/usage/model/effort/compact/stop/resolve/resume/new/main`만 등록한다.
+`help/status/restart/context/usage/cron/model/effort/compact/stop/resolve/resume/new/main`만 등록한다.
 별도 guild 명령이 전역 명령을 가리는 경우 몰래 삭제하지 않고 충돌을 알린다.
 등록은 모델·메신저 연결을 시작하지 않으며 setup·doctor·start의 부수 효과로 실행되지 않는다.
 인수가 있는 명령은 선택적인 `text` 필드를 사용한다. 예를 들어 `/model`의 `text`에
@@ -811,6 +811,50 @@ native transcript에서 복원하므로 과거 프리셋의 기본값으로 덮�
 여부를 표시한다. 헤드 적용은 성공했지만 전역 저장/확인이 실패했다면 그 두 결과를 분리해서
 알리고, 자동 재시도나 성공으로 가장하지 않는다. 전역 기본값 변경은 새 세션·기본값을
 상속하는 경로에 영향을 줄 수 있다.
+
+### 예약 작업 (`/cron`)
+
+Discord·Telegram에서 `/cron`, Slack의 일반 메시지에서는 `!cron`을 사용한다.
+명령어 대신 “서울 시간으로 평일 오전 9시에 CI 상태를 요약해서 이 대화에 보내줘”라고
+요청해도 된다. HEAD가 `cron_create`로 등록하고 실제 ID와 다음 실행 시각을 확인한다.
+시간대나 작업 내용이 모호하면 확인 질문을 한다. 등록은 요청당 한 건이며,
+자연어로 만든 작업도 같은 대화에서 `/cron`으로 관리한다.
+등록한 앱 명령을 쓰려면 Discord는 `/cron`의 `text` 옵션, Slack은
+`/superagent-cron`에 하위 명령을 넣는다. 기존 앱 명령 메뉴는 별도의 명령 등록을 다시
+적용해야 갱신되며, 일반 메시지 명령에는 그 작업이 필요 없다.
+
+```text
+/cron add "in 30m" 빌드 확인하라고 알려줘
+/cron add "every 2h" CI 상태를 읽고 요약해줘
+/cron add "TZ=Asia/Seoul 0 9 * * 1-5" 평일 아침에 오늘 일정 요약해줘
+/cron add "at 2027-01-09T09:00:00+09:00" 오늘 할 일 알려줘
+/cron list
+/cron show ID
+/cron edit ID "every 4h" CI 상태와 실패 원인을 요약해줘
+/cron edit ID prompt 결과는 세 줄로 요약해줘
+/cron pause ID
+/cron resume ID
+/cron run ID
+/cron remove ID
+```
+
+- 예약은 `in`(1회), `every`(최소 1분, `s/m/h/d`), 시차를 명시한 `at`(1회),
+  또는 5필드 cron이다. cron 표현식은 `TZ=Asia/Seoul`을 붙이지 않으면 등록 당시
+  호스트 시간대를 사용한다. 목록의 다음 실행 시각은 UTC로 표시한다.
+- 등록한 플랫폼·봇 계정·대화·스레드/논리 주제에서만 관리할 수 있다. 새 소유자 메시지로
+  명령을 보내야 하며, 기존 메시지 편집이나 모델 응답은 예약을 변경할 수 없다.
+- 실행은 현재 모델이 설정된 **공유 HEAD**에서 일반 요청과 같은 큐를 타며, 결과와 승인
+  요청은 원래 대화로만 돌아간다. 별도 세션·레인, 첨부 파일 재사용, 상시 승인 권한은
+  만들지 않는다. 예약만으로 도구 승인이나 새로운 외부 효과가 허가되지는 않는다.
+- `run`은 예약을 건드리지 않고 한 번만 큐에 넣는다. `pause`와 `remove`는 이미 큐에
+  들어갔지만 제출되지 않은 실행을 취소한다. 제출된 실행을 중단하려면 `/stop head`를
+  사용한다. 이미 큐에 들어갔던 1회 예약을 취소한 뒤에는 `run` 또는 `edit`로 다시 지정한다.
+  `edit`는 이후 큐에 들어가는 실행에 적용되며, 이미 접수된 실행은 이전 프롬프트를 유지한다.
+- 서비스가 꺼져 있으면 실행하지 않는다. 재시작 때 지난 예약은 작업별 최대 한 번만
+  접수하며, 이전 실행이 대기·진행 중이면 반복 예약의 겹친 회차는 건너뛴다.
+  `/stop head`는 기존 예약도 보류하며, 원하는 작업을 `/cron resume ID`로 개별 재개한다.
+  이전 실행이 불확실하면 원래 세션을 확인하고 `/resolve <실행 ID>`로 먼저 해소한다.
+  예약 등록·큐 접수·실행 완료는 서로 다른 상태다.
 
 ### 상태·맥락·사용량·중단
 

@@ -315,7 +315,7 @@ export class TelegramMessenger implements Messenger {
     await this.handlers!.message(input);
   }
 
-  private assertRoute(route: Route): void {
+  assertRoute(route: Route): void {
     if (!this.me || route.platform !== "telegram" || route.accountId !== String(this.me.id) || route.authorityId !== this.options.ownerId ||
       (route.guildId === null ? route.channelId !== this.options.ownerId : route.guildId !== route.channelId || !this.chats.has(route.channelId)) ||
       (route.threadId !== null && (!integer(route.threadId) || Number(route.threadId) <= 0)) ||

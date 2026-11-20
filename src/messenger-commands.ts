@@ -5,6 +5,7 @@ export const MESSENGER_COMMANDS = [
   { name: "restart", description: "Restart Superagent Gateway and HEAD together when idle, preserving the session." },
   { name: "context", description: "Inspect Superagent HEAD context without starting a model turn." },
   { name: "usage", description: "Inspect Superagent HEAD usage without starting a model turn." },
+  { name: "cron", description: "Schedule and manage Superagent jobs in this conversation.", text: "Use help, add, list, show, edit, pause, resume, run or remove." },
   { name: "resume", description: "Resume the Superagent lane bound to this conversation." },
   { name: "resolve", description: "Close an uncertain Superagent HEAD or bound lane input without replay.", text: "Exact uncertain HEAD input ID, or --lane followed by the bound lane's exact input ID." },
   { name: "main", description: "Select the main Superagent topic in this owner DM." },
