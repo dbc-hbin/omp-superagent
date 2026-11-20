@@ -678,6 +678,14 @@ try {
     await until(() => messenger.sent.some(output => output.replyTo?.messageId === choice.messageId
       && output.text.includes("Flat") && output.text.includes("simpler and reversible")), "HEAD's confirmed choice and reason on the original request");
     await until(() => messenger.sent.some(output => output.text === "HEAD:209"), "the original lane continues after the confirmed native choice");
+    const usage: Inbound = { id: "210", messageId: "210", route: thread, receivedAt: Date.now(), attachments: [], text: "/usage" };
+    await messenger.deliver(usage);
+    const usageReply = () => messenger.sent.find(output => output.sourceId === usage.id);
+    await until(() => usageReply() !== undefined, "stock OMP usage reply from the production HEAD extension");
+    assert.deepEqual(usageReply()?.route, thread);
+    assert.match(usageReply()?.text ?? "", /보고된 계정 한도가 없습니다/);
+    const afterUsage = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+    assert(!requestIds(afterUsage).includes(usage.id), "Usage must not enter the native conversation");
   }
   for (const [name, bytes] of settingsBytes) assert.deepEqual(await fs.readFile(path.join(agent, name)), bytes);
   assert.deepEqual(errors, []);

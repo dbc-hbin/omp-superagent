@@ -1,12 +1,31 @@
 import { extractProfileFlags } from "@oh-my-pi/pi-coding-agent/cli/profile-bootstrap";
-import { resolveUsedFraction, usageReportSchema, type UsageLimit } from "@oh-my-pi/pi-ai/usage";
-import { Type } from "@sinclair/typebox";
+import { Type, type Static } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 import { credentialEnvNames, type Config } from "./config";
 
+// Parse only fields used from the CLI JSON. The stock extension loader does not
+// resolve the SDK usage module's internal omptype import.
+const limitSchema = Type.Object({
+  label: Type.String(),
+  amount: Type.Object({
+    unit: Type.String(),
+    used: Type.Optional(Type.Number()),
+    limit: Type.Optional(Type.Number()),
+    remaining: Type.Optional(Type.Number()),
+    usedFraction: Type.Optional(Type.Number()),
+    remainingFraction: Type.Optional(Type.Number()),
+  }),
+  window: Type.Optional(Type.Object({
+    id: Type.String(),
+    label: Type.String(),
+    resetsAt: Type.Optional(Type.Number()),
+    resetLabel: Type.Optional(Type.String()),
+  })),
+  status: Type.Optional(Type.String()),
+});
 const responseSchema = Type.Object({
   generatedAt: Type.Optional(Type.Number()),
-  reports: Type.Array(Type.Unknown()),
+  reports: Type.Array(Type.Object({ provider: Type.String(), limits: Type.Array(limitSchema) })),
   accountsWithoutUsage: Type.Optional(Type.Array(Type.Object({ provider: Type.String() }))),
   disabledCredentials: Type.Optional(Type.Array(Type.Object({ provider: Type.String() }))),
 });
@@ -14,7 +33,7 @@ const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
 const resetDay = new Intl.DateTimeFormat("ko-KR", { month: "numeric", day: "numeric", weekday: "short" });
 const resetTime = new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 
-function limitLine(limit: UsageLimit, today: string): string {
+function limitLine(limit: Static<typeof limitSchema>, today: string): string {
   const { amount, label, window } = limit;
   const windowLabel = window?.label;
   const shortWindow = window?.id === "5h" ? "5시간" : window?.id === "7d" ? "주간" : windowLabel;
@@ -26,11 +45,17 @@ function limitLine(limit: UsageLimit, today: string): string {
       ? `${labelWithoutProvider.slice(0, index)}${shortWindow}${labelWithoutProvider.slice(index + windowLabel.length)}`
       : `${shortWindow} (${labelWithoutProvider})`;
   }
-  const used = resolveUsedFraction(limit);
   const remaining = amount.remaining ?? (amount.limit !== undefined && amount.used !== undefined
     ? Math.max(0, amount.limit - amount.used) : undefined);
-  const fraction = amount.remainingFraction ?? (used !== undefined ? 1 - used
-    : amount.unit === "percent" && remaining !== undefined ? remaining / 100 : undefined);
+  let fraction = amount.remainingFraction;
+  if (fraction === undefined) {
+    if (amount.usedFraction !== undefined) fraction = 1 - amount.usedFraction;
+    else if (amount.limit !== undefined && amount.limit > 0 && remaining !== undefined) fraction = remaining / amount.limit;
+    else if (amount.unit === "percent") {
+      if (remaining !== undefined) fraction = remaining / 100;
+      else if (amount.used !== undefined) fraction = 1 - amount.used / 100;
+    }
+  }
   const parts: string[] = [];
   if (fraction !== undefined && Number.isFinite(fraction)) parts.push(`${number.format(Math.max(0, fraction) * 100)}% 남음`);
   if (remaining !== undefined && amount.unit !== "percent" && amount.unit !== "unknown") {
@@ -72,7 +97,6 @@ export async function readOmpUsage(config: Config, environment: NodeJS.ProcessEn
     accounts.set(provider, entries);
   };
   for (const report of response.reports) {
-    if (!usageReportSchema.allows(report)) throw new Error("Invalid OMP usage report");
     addAccount(report.provider, report.limits.length
       ? report.limits.map(limit => limitLine(limit, today)) : ["• 남은 한도 미확인"]);
   }
