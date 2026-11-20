@@ -20,6 +20,7 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
 import { headRecoveryEvidence } from "./head-recovery";
 import { PrWatcher, type PrWatchCommand } from "./pr-watch";
 import { CRON_RUN_PREFIX, CronJobs, type CronCreate } from "./cron-jobs";
+import { readOmpUsage } from "./omp-usage";
 import type { readPrSnapshot } from "./pr-github";
 import { acknowledgeDecision, decisionRequestId, decisionViews, validateDecisionResponse, type DecisionView } from "./decisions";
 
@@ -71,6 +72,7 @@ export interface RuntimeAdapters {
   persistPreset?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot>;
   requestRestart?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord>;
   readPrSnapshot?: typeof readPrSnapshot;
+  readOmpUsage: typeof readOmpUsage;
 }
 interface Live {
   id: string;
@@ -264,7 +266,7 @@ export class Superagent {
     private readonly report: (error: unknown) => void = console.error,
     adapters: Partial<RuntimeAdapters> = {},
   ) {
-    this.adapters = { connect, startHost, ...adapters };
+    this.adapters = { connect, startHost, readOmpUsage, ...adapters };
     this.prWatcher = new PrWatcher(store, config, adapters.readPrSnapshot);
     this.cronJobs = new CronJobs(store, config);
     // Adapters that do not consume the optional gate must not cause an unhandled
@@ -3005,13 +3007,14 @@ export class Superagent {
   private async queryHead(input: InputRecord, command: HeadCommand, live: Live, state: RuntimeState): Promise<boolean> {
     const reply = (text: string, outcome: "done" | "cancelled" = "done") => this.controlReply(input,
       `${command.name === "help" ? "HEAD controls (help changes no settings)." : "HEAD session only (not lanes or global defaults)."} ${text}`, outcome);
-    if (["help", "context", "usage"].includes(command.name) && command.argument) {
+    if (["help", "context"].includes(command.name) && command.argument) {
       reply(`Invalid syntax. Use /${command.name} with no arguments.`, "cancelled"); return true;
     }
     if (command.name === "help") {
       reply([
         "Supported owner commands (Slack uses ! instead of /, e.g. !status):",
-        "/help; /status; /context; /usage — read current shared HEAD, even while busy; no model turn.",
+        "/help; /status; /context — read current shared HEAD, even while busy; no model turn.",
+        "/usage — view account quotas and reset times from the configured OMP profile; no model turn.",
         "/model; /model list; /model <exact provider/id>; /model preset; /model preset list; /model preset <exact-name>; /effort; /effort <advertised-level> — shared HEAD session only by default; changes require idle, unambiguous state.",
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
@@ -3025,15 +3028,6 @@ export class Superagent {
       ].join("\n")); return true;
     }
     if (command.name === "context") { reply(this.contextStatus(state)); return true; }
-    if (command.name === "usage") {
-      const stats = successful(await live.connection.request({ type: "get_session_stats" }), "get_session_stats");
-      await this.state(live);
-      if (stats.sessionId !== live.sessionId || stats.sessionFile !== state.sessionFile) throw new Error("Native statistics session identity mismatch");
-      const tokens = record(stats.tokens);
-      const credits = record(stats.credits);
-      reply(`Native session usage: input tokens ${this.metric(tokens.input)}; output ${this.metric(tokens.output)}; reasoning ${this.metric(tokens.reasoning)}; cache read ${this.metric(tokens.cacheRead)}; cache write ${this.metric(tokens.cacheWrite)}; total ${this.metric(tokens.total)}.\nCost (USD): ${this.metric(stats.cost)}; premium requests: ${this.metric(stats.premiumRequests)}; credits cost: ${this.metric(credits.cost)}; committed credits: ${this.metric(credits.committedCost)}; ACU cost: ${this.metric(credits.acuCost)}.\nMessages: user ${this.metric(stats.userMessages)}, assistant ${this.metric(stats.assistantMessages)}, total ${this.metric(stats.totalMessages)}; tool calls ${this.metric(stats.toolCalls)}, results ${this.metric(stats.toolResults)}. Missing native accounting is unknown, not zero.`);
-      return true;
-    }
     const presetCommand = this.headPresetCommand(command);
     if (presetCommand && !presetCommand.name && !presetCommand.error) {
       if (!this.adapters.inspectPresets) throw new Error("Native preset inspection is unavailable");
@@ -3274,6 +3268,21 @@ export class Superagent {
 
   private async headControl(input: InputRecord, command: HeadCommand, earlierMain: boolean): Promise<void> {
     if (command.name === "cron") { this.cronControl(input.id, command.argument); return; }
+    if (command.name === "usage") {
+      if (command.argument) {
+        this.controlReply(input, "Invalid syntax. Use /usage with no arguments.", "cancelled");
+        return;
+      }
+      let text: string;
+      try { text = await this.adapters.readOmpUsage(this.config); }
+      catch {
+        // CLI diagnostics may contain provider credentials or account identities.
+        this.controlReply(input, "OMP 사용량을 조회할 수 없습니다. 로컬에서 같은 OMP 프로필로 `omp usage`를 확인해 주세요.", "cancelled");
+        return;
+      }
+      this.controlReply(input, text);
+      return;
+    }
     if (command.name === "restart") {
       if (this.restartActive === input.id || this.admitRestart(input, command)) await this.runHeadRestart(input);
       return;

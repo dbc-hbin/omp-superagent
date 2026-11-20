@@ -15,6 +15,7 @@ import { gatewayPaths } from "../src/gateway-protocol";
 import { GatewayServer } from "../src/gateway-server";
 import { GatewayStore } from "../src/gateway-store";
 import { compareMessageIds } from "../src/message-order";
+import { readOmpUsage } from "../src/omp-usage";
 import { Superagent, type RuntimeAdapters, type RuntimeHost, type RuntimeState } from "../src/runtime";
 import { Store } from "../src/store";
 import type { LaneReport } from "../src/lane-report";
@@ -79,11 +80,6 @@ class HostTransport implements RuntimeHost {
   compactResult: "success" | "rejected" | "throw-after" = "success";
   compactAbort?: () => void;
   abortCount = 0;
-  stats: Record<string, unknown> = {
-    userMessages: 11, assistantMessages: 12, toolCalls: 13, toolResults: 14, totalMessages: 25,
-    tokens: { input: 101, output: 202, reasoning: 33, cacheRead: 404, cacheWrite: 505, total: 1212 },
-    premiumRequests: 2, cost: 0.125,
-  };
   modelSetResult: "success" | "throw-before" | "throw-after" | "mismatch" | "rejected" = "success";
   effortSetResult: "success" | "throw-after" | "model-mismatch" | "missing-effort" | "rejected" = "success";
   levels: unknown[] = ["off", "minimal", "high"];
@@ -129,7 +125,6 @@ class HostTransport implements RuntimeHost {
       await this.beforeLevels?.();
       return { success: this.levelsSuccess, data: { levels: structuredClone(this.levels) } };
     }
-    if (command.type === "get_session_stats") return { success: true, data: { sessionId: this.state.sessionId, sessionFile: this.state.sessionFile, ...structuredClone(this.stats) } };
     if (command.type === "get_entries") {
       if (this.beforeEntries) await this.beforeEntries();
       const leaf = this.journalLeaf ? (this.entries.at(-1) as { id?: string } | undefined)?.id ?? null : null;
@@ -374,7 +369,7 @@ function delegated(store: Store, sourceId: string) {
   return store.input(`handoff:${sourceId}:${lane.id}`);
 }
 
-function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], presetAdapters: Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset" | "requestRestart" | "readPrSnapshot"> = {}) {
+function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset" | "requestRestart" | "readPrSnapshot" | "readOmpUsage">> = {}) {
   const directory = realpathSync(mkdtempSync("/tmp/sa-runtime-"));
   const config: Config = {
     path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
@@ -397,6 +392,7 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], pre
   const presetPersistence: { save?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot> } = {};
   const errors: unknown[] = [];
   const runtime = new Superagent(config, store, messenger, join(directory, "extension.ts"), error => errors.push(error), {
+    readOmpUsage: async () => "OMP 사용량\n\n설정된 OMP 프로필에서 보고된 계정 한도가 없습니다.",
     resolvePreset: async name => {
       const preset = nativePresets.get(name);
       if (!preset) throw new Error("Native preset is not configured");
@@ -433,7 +429,7 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], pre
       if (!existsSync(options.sessionFile)) writeFileSync(options.sessionFile, JSON.stringify({ type: "session", version: 3, id: host.state.sessionId, cwd: options.cwd }) + "\n");
       return { pid: launchBehavior.pid ?? process.pid };
     },
-    ...presetAdapters,
+    ...adapters,
   });
   fixtures.push({ runtime, directory });
   return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
@@ -3268,6 +3264,86 @@ describe("messenger head session controls", () => {
 });
 
 describe("priority native head commands", () => {
+  test("usage shows each provider account's remaining quota and resets only in the requesting thread", async () => {
+    const { runtime, config, main, store, messenger, directory } = fixture(3, undefined, { readOmpUsage });
+    const executable = join(directory, "omp-usage-fixture");
+    config.command = [executable, "--profile", "work", "--model", "fixture/capable"];
+    // Opposite ends of the same local day can fall on different UTC dates.
+    const generatedAt = new Date(2027, 0, 9, 0, 5).getTime();
+    const report = {
+      provider: "openai-codex", fetchedAt: 1, metadata: { email: "private@example.test" }, raw: { token: "private-token" },
+      limits: [{
+        id: "weekly", label: "All models", scope: { provider: "openai-codex", accountId: "private-account-id" },
+        amount: { unit: "percent", remainingFraction: 0.625 },
+        window: { id: "7d", label: "7 Day", resetsAt: new Date(2027, 0, 9, 23, 34).getTime() },
+      }, {
+        id: "credits", label: "Credits", scope: { provider: "openai-codex" },
+        amount: { unit: "credits", used: 1500, limit: 1500 }, status: "exhausted",
+      }],
+    };
+    const snapshot = {
+      generatedAt,
+      reports: [report, {
+        provider: "openai-codex", fetchedAt: 2, metadata: { email: "private-other@example.test" },
+        limits: [{
+          id: "five-hour", label: "5 Hour", scope: { provider: "openai-codex" },
+          amount: { unit: "percent", usedFraction: 0.09 },
+          window: { id: "5h", label: "5 Hour", resetsAt: new Date(2027, 0, 10, 20, 15).getTime() },
+        }],
+      }, {
+        provider: "anthropic", fetchedAt: 3,
+        limits: [{
+          id: "sonnet", label: "Claude 7 Day (Sonnet)", scope: { provider: "anthropic" },
+          amount: { unit: "percent", remaining: 7 },
+          window: { id: "7d", label: "7 Day" },
+        }],
+      }],
+      accountsWithoutUsage: [{ provider: "openai-codex", email: "private-unreported@example.test" }],
+      disabledCredentials: [{ provider: "openai-codex", email: "private-disabled@example.test" }],
+    };
+    writeFileSync(executable, `#!/bin/sh
+[ "$*" = "--profile=work usage --json --redact --no-extensions" ] || exit 2
+cat <<'EOF'
+${JSON.stringify(snapshot)}
+EOF
+`, { mode: 0o700 });
+    await runtime.start();
+    await admit(runtime, message("usage-active", route("11")));
+    const input = applicationCommand("1750000000000000001", route("12"), "/usage");
+    await admit(runtime, input);
+    expect(store.input(input.id)?.state).toBe("done");
+    const output = messenger.sent.find(output => output.sourceId === input.id);
+    expect(output?.route).toEqual(input.route);
+    expect(output?.text).toContain(`OMP 사용량 · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
+    expect(output?.text).toContain("Codex · 계정 1\n• 주간 (All models)  62.5% 남음 · 오늘 23:34 초기화");
+    expect(output?.text).toContain("0% 남음 · 0 credits 남음 · 한도 도달");
+    expect(output?.text).toMatch(/Codex · 계정 2\n• 5시간  91% 남음 · [^\n]*10[^\n]* 20:15 초기화/);
+    expect(output?.text).toContain("Codex · 계정 3\n• 남은 한도 미확인");
+    expect(output?.text).toContain("Codex · 계정 4\n• 계정 비활성화됨");
+    expect(output?.text).toContain("Claude\n• 주간 (Sonnet)  7% 남음");
+    expect(output?.text).not.toContain("private");
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test.each([0, 1])("usage reports failure without exposing stdout or stderr (CLI exit %i)", async code => {
+    const { runtime, config, main, store, messenger, directory } = fixture(3, undefined, { readOmpUsage });
+    const executable = join(directory, "omp-usage-failure");
+    config.command = [executable];
+    writeFileSync(executable, `#!/bin/sh
+echo 'private-stdout'
+echo 'private-stderr' >&2
+exit ${code}
+`, { mode: 0o700 });
+    await runtime.start();
+    const input = message("usage-failed", route(), "/usage");
+    await admit(runtime, input);
+    expect(store.input(input.id)?.state).toBe("cancelled");
+    const output = messenger.sent.find(output => output.sourceId === input.id);
+    expect(output?.text).toContain("OMP 사용량을 조회할 수 없습니다");
+    expect(output?.text).not.toContain("private");
+    expect(main.prompts).toEqual([]);
+  });
+
   for (const platform of ["slack", "discord"] as const) {
     test(`busy ${platform} slash diagnostics and mutation refusals never prompt, react, or advance message cursors`, async () => {
       const { runtime, config, main, store, messenger } = fixture();
@@ -3286,7 +3362,8 @@ describe("priority native head commands", () => {
         await admit(runtime, input);
         expect(store.input(input.id)).toMatchObject({ messageId: null, state: "done",
           ...(platform === "slack" ? { invocationId: input.invocationId } : { interactionId: input.interactionId }) });
-        expect(messenger.sent.some(output => output.sourceId === input.id && output.text.includes("HEAD"))).toBe(true);
+        const expected = text === "/usage" ? "OMP 사용량" : "HEAD";
+        expect(messenger.sent.some(output => output.sourceId === input.id && output.text.includes(expected))).toBe(true);
       }
       for (const [index, text] of ["/model fixture/efficient", "/effort high", "/compact inspect"].entries()) {
         const input = command(platform === "slack" ? `busy-${text}` : `175000000000000001${index + 1}`, destination, text);
@@ -3335,14 +3412,11 @@ describe("priority native head commands", () => {
     }
     expect(main.prompts).toHaveLength(1);
     const replies = messenger.sent.map(output => output.text).join("\n");
-    for (const value of ["!status", "/stop [head|lane-id]", "session-main", "query-bound", "submitted: 1", "321", "200000", "101", "202", "404", "505", "1212", "0.125", "not proof of task completion"]) expect(replies).toContain(value);
+    for (const value of ["!status", "/stop [head|lane-id]", "session-main", "query-bound", "submitted: 1", "321", "200000", "OMP 사용량", "not proof of task completion"]) expect(replies).toContain(value);
     expect(replies).not.toContain("secret");
     expect(main.commands.some(command => ["compact", "set_model", "set_model_preset", "set_thinking_level"].includes(String(command.type)))).toBe(false);
-    main.stats = { tokens: {}, cost: undefined };
     main.state.contextUsage = undefined;
     await admit(runtime, message("unknown-context", route(), "/context"));
-    await admit(runtime, message("unknown-usage", route(), "/usage"));
-    expect(messenger.sent.at(-2)?.text).toContain("unknown");
     expect(messenger.sent.at(-1)?.text).toContain("unknown");
   });
 

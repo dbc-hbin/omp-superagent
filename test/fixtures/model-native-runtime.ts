@@ -8,6 +8,7 @@ import { type Config, hostPaths, privateDirectory } from "../../src/config";
 import type { Approval, Inbound, Lane, LanePresetSnapshot, Messenger, OutputRecord, Route } from "../../src/contracts";
 import { buildHostArgs, HostConnection, startHost, type HostOptions } from "../../src/host";
 import { Superagent } from "../../src/runtime";
+import { readOmpUsage } from "../../src/omp-usage";
 import { NativePresetManager } from "../../src/native-presets";
 import { Store } from "../../src/store";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -216,6 +217,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
   const runtime = new Superagent(config, store, messenger, providerFixture, error => {
     errors.push(error);
   }, {
+    readOmpUsage: config => readOmpUsage(config, env),
     startHost: options => startHost({ ...options, managedUlwPath, env: { ...env,
       ...Object.fromEntries(Object.entries(options.env).filter(([name]) => name.startsWith("OMP_SUPERAGENT_"))) } }),
     connect: async socketPath => {
@@ -531,7 +533,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       expect(nativeUsage.tokens.input).toBeGreaterThan(0);
       expect(nativeUsage.tokens.output).toBeGreaterThan(0);
       const { text: usage } = await commandReply("213", "/usage");
-      for (const value of [nativeUsage.tokens.input, nativeUsage.tokens.output, nativeUsage.tokens.total, nativeUsage.cost]) visibleNumber(usage, value);
+      expect(usage).toContain("보고된 계정 한도가 없습니다");
       for (const [id, text] of [["214", "/model preset"], ["215", "/model preset list"]]) {
         const { text: presets } = await commandReply(id!, text!);
         for (const name of Object.keys(agentConfig.modelPresets!)) expect(presets).toMatch(new RegExp(`\\b${name}\\b`));
