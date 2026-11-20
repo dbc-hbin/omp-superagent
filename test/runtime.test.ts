@@ -6139,7 +6139,7 @@ describe("real Store runtime coordination", () => {
   });
 
   test("a reattached lane reports held follow-ups until the owner resolves the exact input in its topic", async () => {
-    const { runtime, store, config, hosts, launched, messenger } = fixture();
+    const { runtime, store, config, hosts, launched, messenger, main } = fixture();
     const lane = savedLane(store, config, "survivor", route("11"), process.pid);
     const other = savedLane(store, config, "unrelated", route("12"));
     const host = new HostTransport(lane.sessionFile, "session-survivor");
@@ -6168,8 +6168,12 @@ describe("real Store runtime coordination", () => {
     host.beforeState = undefined;
     // Reconcile the independent runtime block without clearing durable uncertainty.
     await runtime.resume(lane.id);
+    main.beforeState = () => { throw new Error("HEAD state is temporarily unavailable"); };
     await admit(runtime, message("lane-queue-status", lane.route, "/status"));
-    expect(messenger.sent.find(output => output.sourceId === "lane-queue-status")?.text).toContain("original-lane-input");
+    const status = messenger.sent.find(output => output.sourceId === "lane-queue-status")?.text;
+    expect(status).toContain("Native HEAD: unavailable or unverified.");
+    expect(status).toContain("original-lane-input");
+    main.beforeState = undefined;
 
     await admit(runtime, message("other-topic-resolve", other.route, "/resolve --lane original-lane-input"));
     expect(store.input("other-topic-resolve")?.state).toBe("cancelled");
@@ -6191,6 +6195,58 @@ describe("real Store runtime coordination", () => {
     await host.whenPrompts(1);
     expect(host.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining("Request ID: handoff:after-restart:survivor")]);
     expect(launched).toEqual([]);
+  });
+
+  test("a settled lane drains after resolve and a transient state read failure without another native event", async () => {
+    const { runtime, config, store, hosts } = fixture();
+    const lane = savedLane(store, config, "lost-admission", route("11"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-lost-admission");
+    hosts.set(lane.socketPath, host);
+    await runtime.start();
+    host.beforePrompt = () => { throw new Error("Native prompt acknowledgement was lost"); };
+    await delegate(runtime, message("lost", lane.route));
+    host.beforePrompt = undefined;
+    await delegate(runtime, message("later", lane.route));
+    expect(delegated(store, "lost")?.state).toBe("uncertain");
+
+    host.beforeState = () => { throw new Error("Native settlement read failed"); };
+    await admit(runtime, message("resolve-lost-lane", lane.route, "/resolve --lane handoff:lost:lost-admission"));
+    expect(delegated(store, "lost")?.state).toBe("cancelled");
+    expect(delegated(store, "later")?.state).toBe("pending");
+    expect(host.prompts).toHaveLength(1);
+
+    host.beforeState = undefined;
+    await runtime.kick();
+    expect(host.prompts.map(prompt => prompt.command.message)).toEqual([
+      expect.stringContaining("Request ID: handoff:lost:lost-admission"),
+      expect.stringContaining("Request ID: handoff:later:lost-admission"),
+    ]);
+  });
+
+  test("a pending workflow reports a later uncertain steering input in its active lane group", async () => {
+    const { runtime, config, store, hosts } = fixture();
+    const lane = savedLane(store, config, "lane-group", route("11"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-lane-group");
+    hosts.set(lane.socketPath, host);
+    await runtime.start();
+    const activateSource = (id: string) => {
+      const source = message(id, lane.route);
+      store.receive(source, "main", { [`user-source:${id}`]: "true" });
+      store.settle(id, "done");
+      return source;
+    };
+    const initial = activateSource("active-lane");
+    await runtime.messageLane(lane.id, initial.text, initial.id);
+    const workflow = activateSource("queued-workflow");
+    const choice = { name: "ulw-plan" as const, reason: "Select the planning workflow for this follow-up." };
+    await runtime.messageLane(lane.id, workflow.text, workflow.id, choice);
+    const steer = activateSource("later-steer");
+    host.beforePrompt = () => { throw new Error("Native steering acknowledgement was lost"); };
+    expect(await runtime.messageLane(lane.id, steer.text, steer.id)).toMatchObject({ state: "uncertain" });
+    expect(host.prompts.map(prompt => prompt.command.streamingBehavior)).toEqual([undefined, "steer"]);
+    expect(await runtime.messageLane(lane.id, workflow.text, workflow.id, choice)).toMatchObject({
+      state: "pending", queueHolds: { uncertainInputIds: ["handoff:later-steer:lane-group"] },
+    });
   });
 
   test("a surviving PID without a verified lane connection reports a runtime hold instead of dispatching", async () => {

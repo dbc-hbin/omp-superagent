@@ -76,7 +76,7 @@ No polling, duty model, aggregate goal for lanes, or follow-up just for a report
 2. After interruption, separate what was queued, executed, persisted, and
    delivered. Reconcile native history, workspace, and authoritative external
    effects before repeating anything. `lane_message` returns the durable input
-   state, and pending follow-ups report earlier uncertain IDs, runtime blocks,
+   state, and pending follow-ups report blocking uncertain IDs, runtime blocks,
    and unconfirmed kickoff delivery.
    Check those holds separately from observation ownership. Resume cannot clear
    uncertainty. Report the exact held ID and tell the owner to use
