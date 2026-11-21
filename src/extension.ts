@@ -14,6 +14,7 @@ import { publishNativeSession } from "./native-sessions";
 import { MODEL_PRESET_NAMES, WORKFLOW_NAMES } from "./contracts";
 import type { PrWatchCommand } from "./pr-watch";
 import { registerDecisionAsk } from "./decision-tool";
+import { registerResultAttach, RESULT_ATTACH_TOOL } from "./result-attachment";
 import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent, type RotationProbeEvent } from "./head-rotation";
 
 // Inject the role contract, not the references. Resolve the reference directory

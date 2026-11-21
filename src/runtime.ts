@@ -3,8 +3,9 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { untilAborted } from "@oh-my-pi/pi-utils";
+import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
 import type { MemoryRuntimeContext } from "@oh-my-pi/pi-coding-agent/memory-backend";
+import { getAgentDbPath } from "@oh-my-pi/pi-utils/dirs";
 import type { Approval, ApprovalResolution, DialogResponse, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, InputRecord, Lane, LaneModel, LaneModelChoice, LanePresetSnapshot, ResolvedLanePreset, ModelPreset, Messenger, Route, StorePort, ThreadInfo, ThreadUpdate, WorkflowChoice } from "./contracts";
 import { authorizeDiscordPurpose, discordPurposeRequest } from "./discord-context";
 import { HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type HeadModelChange, type HeadPicker } from "./contracts";
@@ -300,6 +301,7 @@ export class Superagent {
   private timer?: NodeJS.Timeout;
   private readonly prWatcher: PrWatcher;
   private readonly cronJobs: CronJobs;
+  private groups?: GroupAccess;
   private readonly stopSignal = new AbortController();
   private prObservation?: Promise<void>;
   private presetSync?: Promise<void>;
@@ -435,7 +437,7 @@ export class Superagent {
         void this.kick().catch(this.report);
         this.observePrs();
         this.observePresetRoles();
-        if (this.groups && !this.stopped && !this.restartFence()) {
+        if (this.groups && !this.stopped && !this.restartFence() && !this.headRotationHeld()) {
           this.groups.tick(!this.headStopping && this.residentHosts().size < this.config.maxHosts, this.report);
         }
       }, 1000);
@@ -492,7 +494,7 @@ export class Superagent {
       || this.initializationHoldsHead() || this.restartFence() || this.restartActive || this.restartReconciliation
       || this.recoveryReconciliation || this.headRecoveryActive() || this.restartControllerBusy()
       || this.controls.size || this.tasks.size || this.pumping || this.catchupTask || this.outbound || this.prObservation
-      || this.presetSync || this.reactionQueues.size || this.threadEditQueues.size
+      || this.presetSync || this.reactionQueues.size || this.threadEditQueues.size || this.groups?.busy
       || this.store.approvals().length || this.store.outputs().length || this.store.hasUnresolvedHeadDelivery()
       || this.store.inputs().some(input => input.state === "pending" || input.state === "uncertain" || input.target === "main")
       || performance.now() - this.headActivityAt < MIN_HEAD_IDLE_MS) return undefined;
@@ -991,7 +993,7 @@ export class Superagent {
   }): string {
     const { source, input, outputSourceId, route } = binding;
     const lane = live.id === "main" ? null : this.requireLane(live.id);
-    const sessionFile = lane?.sessionFile ?? hostPaths(this.config, "main").sessionFile;
+    const sessionFile = lane?.sessionFile ?? this.headSessionFile();
     if (this.restartFence() || !this.current(live) || !live.running || live.ownedRuns !== 1 || live.result || live.recovery
       || (lane && lane.workState !== "open") || intent.sessionFile !== sessionFile || intent.sessionId !== live.sessionId
       || input.state !== "submitted" || input.generation !== live.generation || input.target !== live.id || !input.requestId
@@ -1044,7 +1046,7 @@ export class Superagent {
     // journal is not permission to reopen a path or replay after disconnect.
     for (const { input } of live.admitted.values()) {
       const native = this.store.input(input.id);
-      const topic = native && this.store.resultAttachmentDelivery(native.id);
+      const topic = native && this.store.topicDelivery(native.id);
       if (!native || topic?.source.id !== intent.sourceId) continue;
       try { this.queueResultAttachment(live, intent, { ...topic, input: native }); }
       catch (error) { this.report(error); }
@@ -5117,6 +5119,11 @@ export class Superagent {
     }
     const topic = !persisted && live.input ? this.store.topicDelivery(live.input.id) : null;
     const route = persisted?.route ?? topic?.route ?? live.input?.route ?? this.store.lane(live.id)?.route;
+    if (route && groupRoom(this.config, route)) {
+      if (persisted) this.store.resolveApproval(persisted.id, live.generation, "cancelled");
+      live.connection.uiResponse(frame.id, { cancelled: true });
+      return;
+    }
     if (!route && live.id === "main" && this.store.hasInput("main", "uncertain")) return;
     if (!route && live.id === "main" && frame.secret !== true) {
       // Native-only setup dialogs have no messenger destination. Retain them

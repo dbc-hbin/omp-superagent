@@ -129,11 +129,17 @@ export function requireMessengerCredentials(config: Config): void {
 
 /** Configuration policy; each adapter additionally checks authenticated account identity. */
 export function authorizeRoute(config: Config, route: Route): boolean {
+  if (groupRoom(config, route)) return false;
   if (route.guildId !== null && route.topicId !== undefined
     && (route.platform === "telegram" || route.platform === "discord")) {
     return route.threadId === null && typeof route.topicId === "string" && route.topicId.length > 0 && route.topicId.length <= 128
-      && authorizeRoute(config, physicalRoute(route));
+      && isConfiguredRoute(config, physicalRoute(route));
   }
+  return isConfiguredRoute(config, route);
+}
+
+/** Transport destination policy is not authorization to use operator controls. */
+export function isConfiguredRoute(config: Config, route: Route): boolean {
   if (!route.accountId || !route.channelId || !route.authorityId) return false;
   if (route.topicId !== undefined && (route.guildId !== null || route.threadId !== null || !route.topicId || route.topicId.length > 128)) return false;
   switch (route.platform) {

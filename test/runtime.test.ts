@@ -529,11 +529,9 @@ describe("explicit outbound result attachments", () => {
       await runtime.start();
       const original = originalMessage("1003", route(null), `cwd: ${workspace}\nattach: ${filename}\nSend the generated report.`);
       await admit(runtime, original);
-      const lane = await runtime.startLane({ ...selection, sourceId: original.id, cwd: workspace,
-        title: "Result attachment", kickoff: "I will prepare and verify the requested result." });
-      await runtime.kick();
-      const host = hosts.get(lane.socketPath);
-      if (!host) throw new Error("Expected an admitted topic lane");
+      const lane = store.lanes()[0];
+      const host = lane && hosts.get(lane.socketPath);
+      if (!lane || !host) throw new Error("Expected an admitted topic lane");
       const params = { sourceId: original.id, path: filename };
       const start = (toolCallId: string, path = filename) => host.emit({
         type: "tool_execution_start", toolName, toolCallId,
@@ -8408,11 +8406,13 @@ describe("ordinary placement in owner parents without native threads", () => {
     expect(store.output(`${original.id}:kickoff`)).toBeNull();
   });
 
-  test("logical routing does not authorize unlisted, foreign, or threaded Telegram destinations", async () => {
+  test("logical routing does not authorize restricted, foreign, or threaded Telegram destinations", async () => {
     const { runtime, config, store } = fixture();
     const parent = route(null, { platform: "telegram", guildId: "-1001234567890", channelId: "-1001234567890" });
     const restricted = "-1009876543210";
-    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [parent.channelId] };
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [parent.channelId, restricted] };
+    config.groupRooms = [{ platform: "telegram", guildId: restricted, channelId: restricted,
+      userIds: ["1"], mode: "request", revision: "restricted", dailyLimit: 1 }];
     const logical = { ...parent, topicId: "some-work" };
     for (const destination of [
       { ...logical, guildId: restricted, channelId: restricted },

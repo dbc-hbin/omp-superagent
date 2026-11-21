@@ -285,6 +285,8 @@ crash supervisor; Linux service installation is not provided.
   with `/head` to switch its own model after that turn. Global preset changes
   require explicit `--global`. Slack's message commands use `!`.
 - `/usage` shows provider account quotas and reset times reported by stock OMP, without a model turn.
+- To receive a generated file, start an owner request with `attach: path/to/result.pdf` (relative to the work directory).
+- For a shared server or room, [configure restricted group access](docs/OPERATIONS.md#단체방서버-권한-분리) for request intake, tool-free chat or scoped worktree edits. These rooms cannot operate the owner session.
 - Ask `/head` to summarize CI every two hours, or use `/cron add "every 2h" Summarize CI`, and
   manage it from the same chat with [`/cron`](docs/OPERATIONS.md#예약-작업-cron).
 - `/stop` pauses the bound lane; `/resume` authorizes continuation. Approvals,

@@ -740,18 +740,6 @@ export class Store implements StorePort {
     return decision.destination;
   }
 
-  resultAttachmentDelivery(inputId: string): { source: InputRecord; outputSourceId: string; route: Route } | null {
-    const input = this.input(inputId);
-    if (!input?.target || input.target === "main") return null;
-    const from = this.getMeta(`handoff-source:${inputId}`);
-    const source = from === null ? input : this.input(from);
-    if (!source || this.getMeta(`user-source:${source.id}`) !== "true") return null;
-    const route = this.deliveryRoute(source);
-    if (routeKey(route) === routeKey(source.route)) return { source, outputSourceId: source.id, route };
-    if (routeKey(route) === routeKey(input.route)) return { source, outputSourceId: input.id, route };
-    return null;
-  }
-
   queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error">): boolean {
     return this.db.transaction(() => {
       const existing = this.output(output.id);
@@ -776,7 +764,7 @@ export class Store implements StorePort {
       const attachment = output.resultAttachment;
       if (attachment) {
         const native = this.input(attachment.inputId);
-        const topic = native && this.resultAttachmentDelivery(native.id);
+        const topic = native && this.topicDelivery(native.id);
         const runId = native && this.getMeta(`steering-owner:${native.id}`);
         const run = runId && this.input(runId);
         const ownership = run && this.getMeta(`${native?.target === "main" ? "head-native-owner" : "lane-observation-owner"}:${run.id}`);
