@@ -255,7 +255,8 @@ impl Lifecycle {
             let initialization = saved.filter(|saved| saved["sessionId"].as_str() == Some(head.session_id.as_str()))
                 .unwrap_or_else(|| json!({"sessionId": head.session_id, "state": "checking",
                     "detail": "Waiting for authoritative native HEAD attachment, approval reconciliation and preset inspection."}));
-            native["ready"] = json!(live && head_ready && initialization["state"] == "complete"
+            native["loadedSuperkitPath"] = json!(head.loaded_superkit_path.as_ref().filter(|_| live && connected));
+            native["ready"] = json!(live && head_ready && head.loaded_superkit_path.is_some() && initialization["state"] == "complete"
                 && !rotation.as_ref().is_some_and(|plan| plan.stage == rotation::Stage::Stopping));
             native["initialization"] = initialization;
         }

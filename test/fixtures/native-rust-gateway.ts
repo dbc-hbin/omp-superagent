@@ -112,6 +112,7 @@ export function gatewayFixture(root: string) {
     assert.equal(status.gateway.admissionReady, true);
     assert.equal(status.head.ready, true);
     assert.equal(status.head.pid, head.pid);
+    assert.equal(status.head.loadedSuperkitPath, env.OMP_SUPERAGENT_TEST_MANAGED_ULW_PATH);
     assert.equal(status.head.initialization?.sessionId, head.sessionId);
     assert.equal(head.sessionFile, sessionFile);
     return { head, gatewayPid };

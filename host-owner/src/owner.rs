@@ -61,6 +61,7 @@ struct Manifest {
 struct Options {
     command: Vec<String>,
     cwd: PathBuf,
+    managed_ulw_path: PathBuf,
     session_file: String,
     socket_path: PathBuf,
     model_preset: Option<Preset>,
@@ -797,6 +798,7 @@ pub(crate) async fn run(path: PathBuf) -> anyhow::Result<ExitCode> {
     let options = &manifest.options;
     ensure!(
         options.cwd.is_absolute()
+            && options.managed_ulw_path.is_absolute()
             && Path::new(&options.session_file).is_absolute()
             && options.socket_path.is_absolute()
             && manifest.config_path.is_absolute()
@@ -965,11 +967,16 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
             .await
             .context("Native launch identity is unavailable")?,
     )
-    .context("Native launch identity is unavailable")?;
+    .context("Native launch identity or managed omp-superkit load verification failed")?;
     ensure!(
         identity["hostPid"].as_u64() == Some(u64::from(owner.native_pid))
             && identity["sessionFile"].as_str() == Some(&manifest.options.session_file),
         "Native launch identity mismatch"
+    );
+    ensure!(
+        identity["loadedSuperkitPath"].as_str().map(Path::new)
+            == Some(manifest.options.managed_ulw_path.as_path()),
+        "Native session did not confirm loading the selected omp-superkit package"
     );
     owner
         .identity

@@ -11,6 +11,7 @@ export type HostState = RpcSessionState & {
   hostPid: number;
   adapterOwnerPid: number;
   adapterProtocol: "owned-stock-stdio-v1";
+  readonly loadedSuperkitPath?: string;
   readonly journalCursorVersion?: 1;
   settingsScope: "session";
   modelSettings: LanePresetSnapshot;

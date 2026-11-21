@@ -17,6 +17,8 @@ import type { RpcAbortAndRestoreQueueResult, RpcSessionState } from "@oh-my-pi/p
 import { calculateTokensPerSecond } from "@oh-my-pi/pi-coding-agent/utils/token-rate";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import type { LanePresetSnapshot } from "./contracts";
+import { MANAGED_ULW_ENV } from "./managed-ulw";
+import { verifyHostSuperkit } from "./host-superkit";
 import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent,
   type RotationNative, type RotationProbeEvent } from "./head-rotation";
 
@@ -60,6 +62,8 @@ export default function hostExtension(pi: ExtensionAPI): void {
   let observationHeld = false;
   let runOrdinal = 0;
   let instanceKey: string | undefined;
+  const selectedSuperkit = process.env[MANAGED_ULW_ENV];
+  let loadedSuperkitPath: string | undefined;
   type ServiceStart = {
     readonly name: string; readonly scope: UnitScope; readonly owner: string;
     readonly sessionId: string; readonly toolCallId: string;
@@ -448,8 +452,10 @@ export default function hostExtension(pi: ExtensionAPI): void {
     }
     if (command.type === "snapshot") {
       const ownership = await owned();
+      // The owner requires this first snapshot before opening its public socket.
+      loadedSuperkitPath ??= await verifyHostSuperkit(ownership.identity.session, selectedSuperkit);
       // Only an owner that implements the cursor command can advertise it to peers.
-      return { ...ownerIdentity(ownership.identity), settingsScope: "session", modelSettings: snapshot(),
+      return { ...ownerIdentity(ownership.identity), loadedSuperkitPath, settingsScope: "session", modelSettings: snapshot(),
         journalCursorControlVersion: 1,
         hasOwnedRunningWork: ownership.unknown ? undefined : ownership.busy, mutationHeld, observationHeld,
         admitted: ownership.identity.session.hasAdmittedSubmission,

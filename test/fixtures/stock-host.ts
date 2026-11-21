@@ -59,6 +59,7 @@ export async function stockHostFixture(options: {
           respond(channel, command, result ?? { data: { shutdown: true } });
         } else if (command.type === "snapshot") {
           respond(channel, command, { data: { ...state(), hostPid: process.pid, generation: 1,
+            loadedSuperkitPath: process.env.OMP_SUPERAGENT_MANAGED_ULW_PATH,
             settingsScope: "session", modelSettings: { modelRoles: {}, defaultThinkingLevel: "high" },
             hasOwnedRunningWork: false, mutationHeld: false, admitted: false, postPromptWork: false } });
         } else if (command.type === "activate") {

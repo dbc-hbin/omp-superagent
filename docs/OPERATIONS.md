@@ -246,8 +246,13 @@ Gateway 상태 응답의 `ulw`는 `revision`, `packagePath`, `upstreamRevision`,
 `error`, `updating`을 구분한다(`injected`는 테스트용 주입인 경우에만 표시). `revision`과
 `packagePath`는 **다음 새 Host가 사용할 active package**이며 실행 중 모든 Host의 버전이 아니다.
 `upstreamRevision`은 마지막 확인한 원격 결과이고 `checkedAt`·`error`·`updating`과 함께 읽는다.
-원격 조회 실패·미확인을 최신 일치로 표시하지 않는다. 현재 각 Host의 정확한 경로는 그 Host의
-`OMP_SUPERAGENT_MANAGED_ULW_PATH` 환경에 고정되며 별도 공개 current-Host revision 필드는 없다.
+원격 조회 실패·미확인을 최신 일치로 표시하지 않는다. `omp-sa status --config FILE`의
+`gateway.head.loadedSuperkitPath`는 연결된 head의 실제 OMP 세션이 시작할 때 확인한 패키지 경로다.
+이 경로와 `gateway.ulw.packagePath`가 다르면 head는 아직 이전 버전을 쓰고 있다.
+각 새 head·lane은 manifest의 모든 확장 모듈이 그 세션의 활성 목록에 있어야 시작한다.
+파일이 있어도 import·초기화가 실패하거나 모듈이 비활성이면 준비 완료가 되지 않는다.
+로드 확인을 지원하지 않는 기존 Host는 작업용으로 재연결하지 않는다. 진행 중인 작업을
+확인하고 정상 종료한 뒤 다시 시작한다. 설치·검사는 일반 OMP의 전역 설정을 변경하지 않는다.
 
 **실행 중 Host의 revision과 다음 Host의 revision은 다를 수 있다.** 이미 실행 중인 head/lane은
 자신이 로드한 정확한 package 경로를 유지하며 업데이트 때문에 재시작·hot reload하지 않는다.

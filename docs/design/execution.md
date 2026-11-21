@@ -241,8 +241,16 @@ A production Gateway requires a valid active installation before adapter
 activation. With that installation in place, startup does not wait for the remote.
 Startup and periodic update checks run in ordinary code, not a model turn.
 Every **new Host** resolves the active revision; a running Host or reconnect
-keeps its existing immutable package. Status reports the next-launch revision,
-not necessarily what a running session has loaded. Managed discovery preserves
+keeps its existing immutable package. Before the owner exposes its socket, the
+root session checks every manifest entry against the active extensions in its own
+OMP `extensionRunner`, after deferred binding if necessary. The owner requires
+the resulting canonical package path to match its immutable launch selection.
+An import or factory failure, a disabled module, or an unavailable runner cannot
+produce a ready Host. Reattaching a managed session requires its startup receipt,
+not a match against a newer active pointer; an unverified older Host can still
+be inspected and stopped. Gateway status distinguishes `head.loadedSuperkitPath`
+(the attached head's startup receipt) from `ulw.packagePath` (next launch).
+This is not a continuous check of workflow mode or prompt execution. Managed discovery preserves
 unrelated native resources and avoids loading a duplicate ULW instance. Refuse
 configurations the stock CLI cannot express without silently changing scope,
 discarding custom commands or enabling disabled extensions.

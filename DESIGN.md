@@ -71,7 +71,9 @@ part of the native build.
    tracks the initial approval barrier. After that barrier, the Gateway can keep
    admitting authorized input while the head is absent. `head.connected` is not
    `head.ready`: readiness also requires a live head, a ready controller, and
-   completed preset initialization. Check `gateway.unresolvedEvents` for held ingress.
+   completed preset initialization. A managed Host must also verify the selected
+   superkit modules in its actual root OMP session before exposing its socket.
+   Check `gateway.unresolvedEvents` for held ingress.
 4. Automatic recovery reconnects only after verifying native PID, session ID/file,
    and socket ownership. Start a replacement only after confirming the old process
    and its stdio owner are gone; remove a stale socket only if its inode is the owned

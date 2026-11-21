@@ -108,7 +108,7 @@ function nextFrame(emitter: EventEmitter, name: string, predicate: (frame: HostF
   return promise;
 }
 
-async function fixture(handler?: (frame: HostFrame, peer: net.Socket) => boolean) {
+async function fixture(handler?: (frame: HostFrame, peer: net.Socket) => boolean, loadedSuperkitPath?: string) {
   const root = await directory();
   const socketPath = path.join(root, "h.sock");
   const sessionFile = path.join(root, "session.jsonl");
@@ -136,7 +136,7 @@ async function fixture(handler?: (frame: HostFrame, peer: net.Socket) => boolean
         if (frame.type === "extension_ui_response") continue;
         const data = frame.type === "negotiate_protocol" ? { protocolVersion: 2 }
           : frame.type === "get_state" ? { sessionId: "fixture-session", sessionFile, hostPid: process.pid,
-            adapterOwnerPid: process.pid, adapterProtocol: "owned-stock-stdio-v1" }
+            adapterOwnerPid: process.pid, adapterProtocol: "owned-stock-stdio-v1", loadedSuperkitPath }
           : { message: frame.message };
         send(peer, { type: "response", id: frame.id, command: frame.type, success: true, data });
         if (frame.type === "prompt") {
@@ -171,13 +171,24 @@ test("connect negotiates through public RpcClient and probes the live session", 
   expect((await connection.client.getState()).sessionFile).toBe(host.sessionFile);
 });
 
-test("managed attachment to an older owner does not try to change its native event filter", async () => {
-  const host = await fixture();
+test("managed attachment to a verified owner without activity projection preserves its native event filter", async () => {
+  const host = await fixture(undefined, path.resolve(import.meta.dir, "fixtures/managed-ulw"));
   const connection = await HostConnection.connectForActivity(host.socketPath);
   cleanups.push(() => connection.close());
   expect((await connection.client.getState()).sessionFile).toBe(host.sessionFile);
   expect(host.received.map(frame => frame.type)).toEqual([
     "negotiate_protocol", "get_state", "get_host_admission", "get_state",
+  ]);
+});
+
+test("an owner without a superkit load receipt remains inspectable but cannot accept managed work", async () => {
+  const host = await fixture();
+  await expect(HostConnection.connectForActivity(host.socketPath)).rejects.toThrow("has not verified its omp-superkit extension");
+  const connection = await HostConnection.connect(host.socketPath);
+  cleanups.push(() => connection.close());
+  expect((await connection.client.getState()).sessionFile).toBe(host.sessionFile);
+  expect(host.received.map(frame => frame.type)).toEqual([
+    "negotiate_protocol", "get_state", "negotiate_protocol", "get_state", "get_state",
   ]);
 });
 

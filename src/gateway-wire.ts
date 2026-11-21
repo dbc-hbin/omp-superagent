@@ -25,6 +25,8 @@ export type GatewayStatus = {
     readonly pid: number | null;
     readonly ready: boolean;
     readonly connected: boolean;
+    /** Verified by this Host's root session at startup, not the next-launch package. */
+    readonly loadedSuperkitPath?: string | null;
     readonly socketPath: string;
     readonly error: string | null;
     readonly initialization?: HeadInitialization;

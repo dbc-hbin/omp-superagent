@@ -200,7 +200,7 @@ impl PreparedHost {
         let native_socket = run_dir.join(format!(".n-{}.sock", &socket_id[..8]));
         let helper = source.join("host-sdk-helper.ts");
         let mut manifest = json!({
-            "options": { "command": command, "cwd": config.cwd, "sessionFile": session_file,
+            "options": { "command": command, "cwd": config.cwd, "sessionFile": session_file, "managedUlwPath": package,
                 "socketPath": config.head_socket, "modelSettings": settings.as_ref().map(|saved| &saved.settings) },
             "args": args, "configPath": config_path, "processBackend": backend,
             "helperPath": helper, "nativeSocket": native_socket,

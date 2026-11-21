@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { watch } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseSessionEntries, SessionManager } from "@oh-my-pi/pi-coding-agent";
@@ -13,6 +14,32 @@ import { offlineMnemopi } from "./fixtures/native-memory";
 const nativeTest = process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 const RECORD_TYPE = "omp-superagent-native-test";
 const fixturePath = path.resolve(import.meta.dir, "fixtures/native-extension.ts");
+
+const managedEntries = ["companion", "primary"] as const;
+type ManagedEntry = (typeof managedEntries)[number];
+const managedFactoryReceipt = (root: string, entry: ManagedEntry) => path.join(root, `managed-${entry}.pids`);
+
+async function stageManagedPackage(root: string, entries: readonly ManagedEntry[], failing?: ManagedEntry): Promise<string> {
+  const packagePath = path.join(root, "managed");
+  await fs.mkdir(path.join(packagePath, "skills"), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(packagePath, "package.json"), JSON.stringify({
+    name: "omp-superkit", version: "0.0.0-fixture", type: "module",
+    omp: { extensions: entries.map(entry => `./${entry}.ts`), skills: ["./skills"] },
+  }), { mode: 0o600 });
+  for (const entry of entries) {
+    const receipt = JSON.stringify(managedFactoryReceipt(root, entry));
+    await fs.writeFile(path.join(packagePath, `${entry}.ts`), `
+import { writeFileSync } from "node:fs";
+export default function () {
+  if (process.env.OMP_SUPERAGENT_HOST_CONFIG) {
+    writeFileSync(${receipt}, String(process.pid) + "\\n" + String(process.ppid), { mode: 0o600 });
+  }
+  ${entry === failing ? 'throw new Error("Intentional managed extension factory failure");' : ""}
+}
+`, { mode: 0o600 });
+  }
+  return packagePath;
+}
 
 interface FixtureRecord {
   fixture?: string;
@@ -104,7 +131,7 @@ async function proveForeignServiceSurvives(options: HostOptions, connection: Hos
   }
 }
 
-nativeTest("actual OMP preserves approvals and structured owner decisions across one persistent host", async () => {
+async function nativeHostOptions(entries: readonly ManagedEntry[], failing?: ManagedEntry) {
   const command = await nativeTestCommand();
   const nativesDirectory = process.env.OMP_TEST_NATIVES_DIR;
   if (nativesDirectory && !path.isAbsolute(nativesDirectory)) {
@@ -120,6 +147,7 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
   await fs.writeFile(configPath, JSON.stringify({ ...offlineMnemopi, task: { maxConcurrency: 1 }, disabledProviders: nativeDisabledProviders,
     bash: { patterns: [{ match: "printf 'superagent-service-completed\\n'", approval: "prompt" }] },
     eval: { js: false, py: false } }), { mode: 0o600 });
+  const managedPackage = await stageManagedPackage(root, entries, failing);
   const options: HostOptions = {
     command,
     socketPath: path.join(root, "host.sock"), sessionFile: path.join(root, "main.jsonl"),
@@ -135,9 +163,53 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
       OMP_DAEMON_DIR: path.join(root, "daemon"),
       TMPDIR: root, TMP: root, TEMP: root,
     },
-    managedUlwPath: path.resolve(import.meta.dir, "fixtures/managed-ulw"),
+    managedUlwPath: managedPackage,
     model: "socket-host-smoke/local", subagentConcurrency: 1,
   };
+  return { root, options };
+}
+
+for (const entries of [["primary"], managedEntries] as const) {
+  nativeTest(`actual OMP refuses startup before readiness when a managed factory fails (${entries.length} declared)`, async () => {
+    const { root, options } = await nativeHostOptions(entries, "primary");
+    let publishedSocket = false;
+    const watcher = watch(root, { persistent: false }, (_event, name) => {
+      if (name === path.basename(options.socketPath)) publishedSocket = true;
+    });
+    let succeeded = false;
+    try {
+      await expect(startHost(options)).rejects.toThrow("OMP host exited during startup");
+      // The module existed, was discovered, and its factory reached the throw
+      // inside the stock OMP process launched by the Rust owner.
+      const receipt = await fs.readFile(managedFactoryReceipt(root, "primary"), "utf8");
+      const pids = receipt.split("\n").map(Number);
+      expect(pids).toHaveLength(2);
+      expect(pids.every(pid => Number.isSafeInteger(pid) && pid > 1)).toBe(true);
+      expect(new Set(pids).size).toBe(2);
+      if (entries.length > 1) {
+        expect(await fs.readFile(managedFactoryReceipt(root, "companion"), "utf8")).toBe(receipt);
+      }
+      // Assert independent exit before the teardown helper is allowed to signal.
+      await waitForFixtureProcessExit(pids);
+      await expect(fs.lstat(options.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.lstat(`${options.socketPath}.exit.json`)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(publishedSocket).toBe(false);
+      succeeded = true;
+    } catch (cause) {
+      const tail = await fs.readFile(options.logPath, "utf8").then(text => text.slice(-16_384), () => "<native log unavailable>");
+      throw new Error(`${cause instanceof Error ? cause.message : String(cause)}\nNative artifacts retained: ${root}\nNative log tail:\n${tail}`, { cause });
+    } finally {
+      watcher.close();
+      if (await stopHostFixtures(root) !== 1 && succeeded)
+        throw new Error(`Expected one rejected native Host registration; retained ${root}`);
+      if (succeeded) await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+}
+
+nativeTest("actual OMP preserves approvals and structured owner decisions across one persistent host", async () => {
+  const { root, options } = await nativeHostOptions(managedEntries);
+  const { command, cwd } = options;
   let succeeded = false;
   const connections = new Set<HostConnection>();
   try {
@@ -148,6 +220,9 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
     expect(initial.hostPid).toBe(child.pid);
     expect(initial.sessionFile).toBe(options.sessionFile);
     expect(initial.model).toMatchObject({ provider: "socket-host-smoke", id: "local" });
+    for (const entry of managedEntries) {
+      expect(await fs.readFile(managedFactoryReceipt(root, entry), "utf8")).toBe(`${child.pid}\n${initial.adapterOwnerPid}`);
+    }
     const before = await checkpoint(first, "before-detach", "native-checkpoint-before");
     expect(before).toMatchObject({ sessionId: initial.sessionId, pid: child.pid, agentStarts: 0, networkAttempts: 0, answers: [] });
 

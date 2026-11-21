@@ -41,6 +41,7 @@ const header = { type: "session", version: 3, id: sessionId, timestamp: "2024-01
 const env = {
   PATH: "/usr/bin:/bin", HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: agent, TMPDIR: root,
   FIXTURE_ROOT: root, FIXTURE_SESSION: sessionFile, FIXTURE_MODE: mode,
+  OMP_SUPERAGENT_MANAGED_ULW_PATH: join(import.meta.dir, "../fixtures/managed-ulw"),
   OMP_SUPERAGENT_BUN: bun, FIXTURE_STOCK_PEER: join(import.meta.dir, "stock-peer.ts"),
 };
 const privateFile = { mode: 0o600, flag: "wx" };
@@ -83,7 +84,8 @@ try {
     writeFile(configPath, "{}\n", privateFile),
     writeFile(sessionFile, `${JSON.stringify(header)}\n`, privateFile),
     writeFile(manifest, JSON.stringify({
-      options: { cwd: root, sessionFile, socketPath, command: [stock], logPath: join(root, "owner.log"), subagentConcurrency: 1 },
+      options: { cwd: root, sessionFile, socketPath, command: [stock], logPath: join(root, "owner.log"), subagentConcurrency: 1,
+        managedUlwPath: env.OMP_SUPERAGENT_MANAGED_ULW_PATH },
       args: ["--mode", "rpc-ui", "--session", sessionFile, "--cwd", root, "--config", configPath, "--no-tools"],
       nativeSocket: join(root, "n.sock"), configPath, processBackend: "broker",
       helperPath, toolsExplicitlySelected: false, noTools: true,
@@ -116,7 +118,10 @@ try {
     assert.equal(data.adapterOwnerPid, ownerPid, "state must reference the actual owner process");
     assert.equal(data.sessionFile, sessionFile, "state must reference the supplied journal");
     assert.equal(data.instanceKey, instanceKey, "state must reference the actual native instance");
-    return { ...frame, data: { ...data, hostPid: "$native", adapterOwnerPid: "$owner",
+    const { loadedSuperkitPath, ...originalFields } = data;
+    // Check the additive receipt independently of the historical protocol transcript.
+    assert.equal(loadedSuperkitPath, env.OMP_SUPERAGENT_MANAGED_ULW_PATH);
+    return { ...frame, data: { ...originalFields, hostPid: "$native", adapterOwnerPid: "$owner",
       sessionFile: "$session-file", instanceKey: "$instance" } };
   }
 

@@ -186,7 +186,11 @@ export class HostConnection {
           || state.adapterOwnerPid < 1) {
         throw new Error("Endpoint did not identify an owned stock-stdio adapter and persistent OMP session");
       }
-      if (messageUpdates === "activity-v1") await connection.#enableActivityUpdates();
+      if (messageUpdates === "activity-v1") {
+        if (typeof state.loadedSuperkitPath !== "string" || !path.isAbsolute(state.loadedSuperkitPath))
+          throw new Error("Native Host has not verified its omp-superkit extension; stop and start the Host");
+        await connection.#enableActivityUpdates();
+      }
       return { connection, identity: { pid: state.hostPid, ownerPid: state.adapterOwnerPid,
         sessionId: state.sessionId, sessionFile: state.sessionFile, dev: after.dev, ino: after.ino } };
     } catch (error) {

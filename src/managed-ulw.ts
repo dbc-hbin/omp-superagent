@@ -79,19 +79,23 @@ function readActive(root: string): ActiveRevision | null {
     return value;
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
 }
-export function validateManagedUlwPackage(packagePath: string): string {
+export function readManagedUlwPackage(packagePath: string) {
   if (!isAbsolute(packagePath)) throw new Error("Managed ULW package must have an absolute path");
   const canonical = realpathSync(packagePath);
   const pkg = JSON.parse(readFileSync(join(canonical, "package.json"), "utf8")) as PackageManifest;
   if (!isManagedUlwPackageName(pkg.name) || !Array.isArray(pkg.omp?.extensions) || !pkg.omp.extensions.length)
     throw new Error("Managed ULW package has no native extension manifest");
-  for (const entry of pkg.omp.extensions) {
+  const extensionFiles = pkg.omp.extensions.map(entry => {
     if (typeof entry !== "string" || !entry || isAbsolute(entry)) throw new Error("Invalid managed ULW extension entry");
     const target = realpathSync(resolve(canonical, entry));
     if (!target.startsWith(canonical + sep) || !lstatSync(target).isFile()) throw new Error("Managed ULW extension leaves its package");
-  }
+    return target;
+  });
   if (!lstatSync(join(canonical, "skills")).isDirectory()) throw new Error("Managed ULW skills are missing");
-  return canonical;
+  return { packagePath: canonical, extensionFiles };
+}
+export function validateManagedUlwPackage(packagePath: string): string {
+  return readManagedUlwPackage(packagePath).packagePath;
 }
 export function activeManagedUlw(options: ManagedUlwOptions = {}): string {
   const root = rootFor(options);

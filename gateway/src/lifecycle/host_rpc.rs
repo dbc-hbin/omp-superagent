@@ -32,6 +32,9 @@ pub(super) struct Head {
     pub session_file: PathBuf,
     pub dev: u64,
     pub ino: u64,
+    /// A live launch receipt, never recovered from the coordination store.
+    #[serde(skip)]
+    pub loaded_superkit_path: Option<PathBuf>,
 }
 
 impl Head {
@@ -59,6 +62,7 @@ struct HostState {
     adapter_protocol: String,
     session_id: String,
     session_file: PathBuf,
+    loaded_superkit_path: Option<PathBuf>,
 }
 
 pub(super) struct Probe {
@@ -139,6 +143,7 @@ impl Probe {
                     session_file: identity.session_file,
                     dev: after.dev(),
                     ino: after.ino(),
+                    loaded_superkit_path: identity.loaded_superkit_path.filter(|path| path.is_absolute()),
                 },
             })
         })

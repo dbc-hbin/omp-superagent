@@ -29,6 +29,8 @@ impl Lifecycle {
             None
         };
         let actual = self.probe().await?.head;
+        ensure!(actual.loaded_superkit_path.is_some(),
+            EffectError::rejected("Native head has not verified its omp-superkit extension; restart the Host"));
         let state = self.state()?;
         let rotation = self.rotation()?;
         let rotating = rotation.as_ref().is_some_and(|plan| plan.stage == RotationStage::Launching);
@@ -76,16 +78,21 @@ impl Lifecycle {
         {
             let identified = self.probe().await.and_then(|probe| {
                 ensure!(probe.head.same(known), "Known native head identity changed");
-                Ok(())
+                Ok(probe.head)
             });
             // A vanished process is ordinary recovery; a live PID with an
             // unverifiable owner/session/inode cannot authorize a second HEAD.
-            if identified.is_ok() {
-                self.state()?.head_error = None;
-                return Ok(());
-            }
-            if alive(known.pid)? {
-                return identified;
+            match identified {
+                Ok(head) => {
+                    let mut state = self.state()?;
+                    state.head_error = head.loaded_superkit_path.is_none().then_some(
+                        "Native head has not verified its omp-superkit extension; stop and start the Host",
+                    );
+                    state.head = Some(head);
+                    return Ok(());
+                }
+                Err(error) if alive(known.pid)? => return Err(error),
+                Err(_) => {}
             }
         }
         let config = &self.0.config;
