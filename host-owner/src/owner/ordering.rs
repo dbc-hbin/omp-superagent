@@ -137,6 +137,141 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn stock_state_cannot_advertise_an_unattested_journal_cursor() {
+    let mut fixture = Fixture::new().await;
+    assert!(
+        fixture
+            .owner
+            .identity
+            .set(Identity {
+                session_id: "session".into(),
+                session_file: "/session.jsonl".into(),
+                generation: None,
+                instance_key: None,
+                journal_cursor: false,
+            })
+            .is_ok()
+    );
+    fixture.admit(json!({"type": "get_state", "id": "state"}));
+    let stock = fixture.native.frame().await;
+    fixture
+        .native
+        .reply(
+            &stock,
+            json!({"success": true, "data": {"sessionId": "session", "sessionFile": "/session.jsonl",
+                "journalCursorControlVersion": 1, "journalCursorVersion": 1}}),
+        )
+        .await;
+    let snapshot = fixture.control.frame().await;
+    fixture
+        .control
+        .reply(
+            &snapshot,
+            json!({"success": true, "data": {"hostPid": 1, "sessionId": "session", "sessionFile": "/session.jsonl",
+                "hasOwnedRunningWork": false}}),
+        )
+        .await;
+    let response = fixture.peer.frame().await;
+    assert_eq!(response["success"], true);
+    assert!(response["data"].get("journalCursorVersion").is_none());
+    assert!(response["data"].get("journalCursorControlVersion").is_none());
+
+    fixture.admit(json!({"type": "get_journal_cursor", "id": "lookup"}));
+    let response = fixture.peer.frame().await;
+    assert_eq!(response["id"], "lookup");
+    assert_eq!(response["success"], false);
+}
+
+#[tokio::test]
+async fn journal_cursor_waits_for_durable_observations_and_validates_its_owner() {
+    let mut fixture = Fixture::new().await;
+    let owner = Arc::clone(&fixture.owner);
+    assert!(
+        owner
+            .identity
+            .set(Identity {
+                session_id: "session".into(),
+                session_file: "/session.jsonl".into(),
+                generation: Some(json!(2)),
+                instance_key: Some(json!("instance")),
+                journal_cursor: true,
+            })
+            .is_ok()
+    );
+    let identity = json!({
+        "hostPid": 1, "sessionId": "session", "sessionFile": "/session.jsonl",
+        "generation": 2, "instanceKey": "instance",
+    });
+    let completion = json!({"type": "prompt_result", "id": "finished", "status": "completed"});
+    owner.native_event(completion.clone()).await.unwrap();
+    let observation = fixture.control.frame().await;
+    assert_eq!(observation["type"], "observe");
+    assert_eq!(observation["frame"], completion);
+
+    let mut cursor = std::pin::pin!(owner.journal_cursor());
+    tokio::select! {
+        biased;
+        result = &mut cursor => panic!("cursor finished before observation acknowledgement: {result:?}"),
+        () = ready(()) => {}
+    }
+    // A cursor dispatched before the pending ACK would be ahead of this
+    // marker on the control channel. No timer or scheduling assumption.
+    owner
+        .control()
+        .unwrap()
+        .send(json!({"type": "marker"}))
+        .unwrap();
+    assert_eq!(fixture.control.frame().await["type"], "marker");
+    fixture
+        .control
+        .reply(
+            &observation,
+            json!({"success": true, "data": {"entryId": "receipt"}}),
+        )
+        .await;
+    let (result, ()) = tokio::join!(cursor, async {
+        let request = fixture.control.frame().await;
+        assert_eq!(request["type"], "get_journal_cursor");
+        let mut data = identity.clone();
+        data["leafId"] = json!("receipt");
+        fixture
+            .control
+            .reply(&request, json!({"success": true, "data": data}))
+            .await;
+    });
+    assert_eq!(result.unwrap().as_deref(), Some("receipt"));
+    assert_eq!(fixture.peer.frame().await, completion);
+
+    for (key, value, ok) in [
+        ("leafId", Some(Value::Null), true),
+        ("leafId", None, false),
+        ("leafId", Some(json!(7)), false),
+        ("generation", Some(json!(3)), false),
+        ("instanceKey", Some(json!("other-instance")), false),
+    ] {
+        fixture.admit(json!({"type": "get_journal_cursor", "id": "lookup"}));
+        let request = fixture.control.frame().await;
+        assert_eq!(request["type"], "get_journal_cursor");
+        let mut data = identity.clone();
+        if key != "leafId" {
+            data["leafId"] = json!("receipt");
+        }
+        if let Some(value) = value {
+            data[key] = value;
+        }
+        fixture
+            .control
+            .reply(&request, json!({"success": true, "data": data}))
+            .await;
+        let reply = fixture.peer.frame().await;
+        assert_eq!(reply["success"], ok, "{key}: {reply}");
+        if ok {
+            assert_eq!(reply["data"], json!({"leafId": null}));
+        }
+    }
+}
+
+#[tokio::test]
 async fn maintenance_cannot_fence_an_earlier_admitted_prompt() {
     let mut fixture = Fixture::new().await;
 

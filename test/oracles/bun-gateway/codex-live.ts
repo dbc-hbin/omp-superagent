@@ -4,7 +4,7 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { openLive } from "./openai-live";
 
-const BRIDGE = fileURLToPath(new URL("../../../src/codex-live-bridge.py", import.meta.url));
+const BRIDGE = fileURLToPath(new URL("./codex-live-bridge.py", import.meta.url));
 const START_TIMEOUT_MS = 45_000;
 const FORWARD_TIMEOUT_MS = 10_000;
 const MAX_INPUT_BYTES = 24_000; // Half a second of 24 kHz mono PCM16.

@@ -1,5 +1,0 @@
-aiortc==1.16.0
-anyio==4.16.0
-httpx2[http2,brotli,zstd]==2.16.2
-pydantic==2.14.3
-websockets==17.4

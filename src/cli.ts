@@ -107,13 +107,11 @@ Add Discord voice using a Codex subscription (optional; no API key or paid fallb
 
   As the OS user running the Gateway (macOS/Linux):
     codex login                         # Sign in with an eligible ChatGPT account, not an API key.
-    VENV="$HOME/.local/share/omp-superagent/codex-voice"
-    uv venv --python 3.12 "$VENV"       # First-time setup only.
-    uv pip install --python "$VENV/bin/python" -r ${Bun.$.escape(join(import.meta.dir, "codex-voice-requirements.txt"))}
     omp-sa doctor --config FILE        # Checks config without connecting; does not verify voice entitlement.
-  The next Gateway start loads the change. Configuration alone does not start a call.
+  The Gateway includes WebRTC; no Python environment is required. The next Gateway start loads
+  the change. Configuration alone does not start a call.
 
-Alternative: Discord voice with separately billed OpenAI Live API (no Codex login or Python bridge):
+Alternative: Discord voice with separately billed OpenAI Live API (no Codex login):
   Use the same channel allowlists. Set discord.voice to an API object instead of the subscription object:
   {"auth":"api","channelId":"VOICE_CHANNEL_ID","textChannelId":"TEXT_CHANNEL_ID","voice":"marin","maxSessionSeconds":300,"model":"gpt-live-1","backendModel":"gpt-6-luna","apiKeyEnv":"SUPERAGENT_VOICE_OPENAI_KEY"}
   Choose models and a voice available to your account. Put the key in the named environment variable or FILE.env,

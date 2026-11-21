@@ -39,12 +39,16 @@ durable reports, not messenger SDKs. Distinguish dispatch acceptance, actual
 execution, native settlement, verified acceptance criteria, and user delivery.
 
 The [`lane_report` tool](../../src/lane-extension.ts) records evidence in the
-native journal. It hashes selected file bytes or successful tool results. Duplicate
+native journal. It hashes selected files in bounded chunks, verifying their identity
+and metadata before accepting the digest, or hashes successful tool results. Duplicate
 content and repeated waits do not refresh evidence timestamps; ordinary
 commentary is not verification. Resolve only the exact tool/approval/job or
 dependency wait. Lane observation reads request only the entries appended
 after the source-bound journal cursor (`get_entries` with `since`). A missing
 cursor fails the observation rather than replaying another request's history.
+When only a starting position is needed, the managed owner waits for its queued
+observations to be journaled and returns the native leaf ID, not the transcript.
+Already-running owners without that capability keep using their stock response.
 Ownership and outcome checks that need the full journal still read it. The
 runtime exposes observation timestamps and `ownerCurrent`, not a guarantee
 that a reported dependency is still live. Native children cannot use the

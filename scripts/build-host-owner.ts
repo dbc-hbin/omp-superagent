@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { constants } from "node:fs";
 import { access, chmod, copyFile, cp, mkdir, mkdtempDisposable, readdir, rename, rm } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
 const nativePackages = [
@@ -34,7 +34,20 @@ const upstreamNoticeFiles: ReadonlyMap<string, readonly string[]> = new Map([
   ["openmls/openmls", ["LICENSE"]],
   ["cryspen/libcrux", ["LICENSE", "LICENSE-MIT"]],
   ["hacspec/hax", ["LICENSE"]],
+  ["rusticata/asn1-rs", ["LICENSE-APACHE", "LICENSE-MIT"]],
+  ["sancane/precis", ["LICENSE"]],
+  ["webrtc-rs/webrtc", ["LICENSE-APACHE", "LICENSE-MIT"]],
+  ["qnighy/yasna.rs", ["LICENSE-APACHE", "LICENSE-MIT"]],
 ]);
+// These published PRECIS revisions also generate tables from bundled UCD data.
+const precisUnicodeVersions: ReadonlyMap<string, string> = new Map([
+  ["precis-core-0.1.11", "6.3.0"],
+  ["precis-profiles-0.1.13", "17.0.0"],
+]);
+// Their recorded revisions are unavailable upstream. Both archives offer MIT;
+// the released sibling precis-tools preserves the workspace's MIT text.
+const precisNoticeRevision = "5e9fb2b1a33246bceb3edb1018fb20fcd46dc316";
+const unicodeTextUrl = "https://raw.githubusercontent.com/unicode-org/unicodetools/ecd26be2e82be37609090942c14e518e57e905d8/LICENSE";
 const mplTextUrl = "https://www.mozilla.org/media/MPL/2.0/index.48a3fe23ed13.txt";
 
 function licenseRevision(metadata: unknown): string {
@@ -72,7 +85,7 @@ async function stageNotices(directory: string, manifest: string, { cargo, target
     const destination = join(directory, "crates", identifier);
     const entries = await readdir(crateDir, { recursive: true, withFileTypes: true });
     const files = new Set(entries
-      .filter(file => file.isFile() && noticeName.test(file.name))
+      .filter(file => file.isFile() && (noticeName.test(file.name) || basename(file.parentPath) === "LICENSES"))
       .map(file => join(file.parentPath, file.name)));
     if ("license_file" in crate && typeof crate.license_file === "string") {
       files.add(resolve(crateDir, crate.license_file));
@@ -92,16 +105,25 @@ async function stageNotices(directory: string, manifest: string, { cargo, target
     const license = "license" in crate && typeof crate.license === "string" ? crate.license : null;
     if (!files.size) {
       // Some workspace packages omit their repository-level license from the
-      // published crate. Use the packaged commit, never an upstream branch.
+      // published crate. Pin the license source to a commit, never a branch.
       const repository = "repository" in crate && typeof crate.repository === "string"
-        ? /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)(?:\/|$)/.exec(crate.repository)?.[1]
+        ? /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)(?:\/|$)/.exec(crate.repository)?.[1]?.replace(/\.git$/, "")
         : undefined;
       const upstreamFiles = repository ? upstreamNoticeFiles.get(repository) : undefined;
       const notices: { readonly file: string; readonly url: string }[] = [];
       if (repository && upstreamFiles) {
-        const revision = licenseRevision(await Bun.file(join(crateDir, ".cargo_vcs_info.json")).json());
+        const unicodeVersion = repository === "sancane/precis" ? precisUnicodeVersions.get(identifier) : undefined;
+        const revision = unicodeVersion
+          ? precisNoticeRevision
+          : licenseRevision(await Bun.file(join(crateDir, ".cargo_vcs_info.json")).json());
         for (const file of upstreamFiles) {
           notices.push({ file, url: `https://raw.githubusercontent.com/${repository}/${revision}/${file}` });
+        }
+        if (unicodeVersion) {
+          notices.push(
+            { file: "LICENSE-UNICODE", url: unicodeTextUrl },
+            { file: "NOTICE-UNICODE.txt", url: `https://www.unicode.org/Public/${unicodeVersion}/ucd/ReadMe.txt` },
+          );
         }
       } else if (repository === "cryspen/hpke-rs" && license === "MPL-2.0") {
         // hpke-rs declares MPL-2.0 but its repository has no license file.

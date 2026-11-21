@@ -148,7 +148,7 @@ describe("native lane reporting", () => {
   test("file evidence hashes canonical regular bytes and only explicitly selected evidence", async () => {
     const f = await fixture();
     const path = join(f.directory, "artifact.bin");
-    const bytes = Buffer.from([0, 255, 1, 128, 10]);
+    const bytes = Buffer.alloc(1024 * 1024 + 5, Buffer.from([0, 255, 1, 128, 10]));
     writeFileSync(path, bytes);
     symlinkSync("artifact.bin", join(f.directory, "artifact-link"));
     writeFileSync(join(f.directory, "not-selected"), "Must not leak");

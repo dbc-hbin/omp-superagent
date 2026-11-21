@@ -169,7 +169,7 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
     connections.add(second);
     const reattached = await second.client.getState();
     expect(reattached).toMatchObject({ sessionId: initial.sessionId, sessionFile: options.sessionFile, hostPid: child.pid,
-      adapterOwnerPid: initial.adapterOwnerPid });
+      adapterOwnerPid: initial.adapterOwnerPid, journalCursorVersion: 1 });
     await assertResidentFixtureOwner(root, { nativePid: child.pid, ownerPid: reattached.adapterOwnerPid });
     expect(reattached.pendingUiRequests).toContainEqual(expect.objectContaining({ id: dialog.id, message: "original-approval-token" }));
     expect(await second.request({ type: "shutdown_host" }, "native-still-refused-shutdown")).toMatchObject({ success: false, code: "session_busy" });
@@ -185,6 +185,16 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
     expect(after.answers).toHaveLength(1);
     expect(after.answers?.[0]).toMatchObject({ token: "original-approval-token", confirmed: true });
     expect(after).toMatchObject({ agentStarts: 0, networkAttempts: 0 });
+    const cursor = await second.request({ type: "get_journal_cursor" }, "native-cursor-after-reattach");
+    const journal = await second.request({ type: "get_entries" });
+    if (!journal.success || journal.command !== "get_entries") throw new Error("Stock journal query failed");
+    const leaf = parseSessionEntries(await fs.readFile(options.sessionFile, "utf8"))
+      .find(entry => entry.type !== "session" && entry.id === journal.data.leafId);
+    expect(leaf).toMatchObject({ type: "custom", customType: "rpc_prompt_result", data: {
+      sessionId: initial.sessionId, frame: { id: "native-checkpoint-after", status: "completed" },
+    } });
+    expect(cursor).toEqual({ type: "response", command: "get_journal_cursor", id: "native-cursor-after-reattach",
+      success: true, data: { leafId: journal.data.leafId } });
     const decisionProof: { request: HostFrame; result: unknown }[] = [];
     for (const action of ["submit", "cancel"] as const) {
       const id = decisionId(initial.sessionId, `native-decision-${action}`);

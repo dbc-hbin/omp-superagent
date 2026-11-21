@@ -9,7 +9,7 @@
 #     "websockets==17.4",
 # ]
 # ///
-# Run with the optional voice Python interpreter: python -B test/codex-live-smoke.py
+# Legacy Bun/Python reference, not the production voice backend: uv run --script test/codex-live-smoke.py
 # No provider calls or actual account access: only local ICE/RTP and a fake Codex process.
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from aiortc import MediaStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSes
 from anyio.abc import ObjectReceiveStream, ObjectSendStream
 from pydantic import SecretStr, ValidationError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "oracles" / "bun-gateway"))
 
 from codex_live_auth import CodexLogin, CodexLoginError, read_codex_login
 from codex_live_media import BridgeEvent, Command, DraftResult, Input, PcmInputTrack, Sideband, run_peer

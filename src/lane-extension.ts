@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -62,15 +62,23 @@ function fileEvidence(path: string, cwd: string): LaneEvidence {
   try {
     const before = fstatSync(fd, { bigint: true });
     if (!before.isFile()) throw new Error("Lane file evidence must be a regular file");
-    const bytes = readFileSync(fd);
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(Math.min(Number(before.size), 256 * 1024));
+    let bytes = 0n;
+    while (bytes < before.size) {
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (!count) break;
+      hash.update(buffer.subarray(0, count));
+      bytes += BigInt(count);
+    }
     const after = fstatSync(fd, { bigint: true });
     const current = lstatSync(ref, { bigint: true });
-    if (!current.isFile() || realpathSync(source) !== ref || BigInt(bytes.length) !== before.size ||
+    if (!current.isFile() || realpathSync(source) !== ref || bytes !== before.size ||
         [after, current].some(stat => stat.dev !== before.dev || stat.ino !== before.ino ||
           stat.size !== before.size || stat.mtimeNs !== before.mtimeNs || stat.ctimeNs !== before.ctimeNs)) {
       throw new Error("Lane file evidence changed while being read");
     }
-    return { kind: "file", ref, fingerprint: createHash("sha256").update(bytes).digest("hex") };
+    return { kind: "file", ref, fingerprint: hash.digest("hex") };
   } finally {
     closeSync(fd);
   }

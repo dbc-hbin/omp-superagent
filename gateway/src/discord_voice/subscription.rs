@@ -1,275 +1,160 @@
-use anyhow::{Context as _, Result, bail, ensure};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde_json::{Value, json};
-use std::{collections::HashSet, path::PathBuf, process::Stdio, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    time::{Instant, timeout},
-};
+#[path = "subscription/auth.rs"]
+mod auth;
+#[path = "subscription/control.rs"]
+mod control;
+#[path = "subscription/rtc.rs"]
+mod rtc;
 
-use super::{Event, MAX_INPUT, pcm};
+use anyhow::{Result, bail, ensure};
+use std::time::Duration;
+use tokio::time::Instant;
 
-const MAX_LINE: usize = 65_536;
-const MAX_DRAFTS: usize = 32;
+use super::Event;
+use control::{Control, ControlEvent, DraftResult};
+use rtc::MediaPeer;
+
 const SPEECH_GAP: Duration = Duration::from_millis(200);
 const RECENT_SPEECH: Duration = Duration::from_secs(20);
 
 pub(super) struct Subscription {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    partial: Vec<u8>,
-    last_speech: Option<Instant>,
-    utterance: u64,
-    drafted: u64,
-    seen: HashSet<String>,
-    pending: Option<String>,
+    media: MediaPeer,
+    control: Control,
+    drafts: SpeechGate,
 }
 
 impl Subscription {
     pub(super) async fn open(voice: &str) -> Result<Self> {
         ensure!(
-            matches!(
-                voice,
-                "arbor"
-                    | "breeze"
-                    | "cove"
-                    | "ember"
-                    | "juniper"
-                    | "maple"
-                    | "sol"
-                    | "spruce"
-                    | "vale"
-            ),
+            control::validated_voice(voice),
             "Unsupported Codex subscription voice"
         );
-        let home = absolute_env("HOME")?.context("Codex voice requires an absolute HOME")?;
-        let root = absolute_env("OMP_SUPERAGENT_ROOT")?
-            .context("Missing trusted Superagent installation path")?;
-        let bridge = root.join("src/codex-live-bridge.py");
-        let python = absolute_env("OMP_SA_CODEX_VOICE_PYTHON")?
-            .unwrap_or_else(|| home.join(".local/share/omp-superagent/codex-voice/bin/python"));
-        // Do not inherit any platform or API tokens, Python injection, or proxy variables.
-        let mut command = Command::new(python);
-        command
-            .args(["-E", "-s", "-B", "-u"])
-            .arg(bridge)
-            .arg(voice)
-            .current_dir(&home)
-            .env_clear()
-            .env("HOME", &home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        for key in [
-            "CODEX_HOME",
-            "SYSTEMROOT",
-            "USERPROFILE",
-            "LOCALAPPDATA",
-            "TMPDIR",
-            "TEMP",
-            "TMP",
-        ] {
-            if let Some(path) = absolute_env(key)? {
-                command.env(key, path);
-            }
-        }
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command
-            .spawn()
-            .context("Could not start the optional Codex voice bridge")?;
-        let input = child
-            .stdin
-            .take()
-            .context("Codex voice bridge stdin unavailable")?;
-        let output = BufReader::new(
-            child
-                .stdout
-                .take()
-                .context("Codex voice bridge stdout unavailable")?,
-        );
-        let mut bridge = Self {
-            child,
-            input,
-            output,
-            partial: Vec::new(),
-            last_speech: None,
-            utterance: 0,
-            drafted: 0,
-            seen: HashSet::new(),
-            pending: None,
-        };
-        ensure!(
-            bridge.read().await?["type"] == "ready",
-            "Codex subscription voice is unavailable"
-        );
-        Ok(bridge)
+        let login = auth::read_login().await?;
+        let (media, offer) = MediaPeer::offer().await?;
+        let (control, answer) = Control::open(&offer, voice, &login).await?;
+        drop(login);
+        Self::connect(media, control, answer).await
     }
 
-    pub(super) async fn input(&mut self, pcm: &[u8]) -> Result<()> {
-        if energetic(pcm) {
-            let now = Instant::now();
-            if self
-                .last_speech
-                .is_none_or(|last| now.duration_since(last) >= SPEECH_GAP)
-            {
-                self.utterance = self.utterance.saturating_add(1);
+    async fn connect(mut media: MediaPeer, mut control: Control, answer: String) -> Result<Self> {
+        let setup = async {
+            media.apply_answer(answer).await?;
+            let mut started = false;
+            let mut connected = false;
+            while !started || !connected {
+                tokio::select! {
+                    result = async {
+                        if connected { media.closed().await } else { media.ready().await }
+                    } => { result?; connected = true; }
+                    event = control.recv() => match event? {
+                        ControlEvent::Started => started = true,
+                        ControlEvent::Draft { id, .. } => control.draft_result(&id, DraftResult::NoText).await?,
+                        ControlEvent::Other => {}
+                    }
+                }
             }
-            self.last_speech = Some(now);
+            media.activate()
+        };
+        if let Err(error) = setup.await {
+            tokio::join!(media.close(), control.close());
+            return Err(error);
         }
-        self.send(json!({"type":"input", "audio":STANDARD.encode(pcm)}))
-            .await
+        Ok(Self {
+            media,
+            control,
+            drafts: SpeechGate::default(),
+        })
+    }
+
+    pub(super) fn input(&mut self, pcm: &[u8]) -> Result<()> {
+        self.media.input(pcm)?;
+        if energetic(pcm) {
+            self.drafts.speech(Instant::now());
+        }
+        Ok(())
     }
 
     pub(super) async fn recv(&mut self) -> Result<Event> {
-        let event = self.read().await?;
-        match event["type"].as_str() {
-            Some("audio") => {
-                let audio = pcm(&event["audio"], MAX_INPUT)?;
-                ensure!(!audio.is_empty(), "Empty Codex voice bridge audio");
-                Ok(Event::Audio(audio))
+        tokio::select! {
+            audio = self.media.recv() => audio.map(Event::Audio),
+            event = self.control.recv() => match event? {
+                ControlEvent::Started | ControlEvent::Other => Ok(Event::None),
+                ControlEvent::Draft { id, text } => Ok(self.drafts.offer(id, text, Instant::now())),
             }
-            Some("draft") => {
-                let id = event["id"]
-                    .as_str()
-                    .filter(|id| {
-                        !id.is_empty()
-                            && id.len() <= 128
-                            && id
-                                .bytes()
-                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                    })
-                    .context("Invalid Codex voice draft ID")?;
-                let text = event["text"]
-                    .as_str()
-                    .filter(|text| {
-                        *text == text.trim()
-                            && !text.is_empty()
-                            && text.encode_utf16().count() <= 1_000
-                    })
-                    .context("Invalid Codex voice draft text")?;
-                if self.seen.contains(id) {
-                    return Ok(Event::None);
-                }
-                ensure!(
-                    self.seen.len() < MAX_DRAFTS,
-                    "Codex voice draft budget reached"
-                );
-                self.seen.insert(id.to_owned());
-                if self.pending.is_some()
-                    || self.drafted == self.utterance
-                    || self
-                        .last_speech
-                        .is_none_or(|at| at.elapsed() > RECENT_SPEECH)
-                {
-                    return Ok(Event::Reject(id.to_owned()));
-                }
-                self.drafted = self.utterance;
-                self.pending = Some(id.to_owned());
-                Ok(Event::Draft {
-                    id: id.to_owned(),
-                    text: Some(text.to_owned()),
-                })
-            }
-            Some("ended") => bail!("Codex subscription voice is unavailable or ended"),
-            _ => bail!("Unexpected Codex voice bridge event"),
         }
     }
 
     pub(super) async fn draft_result(&mut self, id: &str, posted: bool) -> Result<()> {
-        if self.pending.as_deref() == Some(id) {
-            self.pending = None;
-        } else {
-            ensure!(!posted, "Unexpected Codex voice draft result");
-        }
-        self.send(json!({"type":"draft_result", "id":id, "posted":posted}))
-            .await
+        let result = self.drafts.result(id, posted)?;
+        self.control.draft_result(id, result).await
     }
 
     pub(super) async fn close(&mut self) {
-        if let Err(error) = timeout(Duration::from_secs(2), async {
-            self.input.write_all(b"{\"type\":\"stop\"}\n").await?;
-            self.input.shutdown().await?;
-            self.child.wait().await
-        })
-        .await
+        tokio::join!(self.media.close(), self.control.close());
+    }
+}
+
+#[derive(Default)]
+struct SpeechGate {
+    last_speech: Option<Instant>,
+    fresh: bool,
+    publishing: Option<String>,
+    // media.rs answers a rejected draft before receiving the next event. It may
+    // do so while a different draft is still being published on Discord.
+    rejected: Option<(String, DraftResult)>,
+}
+
+impl SpeechGate {
+    fn speech(&mut self, now: Instant) {
+        if self
+            .last_speech
+            .is_none_or(|last| now.duration_since(last) >= SPEECH_GAP)
         {
-            drop(error);
+            self.fresh = true;
         }
+        self.last_speech = Some(now);
     }
 
-    async fn read(&mut self) -> Result<Value> {
-        loop {
-            let chunk = self
-                .output
-                .fill_buf()
-                .await
-                .context("Codex voice bridge output failed")?;
-            ensure!(!chunk.is_empty(), "Codex voice bridge disconnected");
-            let newline = chunk.iter().position(|&b| b == b'\n');
-            let measured = newline.map_or(chunk.len(), |at| at + 1);
-            ensure!(
-                measured <= MAX_LINE.saturating_sub(self.partial.len()),
-                "Codex voice bridge frame exceeded its limit"
-            );
-            self.partial.extend_from_slice(&chunk[..measured]);
-            self.output.consume(measured);
-            if newline.is_some() {
-                let result = serde_json::from_slice(&self.partial)
-                    .map_err(|_| anyhow::anyhow!("Invalid Codex voice bridge frame"));
-                self.partial.clear();
-                return result;
+    fn offer(&mut self, id: String, text: Option<String>, now: Instant) -> Event {
+        let rejection = match text {
+            None => DraftResult::NoText,
+            Some(text)
+                if self.fresh
+                    && self.publishing.is_none()
+                    && self
+                        .last_speech
+                        .is_some_and(|last| now.duration_since(last) <= RECENT_SPEECH) =>
+            {
+                self.fresh = false;
+                self.publishing = Some(id.clone());
+                return Event::Draft {
+                    id,
+                    text: Some(text),
+                };
             }
+            Some(_) => DraftResult::NotPosted,
+        };
+        self.rejected = Some((id.clone(), rejection));
+        Event::Reject(id)
+    }
+
+    fn result(&mut self, id: &str, posted: bool) -> Result<DraftResult> {
+        if self.publishing.as_deref() == Some(id) {
+            self.publishing = None;
+            return Ok(if posted {
+                DraftResult::Posted
+            } else {
+                DraftResult::NotPosted
+            });
         }
-    }
-
-    async fn send(&mut self, payload: Value) -> Result<()> {
-        let frame = format!("{payload}\n");
-        ensure!(
-            frame.len() <= MAX_LINE,
-            "Codex voice bridge command exceeded its limit"
-        );
-        timeout(
-            Duration::from_secs(2),
-            self.input.write_all(frame.as_bytes()),
-        )
-        .await?
-        .context("Codex voice bridge input closed")
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if matches!(self.child.try_wait(), Ok(None))
-            && let Some(pid) = self.child.id().and_then(|id| i32::try_from(id).ok())
-            && let Err(error) = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            )
-            && error != nix::errno::Errno::ESRCH
+        if !posted && let Some((_, result)) = self.rejected.take_if(|(rejected, _)| rejected == id)
         {
-            eprintln!("Codex voice subprocess group cleanup failed");
+            return Ok(result);
         }
+        bail!("Uncorrelated Codex voice draft result")
     }
 }
 
-fn absolute_env(key: &str) -> Result<Option<PathBuf>> {
-    let Some(raw) = std::env::var_os(key) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(raw);
-    ensure!(
-        path.is_absolute(),
-        "Codex voice path configuration must be absolute"
-    );
-    Ok(Some(path))
-}
-
-pub(super) fn energetic(pcm: &[u8]) -> bool {
+fn energetic(pcm: &[u8]) -> bool {
     let samples = pcm.chunks_exact(2);
     let count = u64::try_from(samples.len()).unwrap_or(u64::MAX);
     let energy: u64 = samples
@@ -281,3 +166,7 @@ pub(super) fn energetic(pcm: &[u8]) -> bool {
         .sum();
     count > 0 && energy >= count.saturating_mul(256 * 256)
 }
+
+#[cfg(test)]
+#[path = "subscription/tests.rs"]
+mod tests;

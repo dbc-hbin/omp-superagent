@@ -19,17 +19,21 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 nix = { version = "0.30", features = ["signal", "process", "user", "fs"] }
 opus2 = { version = "0.4", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "multipart"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 time = { version = "0.3", features = ["parsing"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 url = "2"
+unicase = "2"
 unicode-width = { version = "0.2", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+webrtc = "0.17.1"
+zeroize = "1"
 
 # Match Bun's Darwin SQLite VFS: it preserves the WAL sidecars needed by
 # read-only operator queries after the final Gateway/HEAD writer exits.

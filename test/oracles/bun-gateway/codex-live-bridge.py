@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# The Gateway runs this with the Python environment installed from codex-voice-requirements.txt.
-# The Bun adapter owns the private stdin/stdout pipes; the bridge is not a CLI.
+# Reference for the former Bun Gateway. Not part of the shipped package.
 
 from __future__ import annotations
 

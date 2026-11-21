@@ -119,6 +119,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
       || typeof session.abortCompaction !== "function" || typeof session.goalRuntime.pauseGoal !== "function"
       || typeof session.waitForIdle !== "function" || typeof session.yieldQueue?.has !== "function"
       || typeof session.sessionManager.ensureOnDisk !== "function" || typeof session.sessionManager.flushSync !== "function"
+      || typeof session.sessionManager.getLeafId !== "function"
       || typeof session.settings.reloadFromDisk !== "function" || typeof session.settings.mirrorState !== "function"
       || typeof session.settings.getModelRoles !== "function")
       throw new Error("Installed OMP lacks required public native lifecycle capabilities");
@@ -127,6 +128,9 @@ export default function hostExtension(pi: ExtensionAPI): void {
     instanceKey ??= session.instanceKey;
     return { ref, session, id: session.sessionManager.getSessionId(), file: session.sessionManager.getSessionFile() };
   };
+  const ownerIdentity = ({ id, file, ref, session }: ReturnType<typeof exact>) => ({
+    hostPid: process.pid, sessionId: id, sessionFile: file, generation: ref.generation, instanceKey: session.instanceKey,
+  });
   const snapshot = () => {
     const { session } = exact();
     return { modelRoles: session.settings.getModelRoles(),
@@ -406,10 +410,16 @@ export default function hostExtension(pi: ExtensionAPI): void {
         frame: command.frame, runOrdinal: command.runOrdinal, hostPid: command.hostPid,
       }) };
     }
+    if (command.type === "get_journal_cursor") {
+      const identity = exact();
+      if (observationHeld) throw new Error("Durable native observations are unavailable");
+      return { ...ownerIdentity(identity), leafId: identity.session.sessionManager.getLeafId() };
+    }
     if (command.type === "snapshot") {
       const ownership = await owned();
-      return { hostPid: process.pid, sessionId: ownership.identity.id, sessionFile: ownership.identity.file,
-        generation: ownership.identity.ref.generation, instanceKey, settingsScope: "session", modelSettings: snapshot(),
+      // Only an owner that implements the cursor command can advertise it to peers.
+      return { ...ownerIdentity(ownership.identity), settingsScope: "session", modelSettings: snapshot(),
+        journalCursorControlVersion: 1,
         hasOwnedRunningWork: ownership.unknown ? undefined : ownership.busy, mutationHeld, observationHeld,
         admitted: ownership.identity.session.hasAdmittedSubmission,
         postPromptWork: ownership.identity.session.hasPostPromptWork };

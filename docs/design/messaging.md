@@ -243,8 +243,10 @@ separate from voice attachments or the head model. A fresh original owner
 conversation in the configured voice channel. Use channel permissions to
 exclude other participants. Edits, catch-up and restart cannot open or resume it.
 
-Subscription mode uses the local [Codex bridge](../../src/codex-live-bridge.py) and
-WebRTC; API mode uses the separately billed OpenAI Live API.
+In subscription mode the [Rust Gateway](../../gateway/src/discord_voice/subscription.rs)
+uses the installed Codex CLI to verify the active subscriber, then sends audio via
+WebRTC and receives draft requests over the same call's sideband connection.
+No Python worker or provider API key is required. API mode uses the separately billed OpenAI Live API.
 Subscription rejection or connection loss never falls back to API billing or
 retries automatically. Live answers ordinary conversation. For explicit work
 requests it produces a text draft of the owner's speech, not a second task

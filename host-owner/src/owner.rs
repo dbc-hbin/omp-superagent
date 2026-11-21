@@ -91,6 +91,7 @@ struct Identity {
     session_file: String,
     generation: Option<Value>,
     instance_key: Option<Value>,
+    journal_cursor: bool,
 }
 
 #[derive(Default)]
@@ -538,6 +539,44 @@ impl Owner {
         )
     }
 
+    fn validate_control_identity(&self, owned: &Value) -> Result<&Identity> {
+        let identity = self
+            .identity
+            .get()
+            .ok_or(Error::Unavailable("Native launch identity mismatch"))?;
+        if owned["sessionId"].as_str() != Some(identity.session_id.as_str())
+            || owned["sessionFile"].as_str() != Some(identity.session_file.as_str())
+            || owned["hostPid"].as_u64() != Some(u64::from(self.native_pid))
+            || owned.get("generation") != identity.generation.as_ref()
+            || owned.get("instanceKey") != identity.instance_key.as_ref()
+        {
+            return Err(Error::Unavailable("Native identity/generation changed"));
+        }
+        Ok(identity)
+    }
+
+    pub(crate) async fn journal_cursor(&self) -> Result<Option<String>> {
+        if !self
+            .identity
+            .get()
+            .is_some_and(|identity| identity.journal_cursor)
+        {
+            return Err(Error::Unavailable("Native journal cursor is unavailable"));
+        }
+        self.observations_flushed().await?;
+        let mut owned = data(
+            self.control()?
+                .request(json!({"type": "get_journal_cursor"}))
+                .await?,
+        )?;
+        self.validate_control_identity(&owned)?;
+        match owned.get_mut("leafId").map(Value::take) {
+            Some(Value::Null) => Ok(None),
+            Some(Value::String(leaf)) if !leaf.is_empty() => Ok(Some(leaf)),
+            _ => Err(Error::Unavailable("Native journal cursor is unavailable")),
+        }
+    }
+
     pub(crate) async fn snapshot(&self) -> Result<Value> {
         self.observations_flushed().await?;
         let control = self.control()?;
@@ -545,17 +584,9 @@ impl Owner {
         let rpc = if active { control } else { &self.native };
         let native = data(rpc.request(json!({"type": "get_state"})).await?)?;
         let owned = data(control.request(json!({"type": "snapshot"})).await?)?;
-        let identity = self
-            .identity
-            .get()
-            .ok_or(Error::Unavailable("Native launch identity mismatch"))?;
+        let identity = self.validate_control_identity(&owned)?;
         if owned.get("sessionId") != native.get("sessionId")
             || owned.get("sessionFile") != native.get("sessionFile")
-            || owned["sessionId"].as_str() != Some(identity.session_id.as_str())
-            || owned["sessionFile"].as_str() != Some(identity.session_file.as_str())
-            || owned["hostPid"].as_u64() != Some(u64::from(self.native_pid))
-            || owned.get("generation") != identity.generation.as_ref()
-            || owned.get("instanceKey") != identity.instance_key.as_ref()
         {
             return Err(Error::Unavailable("Native identity/generation changed"));
         }
@@ -571,8 +602,14 @@ impl Owner {
             return Err(Error::Unavailable("Native state is unavailable"));
         };
         native.extend(owned);
+        // Only publish the capability attested by this owner's private launch control.
+        native.remove("journalCursorControlVersion");
+        native.remove("journalCursorVersion");
         native.insert("adapterOwnerPid".to_owned(), json!(std::process::id()));
         native.insert("adapterProtocol".to_owned(), json!("owned-stock-stdio-v1"));
+        if identity.journal_cursor {
+            native.insert("journalCursorVersion".to_owned(), json!(1));
+        }
         let pending_ui = self
             .state()?
             .ui
@@ -916,6 +953,7 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
             session_file: manifest.options.session_file.clone(),
             instance_key: identity.get("instanceKey").cloned(),
             generation: identity.get("generation").cloned(),
+            journal_cursor: identity["journalCursorControlVersion"].as_u64() == Some(1),
         })
         .map_err(|_| anyhow::anyhow!("Duplicate native launch identity"))?;
     let explicit = manifest.options.model_preset.as_ref();

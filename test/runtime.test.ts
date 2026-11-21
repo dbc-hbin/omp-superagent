@@ -74,6 +74,8 @@ class HostTransport implements RuntimeHost {
   beforeGoalResume?: () => Promise<void> | void;
   beforePrompt?: () => Promise<void> | void;
   beforeState?: () => Promise<void> | void;
+  beforeCursor?: () => Promise<void> | void;
+  cursorResponse?: unknown;
   beforeEntries?: () => Promise<void> | void;
   afterEntries?: () => Promise<void> | void;
   goalResumeRuns = true;
@@ -91,7 +93,7 @@ class HostTransport implements RuntimeHost {
   state: RuntimeState;
 
   constructor(sessionFile: string, sessionId: string, model: LaneModel | null = executionModel) {
-    this.state = { sessionFile, sessionId, model, thinkingLevel: "high", isCompacting: false, queuedMessageCount: 0, settingsScope: "session",
+    this.state = { sessionFile, sessionId, journalCursorVersion: 1, model, thinkingLevel: "high", isCompacting: false, queuedMessageCount: 0, settingsScope: "session",
       modelSettings: { modelRoles: { default: "fixture/capable", smol: "fixture/efficient" }, defaultThinkingLevel: Effort.High },
       contextUsage: { tokens: 321, contextWindow: 200_000, percent: 0.1605 },
       hostPid: process.pid, isSettled: true, isStreaming: false, hasPendingAsyncWork: false, hasOwnedRunningWork: false, pendingUiRequests: [], goal: null };
@@ -115,6 +117,11 @@ class HostTransport implements RuntimeHost {
     getSubagents: async () => this.children,
     cancelSubagent: async (id: string) => { this.cancelled.push(id); },
   };
+  private leafId(): string | null {
+    const leaf = this.entries.at(-1);
+    return this.journalLeaf && leaf !== null && typeof leaf === "object"
+      && "id" in leaf && typeof leaf.id === "string" ? leaf.id : null;
+  }
   async request(command: Record<string, unknown>, id?: string): Promise<unknown> {
     this.commands.push(command);
     if (command.type === "get_available_models") {
@@ -125,15 +132,18 @@ class HostTransport implements RuntimeHost {
       await this.beforeLevels?.();
       return { success: this.levelsSuccess, data: { levels: structuredClone(this.levels) } };
     }
+    if (command.type === "get_journal_cursor") {
+      await this.beforeCursor?.();
+      return this.cursorResponse ?? { success: true, data: { leafId: this.leafId() } };
+    }
     if (command.type === "get_entries") {
       if (this.beforeEntries) await this.beforeEntries();
-      const leaf = this.journalLeaf ? (this.entries.at(-1) as { id?: string } | undefined)?.id ?? null : null;
       const since = command.since;
       const index = typeof since === "string" ? this.entries.findIndex(entry =>
         entry !== null && typeof entry === "object" && "id" in entry && entry.id === since) : -1;
       const response = since !== undefined && index < 0
         ? { success: false, code: "unknown_since", error: "Unknown entries cursor" }
-        : { success: true, data: { entries: structuredClone(this.entries.slice(index + 1)), leafId: leaf } };
+        : { success: true, data: { entries: structuredClone(this.entries.slice(index + 1)), leafId: this.leafId() } };
       const after = this.afterEntries?.();
       if (after) await after;
       return response;
@@ -1238,7 +1248,7 @@ describe("event-driven nonterminal progress", () => {
       waiting: { since: 6000, target: { kind: "dependency", target: "Latest direct target" } }, lastReportAt: 6000,
     });
     expect(worker.commands.filter(command => command.type === "get_entries").map(command => command.since)).toEqual([
-      undefined, undefined, undefined, "native-eval-receipt", "native-eval-duplicate", "last-appended",
+      undefined, undefined, "native-eval-receipt", "native-eval-duplicate", "last-appended",
     ]);
     expect(worker.prompts).toHaveLength(1);
     expect(errors).toEqual([]);
@@ -1268,7 +1278,7 @@ describe("event-driven nonterminal progress", () => {
     await runtime.kick();
     expect(store.lane(lane.id)?.observation).toEqual(before);
     expect(worker.commands.filter(command => command.type === "get_entries").map(command => command.since))
-      .toEqual([undefined, undefined, "original-cursor"]);
+      .toEqual([undefined, "original-cursor"]);
     expect(errors.map(error => error instanceof Error ? error.message : error)).toEqual(["Native observation journal cursor is unavailable"]);
   });
 
@@ -1616,14 +1626,56 @@ describe("original-message processing reactions", () => {
   });
 });
 
+describe("HEAD native journal ownership", () => {
+  test.each([
+    ["empty", null, true],
+    ["resumed", "previous-native-leaf", true],
+    ["older owner", "legacy-native-leaf", false],
+  ] as const)("records the %s cursor before prompt admission", async (kind, leafId, supportsCursor) => {
+    const { runtime, main, store } = fixture();
+    if (!supportsCursor) main.state = { ...main.state, journalCursorVersion: undefined };
+    main.journalLeaf = true;
+    if (leafId !== null) main.entries.push({ id: leafId, type: "custom" });
+    await runtime.start();
+
+    const original = message(`native-cursor-${kind}`);
+    await admit(runtime, original);
+
+    expect(main.prompts).toHaveLength(1);
+    expect(JSON.parse(store.getMeta(`head-native-owner:${original.id}`)!)).toMatchObject({
+      cursor: leafId, requestId: main.prompts[0]?.id, sessionId: main.state.sessionId, sessionFile: main.state.sessionFile,
+    });
+    expect(main.commands.filter(command => command.type === "get_entries")).toHaveLength(supportsCursor ? 0 : 1);
+  });
+
+  test.each([
+    ["missing", { success: true, data: {} }],
+    ["non-string", { success: true, data: { leafId: 7 } }],
+    ["blank", { success: true, data: { leafId: "" } }],
+    ["unavailable", { success: false, error: "Native request failed" }],
+  ] as const)("holds input without a full journal fallback for a %s advertised cursor", async (kind, response) => {
+    const { runtime, main, store } = fixture();
+    main.cursorResponse = response;
+    await runtime.start();
+
+    const original = message(`invalid-native-cursor-${kind}`);
+    await admit(runtime, original);
+
+    expect(main.prompts).toEqual([]);
+    expect(store.input(original.id)?.state).toBe("pending");
+    expect(store.getMeta(`head-native-owner:${original.id}`)).toBeNull();
+    expect(main.commands.some(command => command.type === "get_entries")).toBe(false);
+  });
+});
+
 describe("thread kickoff before execution", () => {
-  test("a persisted kickoff fence added during HEAD journal read holds native submission", async () => {
+  test("a persisted kickoff fence added during HEAD journal cursor read holds native submission", async () => {
     const { runtime, main, store } = fixture();
     await runtime.start();
     const reading = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    main.beforeEntries = async () => {
-      main.beforeEntries = undefined;
+    main.beforeCursor = async () => {
+      main.beforeCursor = undefined;
       reading.resolve();
       await release.promise;
     };
@@ -2196,7 +2248,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(main.abortCount).toBe(1);
   });
 
-  test.each(["resident-state", "resident-journal", "final-state"] as const)("a newer HEAD stop cannot be resurrected across the %s checkpoint await", async boundary => {
+  test.each(["resident-state", "resident-cursor", "final-state"] as const)("a newer HEAD stop cannot be resurrected across the %s checkpoint await", async boundary => {
     const { runtime, main, store, config, hosts, requests } = restartFixture();
     const lane = savedLane(store, config, `stop-checkpoint-${boundary}`, route(`stop-${boundary}`), process.pid);
     const resident = new HostTransport(lane.sessionFile, `session-${lane.id}`);
@@ -2208,7 +2260,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     const released = Promise.withResolvers<void>();
     const block = async () => { entered.resolve(); await released.promise; };
     if (boundary === "resident-state") resident.beforeState = async () => { resident.beforeState = undefined; await block(); };
-    if (boundary === "resident-journal") resident.beforeEntries = async () => { resident.beforeEntries = undefined; await block(); };
+    if (boundary === "resident-cursor") resident.beforeCursor = async () => { resident.beforeCursor = undefined; await block(); };
     if (boundary === "final-state") main.beforeState = async () => {
       if (store.input("checkpoint-running-head")?.state !== "uncertain") return;
       main.beforeState = undefined;
@@ -4979,7 +5031,7 @@ describe("frozen native preset lane choices", () => {
     expect(launched).toHaveLength(1);
     expect(launched[0]).not.toHaveProperty("model");
     const host = hosts.get(lane.socketPath)!;
-    expect(host.commands.map(command => command.type)).toEqual(["set_model", "get_entries", "prompt"]);
+    expect(host.commands.map(command => command.type)).toEqual(["set_model", "get_journal_cursor", "prompt"]);
     expect(host.state.model).toEqual(otherModel);
     expect(store.getMeta(`lane-model:${lane.id}:apply`)).toBe("");
     expect(host.prompts).toHaveLength(1);

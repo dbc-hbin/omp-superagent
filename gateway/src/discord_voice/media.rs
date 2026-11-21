@@ -33,7 +33,7 @@ impl Service {
                 transfer = link.poll() => {
                     let pcm = link.handle(transfer?).await?;
                     ensure!(link.encrypted(), "Owner-only Discord media verification was lost");
-                    if let Some(pcm) = pcm { provider.input(&pcm).await?; }
+                    if let Some(pcm) = pcm { provider.input(&pcm)?; }
                 }
                 _ = frame_clock.tick() => {
                     link.tick().await?;

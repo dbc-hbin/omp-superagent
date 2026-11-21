@@ -50,27 +50,17 @@
    Rust Gateway에 DAVE 및 Opus가 포함됩니다. 음성 연결은 소유자가 명시적으로 시작할 때만 열며 설치·진단 중에는 봇을 접속시키지 않습니다.
    설정 변경은 다음 Gateway 시작에 반영됩니다.
 
-### 구독 모드의 WebRTC 브리지 설치
+### 구독 모드의 Codex 로그인
 
-Gateway를 실행하는 OS 사용자로 아래 명령을 한 번 실행하세요(macOS/Linux, 프로젝트 루트 기준).
-Codex CLI는 별도로 설치합니다. 로그인 조회에 사용한 버전은 `codex-cli 0.166.0`입니다.
-브리지는 사용자 설치 위치(`~/.local/bin/codex`)와 표준 시스템 설치 위치만 검색하며 프로젝트의 `PATH`는 쓰지 않습니다.
+WebRTC는 Rust Gateway에 포함되어 있어 Python이나 가상환경을 설치할 필요가 없습니다.
+Codex CLI는 별도로 설치하고 Gateway를 실행하는 OS 사용자로 `codex login`을 실행하세요.
+Gateway는 `~/.local/bin/codex`와 표준 설치 위치에서만 CLI를 찾으며 프로젝트의 `PATH`는 쓰지 않습니다.
 
-```sh
-VENV="$HOME/.local/share/omp-superagent/codex-voice"
-uv venv --python 3.12 "$VENV"
-uv pip install --python "$VENV/bin/python" -r src/codex-voice-requirements.txt
-```
-
-다른 가상환경을 쓰려면 Gateway를 시작하는 환경의 `OMP_SA_CODEX_VOICE_PYTHON`에 그 인터프리터의
-절대 경로를 지정하세요. `FILE.env`는 메신저 자격증명 전용이며, macOS 로그인 런처는 터미널의
-환경 변수를 상속하지 않으므로 기본 경로가 편합니다. API 모드나 텍스트 전용 설치에는 Python이 필요 없습니다.
-
-`/voice start` 때만 브리지가 Codex의 로컬 `app-server`에 현재 로그인 정보를 요청합니다. Codex 작업 스레드는
+`/voice start` 때만 Gateway가 Codex의 로컬 `app-server`에 현재 로그인 정보를 요청합니다. Codex 작업 스레드는
 시작하지 않습니다. 오디오는 WebRTC로 OpenAI에 보내고 작업 초안과 상태 이벤트는 같은 통화의 별도 연결로 받습니다.
 Codex 로그인이나 음성 권한이 거절되면 먼저 같은 OS 사용자와 `CODEX_HOME`으로 로그인했는지 확인하세요.
 API 키로 로그인한 Codex, 만료된 자격증명, 별도의 지역·전용 서버 경로가 필요한 워크스페이스는
-지원하지 않습니다. 브리지는 조직의 경로 제한을 무시하거나 다른 계정·API 키로 재시도하지 않습니다.
+지원하지 않습니다. Gateway는 조직의 경로 제한을 무시하거나 다른 계정·API 키로 재시도하지 않습니다.
 
 ## 사용
 

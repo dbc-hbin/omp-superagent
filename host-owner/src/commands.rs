@@ -431,6 +431,9 @@ async fn execute(
             sanitize_private_error(&mut response);
             return Ok(response);
         }
+        "get_journal_cursor" => {
+            return Ok(json!({"success": true, "data": {"leafId": owner.journal_cursor().await?}}));
+        }
         "get_entries" => owner
             .observations_flushed()
             .await

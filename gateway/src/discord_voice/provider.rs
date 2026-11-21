@@ -32,7 +32,7 @@ pub(super) struct Provider(Backend);
 
 enum Backend {
     Api(Box<Api>),
-    Subscription(Subscription),
+    Subscription(Box<Subscription>),
 }
 
 pub(super) struct Setup<'a>(Authorization<'a>);
@@ -66,21 +66,21 @@ impl<'a> Setup<'a> {
             Authorization::Subscription { voice } => {
                 let subscription =
                     timeout(Duration::from_secs(45), Subscription::open(voice)).await??;
-                Ok(Provider(Backend::Subscription(subscription)))
+                Ok(Provider(Backend::Subscription(Box::new(subscription))))
             }
         }
     }
 }
 
 impl Provider {
-    pub(super) async fn input(&mut self, pcm: &[u8]) -> Result<()> {
+    pub(super) fn input(&mut self, pcm: &[u8]) -> Result<()> {
         ensure!(
             pcm.len() <= MAX_INPUT && pcm.len() % 2 == 0,
             "Invalid provider PCM input"
         );
         match &mut self.0 {
             Backend::Api(api) => api.input(pcm),
-            Backend::Subscription(bridge) => timeout(IO_TIMEOUT, bridge.input(pcm)).await?,
+            Backend::Subscription(subscription) => subscription.input(pcm),
         }
     }
 
@@ -94,28 +94,28 @@ impl Provider {
     pub(super) async fn recv(&mut self) -> Result<Event> {
         match &mut self.0 {
             Backend::Api(api) => api.recv().await,
-            Backend::Subscription(bridge) => bridge.recv().await,
+            Backend::Subscription(subscription) => subscription.recv().await,
         }
     }
 
     pub(super) async fn draft_result(&mut self, id: &str, posted: bool) -> Result<()> {
-        match &mut self.0 {
-            Backend::Api(api) => timeout(IO_TIMEOUT, api.draft_result(id, posted)).await?,
-            Backend::Subscription(bridge) => {
-                timeout(IO_TIMEOUT, bridge.draft_result(id, posted)).await?
+        timeout(IO_TIMEOUT, async {
+            match &mut self.0 {
+                Backend::Api(api) => api.draft_result(id, posted).await,
+                Backend::Subscription(subscription) => subscription.draft_result(id, posted).await,
             }
-        }
+        })
+        .await?
     }
 
     pub(super) async fn close(&mut self) {
-        match &mut self.0 {
-            Backend::Api(api) => {
-                if let Err(error) = timeout(IO_TIMEOUT, api.close()).await {
-                    drop(error);
-                }
+        let _ = timeout(IO_TIMEOUT, async {
+            match &mut self.0 {
+                Backend::Api(api) => api.close().await,
+                Backend::Subscription(subscription) => subscription.close().await,
             }
-            Backend::Subscription(bridge) => bridge.close().await,
-        }
+        })
+        .await;
     }
 }
 

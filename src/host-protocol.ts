@@ -11,6 +11,7 @@ export type HostState = RpcSessionState & {
   hostPid: number;
   adapterOwnerPid: number;
   adapterProtocol: "owned-stock-stdio-v1";
+  readonly journalCursorVersion?: 1;
   settingsScope: "session";
   modelSettings: LanePresetSnapshot;
   hasOwnedRunningWork: boolean;
@@ -28,6 +29,9 @@ export type HostResponse = RpcResponse | {
 } | {
   type: "response"; id?: string; command: "set_host_message_updates"; success: true;
   data: { readonly messageUpdates: "full" | "activity-v1" };
+} | {
+  type: "response"; id?: string; command: "get_journal_cursor"; success: true;
+  data: { readonly leafId: string | null };
 } | {
   type: "response"; id?: string; command: string; success: false; error: string; code?: string;
 };

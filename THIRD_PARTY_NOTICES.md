@@ -38,6 +38,26 @@ The Gateway's graph is pinned by `gateway/Cargo.lock`. In particular:
   (MIT or Apache-2.0). [`libopus_sys` 0.3.3](https://docs.rs/crate/libopus_sys/0.3.3/source/)
   builds its bundled Xiph.Org Opus codec statically. Redistribution must also
   preserve its separate `opus/COPYING` and corresponding notices.
+- Codex subscription voice uses [`webrtc` 0.17.3](https://docs.rs/crate/webrtc/0.17.3)
+  (MIT or Apache-2.0) for ICE, DTLS, SRTP and RTP; both ends of the Gateway's
+  audio conversion use the bundled Opus codec above. The Gateway stages the
+  locked WebRTC graph's notices and source URLs, including:
+  - The MIT and Apache-2.0 files at the published Git revisions for
+    [`webrtc`](https://github.com/webrtc-rs/webrtc/tree/a3c3f4dff44f2c935be3535ae94330770cd50dbd),
+    [`asn1-rs-impl` 0.2.0](https://github.com/rusticata/asn1-rs/tree/a20e5f7319c896737ad0f2557037817b91ad854f),
+    and [`yasna` 0.5.2](https://github.com/qnighy/yasna.rs/tree/b7e65f9a4c317494cce2d18ea02b3d6eaaea7985).
+  - The two [`crc-catalog` 2.5.0 license files](https://github.com/akhilles/crc-catalog/tree/ed4ad631f22b05055c21a3a4127eb7cf6d75bb62/LICENSES)
+    from its published archive's `LICENSES/` directory.
+  - The shared [PRECIS MIT license](https://github.com/sancane/precis/blob/5e9fb2b1a33246bceb3edb1018fb20fcd46dc316/LICENSE)
+    from the `precis-tools` 0.1.10 revision. The recorded Git revisions for
+    [`precis-core` 0.1.11](https://static.crates.io/crates/precis-core/precis-core-0.1.11.crate)
+    and [`precis-profiles` 0.1.13](https://static.crates.io/crates/precis-profiles/precis-profiles-0.1.13.crate)
+    are unavailable upstream; both immutable archives explicitly offer MIT.
+    Their generated tables use Unicode Character Database
+    [6.3.0](https://www.unicode.org/Public/6.3.0/ucd/ReadMe.txt) and
+    [17.0.0](https://www.unicode.org/Public/17.0.0/ucd/ReadMe.txt), respectively.
+    Staging includes those data notices and the
+    [Unicode license](https://github.com/unicode-org/unicodetools/blob/ecd26be2e82be37609090942c14e518e57e905d8/LICENSE).
 - DAVE uses [`davey` 0.2.0](https://docs.rs/crate/davey/0.2.0), whose
   [upstream MIT license](https://github.com/Snazzah/davey/blob/72d1c6d081f4993d618806990f1d3a1f6f53ed67/LICENSE)
   is credited to `Copyright (c) 2025-present Snazzah`. Where published crate

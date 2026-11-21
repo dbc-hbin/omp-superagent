@@ -35,6 +35,7 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 export interface RuntimeState {
   sessionFile?: string;
   sessionId: string;
+  readonly journalCursorVersion?: 1;
   model?: LaneModel | null;
   thinkingLevel?: string;
   isCompacting?: boolean;
@@ -79,6 +80,7 @@ interface Live {
   id: string;
   generation: number;
   sessionId: string;
+  readonly journalCursorVersion?: 1;
   connection: RuntimeHost;
   input?: InputRecord;
   result?: { status: string; agentInvoked: boolean; goalResume?: true };
@@ -768,6 +770,19 @@ export class Superagent {
     return state;
   }
 
+  private async readJournalCursor(live: Live, operation: string): Promise<string | null> {
+    // Owners already running before this capability was added still use stock
+    // get_entries. A failed or malformed cursor on a new owner is not a fallback.
+    const legacy = live.journalCursorVersion === undefined;
+    const { leafId, entries } = successful(await live.connection.request({
+      type: legacy ? "get_entries" : "get_journal_cursor",
+    }), operation);
+    if ((legacy && !Array.isArray(entries)) || (leafId !== null && (typeof leafId !== "string" || !leafId))) {
+      throw new Error(`${operation}: native journal cursor is unavailable`);
+    }
+    return leafId;
+  }
+
   async availableModels(): Promise<LaneModelCandidate[]> {
     const head = this.live.get("main");
     if (!head || !this.current(head)) throw new Error("The authoritative head model catalog is unavailable");
@@ -1092,8 +1107,11 @@ export class Superagent {
       const state = await connection.client.getState();
       if (this.stopped) throw new Error("Controller stopped during connection");
       this.verify({ id, generation, sessionId: "" }, state);
+      if (state.journalCursorVersion !== undefined && state.journalCursorVersion !== 1)
+        throw new Error(`Host ${id} reported an unsupported native journal cursor version`);
       live = {
-        id, generation, sessionId: state.sessionId, connection, busy: !state.isSettled,
+        id, generation, sessionId: state.sessionId, journalCursorVersion: state.journalCursorVersion,
+        connection, busy: !state.isSettled,
         lastActivity: Date.now(), text: "", ownedRuns: 0, nativeVersion: 0, admitted: new Map(), running: false, preparing: 0, unsubscribe,
         goalId: state.goal?.goal?.id,
       };
@@ -2603,13 +2621,13 @@ export class Superagent {
         if (!Number.isSafeInteger(actual.hostPid) || !actual.hostPid || actual.hostPid <= 0
           || live.id !== "main" && actual.hostPid !== this.requireLane(live.id).pid)
           throw new Error(`Native ownership is unavailable for ${live.id}`);
-        const journal = live.input
-          ? successful(await live.connection.request({ type: "get_entries" }), "checkpoint native journal") : null;
+        const entryId = live.input ? await this.readJournalCursor(live, "checkpoint native journal") : null;
         this.assertRestartCurrent(restart);
+        if (!this.current(live)) throw new Error(`Native ownership changed during checkpoint for ${live.id}`);
         residents.push({ id: live.id, generation: live.generation, pid: actual.hostPid, sessionId: live.sessionId,
           inputId: live.input?.id, requestIds: [...live.admitted.keys()], result: live.result,
           ownedRuns: live.ownedRuns, assistantOutcome: live.assistantOutcome,
-          entryId: typeof journal?.leafId === "string" ? journal.leafId : undefined });
+          entryId: entryId ?? undefined });
       }
       restart = { ...restart, checkpoint: {
         goalActive: before.goal?.enabled === true && before.goal.goal?.status === "active",
@@ -3907,13 +3925,8 @@ export class Superagent {
       return;
     }
     let observationCursor: string | null | undefined;
-    if (live.id !== "main" && !steering) {
-      const journal = successful(await live.connection.request({ type: "get_entries" }), "capture native lane observation owner");
-      if (!Array.isArray(journal.entries) || journal.leafId !== null && typeof journal.leafId !== "string") {
-        throw new Error("Native lane observation owner has no journal cursor");
-      }
-      observationCursor = journal.leafId as string | null;
-    }
+    if (live.id !== "main" && !steering)
+      observationCursor = await this.readJournalCursor(live, "capture native lane observation owner");
     if (!this.current(live) || (live.id !== "main" && this.requireLane(live.id).workState !== "open")) return;
     if (live.id === "main" && (this.headStopping > 0 || this.headCompaction)) return;
     if (this.modelChanges.has(live.id)) return;
@@ -3946,9 +3959,7 @@ export class Superagent {
     const requestId = `sg-${key(input.id)}-${live.generation}`;
     if (live.id === "main" && !steering) {
       const version = live.nativeVersion;
-      const journal = successful(await live.connection.request({ type: "get_entries" }), "capture native HEAD request owner");
-      if (!Array.isArray(journal.entries) || journal.leafId !== null && typeof journal.leafId !== "string")
-        throw new Error("Native HEAD request owner has no journal cursor");
+      const cursor = await this.readJournalCursor(live, "capture native HEAD request owner");
       const confirmed = await this.state(live);
       if (input.id.startsWith(CRON_RUN_PREFIX)) {
         // A stored route is not proof the same bot is still authenticated.
@@ -3968,7 +3979,7 @@ export class Superagent {
         || confirmedInput?.state !== "pending" || confirmedInput.target !== live.id || this.kickoffHeld(live.id)) return;
       this.store.setMeta(`head-native-owner:${input.id}`, JSON.stringify({
         requestId, generation: live.generation, sessionId: live.sessionId,
-        sessionFile: confirmed.sessionFile, cursor: journal.leafId,
+        sessionFile: confirmed.sessionFile, cursor,
       }));
     } else if (this.kickoffHeld(live.id)) return;
     this.store.setMeta(`steering-owner:${input.id}`, steering ? owner!.id : input.id);
