@@ -5,6 +5,7 @@ mod cards;
 mod history;
 mod ingress;
 mod media;
+mod picker;
 mod socket;
 mod wire;
 

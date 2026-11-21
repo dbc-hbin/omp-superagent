@@ -176,6 +176,12 @@ default roles/thinking; ordinary head and lane changes leave global configuratio
 and other lanes alone. Native preset bootstrap/refresh and native auth updates
 have separate scopes.
 
+Argumentless `/model` and `/effort` use the same read-only native catalogue and
+effort capabilities to construct menus. A selection is a new owner control on
+the original topic, not a model turn or native approval. The head validates
+the menu's session and generation before applying it, and an effort selection
+also requires the model for which the options were shown.
+
 ## Workflow selection
 
 The root role extensions add only their own role instructions to native context.

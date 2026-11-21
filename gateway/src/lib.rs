@@ -3,6 +3,7 @@ mod commands;
 pub mod daemon;
 mod discord;
 pub mod lifecycle;
+mod picker;
 pub mod server;
 mod slack;
 pub mod store;

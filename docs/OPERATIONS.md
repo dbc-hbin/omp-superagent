@@ -778,14 +778,19 @@ Discord는 등록된 슬래시 명령을 함께 지원한다. Slack은 일반 `!
 
 | 명령 | 동작 |
 | --- | --- |
-| `/model` | 헤드의 실제 provider/model과 현재 effort 조회 |
+| `/model` | 현재 provider/model·effort 표시 및 공급자 → 모델 선택 메뉴 열기 |
 | `/model list` | 현재 native 인증·활성화 상태에서 선택 가능한 chat 모델 목록 |
 | `/model <provider/model>` | 목록의 정확한 provider/model로 헤드 모델 변경 |
-| `/effort` | 헤드의 실제 effort와 현재 모델이 지원하는 선택값 조회 |
+| `/effort` | 현재 effort 표시 및 현재 모델이 지원하는 강도 선택 메뉴 열기 |
 | `/effort <level>` | 조회에 표시된 값으로 헤드 effort 변경 |
 | `/model preset` 또는 `/model preset list` | 기존 native 프리셋의 이름·유효성·가용 기본 모델 조회 |
 | `/model preset <name>` | 해당 native 프리셋의 전체 역할·기본 effort를 유휴 헤드 세션에 적용 |
 | `/model preset <name> --global` | 현재 헤드에 적용·확인한 동일 snapshot을 native 전역 기본 역할·effort에도 저장 |
+
+Discord와 Slack은 드롭다운, Telegram은 인라인 버튼으로 표시한다. 메뉴를 열거나 페이지를
+넘기는 것만으로는 아무 설정도 바뀌지 않는다. 메뉴는 5분 후 또는 Gateway가 재시작되면
+만료된다. 강도 메뉴를 연 뒤 헤드 모델이 달라졌다면 다시 열어야 한다. 클릭 접수와 실제 변경
+완료는 별개이며, 결과는 원래 대화에 별도로 표시된다. 텍스트 명령도 계속 사용할 수 있다.
 
 조회는 실행 중에도 모델 호출 없이 처리한다. 변경은 헤드가 유휴이고 승인·goal·백그라운드
 작업·소유 서비스·compaction·불확실한 제출이 없을 때만 처리한다. 바쁘면 거부하므로 작업이

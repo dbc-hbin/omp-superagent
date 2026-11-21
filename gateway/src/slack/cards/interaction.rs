@@ -1,8 +1,10 @@
 use serde_json::{Value, json};
 
 use crate::adapter::EffectError;
+use crate::picker::PREFIX;
 
 use super::super::Inner;
+use super::super::picker::picker_key;
 use super::super::socket::Ack;
 use super::super::wire::{Ts, same_optional};
 use super::dialog::{modal_input, selection};
@@ -66,7 +68,11 @@ impl<'a> Callback<'a> {
 impl Inner {
     pub(in crate::slack) async fn interaction_key(&self, body: &Value) -> Option<String> {
         let callback = Callback::parse(body)?;
-        let (token, _) = parse_control(callback.control()?)?;
+        let control = callback.control()?;
+        if matches!(callback, Callback::Block(_)) && control.starts_with(PREFIX) {
+            return picker_key(body);
+        }
+        let (token, _) = parse_control(control)?;
         self.cards.lookup(token).await.map(|_| token.to_owned())
     }
 
@@ -90,6 +96,11 @@ impl Inner {
         let Some(control) = callback.control() else {
             return ack.send(None).await;
         };
+        if let Callback::Block(action) = callback
+            && control.starts_with(PREFIX)
+        {
+            return self.interact_picker(&identity, body, action, ack).await;
+        }
         let Some((token, action)) = parse_control(control) else {
             return ack.send(None).await;
         };

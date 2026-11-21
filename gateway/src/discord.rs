@@ -22,6 +22,7 @@ mod markdown;
 mod model;
 mod outputs;
 mod permissions;
+mod picker;
 mod purposes;
 mod responses;
 mod rest;

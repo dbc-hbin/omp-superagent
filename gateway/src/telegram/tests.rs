@@ -30,6 +30,7 @@ use super::Telegram;
 
 mod contract;
 mod faults;
+mod picker;
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -78,7 +79,7 @@ async fn telegram_http(
     let result = match method.as_str() {
         "getMe" => json!({"id":900,"is_bot":true,"username":"room_bot","has_topics_enabled":true}),
         "getWebhookInfo" => json!({"url":""}),
-        "getChat" => group(),
+        "getChat" => chat(&body["chat_id"]),
         "getUpdates" | "answerCallbackQuery" => {
             let (tx, rx) = oneshot::channel();
             let call = if method == "getUpdates" {
@@ -104,12 +105,24 @@ async fn telegram_http(
         "sendMessage" | "editMessageText" => {
             remote.card_writes.fetch_add(1, Ordering::Relaxed);
             let fault = remote.card_fault.lock().expect("card fault").take();
-            let result = json!({
-                "message_id":123,"date":100,"chat":group(),"message_thread_id":7,
-                "from":{"id":900,"is_bot":true},"text":body["text"],"reply_markup":body["reply_markup"]
-            });
+            let mut card = remote.card.lock().expect("card state");
+            let destination = chat(&body["chat_id"]);
+            let mut result = if method == "sendMessage" {
+                json!({
+                    "message_id":123,"date":100,"chat":destination,
+                    "message_thread_id":body["message_thread_id"],
+                    "from":{"id":900,"is_bot":true}
+                })
+            } else {
+                let original = card.as_ref().expect("original card exists");
+                assert_eq!(original["chat"], destination);
+                assert_eq!(original["message_id"], body["message_id"]);
+                original.clone()
+            };
+            result["text"] = body["text"].clone();
+            result["reply_markup"] = body["reply_markup"].clone();
             if fault.as_ref().is_none_or(|fault| fault.apply) {
-                *remote.card.lock().expect("card state") = Some(result.clone());
+                *card = Some(result.clone());
             }
             if let Some(fault) = fault {
                 return (fault.status, fault.body).into_response();
@@ -185,12 +198,21 @@ impl Fixture {
         }
     }
 
-    async fn feedback(&mut self, query: &str, expired: bool) -> Result<()> {
+    async fn callback_feedback(
+        &mut self,
+        query: &str,
+        expired: bool,
+    ) -> Result<oneshot::Sender<Value>> {
         let Call::Feedback(payload, result) = self.call().await? else {
             anyhow::bail!("Telegram polled again before callback feedback");
         };
         assert_eq!(payload["callback_query_id"], query);
         assert_eq!(payload.get("text").is_some(), expired);
+        Ok(result)
+    }
+
+    async fn feedback(&mut self, query: &str, expired: bool) -> Result<()> {
+        let result = self.callback_feedback(query, expired).await?;
         if expired {
             assert!(self.store.next(None)?.is_none());
         } else {
@@ -225,6 +247,14 @@ async fn test_hub(store: &Arc<Store>, base: &str) -> Result<Arc<Hub>> {
 
 fn group() -> Value {
     json!({"id":-100,"type":"supergroup","is_forum":true})
+}
+
+fn chat(id: &Value) -> Value {
+    match id.as_str() {
+        Some("42") => json!({"id":42,"type":"private"}),
+        Some("-100") => group(),
+        _ => panic!("Unexpected Telegram chat: {id}"),
+    }
 }
 
 fn route() -> Value {

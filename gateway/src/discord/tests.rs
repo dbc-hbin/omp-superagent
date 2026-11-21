@@ -433,6 +433,56 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     assert_eq!(answer["response"], json!({"confirmed": true}));
     received(&mut observed, "/channels/99/messages/700").await;
 
+    let models = (0..10).map(|index| format!("fixture/model-{index}")).collect::<Vec<_>>();
+    let status = format!("HEAD model {}", "🦊".repeat(1_100));
+    let picker = json!({"id":"model-card","route":route,"text":status,
+        "picker":{"kind":"model","expiresAt":crate::store::now().unwrap()+300_000,
+            "groups":[{"label":"fixture","options":models}]}});
+    hub.effect("send", &[picker]).await.unwrap();
+    let outgoing = received(&mut observed, "/channels/99/messages").await;
+    let provider = &outgoing["components"][0]["components"][0];
+    let mut choose = interaction("510", 3, json!({
+        "custom_id": provider["custom_id"], "component_type":3, "values":["0"]
+    }));
+    choose["message"] = last_card.lock().unwrap().clone();
+    dispatch(&mut socket, 1213, "INTERACTION_CREATE", choose).await;
+    let provider_ack = received(&mut observed, "/interactions/510/offline-interaction/callback").await;
+    assert_eq!(provider_ack["type"], 7);
+    assert!(provider_ack["data"]["content"].as_str().unwrap().encode_utf16().count() <= 2_000);
+    assert_eq!(store.pending().unwrap(), 0, "navigation must not admit a command");
+    let first_page = &provider_ack["data"]["components"];
+    let next = first_page[1]["components"].as_array().unwrap().iter()
+        .find(|button| button["label"] == "Next").unwrap();
+    let mut navigate = interaction("514", 3, json!({"custom_id":next["custom_id"],"component_type":2}));
+    navigate["message"] = last_card.lock().unwrap().clone();
+    navigate["message"]["components"] = first_page.clone();
+    dispatch(&mut socket, 1214, "INTERACTION_CREATE", navigate).await;
+    let page_ack = received(&mut observed, "/interactions/514/offline-interaction/callback").await;
+    let model_menu = &page_ack["data"]["components"][0]["components"][0];
+    assert_eq!(model_menu["options"][0]["label"], "fixture/model-8");
+    let select = json!({"custom_id":model_menu["custom_id"],"component_type":3,"values":["8"]});
+    let mut click = interaction("511", 3, select);
+    click["message"] = last_card.lock().unwrap().clone();
+    click["message"]["components"] = page_ack["data"]["components"].clone();
+    let mut other_card = click.clone();
+    other_card["id"] = json!("512");
+    other_card["message"]["id"] = json!("701");
+    dispatch(&mut socket, 1215, "INTERACTION_CREATE", other_card).await;
+    assert_eq!(received(&mut observed, "/interactions/512/offline-interaction/callback").await["type"], 4);
+    assert_eq!(store.pending().unwrap(), 0);
+    dispatch(&mut socket, 1216, "INTERACTION_CREATE", click.clone()).await;
+    assert_eq!(received(&mut observed, "/interactions/511/offline-interaction/callback").await["data"]["components"], json!([]));
+    let picked = event(&hub, &store).await;
+    assert_eq!(picked["kind"], "message");
+    assert_eq!(picked["input"]["route"], route);
+    assert_eq!(picked["input"]["messageId"], Value::Null);
+    assert_eq!(picked["input"]["pickerSelection"], json!({"outputId":"model-card","cardId":"700","group":0,"option":8}));
+    click["id"] = json!("513");
+    let last_sequence = 1217;
+    dispatch(&mut socket, last_sequence, "INTERACTION_CREATE", click).await;
+    assert_eq!(received(&mut observed, "/interactions/513/offline-interaction/callback").await["type"], 4);
+    assert_eq!(store.pending().unwrap(), 0);
+
     let send = hub
         .effect(
             "send",
@@ -591,22 +641,22 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     let resume: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
     assert_eq!(resume["op"], 6);
     assert_eq!(resume["d"]["session_id"], "test-session");
-    assert_eq!(resume["d"]["seq"], 1212);
+    assert_eq!(resume["d"]["seq"], last_sequence);
     dispatch(
         &mut resumed,
-        1213,
+        last_sequence + 1,
         "MESSAGE_CREATE",
         message("205", None, "99", "42", "owner DM"),
     )
     .await;
     dispatch(
         &mut resumed,
-        1214,
+        last_sequence + 2,
         "MESSAGE_CREATE",
         message("207", None, "99", "42", "while offline"),
     )
     .await;
-    dispatch(&mut resumed, 1215, "RESUMED", json!({"trace":[]})).await;
+    dispatch(&mut resumed, last_sequence + 3, "RESUMED", json!({"trace":[]})).await;
     assert_eq!(event(&hub, &store).await["input"]["messageId"], "207");
     assert_eq!(event(&hub, &store).await["kind"], "reconnect");
     hub.stop().await.unwrap();

@@ -65,7 +65,7 @@ const SCHEMA = `
     source_id TEXT NOT NULL, route TEXT NOT NULL, text TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending'
       CHECK(state IN ('pending','sending','sent','uncertain','failed')),
-    remote_id TEXT, error TEXT, reply_to TEXT
+    remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT
   );
   CREATE INDEX IF NOT EXISTS outputs_queue ON outputs(state, sequence);
   CREATE TABLE IF NOT EXISTS approvals (
@@ -99,6 +99,7 @@ interface OutputRow {
   source_id: string;
   route: string;
   reply_to: string | null;
+  picker: string | null;
   text: string;
   state: OutputRecord["state"];
   remote_id: string | null;
@@ -114,6 +115,7 @@ const toInput = (row: InputRow): InputRecord => {
 const toOutput = (row: OutputRow): OutputRecord => ({
   id: row.id, sourceId: row.source_id, route: JSON.parse(row.route) as Route,
   ...(row.reply_to === null ? {} : { replyTo: JSON.parse(row.reply_to) as NonNullable<OutputRecord["replyTo"]> }),
+  ...(row.picker === null ? {} : { picker: JSON.parse(row.picker) as NonNullable<OutputRecord["picker"]> }),
   text: row.text, state: row.state, remoteId: row.remote_id, error: row.error,
 });
 const toApproval = (row: ApprovalRow): Approval => ({
@@ -123,6 +125,7 @@ const inboundData = (input: Inbound): Inbound => ({
   id: input.id, route: input.route, messageId: input.messageId, text: input.text,
   ...(input.interactionId === undefined ? {} : { interactionId: input.interactionId }),
   ...(input.invocationId === undefined ? {} : { invocationId: input.invocationId }),
+  ...(input.pickerSelection === undefined ? {} : { pickerSelection: input.pickerSelection }),
   ...(input.reply === undefined ? {} : { reply: input.reply }),
   ...(input.discordContext === undefined ? {} : { discordContext: input.discordContext }),
   receivedAt: input.receivedAt, attachments: input.attachments,
@@ -189,6 +192,7 @@ export class Store implements StorePort {
       db.run(SCHEMA);
       const outputColumns = db.query("PRAGMA table_info(outputs)").all() as Array<{ name: string }>;
       if (!outputColumns.some(column => column.name === "reply_to")) db.run("ALTER TABLE outputs ADD COLUMN reply_to TEXT");
+      if (!outputColumns.some(column => column.name === "picker")) db.run("ALTER TABLE outputs ADD COLUMN picker TEXT");
       this.db = db;
       this.writerLock = lock;
     } catch (error) {
@@ -200,11 +204,14 @@ export class Store implements StorePort {
 
   receive(input: Inbound, target: string | null, metadata: Readonly<Record<string, string>> = {}, workflow: WorkflowActivation | null = null): boolean {
     const slackInvocation = input.route.platform === "slack" && typeof input.invocationId === "string" && /^[a-f0-9]{64}$/.test(input.invocationId);
-    if (input.interactionId !== undefined && (input.route.platform !== "discord" || typeof input.interactionId !== "string" || !/^[1-9]\d{0,19}$/.test(input.interactionId))
+    const selection = input.pickerSelection;
+    if (selection ? input.messageId !== null || input.interactionId !== undefined || input.invocationId !== undefined
+      || input.id !== `picker:${selection.outputId}` || target !== "main"
+      : input.interactionId !== undefined && (input.route.platform !== "discord" || typeof input.interactionId !== "string" || !/^[1-9]\d{0,19}$/.test(input.interactionId))
       || (input.invocationId !== undefined && !slackInvocation)
       || (slackInvocation && (input.messageId !== null || input.interactionId !== undefined))
       || (input.messageId === null ? input.interactionId === undefined && !slackInvocation : typeof input.messageId !== "string" || !input.messageId.length)) {
-      throw new Error("Inbound event requires a real message ID, Discord interaction snowflake, or scoped Slack invocation");
+      throw new Error("Inbound event requires a real message ID, Discord interaction snowflake, scoped Slack invocation, or valid picker selection");
     }
     return this.db.transaction(() => {
       const existing = this.input(input.id);
@@ -482,7 +489,7 @@ export class Store implements StorePort {
     }).immediate();
   }
 
-  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: { id: string; text: string }, headModel?: HeadModelChange): boolean {
+  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange): boolean {
     return this.db.transaction(() => {
       const input = this.input(id);
       if (!input || input.state === "done" || input.state === "cancelled" || input.state === state) return false;
@@ -648,7 +655,8 @@ export class Store implements StorePort {
       const existing = this.output(output.id);
       if (existing) {
         if (existing.sourceId !== output.sourceId || routeKey(existing.route) !== routeKey(output.route)
-          || existing.text !== output.text || output.replyTo !== undefined && (!existing.replyTo
+          || existing.text !== output.text || !isDeepStrictEqual(existing.picker, output.picker)
+          || output.replyTo !== undefined && (!existing.replyTo
             || existing.replyTo.messageId !== output.replyTo.messageId
             || physicalRouteKey(existing.replyTo.route) !== physicalRouteKey(output.replyTo.route))) {
           throw new Error(`Output identity conflict: ${output.id}`);
@@ -669,8 +677,9 @@ export class Store implements StorePort {
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(replyTo.route))) {
         throw new Error(`Output reply differs from its source: ${output.id}`);
       }
-      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to) VALUES (?, ?, ?, ?, ?)")
-        .run(output.id, output.sourceId, JSON.stringify(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null).changes === 1;
+      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to, picker) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(output.id, output.sourceId, JSON.stringify(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
+          output.picker ? JSON.stringify(output.picker) : null).changes === 1;
     }).immediate();
   }
 

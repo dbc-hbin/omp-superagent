@@ -5,9 +5,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::adapter::EffectError;
+use crate::picker::Picker;
 
 use super::Inner;
 use super::api::secure_url;
+use super::picker::menu_blocks;
 use super::wire::{Attachment, Route, Ts, file_id, js_len, same_optional, short_hash};
 
 const FILE_LIMIT: usize = 8 * 1024 * 1024;
@@ -18,6 +20,7 @@ pub(super) struct Output {
     id: String,
     route: Route,
     text: String,
+    picker: Option<Picker>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +133,22 @@ impl Inner {
             return Err(EffectError::rejected(
                 "Slack text output exceeds the safe 8 MiB upload limit",
             ));
+        }
+        if let Some(spec) = &output.picker {
+            let _delivery = self.ctx.pickers.delivery().await;
+            if let Some(opening) = self.ctx.pickers.open(&output.id, json!(output.route), &output.text, spec)? {
+                let receipt = self
+                    .post(
+                        &output.route,
+                        &opening.menu.text,
+                        Some(menu_blocks(&opening.menu)),
+                    )
+                    .await?
+                    .as_str()
+                    .to_owned();
+                self.ctx.pickers.posted(opening, receipt.clone())?;
+                return Ok(receipt);
+            }
         }
         if js_len(&output.text) <= TEXT_LIMIT {
             return self

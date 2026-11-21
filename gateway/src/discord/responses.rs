@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::picker::PREFIX;
+
 use super::dialogs::{Dialog, PAGE, Question};
 use super::model::{ComponentRow, Interaction, utf16};
 use super::rest::broken;
@@ -13,11 +15,11 @@ use super::{
 };
 
 #[derive(Deserialize)]
-struct Callback {
-    custom_id: String,
-    component_type: Option<u8>,
+pub(super) struct Callback {
+    pub custom_id: String,
+    pub component_type: Option<u8>,
     #[serde(default)]
-    values: Vec<String>,
+    pub values: Vec<String>,
     #[serde(default)]
     components: Vec<ComponentRow>,
 }
@@ -207,6 +209,9 @@ impl State {
         let Ok(callback) = serde_json::from_value::<Callback>(data.clone()) else {
             return Ok(());
         };
+        if callback.custom_id.starts_with(PREFIX) {
+            return self.picker_interaction(&interaction, &callback, ready).await;
+        }
         let Some((token, action)) = cards::split_control(&callback.custom_id) else {
             return Ok(());
         };

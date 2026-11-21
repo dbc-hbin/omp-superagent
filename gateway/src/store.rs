@@ -188,7 +188,7 @@ fn set_meta(db: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn now() -> Result<i64> {
+pub(crate) fn now() -> Result<i64> {
     Ok(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
     )?)

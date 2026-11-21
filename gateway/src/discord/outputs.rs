@@ -5,6 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
+use crate::picker::Picker;
+
+use super::picker::components as picker_components;
 use super::rest::{FILE_LIMIT, Rest, broken, no_mentions};
 use super::{
     Effect, EffectError, State, markdown,
@@ -24,6 +27,7 @@ pub(super) struct Output {
     route: Route,
     text: String,
     reply_to: Option<MessageReference>,
+    picker: Option<Picker>,
 }
 
 #[derive(Deserialize)]
@@ -162,11 +166,21 @@ impl State {
         let channel = timeout_at(deadline, self.destination(&output.route))
             .await
             .map_err(|_| not_started())??;
-        let payloads = Payload::split(
-            &output.text,
-            &nonce(&output.id, &output.route, 0),
-            MESSAGE_PARTS,
-        )?;
+        let first_nonce = nonce(&output.id, &output.route, 0);
+        let _delivery = match &output.picker {
+            Some(_) => Some(self.ctx.pickers.delivery().await),
+            None => None,
+        };
+        let opening = match &output.picker {
+            Some(spec) => self.ctx.pickers.open(&output.id, json!(output.route), &output.text, spec)?,
+            None => None,
+        };
+        let payloads = match &opening {
+            Some(card) => vec![Payload::new(
+                &card.menu.text, &first_nonce, Some(picker_components(&card.menu)),
+            )?],
+            None => Payload::split(&output.text, &first_nonce, MESSAGE_PARTS)?,
+        };
         let mut first = None;
         for (part, mut payload) in payloads.into_iter().enumerate() {
             payload.create(&nonce(&output.id, &output.route, part));
@@ -201,9 +215,24 @@ impl State {
                 }
                 Err(error) => return Err(error),
             };
+            if let Some(card) = &opening {
+                let mut controls = sent.components.iter().flat_map(|row| &row.components)
+                    .filter_map(|component| component.custom_id.as_deref());
+                if controls.next() != Some(card.menu.select_id.as_str())
+                    || !controls.eq(card.menu.buttons.iter().map(|item| item.control.as_str()))
+                {
+                    // Discord can return an older message for an enforced nonce.
+                    // Do not register controls that were not actually posted.
+                    return Err(broken("Discord picker send did not confirm these controls"));
+                }
+            }
             first.get_or_insert(sent.id);
         }
-        first.ok_or_else(|| broken("Discord message was not sent"))
+        let first = first.ok_or_else(|| broken("Discord message was not sent"))?;
+        if let Some(card) = opening {
+            self.ctx.pickers.posted(card, first.clone())?;
+        }
+        Ok(first)
     }
 
     pub(super) async fn activity(

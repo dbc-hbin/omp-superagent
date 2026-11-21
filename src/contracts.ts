@@ -89,6 +89,13 @@ export interface Inbound {
   interactionId?: string;
   /** Slack's scoped SHA256 trigger fingerprint, never a message timestamp or capability. */
   invocationId?: string;
+  /** Authenticated card selection; not a platform message, approval, or topic boundary. */
+  readonly pickerSelection?: {
+    readonly outputId: string;
+    readonly cardId: string;
+    readonly group: number;
+    readonly option: number;
+  };
   text: string;
   receivedAt: number;
   attachments: Attachment[];
@@ -186,6 +193,17 @@ export interface InputRecord extends Inbound {
 }
 
 export type OutputState = "pending" | "sending" | "sent" | "uncertain" | "failed";
+export type HeadPicker = {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly expiresAt: number;
+  readonly current?: string;
+  readonly groups: readonly { readonly label: string; readonly options: readonly string[] }[];
+} & (
+  | { readonly kind: "model"; readonly currentProvider?: string }
+  | { readonly kind: "effort"; readonly forModel: LaneModel }
+);
+
 export interface KickoffHold {
   readonly outputId: string;
   readonly state: OutputState | "missing";
@@ -196,6 +214,7 @@ export interface OutputRecord {
   route: Route;
   /** Durable original owner message, only in the same physical conversation. */
   replyTo?: MessageReference;
+  readonly picker?: HeadPicker;
   text: string;
   state: OutputState;
   remoteId: string | null;
@@ -277,7 +296,7 @@ export interface StorePort {
   progress(id: string, generation: number, sessionId: string, eventId: string, text: string): boolean;
   recordLaneReport(id: string, generation: number, sessionId: string, eventId: string, report: LaneReport, observedAt?: number): boolean;
   resolveLaneWaiting(id: string, generation: number, sessionId: string, kind: "tool" | "approval", nativeId: string): boolean;
-  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: { id: string; text: string }, headModel?: HeadModelChange): boolean;
+  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange): boolean;
   settleCronControl(inputId: string, update: CronUpdate): boolean;
   resolveLaneInput(controlId: string, laneId: string, inputId: string, output: { readonly id: string; readonly text: string }): boolean;
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[];

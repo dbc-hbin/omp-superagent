@@ -353,6 +353,10 @@ const slackCommand = (identity: string, destination: Route, text = "/status"): I
   ...message(`slack-command:${identity}`, destination, text), messageId: null,
   invocationId: createHash("sha256").update(identity).digest("hex"),
 });
+const pickerClick = (output: OutputRecord, group: number, option: number): Inbound => ({
+  id: `picker:${output.id}`, route: output.route, text: "", messageId: null, receivedAt: 300, attachments: [],
+  pickerSelection: { outputId: output.id, cardId: `remote-${output.id}`, group, option },
+});
 async function admit(runtime: Superagent, input: Inbound): Promise<void> {
   await runtime.receive(input);
   await runtime.kick();
@@ -3019,6 +3023,74 @@ describe("messenger head session controls", () => {
     expect(main.prompts).toEqual([]);
   });
 
+  test("picker selections stay on their opening topic and reject effort for a different model", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    const destination = route(null, { guildId: null });
+    await runtime.start();
+    await admit(runtime, message("1001", destination, "/new"));
+    await admit(runtime, message("1002", destination, "/effort"));
+    await admit(runtime, message("1003", destination, "/model"));
+    const effort = messenger.sent.find(output => output.sourceId === "1002");
+    const model = messenger.sent.find(output => output.sourceId === "1003");
+    if (!effort?.picker || !model?.picker) throw new Error("HEAD did not send both menus");
+    expect(model.picker.groups).toEqual([{ label: "fixture", options: ["fixture/capable", "fixture/efficient"] }]);
+    expect(effort.picker.groups).toEqual([{ label: "Effort", options: ["off", "minimal", "high"] }]);
+    await admit(runtime, message("1004", destination, "/main"));
+    const modelSelection = pickerClick(model, 0, 1);
+    await expect(runtime.receive({ ...modelSelection, route: destination })).rejects.toThrow("original owner command and card");
+    await admit(runtime, modelSelection);
+    await admit(runtime, modelSelection);
+    expect(main.state.model).toEqual(otherModel);
+    expect(main.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+    expect(store.input(modelSelection.id)?.route).toEqual(model.route);
+    expect(messenger.sent.at(-1)?.route).toEqual(model.route);
+
+    const staleEffort = pickerClick(effort, 0, 1);
+    await admit(runtime, staleEffort);
+    expect(store.input(staleEffort.id)?.state).toBe("cancelled");
+    expect(main.commands.filter(command => command.type === "set_thinking_level")).toEqual([]);
+    await admit(runtime, message("1005", destination, "/effort"));
+    const freshEffort = messenger.sent.at(-1);
+    if (!freshEffort?.picker) throw new Error("HEAD did not refresh the effort menu");
+    await admit(runtime, pickerClick(freshEffort, 0, 1));
+    expect(main.state.thinkingLevel).toBe("minimal");
+    expect(main.prompts).toEqual([]);
+  });
+
+  test.each(["unconfirmed", "wrong-card"] as const)("a %s menu receipt cannot authorize a HEAD model change", async receipt => {
+    const { runtime, main, store, messenger } = fixture();
+    await runtime.start();
+    if (receipt === "unconfirmed") messenger.sendError = new DeliveryError("Lost fixture send receipt", "uncertain");
+    await admit(runtime, message("701", route(), "/model"));
+    messenger.sendError = undefined;
+    const output = messenger.attempted.find(candidate => !!candidate.picker);
+    if (!output) throw new Error("Expected an attempted menu delivery");
+    const click = pickerClick(output, 0, 1);
+    const original = click.pickerSelection;
+    if (!original) throw new Error("Expected a picker receipt");
+    await admit(runtime, receipt === "wrong-card" ? { ...click, pickerSelection: { ...original, cardId: "another-card" } } : click);
+    expect(store.input(click.id)?.state).toBe("cancelled");
+    expect(main.state.model).toEqual(executionModel);
+    expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+  });
+
+  test("the selected provider disambiguates the full identity and keeps native model IDs with spaces", async () => {
+    const { runtime, main, messenger } = fixture();
+    const selected = { provider: "local/team", id: "model" };
+    const spaced = { provider: "local/team", id: "My Model" };
+    main.models.push({ provider: "local", id: "team/model" }, selected, spaced);
+    await runtime.start();
+    for (const [index, model] of [selected, spaced].entries()) {
+      await admit(runtime, message(`picker-exact-${index}`, route(), "/model"));
+      const output = messenger.sent.at(-1);
+      if (!output?.picker) throw new Error("Expected the native catalogue menu");
+      const group = output.picker.groups.findIndex(candidate => candidate.label === model.provider);
+      const option = output.picker.groups[group]?.options.indexOf(`${model.provider}/${model.id}`) ?? -1;
+      await admit(runtime, pickerClick(output, group, option));
+      expect(main.state.model).toEqual(model);
+    }
+  });
+
   test("model changes and queries preserve legitimate native model-default effort rather than inventing off", async () => {
     const { runtime, main, store, messenger } = fixture();
     main.state.thinkingLevel = undefined;
@@ -3056,6 +3128,10 @@ describe("messenger head session controls", () => {
     await runtime.start();
     main.catalogSuccess = false;
     await admit(runtime, message("head-failed-catalog", route(), "/model list"));
+    await admit(runtime, message("head-model-status-without-catalogue", route(), "/model"));
+    const status = messenger.sent.find(output => output.sourceId === "head-model-status-without-catalogue");
+    expect(status?.text).toContain("fixture/capable");
+    expect(status?.picker).toBeUndefined();
     main.levelsSuccess = false;
     await admit(runtime, message("head-failed-levels", route(), "/effort"));
     main.levelsSuccess = true;

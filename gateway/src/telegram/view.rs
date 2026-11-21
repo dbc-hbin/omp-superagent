@@ -1,6 +1,6 @@
-use std::fmt::Write as _;
+mod wire;
 
-use serde::Serialize;
+use std::fmt::Write as _;
 
 use super::{
     approval::Progress,
@@ -10,21 +10,8 @@ use super::{
 
 pub(super) const UNSUPPORTED: &str = "Request cancelled: this dialog cannot safely be represented in Telegram. Use the local OMP interface.";
 
-#[derive(Serialize)]
-struct Button {
-    text: String,
-    callback_data: String,
-}
-
-#[derive(Default, Serialize)]
-pub(super) struct Keyboard {
-    inline_keyboard: Vec<Vec<Button>>,
-}
-
-pub(super) struct View {
-    pub text: String,
-    pub keyboard: Keyboard,
-}
+pub(super) use wire::{Keyboard, View};
+use wire::{Button, truncate};
 
 pub(super) struct Renderer<'a> {
     pub token: &'a str,
@@ -258,21 +245,4 @@ impl Selection<'_> {
             Self::All => true,
         }
     }
-}
-
-fn truncate(text: &str, units: usize) -> String {
-    if text.encode_utf16().count() <= units {
-        return text.to_owned();
-    }
-    let mut remaining = units - 1;
-    let mut prefix = String::new();
-    for ch in text.chars() {
-        let Some(next) = remaining.checked_sub(ch.len_utf16()) else {
-            break;
-        };
-        prefix.push(ch);
-        remaining = next;
-    }
-    prefix.push('…');
-    prefix
 }

@@ -14,7 +14,13 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio_util::task::TaskTracker;
 
-use crate::{discord::Discord, slack::Slack, store::Store, telegram::Telegram};
+use crate::{
+    discord::Discord,
+    picker::{Pickers, Selection},
+    slack::Slack,
+    store::Store,
+    telegram::Telegram,
+};
 
 #[derive(Debug)]
 pub struct EffectError {
@@ -62,6 +68,7 @@ pub trait Adapter: Send + Sync {
 #[derive(Clone)]
 pub struct Context {
     pub http: reqwest::Client,
+    pub(crate) pickers: Pickers,
     platform: &'static str,
     store: Arc<Store>,
     owner: Arc<OnceLock<Weak<Hub>>>,
@@ -70,6 +77,15 @@ pub struct Context {
 }
 
 impl Context {
+    pub(crate) async fn admit_picker(&self, selection: &Selection) -> Result<(), EffectError> {
+        let ctx = self.clone();
+        let event = selection.event.clone();
+        let failure = || EffectError::uncertain("Selector admission could not be confirmed");
+        tokio::task::spawn_blocking(move || ctx.admit(event))
+            .await.map_err(|_| failure())?.map_err(|_| failure())?;
+        self.pickers.admitted(selection)
+    }
+
     pub async fn ready(&self) -> Result<()> {
         self.ready.clone().wait_for(|v| *v).await?;
         Ok(())
@@ -212,6 +228,7 @@ impl Hub {
         let owner = Arc::new(OnceLock::new());
         let ctx = |platform| Context {
             http: http.clone(),
+            pickers: Pickers::default(),
             store: store.clone(),
             ready: rx.clone(),
             platform,

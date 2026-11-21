@@ -23,6 +23,8 @@ use crate::slack::{Config, Slack, api::Api};
 
 #[path = "card_tests.rs"]
 mod cards;
+#[path = "picker_tests.rs"]
+mod picker;
 
 const LIMIT: Duration = Duration::from_secs(5);
 type Peer = WebSocketStream<TcpStream>;

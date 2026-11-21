@@ -528,7 +528,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
         expect(response.route).toEqual(threadRoute);
         expect(response.text).not.toContain("local-test-only");
         expect(response.text).not.toContain("mock://");
-        return { input, text: response.text };
+        return { input, text: response.text, output: response };
       };
       const visibleNumber = (text: string, value: number) => {
         expect(Number.isFinite(value)).toBe(true);
@@ -625,8 +625,24 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       // The frozen role default differs from the later transcript model, and
       // its thinking policy differs from the later transcript effort. Resume
       // must restore both sources independently, not reapply the preset.
-      await commandReply("207", `/model ${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`);
-      await commandReply("208", `/effort ${Effort.Minimal}`);
+      const pick = async (output: OutputRecord, value: string) => {
+        const groups = output.picker?.groups ?? [];
+        const group = groups.findIndex(entry => entry.options.includes(value));
+        const option = groups[group]?.options.indexOf(value) ?? -1;
+        if (option < 0) throw new Error("The installed OMP did not advertise the fixture selection");
+        const id = `picker:${output.id}`;
+        const cardId = store.output(output.id)?.remoteId;
+        if (!cardId) throw new Error("The fixture menu has no confirmed delivery receipt");
+        await messenger.deliver({
+          id, route: output.route, messageId: null, text: "", receivedAt: Date.now(), attachments: [],
+          pickerSelection: { outputId: output.id, cardId, group, option },
+        });
+        await until(() => store.input(id)?.state === "done" && delivered(id), `HEAD applied picker value ${value}`);
+      };
+      const { output: modelPicker } = await commandReply("207", "/model");
+      await pick(modelPicker, `${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`);
+      const { output: effortPicker } = await commandReply("208", "/effort");
+      await pick(effortPicker, Effort.Minimal);
       expect(await initial.client.getState()).toMatchObject({ model: modelFixtureModels.changedDefault,
         thinkingLevel: Effort.Minimal, modelSettings: lowPreset, sessionId: headState.sessionId });
 

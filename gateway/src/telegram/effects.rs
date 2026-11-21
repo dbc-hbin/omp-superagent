@@ -1,5 +1,6 @@
+mod output;
+
 use futures_util::FutureExt;
-use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -9,18 +10,10 @@ use crate::{adapter::EffectError, store::js_trim};
 use super::{
     Core,
     ingress::Message,
-    model::{Chat, ChatKind, Identity, Route, SAFE_INTEGER, Sender, decode, hash, positive_id},
+    model::{Chat, ChatKind, Identity, Route, SAFE_INTEGER, Sender, decode, positive_id},
 };
 
 pub(super) const TEXT_LIMIT: usize = 4096;
-const UPLOAD_LIMIT: usize = 50 * 1024 * 1024;
-
-#[derive(Deserialize)]
-struct Output<'a> {
-    id: &'a str,
-    route: Route,
-    text: &'a str,
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,9 +129,7 @@ impl Core {
             .route(me, &chat, route.thread_id.as_deref().and_then(positive_id))
             .is_some_and(|actual| actual.same_physical(route))
         {
-            return Err(EffectError::rejected(
-                "Telegram destination identity changed",
-            ));
+            return Err(EffectError::rejected("Telegram destination identity changed"));
         }
         Ok(chat)
     }
@@ -164,40 +155,6 @@ impl Core {
         Err(EffectError::uncertain(
             "Telegram mutation returned an unexpected message identity",
         ))
-    }
-
-    async fn send_output(&self, me: &Identity, output: Output<'_>) -> Result<String, EffectError> {
-        let route = &output.route;
-        self.destination(me, route).await?;
-        if output.text.len() > UPLOAD_LIMIT {
-            return Err(EffectError::rejected(
-                "Telegram text document exceeds the 50 MiB upload limit",
-            ));
-        }
-        let message = if output.text.encode_utf16().count() <= TEXT_LIMIT {
-            let mut body = topic_payload(route);
-            body["text"] = json!(if output.text.is_empty() {
-                "(empty output)"
-            } else {
-                output.text
-            });
-            body["link_preview_options"] = json!({"is_disabled":true});
-            body["allow_paid_broadcast"] = json!(false);
-            self.api.call("sendMessage", &body).await?
-        } else {
-            let document = Part::bytes(output.text.as_bytes().to_vec())
-                .file_name(format!("omp-{}.txt", hash(output.id)));
-            let mut body = Form::new()
-                .text("chat_id", route.channel_id.clone())
-                .text("caption", "Full output is attached.")
-                .text("allow_paid_broadcast", "false")
-                .part("document", document);
-            if let Some(thread) = &route.thread_id {
-                body = body.text("message_thread_id", thread.clone());
-            }
-            self.api.send_document(body).await?
-        };
-        self.receipt(me, route, &message)
     }
 
     async fn set_activity(

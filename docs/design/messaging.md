@@ -122,6 +122,18 @@ is a separate explicit apply, not a side effect of setup, doctor or start. Comma
 intake must not wait for a model; Discord's ephemeral admission reply and Slack's
 Socket Mode acknowledgement are not the actual command result.
 
+The head sends model and effort menus through its normal outbox. The Gateway
+renders native components and binds each click to the owner, exact sent card,
+physical conversation, and displayed page. Navigation and cancellation only
+edit the card. One final click admits an ordinary durable control receipt on
+the original logical topic without inventing a message ID; accepting the click
+is not a native mutation receipt. The head requires the recorded sent receipt
+for the exact card before changing settings. Unselected cards expire after five
+minutes, on Gateway restart, or when a new menu of the same kind replaces them
+on the same route.
+The interaction pattern was compared with [Hermes Agent at 242315ce](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/gateway/slash_commands_model.py#L516-L567);
+the catalogue and mutation remain native OMP, and no upstream picker code is used.
+
 Thread capability comes from the authenticated adapter. Permission or network
 failure is not permission to fall back to another destination. Preserve the
 original binding when creating a sibling topic and journal creation intent before

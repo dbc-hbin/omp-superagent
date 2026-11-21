@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{adapter::EffectError, commands::accepts_text, store::js_trim};
+use crate::{adapter::EffectError, commands::accepts_text, picker::PREFIX, store::js_trim};
 
 use super::{
     Core,
@@ -255,6 +255,13 @@ impl Core {
     pub(super) async fn process(&self, update: Update) -> Result<(), EffectError> {
         let me = self.identity().await?;
         if let Some(callback) = update.callback_query {
+            if let Some(control) = callback
+                .data
+                .as_deref()
+                .filter(|data| data.starts_with(PREFIX))
+            {
+                return self.handle_picker(&me, &callback, control).await;
+            }
             return self.handle_callback(&me, &callback).await;
         }
         let Some(message) = update.message.or(update.edited_message) else {

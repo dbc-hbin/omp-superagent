@@ -9,6 +9,7 @@ mod effects;
 mod files;
 mod ingress;
 mod model;
+mod picker;
 mod poll;
 mod view;
 

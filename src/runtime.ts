@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { Approval, ApprovalResolution, DialogResponse, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, InputRecord, Lane, LaneModel, LaneModelChoice, LanePresetSnapshot, ResolvedLanePreset, ModelPreset, Messenger, Route, StorePort, ThreadInfo, ThreadUpdate, WorkflowChoice } from "./contracts";
 import { authorizeDiscordPurpose, discordPurposeRequest } from "./discord-context";
-import { HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type HeadModelChange } from "./contracts";
+import { HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type HeadModelChange, type HeadPicker } from "./contracts";
 import { authorizeRoute, credentialEnvNames, type Config, hostPaths, privateDirectory } from "./config";
 import { DeliveryError } from "./delivery";
 import { HostConnection, type HostOptions, startHost } from "./host";
@@ -26,6 +26,7 @@ import { acknowledgeDecision, decisionRequestId, decisionViews, validateDecision
 
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 const presetSyncIntervalMs = 30_000;
+const headPickerLifetimeMs = 5 * 60_000;
 const dialogs = new Set(["select", "confirm", "input", "editor", "ask"]);
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 40 * 1024 * 1024;
@@ -121,6 +122,7 @@ const laneDecisionReview = "lane-decision-review:";
 interface HeadCommand {
   name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "model" | "effort" | "resolve" | "cron";
   argument: string;
+  readonly picker?: true;
 }
 interface HeadRestart extends GatewayRestartRequest {
   ownerPid: number;
@@ -1224,7 +1226,25 @@ export class Superagent {
   async receive(input: Inbound): Promise<void> {
     if (this.stopped) throw new Error("Controller is stopped");
     this.authorized(input.route);
-    const eventId = this.eventOrderId(input);
+    const selection = input.pickerSelection;
+    if (selection) {
+      const output = this.store.output(selection.outputId);
+      const picker = output?.picker;
+      const source = output && this.store.input(output.sourceId);
+      const opener = source && this.headCommand(source);
+      const argument = Number.isSafeInteger(selection.group) && selection.group >= 0
+        && Number.isSafeInteger(selection.option) && selection.option >= 0
+        ? picker?.groups[selection.group]?.options[selection.option] : undefined;
+      if (!output || !picker || opener?.name !== picker.kind || opener.argument || !argument
+        || input.id !== `picker:${output.id}` || routeKey(input.route) !== routeKey(output.route)
+        || typeof selection.cardId !== "string" || !selection.cardId
+        || input.messageId !== null || input.interactionId !== undefined || input.invocationId !== undefined
+        || input.text !== "" || input.attachments.length) {
+        throw new DeliveryError("Picker selection does not match its original owner command and card", "rejected");
+      }
+      input = { ...input, route: output.route, text: `/${picker.kind} ${argument}` };
+    }
+    const eventId = selection ? null : this.eventOrderId(input);
     const existing = this.store.input(input.id);
     if (existing) {
       if (physicalRouteKey(existing.route) !== physicalRouteKey(input.route)) throw new Error("Inbound physical identity conflict");
@@ -1235,11 +1255,12 @@ export class Superagent {
       return;
     }
     let metadata: Readonly<Record<string, string>> = {};
-    if (this.isDm(input.route) && input.route.platform === "slack") {
+    // A card click keeps the original logical topic; it is not a DM boundary.
+    if (!selection && this.isDm(input.route) && input.route.platform === "slack") {
       const admission = this.slackDmAdmission(input);
       input = admission.input;
       metadata = admission.metadata;
-    } else if (this.isDm(input.route)) {
+    } else if (!selection && this.isDm(input.route)) {
       if (eventId === null) throw new Error("Cannot order this DM input");
       const physical = physicalRoute(input.route);
       const command = input.text.trim();
@@ -2477,7 +2498,8 @@ export class Superagent {
     const match = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/.exec(input.text.trim());
     if (!match || this.store.getMeta(`user-source:${input.id}`) !== "true"
       || this.store.getMeta(`handoff-source:${input.id}`)) return null;
-    return { name: match[1] as HeadCommand["name"], argument: (match[2] ?? "").trim() };
+    return { name: match[1] as HeadCommand["name"], argument: (match[2] ?? "").trim(),
+      ...(input.pickerSelection ? { picker: true } : {}) };
   }
 
   private restartFence(): HeadRestart | null {
@@ -3018,7 +3040,7 @@ export class Superagent {
   }
 
   private headPresetCommand(command: HeadCommand): { name?: string; global: boolean; error?: string } | undefined {
-    if (command.name !== "model" || !/^preset(?:\s|$)/.test(command.argument)) return undefined;
+    if (command.picker || command.name !== "model" || !/^preset(?:\s|$)/.test(command.argument)) return undefined;
     const arguments_ = command.argument.split(/\s+/).slice(1);
     const flags = arguments_.filter(argument => argument.startsWith("-"));
     const names = arguments_.filter(argument => !argument.startsWith("-"));
@@ -3092,7 +3114,7 @@ export class Superagent {
         "Supported owner commands (Slack uses ! instead of /, e.g. !status):",
         "/help; /status; /context — read current shared HEAD, even while busy; no model turn.",
         "/usage — view account quotas and reset times from the configured OMP profile; no model turn.",
-        "/model; /model list; /model <exact provider/id>; /model preset; /model preset list; /model preset <exact-name>; /effort; /effort <advertised-level> — shared HEAD session only by default; changes require idle, unambiguous state.",
+        "/model and /effort open selection menus. Text commands: /model list; /model <exact provider/id>; /model preset; /model preset list; /model preset <exact-name>; /effort <advertised-level>. Changes require idle, unambiguous HEAD state.",
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
         "/cron [help] — schedule and manage one-time or recurring jobs in this conversation.",
@@ -3367,14 +3389,15 @@ export class Superagent {
       return;
     }
     const presetCommand = this.headPresetCommand(command);
-    const reply = (text: string, outcome: "done" | "cancelled" | "uncertain" = "done") => {
+    const reply = (text: string, outcome: "done" | "cancelled" | "uncertain" = "done", picker?: HeadPicker) => {
       const scope = presetCommand?.global ? "HEAD preset command (existing lanes unchanged)." : "HEAD session only (not lanes or global defaults).";
-      this.store.settle(input.id, outcome, { id: `${input.id}:head-control`, text: `${scope} ${text}` });
+      this.store.settle(input.id, outcome, { id: `${input.id}:head-control`, text: `${scope} ${text}`, ...(picker ? { picker } : {}) });
     };
     if (command.name === "stop") { await this.stopControl(input, stopTarget ?? this.stopTarget(input, command)); return; }
     if (command.name === "resolve") { this.resolveControl(input, command); return; }
     if (presetCommand?.error) { reply(presetCommand.error, "cancelled"); return; }
     const mutation = !this.readOnlyHeadCommand(command);
+    const prefix = input.route.platform === "slack" ? "!" : "/";
     let submitted = false;
     try {
       const live = this.live.get("main");
@@ -3397,8 +3420,54 @@ export class Superagent {
           const levels = await this.thinkingLevels(live);
           state = await this.state(live);
           if (isLaneModel(model) && !sameLaneModel(model, state.model)) throw new Error("Native model changed while reading effort capabilities");
-          reply(`${this.headStatus(state)}. Selectable effort levels: ${levels.join(", ") || "none"}. Native auto mode is not exposed by this query.`);
-        } else reply(this.headStatus(state));
+          reply(`${this.headStatus(state)}. Selectable effort levels: ${levels.join(", ") || "none"}. Native auto mode is not exposed by this query.`, "done",
+            levels.length && isLaneModel(model) ? {
+              kind: "effort", forModel: { provider: model.provider, id: model.id }, sessionId: state.sessionId,
+              generation: live.generation, expiresAt: Date.now() + headPickerLifetimeMs,
+              ...(state.thinkingLevel ? { current: state.thinkingLevel } : {}),
+              groups: [{ label: "Effort", options: levels }],
+            } : undefined);
+        } else if (command.name === "model") {
+          const models = await this.availableModels().catch(() => null);
+          state = await this.state(live);
+          if (!models) {
+            reply(`${this.headStatus(state)}. The native model catalogue is unavailable; no menu was opened.`);
+            return;
+          }
+          const providers = new Map<string, string[]>();
+          for (const model of models) {
+            const identity = laneModelArgument(model);
+            const options = providers.get(model.provider);
+            if (options) options.push(identity);
+            else providers.set(model.provider, [identity]);
+          }
+          reply(`${this.headStatus(state)}. Use ${prefix}model list to view exact model IDs.`, "done", providers.size ? {
+            kind: "model", sessionId: state.sessionId, generation: live.generation, expiresAt: Date.now() + headPickerLifetimeMs,
+            ...(isLaneModel(state.model) ? { current: laneModelArgument(state.model), currentProvider: state.model.provider } : {}),
+            groups: [...providers].map(([label, options]) => ({ label, options })),
+          } : undefined);
+        }
+        return;
+      }
+      const selection = input.pickerSelection;
+      let picker: HeadPicker | undefined;
+      if (selection) {
+        // A fast click may reach IPC before the outbox has recorded its result.
+        // An uncertain send is not permission to mutate HEAD.
+        if (this.store.output(selection.outputId)?.state === "sending") await this.outbound;
+        const delivery = this.store.output(selection.outputId);
+        if (!delivery?.picker || delivery.state !== "sent" || delivery.remoteId !== selection.cardId) {
+          reply(`The original menu delivery could not be verified. Open ${prefix}${command.name} again; nothing was changed.`, "cancelled");
+          return;
+        }
+        picker = delivery.picker;
+        state = await this.state(live);
+      }
+      const stalePicker = (current: RuntimeState) => !!picker && (picker.expiresAt <= Date.now()
+        || picker.sessionId !== current.sessionId || picker.generation !== live.generation
+        || picker.kind === "effort" && !sameLaneModel(picker.forModel, current.model));
+      if (stalePicker(state)) {
+        reply(`This menu is stale. Open ${prefix}${command.name} again; nothing was changed.`, "cancelled");
         return;
       }
       const busy = (current: RuntimeState) => this.headRecoveryActive() || !!this.restartFence() || earlierMain || this.initializationHoldsHead() || this.headStopping > 0 || !!this.headCompaction || this.blocked.has("main") || !!live.input || live.busy
@@ -3424,7 +3493,12 @@ export class Superagent {
           await this.requireAvailableModel(model);
         } catch { reply("The exact native preset name is invalid, unavailable or unconfigured; nothing was changed. Use /model preset list.", "cancelled"); return; }
       } else if (command.name === "model") {
-        model = (await this.availableModels()).find(candidate => laneModelArgument(candidate) === command.argument);
+        const available = await this.availableModels();
+        if (selection && picker?.kind === "model") {
+          const group = picker.groups[selection.group];
+          const identity = group?.options[selection.option];
+          model = available.find(candidate => candidate.provider === group?.label && laneModelArgument(candidate) === identity);
+        } else model = available.find(candidate => laneModelArgument(candidate) === command.argument);
         if (!model) { reply("Unknown model. Use /model list, then /model <exact provider/id> with one advertised chat identity.", "cancelled"); return; }
       } else if (command.name === "effort") {
         levels = await this.thinkingLevels(live);
@@ -3434,6 +3508,10 @@ export class Superagent {
       // Recheck identity, ownership and isolation on this same connection before
       // durably admitting the effect. A pending/uncertain receipt is never replayed.
       state = await this.state(live);
+      if (stalePicker(state)) {
+        reply(`This menu is stale. Open ${prefix}${command.name} again; nothing was changed.`, "cancelled");
+        return;
+      }
       if (busy(state)) { reply("HEAD became busy; no change was made. Send a new command after it is idle.", "cancelled"); return; }
       if (state.settingsScope !== "session") { reply("Native session-only settings scope could not be verified; no change was made.", "cancelled"); return; }
       if (command.name === "effort" && !sameLaneModel(capabilityModel, state.model)) {
