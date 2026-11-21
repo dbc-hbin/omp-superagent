@@ -49,6 +49,8 @@ struct Config {
     owner_id: String,
     allowed_guild_ids: HashSet<String>,
     allowed_channel_ids: HashSet<String>,
+    #[serde(default)]
+    require_addressing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

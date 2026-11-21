@@ -281,6 +281,12 @@ Git 추적 파일에 쓰지 않는다. 아래 셋업은 별도 소유자 전용 
    서버 입력은 `allowedGuildIds`와 `allowedChannelIds`를 **모두** 통과해야 한다.
    스레드는 부모 채널 allowlist를 따른다. 빈 배열은 모든 서버 허용이 아니라 서버 입력 차단이다.
    소유자의 1:1 DM은 서버 allowlist와 별개이며 그룹 DM은 대상이 아니다.
+5. 같은 채널에서 여러 봇을 쓰거나 소유자의 일반 대화를 무시하려면 `discord.requireAddressing`을
+   `true`로 설정한다. 허용된 서버의 부모 채널에서는 소유자가 **이 봇을 실제로 멘션**하거나
+   **이 봇이 보낸 메시지에 답장**한 일반 메시지만 받는다. 봇 이름만 적거나 다른 봇을 멘션하는 것은
+   해당하지 않는다. 허용된 스레드에서는 소유자가 멘션이나 답장 없이 대화를 이어갈 수 있다.
+   메시지 수정과 연결 복구 시 가져오는 메시지에도 같은 기준을 적용한다. 소유자 DM, 등록된
+   Discord 앱 슬래시 명령, 승인 버튼의 동작은 그대로다.
 
 ```sh
 read -r -s DISCORD_BOT_TOKEN
@@ -670,6 +676,7 @@ high/middle/low는 명시적 `start`의 전용 초기 설정 턴에서 기존 �
 | `idleMs` | 안전하게 정착한 유휴 레인을 회수하기까지의 시간(밀리초). 필수 0 이상 정수. 헤드는 대상이 아니며 세션 기록은 삭제하지 않는다. |
 | `model` | 선택 항목. 헤드 시작에 사용할 OMP 모델 식별자. 생략 시 기존 OMP 설정을 따른다. 모든 새 레인의 기본값이 아니며 새 레인은 `lane_start`의 model 또는 preset으로 각각 선택한다. 재개는 저장된 레인 선택을 유지한다. |
 | `discord` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedGuildIds`, `allowedChannelIds` 모두 필수. |
+| `discord.requireAddressing` | 선택 불리언, 기본값 `false`. `true`이면 허용된 서버의 부모 채널에서 소유자의 일반 메시지를 받으려면 이 봇을 멘션하거나 이 봇의 메시지에 답장해야 한다. 허용된 스레드와 소유자 DM에는 이 조건이 적용되지 않는다. |
 | `telegram` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedChatIds` 모두 필수. 그룹 chat ID의 음수 부호를 보존한다. |
 | `slack` | 선택 블록. 존재하면 `botTokenEnv`, `appTokenEnv`, `ownerId`, `teamId`, `allowedChannelIds` 모두 필수. |
 | `groupRooms` | 선택 목록. 등록한 방과 사용자에게만 아래 그룹 모드를 열며, 해당 방에서는 운영자도 일반 그룹 권한만 갖는다. 기본값은 빈 목록이다. |

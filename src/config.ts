@@ -9,6 +9,7 @@ export interface DiscordConfig {
   ownerId: string;
   allowedGuildIds: string[];
   allowedChannelIds: string[];
+  requireAddressing?: boolean;
   voice?: DiscordVoiceConfig;
 }
 
@@ -202,6 +203,9 @@ export function parseConfig(value: unknown, path: string): Config {
   const maxHosts = integer(raw.maxHosts, "maxHosts", 2);
   const maxSubagents = integer(raw.maxSubagents, "maxSubagents", maxHosts);
   const discordChannels = discord ? ids(discord.allowedChannelIds, "discord.allowedChannelIds") : [];
+  const requireAddressing = discord?.requireAddressing;
+  if (requireAddressing !== undefined && typeof requireAddressing !== "boolean")
+    throw new Error("discord.requireAddressing must be a boolean");
   const voice = discord?.voice === undefined ? undefined : record(discord.voice, "discord.voice");
   let voiceConfig: DiscordVoiceConfig | undefined;
   if (voice) {
@@ -250,6 +254,7 @@ export function parseConfig(value: unknown, path: string): Config {
       ownerId: id(discord.ownerId, "discord.ownerId", /^\d+$/),
       allowedGuildIds: ids(discord.allowedGuildIds, "discord.allowedGuildIds"),
       allowedChannelIds: discordChannels,
+      requireAddressing: requireAddressing ?? false,
       ...(voiceConfig ? { voice: voiceConfig } : {}),
     } } : {}),
     ...(telegram ? { telegram: {

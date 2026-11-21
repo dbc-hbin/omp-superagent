@@ -45,6 +45,14 @@ describe("operator execution limits", () => {
     await expect(loadConfig(await config({ discord: { tokenEnv: "TOKEN", allowedGuildIds: [], allowedChannelIds: [] } })))
       .rejects.toThrow("discord.ownerId");
   });
+  test.each([undefined, false, true])("normalizes Discord requireAddressing %p", async requireAddressing => {
+    const loaded = await loadConfig(await config({ discord: { ...voiceDiscord, requireAddressing } }));
+    expect(loaded.discord?.requireAddressing).toBe(requireAddressing ?? false);
+  });
+  test.each(["true", 1, null])("rejects non-boolean Discord requireAddressing %p", async requireAddressing => {
+    await expect(loadConfig(await config({ discord: { ...voiceDiscord, requireAddressing } })))
+      .rejects.toThrow("discord.requireAddressing must be a boolean");
+  });
   test.each(["implicit", "explicit"])("bounds API voice and isolates its provider credential with %s auth", async mode => {
     const voice = { ...paidVoice, ...(mode === "explicit" ? { auth: "api" as const } : {}) };
     const loaded = await loadConfig(await config({ discord: { ...voiceDiscord, voice } }));

@@ -589,7 +589,7 @@ ptyTest("actual traced setup wrapper prepares all messengers privately; explicit
     expect(config.stateDir).toBe(context.state);
     expect(config.command).toEqual([context.nativeCommand[0]]);
     expect([config.maxHosts, config.maxSubagents, config.idleMs]).toEqual([4, 8, 300000]);
-    expect(config.discord).toEqual({ tokenEnv: defaultNames[0], ownerId: "123456789", allowedGuildIds: ["11111", "22222"], allowedChannelIds: ["33333"] });
+    expect(config.discord).toEqual({ tokenEnv: defaultNames[0], ownerId: "123456789", allowedGuildIds: ["11111", "22222"], allowedChannelIds: ["33333"], requireAddressing: false });
     expect(config.telegram).toEqual({ tokenEnv: defaultNames[1], ownerId: "246813579", allowedChatIds: ["-97531"] });
     expect(config.slack).toEqual({ botTokenEnv: defaultNames[2], appTokenEnv: defaultNames[3], ownerId: "UOWNER123", teamId: "TTEAM123", allowedChannelIds: ["CCHANNEL123"] });
     const credentialBytes = await fs.readFile(`${context.config}.env`, "utf8");

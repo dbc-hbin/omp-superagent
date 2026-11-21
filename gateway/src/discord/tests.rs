@@ -80,11 +80,52 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
             json!({"id":"206","channel_id":"90","author":{"id":"42"},
             "type":0,"content":"edited by owner", "edited_timestamp":"2026-11-21T01:02:03.456000+00:00"})
         }
+        ("GET", "/channels/90/messages/207") => {
+            json!({"id":"207","channel_id":"90","author":{"id":"42"},"type":0,
+                "content":"newer REST copy","edited_timestamp":"2026-11-21T01:02:04.456000+00:00"})
+        }
+        ("GET", "/channels/90/messages/208") => {
+            json!({"id":"208","channel_id":"90","author":{"id":"42"},"type":0,
+                "content":"<@!71> /status","mentions":[{"id":"71","bot":true}],
+                "edited_timestamp":"2026-11-21T01:02:03.456000+00:00"})
+        }
+        ("GET", "/channels/90/messages/209") => {
+            json!({"id":"209","channel_id":"90","author":{"id":"42"},"type":0,
+                "content":"<@71> /status revised","mentions":[],
+                "edited_timestamp":"2026-11-21T01:02:03.456000+00:00"})
+        }
+        ("GET", "/channels/88/messages/206") => {
+            json!({"id":"206","channel_id":"88","author":{"id":"42"},"type":0,
+                "content":"edited parent chatter","edited_timestamp":"2026-11-21T01:02:03.456000+00:00"})
+        }
+        ("GET", "/channels/88/messages/210") => {
+            json!({"id":"210","channel_id":"88","author":{"id":"42"},"type":0,
+                "content":"/status <@71>","mentions":[{"id":"71","bot":true}],
+                "edited_timestamp":"2026-11-21T01:02:03.456000+00:00"})
+        }
+        ("GET", "/channels/88/messages/211") => {
+            json!({"id":"211","channel_id":"88","author":{"id":"71","bot":true},
+                "content":"bot reply from REST"})
+        }
+        ("GET", "/channels/90/messages") => {
+            json!([
+                message("402", None, "90", "43", "foreign history"),
+                message("401", None, "90", "42", "unaddressed thread history"),
+            ])
+        }
+        ("GET", "/channels/88/messages") => {
+            let ignored = message("401", None, "88", "42", "unaddressed parent history");
+            let mut addressed = message("402", None, "88", "42", "<@71> recovered");
+            addressed["mentions"] = json!([{"id":"71","bot":true}]);
+            json!([addressed, ignored])
+        }
+        ("GET", "/channels/88") => json!({"id":"88", "guild_id":"77", "type":0}),
         ("GET", "/channels/89") => json!({"id":"89", "guild_id":"77", "type":0}),
         ("POST", "/channels/90/messages") => {
             fixture.emitted.send((path, body)).unwrap();
             json!({"id":"701","guild_id":"77","channel_id":"90","author":{"id":"71","bot":true}})
         }
+        ("GET", "/channels/91") => json!({"id":"91", "guild_id":"77", "type":11, "parent_id":"89"}),
         ("GET", "/channels/99") => json!({"id":"99", "type":1, "recipients":[{"id":"42"}]}),
         ("GET", "/channels/98") => {
             json!({"id":"98", "type":3, "recipients":[{"id":"42"},{"id":"43"}]})
@@ -215,7 +256,7 @@ fn interaction(id: &str, kind: u8, data: Value) -> Value {
 
 async fn discord_fixture(config: Value) -> (
     Temp, Arc<Store>, Arc<Hub>, TcpListener, mpsc::UnboundedReceiver<(String, Value)>,
-    Arc<SyncMutex<Value>>, JoinHandle<()>,
+    Arc<SyncMutex<Value>>, JoinHandle<()>, Arc<State>,
 ) {
     let temporary = Temp::new();
     let store = Arc::new(Store::open(&temporary.0).unwrap());
@@ -232,10 +273,11 @@ async fn discord_fixture(config: Value) -> (
     let server: JoinHandle<()> = tokio::spawn(async move {
         axum::serve(http, router).await.unwrap();
     });
+    let mut state = None;
     let hub = Hub::with_factory(&config, Arc::clone(&store), |_, _, ctx| {
         let mut rest = Rest::new(ctx.http.clone(), "offline-token".to_owned())?;
         rest.api.clone_from(&api);
-        Ok(Box::new(Discord {
+        let discord = Discord {
             state: Arc::new(State {
                 ctx,
                 rest,
@@ -244,6 +286,7 @@ async fn discord_fixture(config: Value) -> (
                     owner_id: "42".to_owned(),
                     allowed_guild_ids: HashSet::from(["77".to_owned()]),
                     allowed_channel_ids: HashSet::from(["88".to_owned()]),
+                    require_addressing: config["discord"]["requireAddressing"] == true,
                 },
                 stopping: AtomicBool::new(false),
                 identity: OnceLock::new(),
@@ -253,15 +296,243 @@ async fn discord_fixture(config: Value) -> (
                 purpose_lock: Mutex::new(()),
             }),
             task: Mutex::new(None),
-        }))
+        };
+        state = Some(Arc::clone(&discord.state));
+        Ok(Box::new(discord))
     })
     .unwrap();
-    (temporary, store, hub, ws, observed, last_card, server)
+    (temporary, store, hub, ws, observed, last_card, server, state.unwrap())
+}
+
+#[tokio::test]
+async fn guild_parent_addressing_preserves_thread_follow_ups_across_ingress() {
+    let mut discord = json!({"tokenEnv":"", "ownerId":"42", "allowedGuildIds":["77"],
+        "allowedChannelIds":["88"]});
+    assert!(!Config::deserialize(&discord).unwrap().require_addressing);
+    discord["requireAddressing"] = json!("true");
+    assert!(Config::deserialize(&discord).is_err());
+    let (_temporary, store, hub, _ws, _observed, _last_card, server, state) =
+        discord_fixture(json!({"discord":{"requireAddressing":true}})).await;
+    hub.ready.send_replace(true);
+    state
+        .identity
+        .set(Identity {
+            account: "71".to_owned(),
+            application: "72".to_owned(),
+        })
+        .unwrap();
+
+    let edited_at = "2026-11-21T01:02:03.456000+00:00";
+    state
+        .message_dispatch(
+            message("225", Some("77"), "90", "42", "thread follow-up"),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+    state
+        .message_dispatch(
+            json!({"id":"206","channel_id":"90","edited_timestamp":edited_at}),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    state
+        .message_dispatch(
+            json!({"id":"207","channel_id":"90","author":{"id":"42"},"type":0,
+                "content":"inline edit without mention metadata","attachments":[],
+                "edited_timestamp":edited_at}),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    let channel = state.channel_by_id("90", false).await.unwrap();
+    let thread_route = state.route_for(&channel).unwrap();
+    let recovered = state.fetch_after(&thread_route, "400").await.unwrap();
+    assert_eq!(
+        (store.pending().unwrap(), recovered.as_array().unwrap().len()),
+        (3, 1),
+        "thread create/edits must reach durable intake and thread catch-up must retain owner history"
+    );
+    let created = event(&hub, &store).await;
+    assert_eq!(created["input"]["route"]["channelId"], "88");
+    assert_eq!(created["input"]["route"]["threadId"], "90");
+    assert_eq!(created["input"]["text"], "thread follow-up");
+    for (id, text) in [
+        ("206", "edited by owner"),
+        ("207", "inline edit without mention metadata"),
+    ] {
+        let input = &event(&hub, &store).await["input"];
+        assert_eq!(input["messageId"], id);
+        assert_eq!(input["route"], created["input"]["route"]);
+        assert_eq!(input["text"], text);
+    }
+    assert_eq!(recovered[0]["messageId"], "401");
+    assert_eq!(recovered[0]["route"], created["input"]["route"]);
+    assert_eq!(recovered[0]["text"], "unaddressed thread history");
+
+    let mentions = json!([{"id":"71","bot":true}]);
+    let mut addressed = message("237", Some("77"), "90", "42", "<@71> /status");
+    addressed["mentions"] = mentions.clone();
+    state.message_dispatch(addressed, true, true).await.unwrap();
+    let input = &event(&hub, &store).await["input"];
+    assert_eq!(input["route"], created["input"]["route"]);
+    assert_eq!(input["text"], "/status");
+
+    for (id, content, expected) in [
+        ("208", "<@!71> /status", "/status"),
+        ("209", "<@71> /status", "<@71> /status revised"),
+    ] {
+        state
+            .message_dispatch(
+                json!({"id":id,"channel_id":"90","author":{"id":"42"},"type":0,
+                    "content":content,"attachments":[],"edited_timestamp":edited_at}),
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        let input = &event(&hub, &store).await["input"];
+        assert_eq!(input["messageId"], id);
+        assert_eq!(input["route"], created["input"]["route"]);
+        assert_eq!(input["text"], expected);
+    }
+
+    let valid_file = json!([{"id":"33","filename":"notes.txt","size":10,
+        "url":"https://cdn.discordapp.com/attachments/88/33/notes.txt"}]);
+    let mut file_only = message("220", Some("77"), "88", "42", "");
+    file_only["attachments"] = valid_file.clone();
+    let mut mention_only = message("221", Some("77"), "88", "42", " <@71> ");
+    mention_only["mentions"] = mentions.clone();
+    let mut other_bot = message("222", Some("77"), "88", "42", "<@73> /status");
+    other_bot["mentions"] = json!([{"id":"73","bot":true}]);
+    let mut reply = message("223", Some("77"), "88", "42", "ping off");
+    reply["type"] = json!(19);
+    reply["mentions"] = json!([]);
+    reply["message_reference"] = json!({"message_id":"211","channel_id":"88","guild_id":"77"});
+    reply["referenced_message"] = json!({"id":"211","channel_id":"88",
+        "author":{"id":"71","bot":true},"content":"bot reply from event"});
+    let mut missing = reply.clone();
+    missing["message_reference"]["message_id"] = json!("404");
+    missing["referenced_message"] = Value::Null;
+    missing["mentions"] = mentions.clone(); // notification only, not inline
+    let mut foreign = reply.clone();
+    foreign["referenced_message"]["author"]["id"] = json!("73");
+    let mut not_bot = reply.clone();
+    not_bot["referenced_message"]["author"]["bot"] = json!(false);
+    let mut cross_channel = reply.clone();
+    cross_channel["message_reference"]["channel_id"] = json!("90");
+    let mut cross_channel_source = reply.clone();
+    cross_channel_source["referenced_message"]["channel_id"] = json!("90");
+    let mut crossed_guild_source = reply.clone();
+    crossed_guild_source["referenced_message"]["guild_id"] = json!("78");
+    let mut forwarded = reply.clone();
+    forwarded["message_reference"]["type"] = json!(1);
+    let mut literal = missing.clone();
+    literal["content"] = json!(r"show `<@71>` or \<@71> as text");
+    let mut bot = message("232", Some("77"), "90", "42", "bot author");
+    bot["author"]["bot"] = json!(true);
+    let mut webhook = message("233", Some("77"), "90", "42", "webhook author");
+    webhook["webhook_id"] = json!("345");
+    for ignored in [
+        message("224", Some("77"), "88", "42", "parent chatter"),
+        message("226", Some("77"), "88", "42", "<@71> missing metadata"),
+        message("234", Some("77"), "90", "43", "wrong owner in thread"),
+        message("235", Some("78"), "90", "42", "wrong guild"),
+        message("236", Some("77"), "91", "42", "wrong thread parent"),
+        bot,
+        webhook,
+        file_only,
+        mention_only,
+        other_bot,
+        missing,
+        foreign,
+        not_bot,
+        cross_channel,
+        cross_channel_source,
+        crossed_guild_source,
+        forwarded,
+        literal,
+    ] {
+        state.message_dispatch(ignored, true, true).await.unwrap();
+        assert_eq!(store.pending().unwrap(), 0);
+    }
+
+    let mut addressed = message("227", Some("77"), "88", "42", " <@!71> /status ");
+    addressed["mentions"] = mentions.clone();
+    state.message_dispatch(addressed, true, true).await.unwrap();
+    assert_eq!(event(&hub, &store).await["input"]["text"], "/status");
+    let mut mixed = message("231", Some("77"), "88", "42", "/sta<@71>tus `<@71>`");
+    mixed["mentions"] = mentions.clone();
+    state.message_dispatch(mixed, true, true).await.unwrap();
+    assert_eq!(event(&hub, &store).await["input"]["text"], "/sta tus `<@71>`");
+
+    state.message_dispatch(reply.clone(), true, true).await.unwrap();
+    let received = event(&hub, &store).await;
+    assert_eq!(received["input"]["route"]["channelId"], "88");
+    assert_eq!(received["input"]["route"]["threadId"], Value::Null);
+    assert_eq!(received["input"]["text"], "ping off");
+    assert_eq!(received["input"]["reply"]["authorId"], "71");
+    let mut rest_reply = reply;
+    rest_reply["id"] = json!("228");
+    rest_reply["referenced_message"] = Value::Null;
+    state.message_dispatch(rest_reply, true, true).await.unwrap();
+    assert_eq!(
+        event(&hub, &store).await["input"]["reply"]["text"],
+        "bot reply from REST"
+    );
+
+    let mut addressed_file = message("229", Some("77"), "88", "42", "<@71>");
+    addressed_file["mentions"] = mentions.clone();
+    addressed_file["attachments"] = valid_file;
+    state.message_dispatch(addressed_file, true, true).await.unwrap();
+    let input = &event(&hub, &store).await["input"];
+    assert_eq!(input["text"], "");
+    assert_eq!(input["attachments"][0]["id"], "33");
+
+    let mut dm = message("230", None, "99", "42", "keep <@71> raw in a DM");
+    dm["mentions"] = mentions;
+    state.message_dispatch(dm, true, true).await.unwrap();
+    assert_eq!(
+        event(&hub, &store).await["input"]["text"],
+        "keep <@71> raw in a DM"
+    );
+
+    state
+        .message_dispatch(
+            json!({"id":"206","channel_id":"88","edited_timestamp":edited_at}),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.pending().unwrap(), 0);
+    state
+        .message_dispatch(
+            json!({"id":"210","channel_id":"88","author":{"id":"42"},"type":0,
+                "content":"/status <@71>","attachments":[],
+                "edited_timestamp":edited_at}),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    let input = &event(&hub, &store).await["input"];
+    assert_eq!(input["messageId"], "210");
+    assert_eq!(input["text"], "/status");
+    let recovered = state.fetch_after(&thread_route.parent(), "400").await.unwrap();
+    assert_eq!(recovered.as_array().unwrap().len(), 1);
+    assert_eq!(recovered[0]["messageId"], "402");
+    assert_eq!(recovered[0]["text"], "recovered");
+    server.abort();
 }
 
 #[tokio::test]
 async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
-    let (_temporary, store, hub, ws, mut observed, last_card, server) =
+    let (_temporary, store, hub, ws, mut observed, last_card, server, _) =
         discord_fixture(json!({"discord":{}})).await;
     let (started, mut socket) = time::timeout(Duration::from_secs(5), async {
         tokio::join!(hub.start(), identify(&ws))
@@ -763,8 +1034,8 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
 
 #[tokio::test]
 async fn group_thread_accepts_only_live_member_text_and_replies_without_owner_effects() {
-    let (_temporary, store, hub, ws, mut observed, _, server) = discord_fixture(json!({
-        "discord":{"allowedGuildIds":["77"],"allowedChannelIds":["88"]},
+    let (_temporary, store, hub, ws, mut observed, _, server, _) = discord_fixture(json!({
+        "discord":{"allowedGuildIds":["77"],"allowedChannelIds":["88"],"requireAddressing":true},
         "groupRooms":[{"platform":"discord","guildId":"77","channelId":"88",
             "userIds":["42","43"],"mode":"work","revision":"live","dailyLimit":1}]
     })).await;

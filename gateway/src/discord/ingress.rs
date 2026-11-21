@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use reqwest::Method;
@@ -58,17 +60,92 @@ fn attachment_values(message: &Message) -> Vec<Value> {
         .collect()
 }
 
-fn message_input(message: &Message, route: &Route) -> Option<Value> {
-    if message.author.id != route.authority_id
-        || message.author.bot
-        || message.webhook_id.is_some()
-        || !matches!(message.kind, 0 | 19)
-        || !message.matches(route)
-    {
+fn authorized_message(message: &Message, route: &Route) -> bool {
+    message.author.id == route.authority_id
+        && !message.author.bot
+        && message.webhook_id.is_none()
+        && matches!(message.kind, 0 | 19)
+        && message.matches(route)
+}
+
+fn inline_bot_mentions<'a>(text: &'a str, account: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    let mut code_ticks = 0;
+    std::iter::from_fn(move || {
+        while let Some(&byte) = bytes.get(cursor) {
+            match byte {
+                b'\\' if code_ticks == 0
+                    && bytes.get(cursor + 1).is_some_and(u8::is_ascii_punctuation) =>
+                {
+                    cursor += 2;
+                }
+                b'`' => {
+                    let run = bytes[cursor..].iter().take_while(|&&b| b == b'`').count();
+                    if code_ticks == 0 {
+                        code_ticks = run;
+                    } else if run == code_ticks {
+                        code_ticks = 0;
+                    }
+                    cursor += run;
+                }
+                b'<' if code_ticks == 0 => {
+                    let tail = &text[cursor + 1..];
+                    let mention = tail.strip_prefix('@').and_then(|user| {
+                        user.strip_prefix('!')
+                            .unwrap_or(user)
+                            .strip_prefix(account)?
+                            .strip_prefix('>')
+                    });
+                    if let Some(after) = mention {
+                        let end = text.len() - after.len();
+                        let start = std::mem::replace(&mut cursor, end);
+                        return Some((start, end));
+                    }
+                    cursor += 1;
+                }
+                _ => cursor += 1,
+            }
+        }
+        None
+    })
+}
+
+fn remove_bot_mentions<'a>(message: &'a Message, account: &str) -> Option<Cow<'a, str>> {
+    // Discord can include the replied-to user in mentions without an inline mention.
+    if !message.mentions.iter().any(|user| user.id == account) {
         return None;
     }
+    let text = message.content.as_str();
+    let mut mentions = inline_bot_mentions(text, account).peekable();
+    let (start, end) = mentions.next()?;
+    if mentions.peek().is_none() {
+        if text[..start].trim().is_empty() {
+            return Some(Cow::Borrowed(&text[end..]));
+        }
+        if text[end..].trim().is_empty() {
+            return Some(Cow::Borrowed(&text[..start]));
+        }
+    }
+    let mut result = String::with_capacity(text.len() - (end - start) + 1);
+    let mut copied = 0;
+    for (start, end) in std::iter::once((start, end)).chain(mentions) {
+        result.push_str(&text[copied..start]);
+        // Removing a tag must not join fragments into a new command.
+        if result.ends_with(|ch: char| !ch.is_whitespace())
+            && text[end..].starts_with(|ch: char| !ch.is_whitespace())
+        {
+            result.push(' ');
+        }
+        copied = end;
+    }
+    result.push_str(&text[copied..]);
+    Some(Cow::Owned(result))
+}
+
+fn message_input(message: &Message, route: &Route, text: &str) -> Option<Value> {
     let attachments = attachment_values(message);
-    if message.content.trim().is_empty() && attachments.is_empty() {
+    if text.trim().is_empty() && attachments.is_empty() {
         return None;
     }
     let (received_at, revision) = match &message.edited_timestamp {
@@ -86,9 +163,34 @@ fn message_input(message: &Message, route: &Route) -> Option<Value> {
     };
     Some(json!({
         "id": format!("discord:{}:{}:{revision}", route.account_id, message.id),
-        "route": route, "messageId": message.id, "text": message.content,
+        "route": route, "messageId": message.id, "text": text,
         "receivedAt": received_at, "attachments": attachments
     }))
+}
+
+struct Reply<'a> {
+    id: &'a str,
+    source: Option<Cow<'a, ReferencedMessage>>,
+}
+
+impl Reply<'_> {
+    fn addresses_bot(&self, route: &Route) -> bool {
+        self.source
+            .as_deref()
+            .is_some_and(|source| source.author.bot && source.author.id == route.account_id)
+    }
+
+    fn snapshot(&self, route: &Route) -> Value {
+        let source = self.source.as_deref();
+        let author = source.map(|value| &value.author.id);
+        let text = source
+            .filter(|source| {
+                source.author.id != route.account_id
+                    || !source.content.starts_with(VOICE_DRAFT_HEADER)
+            })
+            .map(|source| &source.content);
+        json!({ "messageId": self.id, "authorId": author, "text": text })
+    }
 }
 
 impl State {
@@ -161,10 +263,36 @@ impl State {
         Ok(channel)
     }
 
-    async fn snapshot_reply(&self, message: &Message, route: &Route) -> Option<Value> {
+    fn addressing_enabled(&self, route: &Route) -> bool {
+        self.config.require_addressing && route.guild_id.is_some()
+    }
+
+    fn has_edit_addressing_metadata(&self, raw: &Value, message: &Message, route: &Route) -> bool {
+        if !self.addressing_enabled(route) {
+            return true;
+        }
+        let has_mentions = raw.get("mentions").is_some();
+        if route.thread_id.is_none() {
+            return has_mentions && (message.kind != 19 || message.message_reference.is_some());
+        }
+        // A thread does not need addressing, but an inline tag can only be stripped
+        // after Discord confirms the mention. Bare edits need no mention lookup.
+        has_mentions
+            || inline_bot_mentions(&message.content, &route.account_id)
+                .next()
+                .is_none()
+    }
+
+    async fn resolve_reply<'a>(
+        &self,
+        message: &'a Message,
+        route: &Route,
+        for_addressing: bool,
+    ) -> Option<Reply<'a>> {
         let reference = message.message_reference.as_ref()?;
         let id = reference.message_id.as_deref()?;
         if message.kind != 19
+            || (for_addressing && reference.kind != 0)
             || !snowflake(id)
             || reference.channel_id.as_deref() != Some(route.destination())
             || !actual_guild(reference.guild_id.as_deref(), route)
@@ -176,35 +304,21 @@ impl State {
                 && source.channel_id == route.destination()
                 && actual_guild(source.guild_id.as_deref(), route)
         };
-        let fetched;
-        let source = if let Some(embedded) = message
-            .referenced_message
-            .as_deref()
-            .filter(|source| matches(source))
-        {
-            Some(embedded)
-        } else {
-            fetched = self
+        let source = match message.referenced_message.as_deref() {
+            Some(source) if matches(source) => Some(Cow::Borrowed(source)),
+            Some(_) if for_addressing => return None,
+            _ => self
                 .rest
                 .get::<ReferencedMessage>(&format!(
                     "channels/{}/messages/{id}",
                     route.destination()
                 ))
-                .await;
-            match &fetched {
-                Ok(source) if matches(source) => Some(source),
-                // Optional context is unavailable; keep just the safe pointer.
-                Ok(_) | Err(_) => None,
-            }
+                .await
+                .ok()
+                .filter(matches)
+                .map(Cow::Owned),
         };
-        let author = source.map(|value| &value.author.id);
-        let text = source
-            .filter(|source| {
-                source.author.id != route.account_id
-                    || !source.content.starts_with(VOICE_DRAFT_HEADER)
-            })
-            .map(|source| &source.content);
-        Some(json!({ "messageId": id, "authorId": author, "text": text }))
+        Some(Reply { id, source })
     }
 
     pub(super) async fn voice_message(
@@ -230,10 +344,8 @@ impl State {
         if self.group_route(&route) {
             return Ok(());
         }
-        let Some(mut input) = message_input(&message, &route) else {
-            return Ok(());
-        };
-        if route.guild_id.is_none()
+        if !authorized_message(&message, &route)
+            || route.guild_id.is_none()
             || route.guild_id != message.guild_id
             || route.thread_id.is_some()
             || outbound.is_closed()
@@ -241,6 +353,11 @@ impl State {
         {
             return Ok(());
         }
+        let Some(mut input) = message_input(&message, &route, &message.content) else {
+            return Ok(());
+        };
+        // Only the separate, receipt-verified reply to a posted voice draft can
+        // produce Confirmed text. Other voice controls never admit model input.
         match voice
             .command(raw, outbound)
             .await
@@ -298,7 +415,8 @@ impl State {
             Ok(message)
                 if create
                     || (raw.get("edited_timestamp").is_some()
-                        && raw.get("attachments").is_some()) =>
+                        && raw.get("attachments").is_some()
+                        && self.has_edit_addressing_metadata(&raw, &message, &route)) =>
             {
                 (message, None)
             }
@@ -383,9 +501,35 @@ impl State {
         route: &Route,
         channel: &Channel,
     ) -> Option<Value> {
-        let mut input = message_input(message, route)?;
-        if let Some(reply) = self.snapshot_reply(message, route).await {
-            input["reply"] = reply;
+        if !authorized_message(message, route) {
+            return None;
+        }
+        let addressing_enabled = self.addressing_enabled(route);
+        let require_addressing = addressing_enabled && route.thread_id.is_none();
+        let addressed_text = if addressing_enabled {
+            remove_bot_mentions(message, &route.account_id)
+        } else {
+            None
+        };
+        let verified_reply = if require_addressing && addressed_text.is_none() {
+            let reply = self.resolve_reply(message, route, true).await?;
+            if !reply.addresses_bot(route) {
+                return None;
+            }
+            Some(reply)
+        } else {
+            None
+        };
+        let text = addressed_text
+            .as_deref()
+            .map_or(message.content.as_str(), str::trim);
+        let mut input = message_input(message, route, text)?;
+        let reply = match verified_reply {
+            Some(reply) => Some(reply),
+            None => self.resolve_reply(message, route, false).await,
+        };
+        if let Some(reply) = reply {
+            input["reply"] = reply.snapshot(route);
         }
         input["discordContext"] = self.context_snapshot(route, Some(channel)).await;
         Some(input)

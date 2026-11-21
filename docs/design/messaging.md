@@ -23,6 +23,17 @@ topic is a binding key, not a fabricated conversation or thread ID.
 | [Telegram](../../gateway/src/telegram.rs) | Bot API `getMe` identifies the bot. Use the configured real owner and allowed chats; anonymous, forwarded, bot-mediated and business identities do not confer authority. Long poll only after startup approval reconciliation; refuse an active webhook without removing it. |
 | [Slack](../../gateway/src/slack.rs) | Socket Mode and the Web API, with bot/workspace and active human owner checks and actual channel membership. No group DMs or public HTTP endpoint. Known-route history is limited by cursors, scopes, membership, retention and rate limits. |
 
+With `discord.requireAddressing: true` (default `false`), ordinary owner
+messages in allowed guild parent channels must contain a Discord mention of the
+authenticated bot or be a verified reply to a message authored by that bot.
+In authorized threads, the owner's otherwise eligible messages reach the head
+without a mention or reply, including edits and history catch-up. When the
+setting is enabled, verified inline bot mentions are still stripped from both
+parent and thread messages, including commands. Guild and parent-channel
+allowlists still apply. Owner DMs, application commands and approval components
+retain their existing authorization rules, and restricted group rooms keep their own
+explicit-command policy.
+
 ## Restricted group rooms
 
 `groupRooms` opts a specific server/workspace/chat and parent channel into a

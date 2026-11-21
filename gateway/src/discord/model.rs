@@ -176,6 +176,8 @@ pub(super) struct Message {
     pub content: String,
     pub edited_timestamp: Option<String>,
     #[serde(default)]
+    pub mentions: Vec<User>,
+    #[serde(default)]
     pub attachments: Vec<RemoteAttachment>,
     #[serde(default)]
     pub flags: u64,
@@ -209,6 +211,8 @@ pub(super) struct Reference {
     pub message_id: Option<String>,
     pub channel_id: Option<String>,
     pub guild_id: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: u8,
 }
 
 #[derive(Clone, Deserialize)]
