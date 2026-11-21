@@ -106,8 +106,8 @@ review·비용·범위·pause/cancel·불확실성 보류를 우회하지 않는
 사용자 jevify 선택은 원래 입력 선두의 소문자 독립 prose `jevify`만 인정하며 `/jevify`·대문자·
 인용/code/path·부정·뒤쪽 언급은 아니다. 호출 없는 일반 원문에도 헤드 선택 필드는 사용 가능하다.
 runtime의 `workflowPrompt`는 fenced context 밖에 소문자 native `jevify`를 prefix하며 ULW
-extension-command capability 조회를 하지 않는다. 레인은 실제 OMP jevify notice와 최신
-`xd://eval/judge`를 따른다. notice 활성화는 native `magicKeywords.enabled`·`magicKeywords.jevify`와
+extension-command capability 조회를 하지 않는다. 레인은 실제 OMP jevify notice와 `eval`이 안내하는
+judge 도움말(OMP 19.1에서는 `help://eval/judge`)을 따른다. notice 활성화는 native `magicKeywords.enabled`·`magicKeywords.jevify`와
 eval 가용성에 달리므로 admission만으로 보장하지 않는다. 전역 설정을 바꾸지 않으며 jevify에는
 ULW 스킬 조회·브랜드·추가 레인·goal·모델 변경·workflow artifact가 필요하지 않다.
 레인의 보고는 헤드용이며 외부 발송이 아니다. 내부 지시·보고는 영어, 헤드의 외부 답변은
@@ -892,7 +892,9 @@ Discord와 Slack은 드롭다운, Telegram은 인라인 버튼으로 표시한�
 모델 변경 후 effort가 native 지원 범위에 맞춰 조정될 수 있으며 응답은 실제 readback 값을
 표시한다. 사용 불가능한 모델이나 effort를 임의의 대체값으로 바꾸지 않는다.
 native 상태에 명시적 effort가 없으면 모델 기본값으로 표시하며 `off`와 혼동하지 않는다.
-RPC에 광고되지 않는 `auto`·`inherit`는 이 메신저 명령의 선택값이 아니다.
+현재 모델이 `auto`를 광고하면 메뉴에서 선택하거나 `/effort auto`를 입력할 수 있다.
+자동 모드에서는 설정값 `auto`와 OMP가 실제 적용하는 강도가 다를 수 있다. `auto`를
+광고하지 않는 구형 Host에는 선택지가 나타나지 않으며 고정 강도로 대신 적용하지 않는다.
 
 `/head 헤드 모델을 6.2 Astra로 바꿔`처럼 명시적으로 요청해도 된다. 헤드가
 가용 모델을 확인하고, 현재 턴이 성공적으로 끝난 뒤 공유 헤드에만 적용한다. 예약 응답은
@@ -1138,7 +1140,9 @@ head의 native 승인 카드 복구를 먼저 마친 뒤 입력·콜백 처리�
 헤드가 대신 고른 원래 선택지를 레인으로 돌려보낸다. 선택 이유는 내부 이력에 남기고 별도
 메신저 알림은 보내지 않는다. 중요한 범위·비용·권한·외부 약속이 걸리거나 사용자 판단이
 필요하면 이관 이유를 원래 질문 카드에 함께 표시한다. 실제 실행 승인과 일반 native dialog는
-헤드가 대신 답하지 않는다.
+헤드가 대신 답하지 않는다. 아래의 `ask` 카드는 `decision_ask`가 쓰는 구조화된
+`askDialog`다. OMP 19.1 내장 `ask`의 HTML `form`은 Host가 메신저로 보내지 않고
+즉시 취소한다. 선택한 기본값도 제출하지 않는다.
 
 | 플랫폼 | 승인·질문 UI와 실제 한계 |
 | --- | --- |

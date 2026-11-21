@@ -83,12 +83,13 @@ class HostTransport implements RuntimeHost {
   compactAbort?: () => void;
   abortCount = 0;
   modelSetResult: "success" | "throw-before" | "throw-after" | "mismatch" | "rejected" = "success";
-  effortSetResult: "success" | "throw-after" | "model-mismatch" | "missing-effort" | "rejected" = "success";
+  effortSetResult: "success" | "throw-after" | "model-mismatch" | "missing-effort" | "missing-selector" | "wrong-selector" | "rejected" = "success";
   levels: unknown[] = ["off", "minimal", "high"];
   levelsSuccess = true;
   entries: unknown[] = [];
   journalLeaf = false;
   effortClamp?: string;
+  autoEffectiveLevel: string | undefined = "minimal";
   modelEffort?: string | null;
   state: RuntimeState;
 
@@ -160,9 +161,15 @@ class HostTransport implements RuntimeHost {
     if (command.type === "set_thinking_level") {
       await this.beforeSetEffort?.();
       if (this.state.settingsScope !== "session" || this.effortSetResult === "rejected") return { success: false, error: "secret endpoint/token native error" };
-      this.state.thinkingLevel = this.effortClamp ?? String(command.level);
+      const automatic = command.level === "auto";
+      this.state.thinkingLevel = automatic ? this.autoEffectiveLevel : this.effortClamp ?? String(command.level);
+      if (this.state.thinkingLevels !== undefined) {
+        this.state.configuredThinkingLevel = automatic ? "auto" : this.state.thinkingLevel;
+      }
       if (this.effortSetResult === "model-mismatch") this.state.model = { ...otherModel };
       if (this.effortSetResult === "missing-effort") this.state.thinkingLevel = undefined;
+      if (this.effortSetResult === "missing-selector") delete this.state.configuredThinkingLevel;
+      if (this.effortSetResult === "wrong-selector") this.state.configuredThinkingLevel = this.state.thinkingLevel;
       if (this.effortSetResult === "throw-after") throw new Error("secret endpoint/token lost effort acknowledgement");
       return { success: true };
     }
@@ -2585,6 +2592,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     const { runtime, main, store, messenger, requests } = restartFixture();
     await runtime.start();
     await admit(runtime, headMessage("restart-active-head"));
+    main.state.configuredThinkingLevel = "auto";
     main.state.goal = { enabled: true, mode: "active", goal: { id: "original-head-goal", status: "active" } };
     main.emit({ type: "goal_updated", state: main.state.goal });
     main.state.pendingUiRequests = [{ id: "head-question", method: "confirm", title: "Continue?" }];
@@ -2606,7 +2614,8 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(main.state.goal?.enabled).toBe(false);
     expect(main.prompts).toHaveLength(1);
     expect(JSON.parse(store.getMeta("head:restart-fence")!).checkpoint).toMatchObject({
-      goalActive: true, goalSourceId: "restart-active-head", model: executionModel, thinkingLevel: "high",
+      goalActive: true, goalSourceId: "restart-active-head", model: executionModel,
+      thinkingLevel: "high", configuredThinkingLevel: "auto",
     });
     await messenger.handlers!.answer(card.id, { confirmed: true }, card.route).catch(() => {});
     expect(main.responses).not.toContainEqual({ id: card.requestId, response: { confirmed: true } });
@@ -2978,6 +2987,30 @@ describe("controlled Gateway AND HEAD restart", () => {
     await instance.runtime.kick();
     expect(JSON.parse(instance.store.getMeta("head:restart-fence")!).state).toBe("failed");
     expect(instance.store.output(`${input.id}:restart-result`)?.text).toContain("differs from its checkpoint");
+    expect(instance.main.prompts).toEqual([]);
+  });
+
+  test.each([
+    ["auto", "medium", "ready"], ["high", "high", "failed"],
+  ] as const)("restart with checkpointed auto and resumed %s/%s is %s", async (configured, effective, outcome) => {
+    const instance = restartFixture();
+    const { input, restart } = savedRestart(instance);
+    const checkpoint = { ...restart, checkpoint: { goalActive: false, residents: [],
+      model: executionModel, thinkingLevel: "high", configuredThinkingLevel: "auto" } };
+    instance.store.setMeta(`head:restart:${input.id}`, JSON.stringify(checkpoint));
+    instance.store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
+    instance.main.state.configuredThinkingLevel = configured;
+    instance.main.state.thinkingLevel = effective;
+    await instance.runtime.start();
+    await instance.runtime.kick();
+    const fence = instance.store.getMeta("head:restart-fence");
+    if (outcome === "ready") {
+      expect(fence).toBe("");
+      expect(instance.store.input(input.id)?.state).toBe("done");
+    } else {
+      expect(JSON.parse(fence!).state).toBe("failed");
+      expect(instance.store.output(`${input.id}:restart-result`)?.text).toContain("differs from its checkpoint");
+    }
     expect(instance.main.prompts).toEqual([]);
   });
 
@@ -3488,6 +3521,9 @@ describe("messenger head session controls", () => {
 
   test("picker selections stay on their opening topic and reject effort for a different model", async () => {
     const { runtime, main, store, messenger } = fixture();
+    main.state.thinkingLevels = ["off", "auto", "minimal", "high"];
+    main.state.configuredThinkingLevel = "high";
+    main.levelsSuccess = false;
     const destination = route(null, { guildId: null });
     await runtime.start();
     await admit(runtime, message("1001", destination, "/new"));
@@ -3497,7 +3533,7 @@ describe("messenger head session controls", () => {
     const model = messenger.sent.find(output => output.sourceId === "1003");
     if (!effort?.picker || !model?.picker) throw new Error("HEAD did not send both menus");
     expect(model.picker.groups).toEqual([{ label: "fixture", options: ["fixture/capable", "fixture/efficient"] }]);
-    expect(effort.picker.groups).toEqual([{ label: "Effort", options: ["off", "minimal", "high"] }]);
+    expect(effort.picker.groups).toEqual([{ label: "Effort", options: ["off", "auto", "minimal", "high"] }]);
     await admit(runtime, message("1004", destination, "/main"));
     const modelSelection = pickerClick(model, 0, 1);
     await expect(runtime.receive({ ...modelSelection, route: destination })).rejects.toThrow("original owner command and card");
@@ -3515,9 +3551,48 @@ describe("messenger head session controls", () => {
     await admit(runtime, message("1005", destination, "/effort"));
     const freshEffort = messenger.sent.at(-1);
     if (!freshEffort?.picker) throw new Error("HEAD did not refresh the effort menu");
-    await admit(runtime, pickerClick(freshEffort, 0, 1));
-    expect(main.state.thinkingLevel).toBe("minimal");
+    const auto = pickerClick(freshEffort, 0, 1);
+    await admit(runtime, auto);
+    expect(store.input(auto.id)).toMatchObject({ state: "done", route: freshEffort.route });
+    expect(messenger.sent.at(-1)).toMatchObject({ route: freshEffort.route });
+    expect(main.state).toMatchObject({ configuredThinkingLevel: "auto", thinkingLevel: "minimal" });
     expect(main.prompts).toEqual([]);
+  });
+
+  test.each(["minimal", undefined])("text Auto verifies its configured selector independently of effective effort %s", async effective => {
+    const { runtime, main, store, messenger } = fixture();
+    main.state.thinkingLevels = ["off", "auto", "minimal", "high"];
+    main.state.configuredThinkingLevel = "high";
+    main.autoEffectiveLevel = effective;
+    main.levelsSuccess = false;
+    await runtime.start();
+    const selection = message("head-text-auto", route(), "/effort auto");
+    await admit(runtime, selection);
+    expect(store.input(selection.id)?.state).toBe("done");
+    expect(main.state.configuredThinkingLevel).toBe("auto");
+    expect(main.state.thinkingLevel).toBe(effective);
+    expect(messenger.sent.at(-1)?.text).toContain(`effort: auto (effective: ${effective ?? "model default"})`);
+    await admit(runtime, message("head-auto-menu", route(), "/effort"));
+    expect(messenger.sent.at(-1)?.picker?.current).toBe("auto");
+    await admit(runtime, message("head-exit-auto", route(), "/effort minimal"));
+    expect(store.input("head-exit-auto")?.state).toBe("done");
+    expect(main.state).toMatchObject({ configuredThinkingLevel: "minimal", thinkingLevel: "minimal" });
+  });
+
+  test("an empty stock selector list neither opens a menu nor falls back to legacy model levels", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    main.state.thinkingLevels = [];
+    main.state.configuredThinkingLevel = null;
+    await runtime.start();
+    await admit(runtime, message("head-no-selectors-menu", route(), "/effort"));
+    expect(store.input("head-no-selectors-menu")?.state).toBe("done");
+    expect(messenger.sent.at(-1)?.picker).toBeUndefined();
+    for (const level of ["off", "auto"]) {
+      const id = `head-no-selectors-${level}`;
+      await admit(runtime, message(id, route(), `/effort ${level}`));
+      expect(store.input(id)?.state).toBe("cancelled");
+    }
+    expect(main.commands.filter(command => command.type === "set_thinking_level")).toEqual([]);
   });
 
   test.each(["unconfirmed", "wrong-card"] as const)("a %s menu receipt cannot authorize a HEAD model change", async receipt => {
@@ -3719,11 +3794,23 @@ describe("messenger head session controls", () => {
     }
   });
 
-  test("effort mutation refuses a model change during capability discovery", async () => {
+  test.each(["legacy", "stock"] as const)("effort mutation refuses a model change after %s capability discovery", async discovery => {
     const { runtime, main, store } = fixture();
+    if (discovery === "stock") {
+      main.state.thinkingLevels = ["off", "auto", "minimal", "high"];
+      main.state.configuredThinkingLevel = "high";
+    }
     await runtime.start();
-    main.beforeLevels = () => { main.state.model = { ...otherModel }; };
-    await admit(runtime, message("head-effort-model-race", route(), "/effort minimal"));
+    if (discovery === "legacy") main.beforeLevels = () => { main.state.model = { ...otherModel }; };
+    else {
+      const getState = main.client.getState;
+      main.client.getState = async () => {
+        const observed = await getState();
+        main.state.model = { ...otherModel };
+        return observed;
+      };
+    }
+    await admit(runtime, message("head-effort-model-race", route(), discovery === "legacy" ? "/effort minimal" : "/effort auto"));
     expect(store.input("head-effort-model-race")?.state).toBe("cancelled");
     expect(main.commands.filter(command => command.type === "set_thinking_level")).toEqual([]);
     expect(main.prompts).toEqual([]);
@@ -3768,6 +3855,21 @@ describe("messenger head session controls", () => {
       expect(main.commands.filter(command => command.type === "set_thinking_level")).toHaveLength(1);
       expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("secret");
     }
+  });
+
+  test.each(["missing-selector", "wrong-selector"] as const)("an Auto acknowledgement with %s is uncertain despite valid effective effort", async result => {
+    const { runtime, main, store, messenger } = fixture();
+    main.state.thinkingLevels = ["off", "auto", "minimal"];
+    main.state.configuredThinkingLevel = main.state.thinkingLevel = "minimal";
+    main.effortSetResult = result;
+    await runtime.start();
+    const original = message(`head-auto-${result}`, route(), "/effort auto");
+    await admit(runtime, original);
+    await admit(runtime, original);
+    expect(store.input(original.id)?.state).toBe("uncertain");
+    expect(main.state.thinkingLevel).toBe("minimal");
+    expect(main.commands.filter(command => command.type === "set_thinking_level")).toHaveLength(1);
+    expect(messenger.sent.at(-1)?.text).toContain("outcome is uncertain");
   });
 
   test("session or settings scope changes during mutation cannot produce a verified success", async () => {

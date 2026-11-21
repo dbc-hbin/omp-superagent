@@ -295,6 +295,8 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       if (headEvents.length > 256) headEvents.shift();
     });
     const headState = await initial.client.getState();
+    const stockEffortSelectors = "thinkingLevels" in headState;
+    let checkpointEffort = headState.thinkingLevel;
     expect(headState).toMatchObject({ hostPid: child.pid, sessionFile: mainPaths.sessionFile, isSettled: true, model: mainModel, settingsScope: "session" });
     owned.set("main", { ...mainPaths, pid: child.pid! });
     await runtime.start();
@@ -541,6 +543,11 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       };
       const { text: help } = await commandReply("210", "/help");
       for (const name of ["help", "status", "stop", "context", "compact", "usage", "model", "effort"]) expect(help).toContain(`/${name}`);
+      if (stockEffortSelectors) {
+        const { output } = await commandReply("2101", "/effort");
+        expect(output.picker).toBeUndefined();
+        await commandReply("2102", "/effort auto", "cancelled");
+      }
       const { text: status } = await commandReply("211", "/status");
       expect(status).toContain(headState.sessionId);
       expect(status).toContain(`${mainModel.provider}/${mainModel.id}`);
@@ -647,7 +654,20 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       const { output: modelPicker } = await commandReply("207", "/model");
       await pick(modelPicker, `${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`);
       const { output: effortPicker } = await commandReply("208", "/effort");
-      await pick(effortPicker, Effort.Minimal);
+      if (stockEffortSelectors) {
+        await pick(effortPicker, "auto");
+        const auto = await initial.client.getState();
+        expect(auto).toMatchObject({ configuredThinkingLevel: "auto" });
+        expect(auto.thinkingLevel).toBeOneOf([Effort.Minimal, Effort.Low]);
+        const { output: automatic } = await commandReply("209", "/effort");
+        expect(automatic.picker?.current).toBe("auto");
+        expect(automatic.text).toContain(`effort: auto (effective: ${auto.thinkingLevel})`);
+        await pick(automatic, Effort.Minimal);
+      } else {
+        expect(effortPicker.picker?.groups.flatMap(group => group.options)).not.toContain("auto");
+        await commandReply("209", "/effort auto", "cancelled");
+        await pick(effortPicker, Effort.Minimal);
+      }
       expect(await initial.client.getState()).toMatchObject({ model: modelFixtureModels.changedDefault,
         thinkingLevel: Effort.Minimal, modelSettings: lowPreset, sessionId: headState.sessionId });
 
@@ -754,6 +774,14 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
         expect(duringCompact).toContain(headState.sessionId);
         await commandReply("307", "/context");
         await commandReply("308", "/usage");
+        if (stockEffortSelectors) {
+          const { output } = await commandReply("310", "/effort");
+          expect(output.picker).toMatchObject({
+            current: Effort.Minimal,
+            groups: [{ label: "Effort", options: ["off", "auto", Effort.Minimal, Effort.Low] }],
+          });
+          await commandReply("311", "/effort auto", "cancelled");
+        }
         await commandReply("309", "/stop head", "cancelled");
       } finally { stopWatchingCompact(); }
       expect(store.input(compactInput.id)).toMatchObject({ state: "cancelled" });
@@ -859,9 +887,15 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       // model/effort, retaining the existing same-session restart proof below.
       await commandReply("220", "/model preset low");
       await commandReply("221", `/model ${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`);
-      await commandReply("222", `/effort ${Effort.Minimal}`);
-      expect(await initial.client.getState()).toMatchObject({ sessionId: headState.sessionId,
-        model: modelFixtureModels.changedDefault, thinkingLevel: Effort.Minimal, modelSettings: lowPreset, settingsScope: "session" });
+      await commandReply("222", `/effort ${stockEffortSelectors ? "auto" : Effort.Minimal}`);
+      const selectedHeadState = await initial.client.getState();
+      expect(selectedHeadState).toMatchObject({ sessionId: headState.sessionId,
+        model: modelFixtureModels.changedDefault, modelSettings: lowPreset, settingsScope: "session" });
+      checkpointEffort = selectedHeadState.thinkingLevel;
+      if (stockEffortSelectors) {
+        expect(selectedHeadState).toMatchObject({ configuredThinkingLevel: "auto" });
+        expect(checkpointEffort).toBeOneOf([Effort.Minimal, Effort.Low]);
+      } else expect(checkpointEffort).toBe(Effort.Minimal);
       expect((await nativeModelRoles(initial, "after-global-head-controls")).calls).toEqual(callsBeforeGlobal);
       expect(nativeResults.length).toBe(nativeResultsBeforeGlobal);
       expect(store.lane(finalLane.id)).toEqual(laneRecordBeforeGlobal);
@@ -877,7 +911,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       expect(confirmedHeadSettings).toEqual(lowPreset);
       expect(confirmedClearedRoles).toEqual(expect.any(Array));
       expect(await initial.client.getState()).toMatchObject({ modelSettings: confirmedHeadSettings,
-        model: modelFixtureModels.changedDefault, thinkingLevel: Effort.Minimal });
+        model: modelFixtureModels.changedDefault, thinkingLevel: checkpointEffort });
     }
 
     let cronResultId: string | undefined;
@@ -921,6 +955,12 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       pid: child.pid, sessionId: headState.sessionId, code: 0, signal: null, persisted: true, observationsFlushed: true,
     });
     if (modelSelection) {
+      if (stockEffortSelectors) {
+        const entries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+        expect(entries.filter(entry => entry.type === "thinking_level_change").at(-1)).toMatchObject({
+          configured: "auto", thinkingLevel: checkpointEffort,
+        });
+      }
       // Frozen roles/policy are a private config overlay; native transcript
       // model and effort remain independent and win over that role default.
       const restartOptions: HostOptions = { ...headOptions, model: undefined,
@@ -935,9 +975,13 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       const resumedState = await resumed.client.getState();
       expect(resumedState).toMatchObject({
         hostPid: restarted.pid, sessionId: headState.sessionId, sessionFile: mainPaths.sessionFile,
-        model: modelFixtureModels.changedDefault, thinkingLevel: Effort.Minimal,
+        model: modelFixtureModels.changedDefault,
         modelSettings: confirmedHeadSettings, settingsScope: "session", isSettled: true,
       });
+      if (stockEffortSelectors) {
+        expect(resumedState).toMatchObject({ configuredThinkingLevel: "auto" });
+        expect(resumedState.thinkingLevel).toBeOneOf([Effort.Minimal, Effort.Low]);
+      } else expect(resumedState.thinkingLevel).toBe(checkpointEffort);
       expect(await nativeModelRoles(resumed, "head-after-restart")).toMatchObject({ model: modelFixtureModels.changedDefault,
         smol: modelFixtureModels.changedDefault, judge: modelFixtureModels.judge });
       await unchangedNativeSettings();

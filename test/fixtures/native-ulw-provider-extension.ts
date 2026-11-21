@@ -2,8 +2,9 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { nativeRequestEnvelope } from "./native-request-envelope";
+import { nativeToolExchanges, nativeToolTurn } from "./native-tool-transport";
 
 export default function nativeUlwProvider(pi: ExtensionAPI): void {
   const root = process.env.OMP_NATIVE_GATEWAY_ROOT;
@@ -54,7 +55,9 @@ export default function nativeUlwProvider(pi: ExtensionAPI): void {
     const policyCount = (context.systemPrompt ?? []).filter(block => /^<omp-ulw-policy>/.test(block)).length;
     const expectedPolicy = role === "lane" || !["301", "302", "303", "report:handoff:303:lane"].includes(requestId);
     assert.equal(policyCount, expectedPolicy ? 1 : 0, `Actual model request policy before reply: ${role}/${requestId}`);
-    const activeTools = pi.getActiveTools();
+    const messages = context.messages.slice(userIndex + 1);
+    const turn = nativeToolTurn(pi, context, nativeToolExchanges(messages));
+    const activeTools = [...turn.enabled];
     if (notices.some(message => message.customType === "orchestrate-notice")) {
       assert(activeTools.includes("task"), "Native orchestration requires its actual enabled task capability");
     }
@@ -70,19 +73,11 @@ export default function nativeUlwProvider(pi: ExtensionAPI): void {
       pi.appendEntry("native-ulw:provider", { role, requestId, policyCount, sessionId: current.sessionManager.getSessionId(),
         notices: notices.map(message => message.customType), directives, activeTools });
     }
-    const calls = new Map(context.messages.slice(userIndex + 1).flatMap(message => message.role === "assistant"
-      ? message.content.flatMap(part => part.type === "toolCall" ? [[part.id, part] as const] : []) : []));
-    const results = context.messages.slice(userIndex + 1).filter(message => message.role === "toolResult");
-    assert.deepEqual(results.filter(message => message.isError), [], "Actual native workflow production tool failed");
-    const tools = new Set(context.tools?.map(tool => tool.name));
-    const called = (name: string) => results.some(message => message.toolName === name ||
-      message.toolName === "write" && calls.get(message.toolCallId)?.arguments.path === `xd://${name}`);
-    const invoke = (name: string, args: Record<string, unknown>): MockResponse => {
-      if (tools.has(name)) return { content: [{ type: "toolCall", name, arguments: args }] };
-      const documented = results.some(message => message.toolName === "read" && calls.get(message.toolCallId)?.arguments.path === `xd://${name}`);
-      return documented ? { content: [{ type: "toolCall", name: "write", arguments: { path: `xd://${name}`, content: JSON.stringify(args) } }] }
-        : { content: [{ type: "toolCall", name: "read", arguments: { path: `xd://${name}` } }] };
-    };
+    assert.deepEqual(messages.filter(message => message.role === "toolResult" && message.isError), [],
+      "Actual native workflow production tool failed");
+    assert.deepEqual(turn.failed, [], "Actual native workflow dispatch failed");
+    const { succeeded: called, invoke } = turn;
+    const results = turn.executions.map(dispatch => dispatch.result);
     if (role === "lane") {
       const expectedNotice = requestId === "handoff:303:lane" ? "ultrathink-notice"
         : requestId.startsWith("handoff:308:") ? "jevify-notice" : "orchestrate-notice";

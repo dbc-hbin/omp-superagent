@@ -17,6 +17,7 @@ import { nativeDisabledProviders } from "./native-extension";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { nativeTestArgv } from "./native-command";
 import { offlineMnemopi } from "./native-memory";
+import { nativeJournalDispatches } from "./native-tool-transport";
 
 interface Event {
   readonly kind: string;
@@ -815,21 +816,21 @@ try {
   });
   assert.deepEqual(envelopes.map(envelope => envelope.sourceId), survivingLane ? ["904", "901", "903", "report:handoff:904:lane"] : ["901", "903"],
     "No original user prompt or /restart prompt may be replayed; native goal RPC supplies continuation");
-  const calls = entries.flatMap(entry => entry.type === "message" && entry.message.role === "assistant"
-    ? entry.message.content.filter(part => part.type === "toolCall") : []);
-  assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "create").length, 1);
-  assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "complete").length, 1);
-  assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "resume").length, 0, "The provider must not substitute a model tool call for the controller's goal RPC");
+  const dispatches = nativeJournalDispatches(entries);
+  assert.deepEqual(dispatches.filter(call => call.name === "goal" && call.mode === "execute")
+    .map(call => ({ op: call.args?.op, ok: call.ok })), [{ op: "create", ok: true }, { op: "complete", ok: true }],
+  "The provider creates and completes one goal; only the controller's native RPC may resume it");
+  const effect = dispatches.filter(call => call.name === "bash" && call.args?.command === "printf 'completed-once\\n' >> completed-effect.log");
+  assert.deepEqual(effect.map(call => call.ok), [true], "The persisted file must have exactly one successful native execution receipt");
   if (busy) {
-    const bashIds = new Set(calls.filter(call => call.name === "bash" && call.arguments.async === true
-      && call.arguments.name === undefined && call.arguments.timeout === 0).map(call => call.id));
-    const results = entries.flatMap(entry => entry.type === "message" && entry.message.role === "toolResult"
-      && bashIds.has(entry.message.toolCallId) ? [entry.message] : []);
-    assert.equal(bashIds.size, 1, "No background Bash job may be replayed by restart");
-    assert.equal(results.length, 1);
-    const details = results[0]?.details;
-    assert(!results[0]?.isError && details && typeof details === "object" && "async" in details);
-    assert.deepEqual(details.async, { state: "running", jobId: runningJob?.job?.id, type: "bash" });
+    const admissions = dispatches.filter(call => call.name === "bash" && call.args?.async === true);
+    assert.equal(admissions.length, 1, "No background Bash job may be replayed by restart");
+    const admission = admissions[0];
+    assert(admission?.ok && admission.args?.name === undefined && admission.args?.timeout === 0);
+    const { details } = admission;
+    assert(details && typeof details === "object" && "async" in details);
+    assert.deepEqual(details.async, { state: "running", jobId: runningJob?.job?.id, type: "bash" },
+      "The original native Bash result and subsequent cancellation must prove the same non-service job");
     assert(!(await fs.readFile(mainPaths.sessionFile, "utf8")).includes(memoryCanary),
       "The retained secret must never come from the restored transcript");
   }

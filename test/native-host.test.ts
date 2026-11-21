@@ -196,6 +196,38 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
     } });
     expect(cursor).toEqual({ type: "response", command: "get_journal_cursor", id: "native-cursor-after-reattach",
       success: true, data: { leafId: journal.data.leafId } });
+
+    const formId = "native-untimed-form";
+    const formOutcome = observe(second, frame => notification(frame)?.token === formId);
+    const formSettled = observe(second, frame => frame.type === "prompt_result" && frame.id === formId);
+    const publishedForms: HostFrame[] = [];
+    const unsubscribeForm = second.onFrame(frame => {
+      if (frame.type === "extension_ui_request" && frame.method === "form") publishedForms.push(frame);
+    });
+    let formPhase: string;
+    try {
+      const [accepted, outcome, settled] = await Promise.all([
+        second.request({ type: "prompt", message: `/fixture-form ${formId}` }, formId),
+        formOutcome.promise, formSettled.promise,
+      ]);
+      expect(accepted).toMatchObject({ id: formId, success: true });
+      const result = notification(outcome);
+      if (!result) throw new Error("Missing native form outcome");
+      expect(result).toMatchObject({ sessionId: initial.sessionId, pid: child.pid, agentStarts: 0, networkAttempts: 0 });
+      formPhase = result.phase;
+      if (formPhase === "form-unavailable") {
+        // Earlier stock RPCs don't expose ui.formDialog.
+        const version = Bun.spawnSync([...command, "--version"], { timeout: 10_000, stdout: "pipe" });
+        expect(version.exitCode).toBe(0);
+        expect(version.stdout.toString().trim()).toMatch(/^omp\/(?:18\.\d+|19\.0)\./);
+      } else {
+        expect(formPhase).toBe("form-cancelled");
+      }
+      expect(settled).toMatchObject({ id: formId, status: "completed", agentInvoked: false, sessionSettled: true });
+      expect(publishedForms).toEqual([]);
+      expect((await second.client.getState()).pendingUiRequests).toEqual([]);
+    } finally { unsubscribeForm(); formOutcome.cancel(); formSettled.cancel(); }
+
     const decisionProof: { request: HostFrame; result: unknown }[] = [];
     for (const action of ["submit", "cancel"] as const) {
       const id = decisionId(initial.sessionId, `native-decision-${action}`);
@@ -311,7 +343,7 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
     expect(await fs.realpath(header!.cwd)).toBe(await fs.realpath(cwd));
     const records = entries.filter(entry => entry.type === "custom" && entry.customType === RECORD_TYPE)
       .map(entry => (entry as { data: FixtureRecord }).data);
-    expect(records.map(record => record.phase)).toEqual(["checkpoint", "answer", "checkpoint", "shutdown"]);
+    expect(records.map(record => record.phase)).toEqual(["checkpoint", "answer", "checkpoint", formPhase, "shutdown"]);
     expect(records.filter(record => record.phase === "answer")).toEqual([expect.objectContaining({ confirmed: true, token: "original-approval-token" })]);
     expect(records.every(record => record.sessionId === initial.sessionId && record.pid === child.pid && record.networkAttempts === 0)).toBe(true);
     expect(records.filter(record => record.phase !== "shutdown").every(record => record.agentStarts === 0)).toBe(true);

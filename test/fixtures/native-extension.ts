@@ -117,6 +117,19 @@ export default function nativeFixture(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("fixture-form", {
+    description: "Await an untimed native HTML form when available",
+    handler: async (args, ctx) => {
+      let phase = "form-unavailable";
+      if (ctx.ui.formDialog) {
+        const answer = await ctx.ui.formDialog('<form><label>Route <input name="route" value="local"></label></form>');
+        phase = answer === undefined ? "form-cancelled" : "form-submitted";
+      }
+      const result = record(ctx, phase, args.trim());
+      ctx.ui.notify(JSON.stringify({ fixture: RECORD_TYPE, ...result }), "info");
+    },
+  });
+
   pi.on("session_shutdown", (_event, ctx) => {
     record(ctx, "shutdown", "native-graceful-shutdown");
   });

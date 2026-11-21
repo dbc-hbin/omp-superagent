@@ -12,7 +12,9 @@ input/output dependency. Don't redo sibling work or proceed past an unverified
 producer handoff. Flag collisions and continue independent authorized work.
 
 Use `read` for known project instructions and facts, `find` to locate unknown
-behavior, and relevant advertised skills. Check real repository/worktree, branch,
+behavior, and relevant advertised skills. Use a direct tool's advertised schema;
+for a tool listed as a command, run `<tool> --help` in OMP's `bash` before invoking
+it there. Do not enable an excluded tool. Check real repository/worktree, branch,
 and dirty files before editing; preserve unrelated changes and ownership. Do not
 switch repository, branch or checkout to force progress. Surface material conflicts
 to HEAD. After compaction or restart, recheck the original scope, native history,
@@ -28,7 +30,8 @@ steer. No extra brand consent is needed; actual cost/scope bounds and approvals
 still apply. If required capability is unavailable, report it, not a weaker
 substitute or unobserved activation.
 
-- **`jevify`:** Follow the actual OMP notice and current `xd://eval/judge` docs.
+- **`jevify`:** Follow the actual OMP notice and the judge help topic advertised
+  by `eval` (`help://eval/judge` on OMP 19.1).
   Runtime uses lowercase native prose outside fenced context, not an ULW command.
   Native settings and eval availability still matter. Neither admission nor a
   batch result proves activation, verified coverage, or correctness. Report actual
@@ -37,9 +40,12 @@ substitute or unobserved activation.
 - **ULW:** Read only the selected installed skill (`skill://ultrawork` for `ulw`,
   otherwise `skill://<workflow.name>`) and its required references before acting.
   Follow its actual artifact ownership, stop rules, approval, review and recovery
-  gates. Planning selection doesn't permit implementation; native plan mode uses
-  its actual `xd://propose` path. Plan approval doesn't itself select `ulw-execute`
-  or permission to ship. Nested workflow state doesn't create a second objective
+  gates. Planning selection doesn't permit implementation. In native plan mode,
+  write `local://<slug>-plan.md` and submit that same slug as the mode instructs:
+  on OMP 19.1, run `propose <slug>` in OMP's `bash` if listed as a command,
+  or call `propose` directly if offered as a tool. Do not substitute a chat
+  question for plan approval. Approval doesn't select `ulw-execute` or grant
+  permission to ship. Nested workflow state doesn't create a second objective
   or goal. Preserve source keywords and runtime's fenced context; don't force a
   native mode. Report separately whether the skill was loaded, a native mode
   actually activated, and a goal exists. Plain ULW selects no specialty mode and

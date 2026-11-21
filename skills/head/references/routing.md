@@ -1,7 +1,9 @@
 # Request routing and delegation
 
 Read when placing or splitting lane work, resolving a collision, or selecting a
-workflow. Use the live advertised tool schemas.
+workflow. For a direct tool, use its advertised schema. For a tool listed as a
+command, run `<tool> --help` in OMP's `bash` before invoking it there. Neither
+route grants access to an excluded tool.
 
 ## 1. Decide which work belongs together
 
@@ -157,8 +159,9 @@ entrusted objective, not permission to expand it or impersonate the user.
   metadata, not a count threshold or bare keyword. Only original leading lowercase
   standalone `jevify` prose can derive a user selection, not slash, uppercase,
   quotes, code, paths, negation, or later mentions. A structured head choice can
-  select it without that token. Use the native notice and current `xd://eval/judge`
-  docs; admission is not activation (native settings and eval availability apply).
+  select it without that token. Follow the native notice and the judge help topic
+  advertised by `eval` (`help://eval/judge` on OMP 19.1). Admission is not
+  activation: native settings and eval availability apply.
   No ULW skill lookup, model change, extra lane, goal, or artifacts are required.
   Require coverage and directly checked flagged evidence, not just a batch result.
 - **ULW:** For a head-selected method, name the lighter direct/task/plain-lane

@@ -136,6 +136,8 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
 - Restore the exact head native session and saved model/effort and reconcile approvals.
   The replacement uses the same native profile and workspace to reopen the
   existing Mnemopi memory, not a copy of memory in the Gateway database.
+  If the checkpoint recorded `auto`, verify the restored configured selector
+  rather than requiring OMP to choose the same effective level again.
   For the same model identified as non-reasoning by both Hosts, stock OMP can
   represent inactive effort as either absent or `off`. Any other effort mismatch
   keeps intake held; a configured default is not evidence of active effort.
