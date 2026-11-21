@@ -12,6 +12,7 @@ import { resolveThinkingLevelForModel } from "@oh-my-pi/pi-tui/thinking";
 import { parseSessionEntries, readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { HostChannel, indexServiceCompletions, serviceGenerationKey, type Frame, type ServiceUnit } from "./host-protocol";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { fitAbortAndRestoreQueueResponse } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type { RpcAbortAndRestoreQueueResult, RpcSessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { calculateTokensPerSecond } from "@oh-my-pi/pi-coding-agent/utils/token-rate";
@@ -642,8 +643,9 @@ export default function hostExtension(pi: ExtensionAPI): void {
       channel.on("frame", (command: Frame) => {
         if (command.type === "response" || typeof command.id !== "string") return;
         void handle(command).then(data => {
+          // This private channel always uses v2: fit the logical response, not an individual JSONL chunk.
           channel.send(command.type === "interrupt_maintenance" && command.restoreQueue === true
-            ? fitAbortAndRestoreQueueResponse(command.id as string, data as RpcAbortAndRestoreQueueResult, channel.encoder.maxResponseBytes)
+            ? fitAbortAndRestoreQueueResponse(command.id as string, data as RpcAbortAndRestoreQueueResult, MAX_RPC_REASSEMBLED_BYTES)
             : { type: "response", command: command.type, id: command.id, success: true, data });
         }, error => {
           channel.send({ type: "response", command: command.type, id: command.id, success: false,

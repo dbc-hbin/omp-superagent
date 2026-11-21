@@ -80,7 +80,11 @@ exit; a shutdown ACK is not exit. Reload the same native session when authorized
 The resident Rust owner speaks the stock JSONL/v2 protocol. Bun and the published SDK still
 prepare and publish the native session under its exact profile. The owner invokes short-lived
 SDK helpers for operations that depend on stock semantics, including fitting a withdrawn
-queue and verifying journal persistence after exit. No second Bun runtime stays resident per Host.
+queue and verifying journal persistence after exit. On the private v2 interrupt channel,
+queue restoration uses the SDK's reassembled-frame byte limit: this is the value of
+[`maxResponseBytes` in OMP 19.0](https://github.com/can1357/oh-my-pi/blob/v19.0.0/packages/coding-agent/src/modes/rpc/rpc-frame.ts#L341-L347)
+and [`maxIntactFrameBytes` in 19.1](https://github.com/can1357/oh-my-pi/blob/v19.1.0/packages/coding-agent/src/modes/rpc/rpc-frame.ts#L341-L347).
+An intact queue must not be reported as truncated. No second Bun runtime stays resident per Host.
 Gateway supervision reads the exact session, process and socket identity from a fresh handshake
 instead of fetching the same full state again on the new connection.
 

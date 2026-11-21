@@ -71,7 +71,13 @@ function git(root: string, ...args: string[]): string {
   return result.stdout.trim();
 }
 
-test.skipIf(!capable)("restricted chat makes stateless requests without tools or filesystem expansion", async () => {
+function expectRestrictedTools(request: Wire, required: readonly string[]) {
+  const names = (request.tools ?? []).map(tool => tool.function.name).sort();
+  // Some stock CLIs also advertise the QA reporter in restricted mode.
+  expect([required, [...required, "report_issue"].sort()]).toContainEqual(names);
+}
+
+test.skipIf(!capable)("restricted chat stays stateless without work tools or filesystem expansion", async () => {
   const fx = await fixture((_wire, _state, count) => response({ content: `local answer ${count}` }, "stop"));
   try {
     const canary = "RESTRICTED_CHAT_NEVER_READ_OWNER_CONFIG";
@@ -91,9 +97,10 @@ test.skipIf(!capable)("restricted chat makes stateless requests without tools or
       else process.env.PI_CODING_AGENT_DIR = selectionBefore;
     }
     expect(fx.paths).toEqual(["/v1/chat/completions", "/v1/chat/completions"]);
-    expect(fx.requests.map(request => [request.model, request.tools ?? []])).toEqual([
-      ["local-fixture", []], ["local-fixture", []],
-    ]);
+    for (const request of fx.requests) {
+      expect(request.model).toBe("local-fixture");
+      expectRestrictedTools(request, []);
+    }
     const userMessages = fx.requests.map(request => request.messages.filter(message => message.role === "user"));
     expect(userMessages.map(messages => messages.length)).toEqual([1, 1]);
     for (const [index, input] of [`@${join(ownerAgent, "AGENTS.md")}`, "second chat message"].entries()) {
@@ -159,9 +166,9 @@ test.skipIf(!capable)("restricted work edits only its detached checkout, without
     expect(await readFile(join(fx.stateDir, "external.txt"), "utf8")).toBe(scopeSecret);
     expect(await Bun.file(marker).exists()).toBe(false);
     expect(fx.paths).toEqual(["/v1/chat/completions", "/v1/chat/completions"]);
-    expect(fx.requests.map(request => request.tools?.map(tool => tool.function.name).sort())).toEqual([
-      ["group_edit", "group_list", "group_read"], ["group_edit", "group_list", "group_read"],
-    ]);
+    for (const request of fx.requests) {
+      expectRestrictedTools(request, ["group_edit", "group_list", "group_read"]);
+    }
     const toolData = fx.requests[1]?.messages?.filter(message => message.role === "tool");
     const byId = Object.fromEntries((toolData ?? []).map(entry => [entry.tool_call_id, entry.content]));
     expect(Object.keys(byId).sort()).toEqual(["absolute", "dot", "edit", "escape", "git", "hardedit", "hardlink", "large", "list", "read", "symlink"]);

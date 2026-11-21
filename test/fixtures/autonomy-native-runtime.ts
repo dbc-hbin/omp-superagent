@@ -345,10 +345,12 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     owned.set(queuePaths.socketPath, queueStarted.pid);
     const queue = await connect(queuePaths.socketPath);
     const queueRoute = { ...route, threadId: "9005" };
-    await queue.client.prompt(workflowContext(`Request ID: queue-proof\n\nOriginal source ID: queue-source\n\nOriginal authorized conversation: ${JSON.stringify(["discord", "2", "1", "3", "4", "9005"])}\n\nContinue entrusted work [pause-goal]`));
+    const queuePrompt = workflowContext(`Request ID: queue-proof\n\nOriginal source ID: queue-source\n\nOriginal authorized conversation: ${JSON.stringify(["discord", "2", "1", "3", "4", "9005"])}\n\nContinue entrusted work [pause-goal]`);
+    await queue.client.prompt(queuePrompt);
     await until(() => frames.some(event => event.socketPath === queuePaths.socketPath
       && event.frame.type === "tool_execution_start" && event.frame.toolName === "fixture_autonomy_hold"), "queue proof owned work");
-    await queue.client.abortAndRestoreQueue();
+    const emptyRestore = await queue.client.abortAndRestoreQueue();
+    expect(emptyRestore).toEqual({ steering: [], followUp: [] });
     await queue.client.waitForSettled();
     expect(await queue.client.getState()).toMatchObject({ goal: { enabled: false, goal: { status: "paused" } } });
     const barrier = Promise.withResolvers<string>();
@@ -369,6 +371,8 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     } });
     const stopped = queue.client.abortAndRestoreQueue();
     const restored = await within(stopped, "priority stop while native compaction is held");
+    // All three user drafts fit. The agent-authored context belongs in the
+    // journal, not in this response; its absence here is not truncation.
     expect(restored).toEqual({
       steering: [
         { text: "Already admitted steering\nKeep the exact first draft." },
@@ -391,6 +395,8 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     await within(queue.exited, "queue proof native shutdown");
     owned.delete(queuePaths.socketPath);
     const queueJournal = parseSessionEntries(await fs.readFile(queuePaths.sessionFile, "utf8"));
+    expect(queueJournal.flatMap(entry => entry.type === "message" && entry.message.role === "user"
+      ? [entry.message.content] : [])).toEqual([[{ type: "text", text: queuePrompt }]]);
     expect(queueJournal.filter(entry => entry.type === "custom_message" && entry.customType === "fixture-stop-context"))
       .toEqual([expect.objectContaining({ content: "Preserve admitted internal context without a model turn.", display: true })]);
 
