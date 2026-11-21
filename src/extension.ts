@@ -14,6 +14,7 @@ import { publishNativeSession } from "./native-sessions";
 import { MODEL_PRESET_NAMES, WORKFLOW_NAMES } from "./contracts";
 import type { PrWatchCommand } from "./pr-watch";
 import { registerDecisionAsk } from "./decision-tool";
+import { registerResultAttach, RESULT_ATTACH_TOOL } from "./result-attachment";
 
 // Inject the role contract, not the references. Resolve the reference directory
 // from this package so a same-name workspace skill cannot change the procedure.
@@ -28,6 +29,7 @@ const managerTools: Record<string, true> = {
   discord_context: true, discord_purpose_list: true, discord_purpose_set: true, discord_purpose_clear: true,
   pr_watch: true, pr_watch_list: true,
   decision_list: true, decision_inspect: true, decision_withdraw: true,
+  [RESULT_ATTACH_TOOL]: true,
 };
 const result = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
@@ -62,6 +64,10 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     if (!runtime) throw new Error(startupError ? `Superagent startup failed: ${String(startupError)}` : "Superagent is starting; retry once startup completes");
     return runtime;
   };
+  registerResultAttach(pi, intent => {
+    if (!runtime) throw new Error("The head controller is unavailable for result delivery");
+    return runtime.requestResultAttachment(intent);
+  });
   const nativePresets = (ctx: ExtensionContext): Promise<NativePresetManager> => {
     requireRuntime(ctx);
     return presets ??= Settings.loadReadOnly({ cwd: ctx.cwd }).then(settings => new NativePresetManager(

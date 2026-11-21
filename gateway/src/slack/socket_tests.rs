@@ -23,8 +23,12 @@ use crate::slack::{Config, Slack, api::Api};
 
 #[path = "card_tests.rs"]
 mod cards;
+#[path = "group_tests.rs"]
+mod group;
 #[path = "picker_tests.rs"]
 mod picker;
+#[path = "result_attachment_tests.rs"]
+mod result_attachment;
 
 const LIMIT: Duration = Duration::from_secs(5);
 type Peer = WebSocketStream<TcpStream>;
@@ -127,6 +131,10 @@ async fn api(
             json!({"channel":args["channel"],"ts":args["ts"]})
         }
         "views.open" => json!({"view":{"id":"VMODAL"}}),
+        "files.getUploadURLExternal" => json!({
+            "file_id":"FRESULT","upload_url":"https://files.slack.com/upload/v1/result"
+        }),
+        "files.completeUploadExternal" => json!({"files":[{"id":"FRESULT"}]}),
         _ => return Json(json!({"ok":false,"error":"invalid_arguments"})).into_response(),
     };
     reply["ok"] = json!(true);
@@ -145,6 +153,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_config(json!({"slack":{}})).await
+    }
+
+    async fn with_config(config: Value) -> Self {
         let root = std::env::temp_dir().join(format!("omp-slack-rust-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).expect("fixture state directory");
         let store = Arc::new(Store::open(&root).expect("fixture durable store"));
@@ -164,13 +176,14 @@ impl Fixture {
         };
         let app = Router::new()
             .route("/api/{method}", post(api))
+            .route("/upload/v1/result", post(result_attachment::upload))
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(api_listener, app)
                 .await
                 .expect("fixture API server")
         });
-        let hub = Hub::with_factory(&json!({"slack":{}}), store.clone(), |name, _, ctx| {
+        let hub = Hub::with_factory(&config, store.clone(), |name, _, ctx| {
             assert_eq!(name, "slack");
             let config = Config {
                 bot_token_env: String::new(),

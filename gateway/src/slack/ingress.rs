@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{adapter::EffectError, commands::accepts_text};
+use crate::{adapter::EffectError, commands::accepts_text, group::{Candidate, Output as GroupOutput}};
 
 use super::Inner;
 use super::api::Identity;
@@ -76,6 +76,16 @@ struct File {
 }
 
 impl Inner {
+    pub(super) async fn send_group(&self, output: GroupOutput<Route>) -> Result<String, EffectError> {
+        let mut route = output.route;
+        self.destination(&route).await?;
+        if route.thread_id.is_none() {
+            route.thread_id = Some(Ts::parse(&output.message_id)
+                .ok_or_else(|| EffectError::rejected("Invalid Slack source message ID"))?);
+        }
+        self.post(&route, &output.text, None).await.map(|receipt| receipt.as_str().to_owned())
+    }
+
     pub(super) async fn handle_event(
         &self,
         identity: &Identity,
@@ -83,7 +93,7 @@ impl Inner {
         event: Event,
     ) -> Result<(), EffectError> {
         match event {
-            Event::Events(body) => self.receive_message(identity, &body, ack).await,
+            Event::Events { body, replayed } => self.receive_message(identity, &body, replayed, ack).await,
             Event::Slash(body) => self.receive_slash(identity, &body, ack).await,
             Event::Interactive(body) => self.interact(&body, ack).await,
             Event::Unknown => ack.send(None).await,
@@ -117,6 +127,7 @@ impl Inner {
         &self,
         identity: &Identity,
         body: &Value,
+        replayed: bool,
         ack: Ack,
     ) -> Result<(), EffectError> {
         if body["team_id"] != self.team || !same_optional(body, "api_app_id", &identity.app_id) {
@@ -131,6 +142,12 @@ impl Inner {
                 .get("channel_type")
                 .is_some_and(|kind| !matches!(kind.as_str(), Some("im" | "channel" | "group")))
         {
+            return ack.send(None).await;
+        }
+        if self.ctx.group_room(Some(&self.team), channel).is_some() {
+            if !replayed {
+                self.group_message(identity, channel, event).await?;
+            }
             return ack.send(None).await;
         }
         let source = match event.get("subtype") {
@@ -159,6 +176,40 @@ impl Inner {
                 .await?;
         }
         ack.send(None).await
+    }
+
+    async fn group_message(&self, identity: &Identity, channel: &str, event: &Value) -> Result<(), EffectError> {
+        let Some(user) = event["user"].as_str().filter(|id| id.starts_with(['U', 'W']) && slack_id(id)) else {
+            return Ok(());
+        };
+        if user == identity.bot_user
+            || event["is_bot"] == true
+            || event["is_app_user"] == true
+            || ["subtype", "edited", "bot_id", "bot_profile", "app_id", "files", "attachments"]
+                .iter().any(|key| event.get(*key).is_some_and(|value| {
+                    !value.is_null() && !value.as_array().is_some_and(Vec::is_empty)
+                }))
+            || !["team", "user_team", "source_team"].iter().all(|key| same_optional(event, key, &self.team))
+            || !self.ctx.group_room(Some(&self.team), channel).is_some_and(|room| room.permits(user))
+        {
+            return Ok(());
+        }
+        let Ok(message) = Message::deserialize(event) else { return Ok(()) };
+        let Some(text) = message.text.as_deref().filter(|text| text.starts_with('!')) else {
+            return Ok(());
+        };
+        let Some(sent_ms) = message.ts.whole_millis() else { return Ok(()) };
+        let thread = message.thread_ts.filter(|root| root != &message.ts);
+        if let Some(route) = self.incoming_route(identity, channel, thread).await? {
+            self.ctx.admit_group(json!(route), Candidate {
+                message_id: message.ts.as_str(),
+                user_id: user,
+                text,
+                sent_ms,
+                qualified_command: None,
+            }).map_err(|_| EffectError::uncertain("Slack group admission could not be confirmed"))?;
+        }
+        Ok(())
     }
 
     fn parse_slash<'a>(&self, identity: &Identity, body: &'a Value) -> Option<(Slash<'a>, String)> {
@@ -194,6 +245,13 @@ impl Inner {
         ack: Ack,
     ) -> Result<(), EffectError> {
         let ephemeral = |text| Some(json!({ "response_type": "ephemeral", "text": text }));
+        if body["team_id"] == self.team
+            && body["channel_id"].as_str().is_some_and(|channel| {
+                self.ctx.group_room(Some(&self.team), channel).is_some()
+            })
+        {
+            return ack.send(None).await;
+        }
         let Some((command, text)) = self.parse_slash(identity, body) else {
             return ack.send(ephemeral(REFUSED)).await;
         };
@@ -248,7 +306,9 @@ impl Inner {
         source: &Value,
         route: Route,
     ) -> Result<Option<Inbound>, EffectError> {
-        if !self.owner_message(source) {
+        if self.ctx.group_room(route.guild_id.as_deref(), &route.channel_id).is_some()
+            || !self.owner_message(source)
+        {
             return Ok(None);
         }
         let Ok(message) = Message::deserialize(source) else {

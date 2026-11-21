@@ -98,6 +98,9 @@ impl State {
         let Ok(route) = self.route_for(&channel) else {
             return deny("This conversation is not authorized for Superagent commands.").await;
         };
+        if self.group_route(&route) {
+            return Ok(());
+        }
         if route.guild_id != interaction.guild_id {
             return deny("This conversation is not authorized for Superagent commands.").await;
         }

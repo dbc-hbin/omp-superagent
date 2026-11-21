@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
+use crate::group::Request as GroupRequest;
+
 use super::{PHYSICAL_ROUTE_FIELDS, Store, json_equal, now, string};
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -44,10 +46,19 @@ impl EventRow {
 
 impl Store {
     pub fn admit(&self, event: &Value) -> Result<bool> {
+        self.admit_event(event, None)
+    }
+
+    pub(crate) fn admit_group(&self, request: &GroupRequest, daily_limit: u64) -> Result<bool> {
+        self.admit_event(&serde_json::json!({"kind": "group", "request": request}), Some(daily_limit))
+    }
+
+    fn admit_event(&self, event: &Value, group_limit: Option<u64>) -> Result<bool> {
         let kind = string(event, "kind")?;
         let key = match kind {
             "message" => format!("message:{}", string(&event["input"], "id")?),
             "answer" => format!("answer:{}", string(event, "approvalId")?),
+            "group" if group_limit.is_some() => format!("group:{}", string(&event["request"], "id")?),
             "restart" => format!(
                 "restart:{}:{}",
                 string(event, "requestId")?,
@@ -86,12 +97,47 @@ impl Store {
             }
             return Ok(false);
         }
+        let received_at = now()?;
+        if let Some(limit) = group_limit {
+            const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+            let today = received_at.div_euclid(DAY_MS) * DAY_MS;
+            let route = &event["request"]["route"];
+            let count: u64 = tx.query_row(
+                "SELECT COUNT(*) FROM gateway_events WHERE identity LIKE 'group:%'
+                   AND received_at >= ?1 AND received_at < ?2
+                   AND json_extract(data,'$.request.route.platform')=?3
+                   AND json_extract(data,'$.request.route.guildId')=?4
+                   AND json_extract(data,'$.request.route.channelId')=?5",
+                params![
+                    today, today + DAY_MS,
+                    string(route, "platform")?, string(route, "guildId")?, string(route, "channelId")?,
+                ],
+                |row| row.get(0),
+            )?;
+            if count >= limit {
+                return Ok(false);
+            }
+        }
         tx.execute(
             "INSERT INTO gateway_events(identity,data,received_at) VALUES (?,?,?)",
-            params![key, serialized, now()?],
+            params![key, serialized, received_at],
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    pub(crate) fn group_request(&self, id: &str) -> Result<Option<GroupRequest>> {
+        let data = self.db()?.query_row(
+            "SELECT data FROM gateway_events WHERE identity=? AND delivery_error IS NOT 'rejected'",
+            [format!("group:{id}")],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        let Some(data) = data else { return Ok(None) };
+        let event: Value = serde_json::from_str(&data)?;
+        if event["kind"] != "group" || event["request"]["id"] != id {
+            return Ok(None);
+        }
+        Ok(Some(GroupRequest::deserialize(&event["request"])?))
     }
 
     pub fn next(&self, sequence: Option<i64>) -> Result<Option<QueuedEvent>> {
@@ -243,6 +289,16 @@ pub fn answer_digest(response: &Value) -> Result<String> {
 }
 
 fn identity(mut event: Value) -> Result<Value> {
+    if event["kind"] == "group" {
+        let request = event.get_mut("request")
+            .and_then(Value::as_object_mut)
+            .context("Invalid Gateway group request")?;
+        // Policy changes cannot re-admit the same source or poison a poll cursor.
+        // Preserve the original recorded policy, while verifying the source payload.
+        request.remove("revision");
+        request.remove("mode");
+        return Ok(event);
+    }
     if event["kind"] != "message" {
         return Ok(event);
     }

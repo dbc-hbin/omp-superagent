@@ -221,8 +221,14 @@ impl Hub {
             client.close_stream();
             return Ok(());
         }
-        let Some(frame) = self.store.next(None)? else {
-            return Ok(());
+        let frame = loop {
+            let Some(frame) = self.store.next(None)? else {
+                return Ok(());
+            };
+            if self.adapters.rooms.allows_event(&frame.event) {
+                break frame;
+            }
+            self.store.receipt(frame.sequence, GatewayReceipt::Rejected)?;
         };
         let mut wire = serde_json::to_vec(&frame)?;
         wire.push(b'\n');

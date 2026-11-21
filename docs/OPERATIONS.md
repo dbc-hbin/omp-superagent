@@ -647,6 +647,7 @@ high/middle/low는 명시적 `start`의 전용 초기 설정 턴에서 기존 �
 | `discord` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedGuildIds`, `allowedChannelIds` 모두 필수. |
 | `telegram` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedChatIds` 모두 필수. 그룹 chat ID의 음수 부호를 보존한다. |
 | `slack` | 선택 블록. 존재하면 `botTokenEnv`, `appTokenEnv`, `ownerId`, `teamId`, `allowedChannelIds` 모두 필수. |
+| `groupRooms` | 선택 목록. 등록한 방과 사용자에게만 아래 그룹 모드를 열며, 해당 방에서는 운영자도 일반 그룹 권한만 갖는다. 기본값은 빈 목록이다. |
 
 상태·cwd 상대 경로는 설정 파일 기준이지만 `command` 인수의 상대 경로는 그렇게 변환되지 않는다.
 실행 cwd가 달라도 동작하도록 command에는 절대 경로를 권장한다.
@@ -656,6 +657,77 @@ OMP 소스 CLI나 프로젝트 패치 바이너리를 지정하지 않는다. �
 하드코딩된 기본값이 아니다. 이 예에서는 헤드 외 최대 3개 레인과 Host별 task 동시성 2를
 예산으로 잡는다. 이는 CPU·메모리·토큰 비용·디스크 할당량의 강제 제한이 아니다.
 저장 기록과 다운로드 파일의 보존·디스크 사용량은 운영자가 관리한다.
+
+### 단체방·서버 권한 분리
+
+기존 플랫폼 허용 목록에 추가한 방을 `groupRooms`에서도 정확한 플랫폼·서버·채널 ID로
+지정한다. 목록에 넣지 않은 기존 운영자 라우트의 동작은 바뀌지 않는다. 같은 서버의 다른
+채널은 자동으로 열리지 않는다. 등록한 부모 채널의 스레드·포럼 토픽에는 같은 규칙이 적용된다.
+운영자는 관리 명령·승인·결과 파일 발송을 위해 본인의 DM이나 별도 운영 채널을 사용한다.
+
+```json
+{
+  "groupRooms": [
+    {
+      "platform": "discord",
+      "guildId": "1234567890",
+      "channelId": "1234567891",
+      "userIds": ["1234567892"],
+      "mode": "request",
+      "dailyLimit": 10
+    }
+  ]
+}
+```
+
+- `platform`: `discord`, `telegram`, `slack`. Telegram은 `guildId`와 `channelId`에 같은 음수
+  그룹 ID를 넣는다. Slack `guildId`는 설정한 `teamId`다. `userIds`는 표시 이름이 아닌 실제
+  사용자 ID이며, 운영자도 제한 모드를 쓰려면 목록에 넣는다. 서버 관리자 역할은 권한이 아니다.
+- 미허가 ID의 호출은 슬래시 명령을 포함해 접수·실행되지 않는다. Discord·Slack에서는
+  등록된 슬래시 명령이 앱 메뉴에 보일 수 있어도 제한 그룹 안에서는 누구에게도 실행되지 않는다.
+  허가된 ID는 해당 방에 설정된 `!request`, `!ask`, `!work` 중 하나만 사용할 수 있다.
+- `request`: `!request 요청 내용`은 접수 확인만 답하고 모델이나 도구를 실행하지 않는다.
+  `omp-sa group --config FILE` 또는 `omp-sa group REQUEST_ID --config FILE`로 운영자가 로컬에서
+  원문을 확인한다. 검토한 요청을 실행하려면 운영자가 자신의 허용된 대화에서 새 요청으로 시작한다.
+- `chat`: `!ask 질문`은 별도 OMP 실행에 현재 질문만 보내고 짧은 텍스트 답을 받는다. 작업
+  디렉터리·도구·이전 대화·운영자 메모리는 사용하지 않는다. `model`에 정확한 `provider/model`을 넣는다.
+- `work`: `!work 작업 내용`은 `model`과 운영자가 `repository`에 지정한 저장소를 사용한다.
+  같은 방에 접수 확인이 실제로 도착한 뒤, 지정 저장소의 커밋으로 만든 별도 Git worktree 안에서
+  허용된 파일만 읽고 편집한다.
+  셸, 테스트 명령, Git 커밋·푸시·병합은 실행하지 않는다. 단체방에는 고정된 상태만 표시하고,
+  실제 diff와 worktree 위치는 운영자가 로컬에서 `omp-sa group REQUEST_ID --config FILE`로
+  확인한다. 종료 상태는 변경 내용 검증이나 배포 승인이 아니다.
+- Telegram 개인정보 보호 모드에서는 봇의 실제 사용자명을 붙인 `/request@BotUsername`,
+  `/ask@BotUsername`, `/work@BotUsername`을 사용한다. 수정한 입력은 새 작업을 만들지 않는다.
+- `dailyLimit`은 UTC 기준 방별 일일 접수 한도다. `chat`과 `work`는 동시에 하나만 실행하며
+  Host 예산에 남는 슬롯을 사용한다. `stateDir/groups/models.yml`에 별도 그룹용 OMP 모델 인증을
+  배치한다. 운영자 프로필은 상속하지 않는다. 이 모델에 전송해도 되는 저장소와 데이터만 지정한다.
+  worktree는 OS 샌드박스가 아니며, 미검토 파일을 원본에 적용하거나 실행하지 않는다.
+- 설정 변경은 다음 Gateway 시작에서 적용된다. 중단된 실행·발송 결과가 불확실한 응답을
+  자동 재실행하거나 재발송하지 않는다. 그룹 모드로 전환하기 전 이미 공개된 메시지는 지워지지 않는다.
+
+`request` 방에는 모델 파일이 필요 없다. `chat`·`work`를 쓰려면 `stateDir/groups`를
+실행 계정만 접근할 수 있게 만들고(`0700`), 그 안에 `models.yml`을 `0600`으로 저장한다.
+예를 들어 OpenAI 호환 API를 쓴다면 아래와 같이 등록하고 방의 `model`을
+`group-provider/EXACT_MODEL_ID`로 지정한다. URL·키·한도·가격을 실제 제공자 값으로
+교체한다. 운영자 자격 증명 대신 그룹 전용 키와 제공자 측 사용량 한도를 사용하는 것을 권장한다.
+
+```yaml
+providers:
+  group-provider:
+    api: openai-completions
+    baseUrl: https://provider.example/v1
+    apiKey: REPLACE_WITH_GROUP_ONLY_API_KEY
+    models:
+      - id: EXACT_MODEL_ID
+        name: Group model
+        contextWindow: 32768
+        maxTokens: 4096
+        cost: {input: 1, output: 4, cacheRead: 0, cacheWrite: 0}
+```
+
+그룹의 질문·작업은 실제 모델 호출이므로 제공자 비용이 발생할 수 있다. 로컬 시간/비용 제한은
+실행을 제한하지만, 이미 전송한 요청의 과금을 취소하거나 제공자 청구액을 보장하지는 않는다.
 
 ## 4. 명령과 일상 사용
 
@@ -1140,6 +1212,13 @@ bun --no-env-file src/cli.ts uninstall --config config.local.json
   - Slack: 토큰 없는 `slack-file:<file_id>`에서 `files.info`로 소유자의 hosted 파일·workspace·
     원래 대화/thread share를 확인한다. 해당 team/file의 `files.slack.com/files-pri/TEAM-FILE/…`
     HTTPS 경로에만 bot Authorization 헤더로 접근한다. 외부 링크 파일은 받지 않는다.
+- 운영자가 만든 파일을 결과물로 받고 싶으면 새 일반 메시지의 요청 첫 줄에
+  `attach: 보고서/결과.pdf`처럼
+  정확한 작업 디렉터리 상대 경로를 적는다. 첫 줄에 `cwd:`를 지정한다면 그 다음 줄에 적는다.
+  첨부는 한 요청당 파일 하나, 최대 8 MiB다. 숨김 경로·링크·런타임 및 자격 증명 경로는 거부한다.
+  Discord·Telegram·Slack의 원래 작업 대화에만 발송되며, 작업 스레드가 없는 경우 원래 요청 대화가
+  대상이다. 수정 메시지·앱 슬래시 상호작용·모델 답변으로는 첨부를 허가할 수 없다.
+  제한 그룹에서도 사용할 수 없다.
 - 긴 출력은 아래 단일 텍스트 첨부로 보낸다. 입력 한도와 다르다. Discord만 예외로, 2,000 UTF-16 단위를
   넘는 답변을 문단·줄·공백 경계에서 최대 5개 메시지로 나눠 순서대로 보낸다. 코드 블록이 경계에
   걸리면 앞 메시지에서 닫고 다음 메시지에서 같은 언어로 다시 연다. 원래 메시지에 대한 답장 표시는 첫

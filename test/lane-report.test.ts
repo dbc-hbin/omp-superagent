@@ -80,7 +80,7 @@ describe("native lane reporting", () => {
     await f.runner.emit({ type: "session_start" });
     expect(f.active()).toEqual(["read", "task", "lane_report"]);
     expect(f.definition).toMatchObject({ name: "lane_report", approval: "read", loadMode: "essential" });
-    expect(f.runner.getAllRegisteredTools().map(tool => tool.definition.name)).toEqual(["decision_ask", "lane_report"]);
+    expect(f.runner.getAllRegisteredTools().map(tool => tool.definition.name)).toEqual(["decision_ask", "result_attach", "lane_report"]);
     const branch = structuredClone(f.session.getBranch());
     const output = await f.execute({ status: "waiting", summary: "Needs owner review",
       waiting: { kind: "dependency", target: "owner's review" } }, "actual-execute-id");

@@ -136,7 +136,7 @@ impl Worker {
                     let Some(envelope) = item else { break };
                     let key = match &envelope.event {
                         Event::Interactive(body) => self.inner.interaction_key(body).await,
-                        Event::Events(_) | Event::Slash(_) | Event::Unknown => None,
+                        Event::Events { .. } | Event::Slash(_) | Event::Unknown => None,
                     };
                     let Some(key) = key else {
                         self.handle(envelope).await;

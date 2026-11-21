@@ -65,7 +65,7 @@ const SCHEMA = `
     source_id TEXT NOT NULL, route TEXT NOT NULL, text TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending'
       CHECK(state IN ('pending','sending','sent','uncertain','failed')),
-    remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT
+    remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT, result_attachment TEXT
   );
   CREATE INDEX IF NOT EXISTS outputs_queue ON outputs(state, sequence);
   CREATE TABLE IF NOT EXISTS approvals (
@@ -100,6 +100,7 @@ interface OutputRow {
   route: string;
   reply_to: string | null;
   picker: string | null;
+  result_attachment: string | null;
   text: string;
   state: OutputRecord["state"];
   remote_id: string | null;
@@ -116,6 +117,7 @@ const toOutput = (row: OutputRow): OutputRecord => ({
   id: row.id, sourceId: row.source_id, route: JSON.parse(row.route) as Route,
   ...(row.reply_to === null ? {} : { replyTo: JSON.parse(row.reply_to) as NonNullable<OutputRecord["replyTo"]> }),
   ...(row.picker === null ? {} : { picker: JSON.parse(row.picker) as NonNullable<OutputRecord["picker"]> }),
+  ...(row.result_attachment === null ? {} : { resultAttachment: JSON.parse(row.result_attachment) as NonNullable<OutputRecord["resultAttachment"]> }),
   text: row.text, state: row.state, remoteId: row.remote_id, error: row.error,
 });
 const toApproval = (row: ApprovalRow): Approval => ({
@@ -193,6 +195,7 @@ export class Store implements StorePort {
       const outputColumns = db.query("PRAGMA table_info(outputs)").all() as Array<{ name: string }>;
       if (!outputColumns.some(column => column.name === "reply_to")) db.run("ALTER TABLE outputs ADD COLUMN reply_to TEXT");
       if (!outputColumns.some(column => column.name === "picker")) db.run("ALTER TABLE outputs ADD COLUMN picker TEXT");
+      if (!outputColumns.some(column => column.name === "result_attachment")) db.run("ALTER TABLE outputs ADD COLUMN result_attachment TEXT");
       this.db = db;
       this.writerLock = lock;
     } catch (error) {
@@ -650,12 +653,25 @@ export class Store implements StorePort {
     return decision.destination;
   }
 
+  resultAttachmentDelivery(inputId: string): { source: InputRecord; outputSourceId: string; route: Route } | null {
+    const input = this.input(inputId);
+    if (!input?.target || input.target === "main") return null;
+    const from = this.getMeta(`handoff-source:${inputId}`);
+    const source = from === null ? input : this.input(from);
+    if (!source || this.getMeta(`user-source:${source.id}`) !== "true") return null;
+    const route = this.deliveryRoute(source);
+    if (routeKey(route) === routeKey(source.route)) return { source, outputSourceId: source.id, route };
+    if (routeKey(route) === routeKey(input.route)) return { source, outputSourceId: input.id, route };
+    return null;
+  }
+
   queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error">): boolean {
     return this.db.transaction(() => {
       const existing = this.output(output.id);
       if (existing) {
         if (existing.sourceId !== output.sourceId || routeKey(existing.route) !== routeKey(output.route)
           || existing.text !== output.text || !isDeepStrictEqual(existing.picker, output.picker)
+          || !isDeepStrictEqual(existing.resultAttachment, output.resultAttachment)
           || output.replyTo !== undefined && (!existing.replyTo
             || existing.replyTo.messageId !== output.replyTo.messageId
             || physicalRouteKey(existing.replyTo.route) !== physicalRouteKey(output.replyTo.route))) {
@@ -670,6 +686,24 @@ export class Store implements StorePort {
       // Synthetic handoffs/reports can carry a copied messageId on a different
       // route. Follow only durable source links, never that copy or ReplyContext.
       const original = this.ownerSource(output.sourceId);
+      const attachment = output.resultAttachment;
+      if (attachment) {
+        const native = this.input(attachment.inputId);
+        const topic = native && this.resultAttachmentDelivery(native.id);
+        const runId = native && this.getMeta(`steering-owner:${native.id}`);
+        const run = runId && this.input(runId);
+        const ownership = run && this.getMeta(`${native?.target === "main" ? "head-native-owner" : "lane-observation-owner"}:${run.id}`);
+        const owner = ownership && JSON.parse(ownership);
+        if (output.text || output.picker || !original || original.id !== attachment.sourceId || !native || native.state !== "submitted"
+          || native.requestId !== attachment.requestId || native.generation !== attachment.generation
+          || !run || !owner || run.target !== native.target || owner.requestId !== run.requestId
+          || owner.generation !== attachment.generation || owner.sessionId !== attachment.sessionId
+          || owner.sessionFile !== attachment.sessionFile
+          || (topic ? topic.source.id !== original.id || topic.outputSourceId !== output.sourceId || routeKey(topic.route) !== routeKey(output.route)
+            : native.target !== "main" || native.id !== original.id || native.id !== output.sourceId)) {
+          throw new Error(`Result attachment does not match its original native request: ${output.id}`);
+        }
+      }
       const replyTo = original?.route.platform === "discord" && original.messageId
         && physicalRouteKey(original.route) === physicalRouteKey(output.route)
         ? { route: physicalRoute(original.route), messageId: original.messageId } : undefined;
@@ -677,9 +711,9 @@ export class Store implements StorePort {
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(replyTo.route))) {
         throw new Error(`Output reply differs from its source: ${output.id}`);
       }
-      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to, picker) VALUES (?, ?, ?, ?, ?, ?)")
+      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to, picker, result_attachment) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(output.id, output.sourceId, JSON.stringify(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
-          output.picker ? JSON.stringify(output.picker) : null).changes === 1;
+          output.picker ? JSON.stringify(output.picker) : null, attachment ? JSON.stringify(attachment) : null).changes === 1;
     }).immediate();
   }
 
@@ -705,6 +739,9 @@ export class Store implements StorePort {
       if (output.state === state) {
         if (remoteId !== undefined && output.remoteId !== remoteId) throw new Error(`Output receipt conflict: ${id}`);
         return;
+      }
+      if (output.resultAttachment && state === "pending") {
+        throw new Error(`A result attachment is never retried: ${id}`);
       }
       const retry = state === "pending" && (output.state === "uncertain" || output.state === "failed");
       const reconcile = output.state === "uncertain" && state === "sent";

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::adapter::EffectError;
 use crate::picker::Picker;
+use crate::result_attachment::ResultAttachment;
 
 use super::Inner;
 use super::api::secure_url;
@@ -16,11 +17,13 @@ const FILE_LIMIT: usize = 8 * 1024 * 1024;
 pub(super) const TEXT_LIMIT: usize = 3_000;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Output {
     id: String,
     route: Route,
     text: String,
     picker: Option<Picker>,
+    result_attachment: Option<ResultAttachment>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +132,13 @@ impl Inner {
 
     pub(super) async fn send(&self, output: Output) -> Result<String, EffectError> {
         self.destination(&output.route).await?;
+        if let Some(file) = output.result_attachment {
+            if output.route.authority_id != self.owner || output.picker.is_some() || !output.text.is_empty() {
+                return Err(EffectError::rejected("Slack result attachments require owner authority and a standalone file"));
+            }
+            let bytes = file.bytes()?;
+            return self.upload(&output.route, file.name, bytes).await;
+        }
         if output.text.len() > FILE_LIMIT {
             return Err(EffectError::rejected(
                 "Slack text output exceeds the safe 8 MiB upload limit",
@@ -160,11 +170,15 @@ impl Inner {
             "omp-{}.txt",
             short_hash(&json!([output.id, output.route.key()]))
         );
+        self.upload(&output.route, filename, output.text.into_bytes()).await
+    }
+
+    async fn upload(&self, route: &Route, filename: String, bytes: Vec<u8>) -> Result<String, EffectError> {
         let ticket: UploadTicket = self
             .api
             .call(
                 "files.getUploadURLExternal",
-                json!({ "filename": filename, "length": output.text.len() }),
+                json!({ "filename": filename, "length": bytes.len() }),
             )
             .await?;
         if !file_id(&ticket.file_id) {
@@ -175,12 +189,11 @@ impl Inner {
         let url = authorized_file_url(&ticket.upload_url, "/upload/v1/", false)
             .ok_or_else(|| EffectError::rejected("Slack returned an unauthorized upload URL"))?;
         let response = self
-            .ctx
-            .http
-            .post(url)
+            .api
+            .file_upload(url)
             .timeout(Duration::from_secs(60))
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(output.text.into_bytes())
+            .body(bytes)
             .send()
             .await
             .map_err(|_| {
@@ -193,9 +206,9 @@ impl Inner {
         }
         drop(response);
         let mut args = json!({
-            "files": [{ "id": ticket.file_id, "title": filename }], "channel_id": output.route.channel_id,
+            "files": [{ "id": ticket.file_id, "title": filename }], "channel_id": route.channel_id,
         });
-        if let Some(root) = &output.route.thread_id {
+        if let Some(root) = &route.thread_id {
             args["thread_ts"] = json!(root);
         }
         let receipt: UploadComplete = self.api.call("files.completeUploadExternal", args).await?;

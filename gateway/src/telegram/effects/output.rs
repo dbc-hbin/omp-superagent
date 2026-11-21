@@ -5,8 +5,11 @@ use serde_json::json;
 use crate::{
     adapter::EffectError,
     picker::Picker,
+    result_attachment::ResultAttachment,
     telegram::{
         Core,
+        files::Media,
+        ingress::Message,
         model::{Identity, Route, hash},
         view::View,
     },
@@ -17,11 +20,31 @@ use super::{TEXT_LIMIT, topic_payload};
 const UPLOAD_LIMIT: usize = 50 * 1024 * 1024;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Output<'a> {
     id: &'a str,
     route: Route,
     text: &'a str,
     picker: Option<Picker>,
+    result_attachment: Option<ResultAttachment>,
+}
+
+#[derive(Deserialize)]
+struct AttachedMessage {
+    #[serde(flatten)]
+    message: Message,
+    document: Media,
+}
+
+fn document_form(route: &Route, document: Part) -> Form {
+    let mut body = Form::new()
+        .text("chat_id", route.channel_id.clone())
+        .text("allow_paid_broadcast", "false")
+        .part("document", document);
+    if let Some(thread) = &route.thread_id {
+        body = body.text("message_thread_id", thread.clone());
+    }
+    body
 }
 
 impl Core {
@@ -32,6 +55,21 @@ impl Core {
     ) -> Result<String, EffectError> {
         let route = &output.route;
         self.destination(me, route).await?;
+        if let Some(file) = output.result_attachment {
+            if output.picker.is_some() || !output.text.is_empty() {
+                return Err(EffectError::rejected("A Telegram result attachment must be a standalone document"));
+            }
+            let bytes = file.bytes()?;
+            let size = bytes.len();
+            let document = Part::bytes(bytes).file_name(file.name.clone());
+            let sent: AttachedMessage = self.api.send_document(document_form(route, document)).await?;
+            if sent.document.file_name.as_deref() != Some(file.name.as_str())
+                || sent.document.file_size.is_some_and(|actual| usize::try_from(actual) != Ok(size))
+                || sent.document.file_id.is_empty() {
+                return Err(EffectError::uncertain("Telegram result document receipt could not be verified"));
+            }
+            return self.receipt(me, route, &sent.message);
+        }
         if output.text.len() > UPLOAD_LIMIT {
             return Err(EffectError::rejected(
                 "Telegram text document exceeds the 50 MiB upload limit",
@@ -65,15 +103,7 @@ impl Core {
         } else {
             let document = Part::bytes(output.text.as_bytes().to_vec())
                 .file_name(format!("omp-{}.txt", hash(output.id)));
-            let mut body = Form::new()
-                .text("chat_id", route.channel_id.clone())
-                .text("caption", "Full output is attached.")
-                .text("allow_paid_broadcast", "false")
-                .part("document", document);
-            if let Some(thread) = &route.thread_id {
-                body = body.text("message_thread_id", thread.clone());
-            }
-            self.api.send_document(body).await?
+            self.api.send_document(document_form(route, document).text("caption", "Full output is attached.")).await?
         };
         self.receipt(me, route, &message)
     }

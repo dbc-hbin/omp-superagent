@@ -227,6 +227,17 @@ impl Api {
     pub(super) fn private_download(&self, url: Url) -> reqwest::RequestBuilder {
         self.client.get(url).bearer_auth(&self.credentials.bot)
     }
+
+    pub(super) fn file_upload(&self, url: Url) -> reqwest::RequestBuilder {
+        #[cfg(test)]
+        let url = self.local.as_ref().map_or_else(|| url.clone(), |base| {
+            let mut target = base.clone();
+            target.set_path(url.path());
+            target.set_query(url.query());
+            target
+        });
+        self.client.post(url)
+    }
 }
 
 pub(super) fn secure_url(url: &Url, scheme: &str) -> bool {

@@ -62,6 +62,7 @@ struct Frame {
     connection_info: Option<ConnectionInfo>,
     envelope_id: Option<String>,
     accepts_response_payload: Option<bool>,
+    retry_attempt: Option<u64>,
     payload: Option<Value>,
 }
 
@@ -71,7 +72,7 @@ struct ConnectionInfo {
 }
 
 pub(super) enum Event {
-    Events(Value),
+    Events { body: Value, replayed: bool },
     Slash(Value),
     Interactive(Value),
     Unknown,
@@ -284,7 +285,10 @@ impl Inner {
                                 let Some(id) = frame.envelope_id.filter(|id| !id.is_empty()) else { continue };
                                 let payload = frame.payload.unwrap_or(Value::Null);
                                 let event = match frame.kind.as_str() {
-                                    "events_api" => Event::Events(payload),
+                                    "events_api" => Event::Events {
+                                        body: payload,
+                                        replayed: frame.retry_attempt.is_some_and(|attempt| attempt > 0),
+                                    },
                                     "slash_commands" => Event::Slash(payload),
                                     "interactive" => Event::Interactive(payload),
                                     _ => Event::Unknown,

@@ -81,6 +81,10 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
             "type":0,"content":"edited by owner", "edited_timestamp":"2026-11-21T01:02:03.456000+00:00"})
         }
         ("GET", "/channels/89") => json!({"id":"89", "guild_id":"77", "type":0}),
+        ("POST", "/channels/90/messages") => {
+            fixture.emitted.send((path, body)).unwrap();
+            json!({"id":"701","guild_id":"77","channel_id":"90","author":{"id":"71","bot":true}})
+        }
         ("GET", "/channels/99") => json!({"id":"99", "type":1, "recipients":[{"id":"42"}]}),
         ("GET", "/channels/98") => {
             json!({"id":"98", "type":3, "recipients":[{"id":"42"},{"id":"43"}]})
@@ -104,8 +108,12 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
                 .strip_prefix("segment ")
                 .and_then(|rest| rest.get(..1))
                 .map_or_else(|| "700".to_owned(), |part| format!("80{part}"));
-            let remote = json!({"id":id, "channel_id":"99", "author":{"id":"71","bot":true},
+            let mut remote = json!({"id":id, "channel_id":"99", "author":{"id":"71","bot":true},
                 "components":body.get("components").cloned().unwrap_or_else(|| json!([])) });
+            if body.as_str().is_some_and(|body| body.contains("filename=\"result.bin\"")) {
+                remote["attachments"] = json!([{"id":"364","filename":"result.bin",
+                    "size":4,"url":"https://cdn.discordapp.com/attachments/99/364/result.bin"}]);
+            }
             *fixture.last_card.lock().unwrap() = remote.clone();
             remote
         }
@@ -205,14 +213,16 @@ fn interaction(id: &str, kind: u8, data: Value) -> Value {
         "token":"offline-interaction","type":kind,"id":id,"data":data})
 }
 
-#[tokio::test]
-async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
+async fn discord_fixture(config: Value) -> (
+    Temp, Arc<Store>, Arc<Hub>, TcpListener, mpsc::UnboundedReceiver<(String, Value)>,
+    Arc<SyncMutex<Value>>, JoinHandle<()>,
+) {
     let temporary = Temp::new();
     let store = Arc::new(Store::open(&temporary.0).unwrap());
     let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", http.local_addr().unwrap());
-    let (emitted, mut observed) = mpsc::unbounded_channel();
+    let (emitted, observed) = mpsc::unbounded_channel();
     let last_card = Arc::new(SyncMutex::new(Value::Null));
     let router = Router::new().fallback(rest).with_state(RestFixture {
         socket: format!("ws://{}/", ws.local_addr().unwrap()),
@@ -222,7 +232,7 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     let server: JoinHandle<()> = tokio::spawn(async move {
         axum::serve(http, router).await.unwrap();
     });
-    let hub = Hub::with_factory(&json!({"discord":{}}), Arc::clone(&store), |_, _, ctx| {
+    let hub = Hub::with_factory(&config, Arc::clone(&store), |_, _, ctx| {
         let mut rest = Rest::new(ctx.http.clone(), "offline-token".to_owned())?;
         rest.api.clone_from(&api);
         Ok(Box::new(Discord {
@@ -246,6 +256,13 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
         }))
     })
     .unwrap();
+    (temporary, store, hub, ws, observed, last_card, server)
+}
+
+#[tokio::test]
+async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
+    let (_temporary, store, hub, ws, mut observed, last_card, server) =
+        discord_fixture(json!({"discord":{}})).await;
     let (started, mut socket) = time::timeout(Duration::from_secs(5), async {
         tokio::join!(hub.start(), identify(&ws))
     })
@@ -622,6 +639,28 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     assert!(upload.contains(&format!("filename=\"{name}\"")));
     assert!(observed.try_recv().is_err());
 
+    let result = json!({"id":"result-file","route":route,"replyTo":reply,"text":"",
+        "resultAttachment":{"name":"result.bin","data":"AEJDCg=="}});
+    assert_eq!(hub.effect("send", &[result.clone()]).await.unwrap(), "700");
+    let posted = received(&mut observed, "/channels/99/messages").await;
+    let multipart = posted.as_str().expect("Discord native binary multipart");
+    let payload: Value = multipart
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .expect("result file payload");
+    assert_eq!(payload["attachments"][0]["filename"], "result.bin");
+    assert_eq!(payload["message_reference"]["message_id"], "205");
+    assert!(multipart.contains("filename=\"result.bin\"\r\n\r\n\0BC\n"));
+    let mut unconfirmed = result;
+    unconfirmed["resultAttachment"]["name"] = json!("unconfirmed.bin");
+    assert_eq!(
+        hub.effect("send", &[unconfirmed]).await.unwrap_err().certainty,
+        "uncertain",
+        "a message without the requested file is not an attachment receipt"
+    );
+    received(&mut observed, "/channels/99/messages").await;
+    assert!(observed.try_recv().is_err());
+
     wire(&mut socket, json!({"op":7})).await;
     let (stream, _) = time::timeout(Duration::from_secs(5), ws.accept())
         .await
@@ -659,6 +698,89 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     dispatch(&mut resumed, last_sequence + 3, "RESUMED", json!({"trace":[]})).await;
     assert_eq!(event(&hub, &store).await["input"]["messageId"], "207");
     assert_eq!(event(&hub, &store).await["kind"], "reconnect");
+    hub.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn group_thread_accepts_only_live_member_text_and_replies_without_owner_effects() {
+    let (_temporary, store, hub, ws, mut observed, _, server) = discord_fixture(json!({
+        "discord":{"allowedGuildIds":["77"],"allowedChannelIds":["88"]},
+        "groupRooms":[{"platform":"discord","guildId":"77","channelId":"88",
+            "userIds":["42","43"],"mode":"work","revision":"live","dailyLimit":1}]
+    })).await;
+    let (started, mut socket) = time::timeout(Duration::from_secs(5), async {
+        tokio::join!(hub.start(), identify(&ws))
+    }).await.unwrap();
+    started.unwrap();
+    hub.ready.send_replace(true);
+    dispatch(&mut socket, 2, "MESSAGE_CREATE", message("501", None, "99", "42", "owner DM")).await;
+    assert_eq!(event(&hub, &store).await["input"]["text"], "owner DM");
+
+    let now = u64::try_from(crate::store::now().unwrap()).unwrap();
+    let at = |age: u64, sequence: u64| (((now - 1_420_070_400_000 - age) << 22) | sequence).to_string();
+    let group_message = |sequence, user: &str, text: &str| {
+        message(&at(0, sequence), Some("77"), "90", user, text)
+    };
+    let mut edited = group_message(3_u64, "43", "!work edited");
+    edited["edited_timestamp"] = json!("2026-11-21T01:02:03.456000+00:00");
+    let mut forwarded = group_message(4_u64, "43", "!work forwarded");
+    forwarded["message_snapshots"] = json!([{"message":{"content":"forwarded secret"}}]);
+    let mut attachment = group_message(5_u64, "43", "!work attached");
+    attachment["attachments"] = json!([{"id":"1","filename":"secret.txt","size":4,"url":"https://example.test/secret.txt"}]);
+    for (index, (kind, msg)) in [
+        ("MESSAGE_CREATE", group_message(1, "42", "/restart")),
+        ("MESSAGE_CREATE", group_message(2, "44", "!work stranger")),
+        ("MESSAGE_UPDATE", edited),
+        ("MESSAGE_CREATE", forwarded),
+        ("MESSAGE_CREATE", attachment),
+        ("MESSAGE_CREATE", message(&at(360_000, 6), Some("77"), "90", "43", "!work stale")),
+        ("MESSAGE_CREATE", group_message(7, "43", "!workbench wrong token")),
+        ("MESSAGE_CREATE", group_message(8, "43", &format!("!work {}", "🙂".repeat(1001)))),
+    ].into_iter().enumerate() {
+        dispatch(&mut socket, 3 + u64::try_from(index).unwrap(), kind, msg).await;
+    }
+    for (sequence, id, channel, user) in [(11, "888", "90", "42"), (12, "889", "88", "43"), (13, "890", "90", "44")] {
+        let mut slash = interaction(id, 2, json!({"type":1,"name":"status"}));
+        slash["guild_id"] = json!("77");
+        slash["channel"]["id"] = json!(channel);
+        slash["member"] = json!({"user":{"id":user}});
+        dispatch(&mut socket, sequence, "INTERACTION_CREATE", slash).await;
+    }
+    let mut accepted = group_message(9, "43", "!work outline");
+    accepted["type"] = json!(19);
+    accepted["message_reference"] = json!({"message_id":"798","channel_id":"90","guild_id":"77"});
+    accepted["referenced_message"] = json!({"id":"798","channel_id":"90","author":{"id":"42"},"content":"private quote"});
+    dispatch(&mut socket, 14, "MESSAGE_CREATE", accepted.clone()).await;
+    dispatch(&mut socket, 15, "MESSAGE_CREATE", accepted).await;
+    dispatch(&mut socket, 16, "MESSAGE_CREATE", group_message(10, "43", "!work over budget")).await;
+    dispatch(&mut socket, 17, "MESSAGE_CREATE", message("502", None, "99", "42", "end marker")).await;
+
+    let group = event(&hub, &store).await;
+    assert_eq!(group["kind"], "group");
+    let route = group["request"]["route"].clone();
+    assert_eq!(route["authorityId"], "42");
+    assert_eq!(route["channelId"], "88");
+    assert_eq!(route["threadId"], "90");
+    assert_eq!(group["request"]["messageId"], at(0, 9));
+    assert_eq!(group["request"]["userId"], "43");
+    assert_eq!(group["request"]["mode"], "work");
+    assert_eq!(group["request"]["revision"], "live");
+    assert_eq!(group["request"]["text"], "outline");
+    assert_eq!(group["request"].as_object().unwrap().len(), 7);
+    assert_eq!(event(&hub, &store).await["input"]["text"], "end marker");
+    assert!(hub.effect("fetchAfter", &[route.clone(), json!("798")]).await.is_err());
+    assert!(hub.effect("assertRoute", &[route.clone()]).await.is_err());
+    assert!(hub.effect("send", &[json!({"route":route,"text":"owner data","id":"ordinary"})]).await.is_err());
+    assert_eq!(hub.send_group(json!({"route":route,"messageId":at(0, 9),
+        "text":"Request finished.","id":"group-effect"})).await.unwrap(), "701");
+    let posted = received(&mut observed, "/channels/90/messages").await;
+    assert_eq!(posted["message_reference"], json!({"message_id":at(0, 9),"fail_if_not_exists":true}));
+    assert_eq!(posted["content"], "Request finished.");
+    assert_eq!(posted["allowed_mentions"]["parse"], json!([]));
+    assert!(posted.get("attachments").is_none());
+    assert!(posted.get("components").is_none());
+
     hub.stop().await.unwrap();
     server.abort();
 }

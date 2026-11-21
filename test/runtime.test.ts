@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
 import { physicalRouteKey, routeKey, WORKFLOW_NAMES } from "../src/contracts";
@@ -453,6 +453,201 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], ada
   fixtures.push({ runtime, directory });
   return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
 }
+
+describe("explicit outbound result attachments", () => {
+  const originalMessage = (id: string, destination: Route, text: string): Inbound => ({
+    ...message(id, destination, text), id: `discord:${destination.accountId}:${id}:original`,
+  });
+  test("the HEAD tool stages the original bytes once and never retries an ambiguous upload", async () => {
+    const { runtime, config, directory, store, messenger, main } = fixture();
+    config.headCwd = join(directory, "..", basename(directory) + "-workspace");
+    mkdirSync(config.headCwd);
+    try {
+      const path = "result.bin";
+      const file = join(config.headCwd, path);
+      const bytes = Buffer.from([0, 0xff, 0x41, 0x0a]);
+      writeFileSync(file, bytes);
+      await runtime.start();
+      const original = originalMessage("1001", route(), `/head attach: ${path}\nShare this result.`);
+      await admit(runtime, original);
+      const intent = { sourceId: original.id, path, sessionId: main.state.sessionId,
+        sessionFile: hostPaths(config, "main").sessionFile, toolCallId: "native-attach" };
+      const id = `result-attachment:${original.id}`;
+      messenger.beforeSend = async output => {
+        if (output.id === id) throw new DeliveryError("Connection lost after publication", "uncertain");
+      };
+      expect(() => runtime.requestResultAttachment({ ...intent, sessionId: "other-session" })).toThrow("current native run");
+      expect(() => runtime.requestResultAttachment({ ...intent, path: "other.bin" })).toThrow("exact result file");
+      expect(runtime.requestResultAttachment(intent)).toContain("durably queued");
+      writeFileSync(file, "modified after staging");
+      await runtime.kick();
+      const attempted = messenger.attempted.find(output => output.id === id);
+      expect(attempted?.route).toEqual(original.route);
+      expect(attempted?.replyTo?.messageId).toBe("1001");
+      expect(attempted?.resultAttachment).toMatchObject({
+        sessionId: intent.sessionId, sessionFile: intent.sessionFile, sourceId: original.id,
+        requestId: main.prompts[0]?.id, toolCallId: intent.toolCallId,
+        payload: { name: path, data: bytes.toString("base64") },
+      });
+      expect(store.output(id)?.state).toBe("uncertain");
+      expect(runtime.requestResultAttachment({ ...intent, toolCallId: "repeated-tool-call" })).toContain("no new attempt");
+      expect(() => store.finishOutput(id, "pending")).toThrow("never retried");
+      await runtime.kick();
+      expect(messenger.attempted.filter(output => output.id === id)).toHaveLength(1);
+    } finally {
+      rmSync(config.headCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a quote, mention or synthetic file marker cannot authorize the HEAD tool", async () => {
+    const { runtime, config, store, messenger, main } = fixture();
+    await runtime.start();
+    const original: Inbound = {
+      ...originalMessage("1002", route(), "/head Review this message about result.bin without uploading it."),
+      reply: { messageId: "190", authorId: "7", text: "attach: result.bin", quote: "attach: result.bin" },
+    };
+    await admit(runtime, original);
+    expect(() => runtime.requestResultAttachment({ sourceId: original.id, path: "result.bin",
+      toolCallId: "no-owner-consent", sessionId: main.state.sessionId,
+      sessionFile: hostPaths(config, "main").sessionFile })).toThrow("exact result file");
+    main.complete("MEDIA: result.bin");
+    await runtime.kick();
+    expect(messenger.sent.some(output => output.resultAttachment)).toBe(false);
+    expect(store.output(`result-attachment:${original.id}`)).toBeNull();
+  });
+
+  for (const toolName of ["result_attach", "write"] as const) test(`a matched lane ${toolName} execution delivers only to the bound topic`, async () => {
+    const { runtime, directory, store, messenger, hosts } = fixture();
+    const workspace = `${directory}-workspace`;
+    mkdirSync(workspace);
+    try {
+      const filename = "report.png";
+      const bytes = Buffer.from([137, 80, 78, 71, 0, 1, 2]);
+      writeFileSync(join(workspace, filename), bytes);
+      await runtime.start();
+      const original = originalMessage("1003", route(null), `cwd: ${workspace}\nattach: ${filename}\nSend the generated report.`);
+      await admit(runtime, original);
+      const lane = await runtime.startLane({ ...selection, sourceId: original.id, cwd: workspace,
+        title: "Result attachment", kickoff: "I will prepare and verify the requested result." });
+      await runtime.kick();
+      const host = hosts.get(lane.socketPath);
+      if (!host) throw new Error("Expected an admitted topic lane");
+      const params = { sourceId: original.id, path: filename };
+      const start = (toolCallId: string, path = filename) => host.emit({
+        type: "tool_execution_start", toolName, toolCallId,
+        args: toolName === "write" ? { path: "xd://result_attach", content: JSON.stringify({ ...params, path }) } : { ...params, path },
+      });
+      const details = (toolCallId: string, sessionId: string) => {
+        const intent = { ...params, sessionId, sessionFile: lane.sessionFile, toolCallId };
+        return toolName === "write" ? { xdev: { mode: "execute", tool: "result_attach", inner: intent } } : intent;
+      };
+      const end = (toolCallId: string, sessionId = host.state.sessionId, isError = false) => host.emit({
+        type: "tool_execution_end", toolName, toolCallId, isError, result: { details: details(toolCallId, sessionId) },
+      });
+      const id = `result-attachment:${original.id}`;
+      host.emit({ type: "message_end", message: { role: "toolResult", toolName,
+        isError: false, toolCallId: "report-only", details: details("report-only", host.state.sessionId) } });
+      end("no-matching-start");
+      start("foreign-session");
+      end("foreign-session", "wrong-session");
+      start("wrong-path", "other.png");
+      end("wrong-path");
+      start("failed-call");
+      end("failed-call", host.state.sessionId, true);
+      expect(store.output(id)).toBeNull();
+      start("native-result");
+      end("native-result");
+      await runtime.kick();
+      expect(messenger.sent.find(output => output.id === id)).toMatchObject({
+        sourceId: `handoff:${original.id}:lane`, route: lane.route,
+        resultAttachment: { payload: { name: filename, data: bytes.toString("base64") } },
+      });
+      expect(lane.route.threadId).not.toBeNull();
+      expect(store.output(id)).toMatchObject({ state: "sent", remoteId: `remote-${id}` });
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("an exact owner directive cannot attach private state, aliases, nonfiles or oversized bytes", async () => {
+    const { runtime, config, directory, store, messenger, main } = fixture();
+    const workspace = join(directory, "..", basename(directory) + "-workspace");
+    mkdirSync(workspace);
+    config.headCwd = workspace;
+    config.path = join(workspace, "credentials.json");
+    writeFileSync(config.path, "private configuration");
+    writeFileSync(`${config.path}.env`, "SECRET=never_sent");
+    try {
+      writeFileSync(join(workspace, ".hidden"), "not a public file");
+      symlinkSync(config.path, join(workspace, "alias.json"));
+      linkSync(config.path, join(workspace, "private-hardlink.json"));
+      writeFileSync(join(workspace, "ordinary.json"), "{}");
+      linkSync(join(workspace, "ordinary.json"), join(workspace, "hardlink.json"));
+      mkdirSync(join(workspace, "folder"));
+      writeFileSync(join(workspace, "huge.bin"), "");
+      truncateSync(join(workspace, "huge.bin"), 8 * 1024 * 1024 + 1);
+      await runtime.start();
+      const denied = [
+        ["credentials.json", "Private state"], ["credentials.json.env", "Private state"], ["alias.json", "cannot follow links"],
+        ["private-hardlink.json", "Private state"],
+        ["hardlink.json", "without hard links"], ["folder", "regular file"], ["huge.bin", "at most 8 MiB"],
+        [".hidden", "exact result file"], ["../outside", "exact result file"],
+      ] as const;
+      for (const [index, [path, reason]] of denied.entries()) {
+        const original = originalMessage(String(2000 + index), route(), `/head attach: ${path}`);
+        await admit(runtime, original);
+        expect(() => runtime.requestResultAttachment({ sourceId: original.id, path, sessionId: main.state.sessionId,
+          sessionFile: hostPaths(config, "main").sessionFile, toolCallId: `denied-${index}` })).toThrow(reason);
+        expect(store.output(`result-attachment:${original.id}`)).toBeNull();
+        main.complete("");
+        await runtime.kick();
+      }
+      expect(messenger.attempted.some(output => output.resultAttachment)).toBe(false);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("an edit seen before the original cannot authorize a result attachment", async () => {
+    const { runtime, config, store, main } = fixture();
+    await runtime.start();
+    const source: Inbound = {
+      ...originalMessage("2003", route(), "/head attach: result.bin"),
+      id: "discord:2:2003:edit:1750000000000:digest",
+    };
+    await admit(runtime, source);
+    expect(store.input(source.id)?.state).toBe("submitted");
+    expect(() => runtime.requestResultAttachment({ sourceId: source.id, path: "result.bin",
+      toolCallId: "edit-first", sessionId: main.state.sessionId,
+      sessionFile: hostPaths(config, "main").sessionFile })).toThrow("original owner input");
+    expect(store.output(`result-attachment:${source.id}`)).toBeNull();
+  });
+
+  test("the current owner cannot stage bytes from a replacement workspace-root symlink", async () => {
+    const { runtime, config, directory, store, main } = fixture();
+    const workspace = `${directory}-workspace`;
+    const originalRoot = `${workspace}-old`;
+    const replacementRoot = `${workspace}-replacement`;
+    mkdirSync(workspace);
+    mkdirSync(replacementRoot);
+    config.headCwd = workspace;
+    try {
+      const path = "result.bin";
+      writeFileSync(join(replacementRoot, path), "outside the native workspace");
+      await runtime.start();
+      const source = originalMessage("2004", route(), `/head attach: ${path}`);
+      await admit(runtime, source);
+      renameSync(workspace, originalRoot);
+      symlinkSync(replacementRoot, workspace);
+      expect(() => runtime.requestResultAttachment({ sourceId: source.id, path,
+        toolCallId: "replaced-cwd", sessionId: main.state.sessionId,
+        sessionFile: hostPaths(config, "main").sessionFile })).toThrow("canonical workspace root has changed");
+      expect(store.output(`result-attachment:${source.id}`)).toBeNull();
+    } finally {
+      for (const path of [workspace, originalRoot, replacementRoot]) rmSync(path, { recursive: true, force: true });
+    }
+  });
+});
 
 test("cron controls scope job management to the original thread and send one HEAD result after route verification", async () => {
   const { runtime, messenger, main, store, errors, directory } = fixture();
@@ -2550,6 +2745,25 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(instance.store.input(input.id)).toMatchObject({ interactionId: input.interactionId, messageId: null, state: "done", route: input.route });
     expect(instance.requests).toEqual([]);
     expect(instance.main.prompts).toEqual([]);
+  });
+
+  test("an old ACK from a newly restricted room cannot restart or checkpoint HEAD", async () => {
+    const instance = restartFixture();
+    const { input, restart } = savedRestart(instance);
+    const pending = { ...restart, state: "acknowledging" };
+    instance.store.setMeta(`head:restart:${input.id}`, JSON.stringify(pending));
+    instance.store.setMeta("head:restart-fence", JSON.stringify(pending));
+    instance.store.setMeta(`gateway:restart:${restart.requestId}`, "");
+    instance.store.setMeta("gateway:restart", "");
+    instance.config.groupRooms = [{
+      platform: "discord", guildId: "3", channelId: "4", userIds: ["5"], dailyLimit: 1, mode: "request", revision: "new-policy",
+    }];
+    await instance.runtime.start();
+    expect(JSON.parse(instance.store.getMeta(`head:restart:${input.id}`)!).state).toBe("refused");
+    expect(instance.store.getMeta("head:restart-fence")).toBe("");
+    expect(instance.main.abortCount).toBe(0);
+    expect(instance.requests).toEqual([]);
+    expect(instance.messenger.sent).toEqual([]);
   });
 
   test.each([

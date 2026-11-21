@@ -16,6 +16,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::{
     discord::Discord,
+    group::{Candidate, Request as GroupRequest, Room, Rooms},
     picker::{Pickers, Selection},
     slack::Slack,
     store::Store,
@@ -74,9 +75,49 @@ pub struct Context {
     owner: Arc<OnceLock<Weak<Hub>>>,
     ready: watch::Receiver<bool>,
     token_names: Arc<[String]>,
+    rooms: Arc<Rooms>,
 }
 
 impl Context {
+    pub(crate) fn group_room(&self, guild: Option<&str>, channel: &str) -> Option<&Room> {
+        self.rooms.get(self.platform, guild, channel)
+    }
+
+    pub(crate) fn has_group_guild(&self, guild: Option<&str>) -> bool {
+        self.rooms.has_guild(self.platform, guild)
+    }
+
+    pub(crate) fn has_group_actor(&self, guild: Option<&str>, user: &str) -> bool {
+        self.rooms.has_actor(self.platform, guild, user)
+    }
+
+    pub(crate) fn admit_group(&self, route: Value, source: Candidate<'_>) -> Result<()> {
+        ensure!(
+            route["platform"].as_str() == Some(self.platform),
+            "Group event crossed platform boundary"
+        );
+        let Some(room) = self.rooms.for_route(&route) else {
+            return Ok(());
+        };
+        let Some(request) = GroupRequest::new(room, route, source)? else {
+            return Ok(());
+        };
+        if !*self.ready.borrow() {
+            return Ok(());
+        }
+        if self.store.admit_group(&request, room.daily_limit)? {
+            self.hub()?.changed.notify_one();
+        }
+        Ok(())
+    }
+
+    fn hub(&self) -> Result<Arc<Hub>> {
+        self.owner
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| anyhow::anyhow!("Gateway not available"))
+    }
+
     pub(crate) async fn admit_picker(&self, selection: &Selection) -> Result<(), EffectError> {
         let ctx = self.clone();
         let event = selection.event.clone();
@@ -97,6 +138,7 @@ impl Context {
         self.store.set_meta(key, value)
     }
     pub fn has_pending_answer(&self, id: &str, route: &Value) -> Result<bool> {
+        self.rooms.owner_route(route)?;
         self.store.has_pending_answer(id, route)
     }
     pub fn has_durable_answer(&self, id: &str, route: &Value, response_hash: &str) -> Result<bool> {
@@ -104,6 +146,7 @@ impl Context {
             route["platform"].as_str() == Some(self.platform),
             "Approval crossed platform boundary"
         );
+        self.rooms.owner_route(route)?;
         self.store.has_durable_answer(id, route, response_hash)
     }
     /// The authenticated head can restore a card before the initial barrier.
@@ -114,11 +157,8 @@ impl Context {
             route["platform"].as_str() == Some(self.platform),
             "Approval crossed platform boundary"
         );
-        let hub = self
-            .owner
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or_else(|| anyhow::anyhow!("Gateway not available"))?;
+        self.rooms.owner_route(route)?;
+        let hub = self.hub()?;
         let fresh = self.store.admit(&json!({
             "kind":"answer","approvalId":id,"response":{"cancelled":true},"route":route
         }))?;
@@ -135,11 +175,7 @@ impl Context {
         .then_some(key)
     }
     pub fn admit(&self, event: Value) -> Result<bool> {
-        let hub = self
-            .owner
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or_else(|| anyhow::anyhow!("Gateway not available"))?;
+        let hub = self.hub()?;
         let (route, message_id) = match event["kind"].as_str() {
             Some("message") => (
                 &event["input"]["route"],
@@ -165,6 +201,7 @@ impl Context {
             route["platform"].as_str() == Some(self.platform),
             "Adapter event crossed platform boundary"
         );
+        self.rooms.owner_route(route)?;
         let fresh = self.store.admit(&event)?;
         if fresh && let Some(id) = message_id {
             let target = json!({"route":route, "messageId":id});
@@ -187,6 +224,7 @@ pub struct Hub {
     started: AtomicBool,
     activity: Mutex<HashMap<String, Arc<AsyncMutex<bool>>>>,
     reactions: TaskTracker,
+    pub(crate) rooms: Arc<Rooms>,
 }
 
 impl Hub {
@@ -226,6 +264,7 @@ impl Hub {
         }
         let (ready, rx) = watch::channel(false);
         let owner = Arc::new(OnceLock::new());
+        let rooms = Arc::new(Rooms::parse(config)?);
         let ctx = |platform| Context {
             http: http.clone(),
             pickers: Pickers::default(),
@@ -234,6 +273,7 @@ impl Hub {
             platform,
             owner: owner.clone(),
             token_names: token_names.clone(),
+            rooms: rooms.clone(),
         };
         let mut adapters: Vec<(&'static str, Box<dyn Adapter>)> = Vec::new();
         for name in ["discord", "telegram", "slack"] {
@@ -249,6 +289,7 @@ impl Hub {
             started: AtomicBool::new(false),
             activity: Mutex::default(),
             reactions: TaskTracker::new(),
+            rooms,
         });
         owner
             .set(Arc::downgrade(&hub))
@@ -295,6 +336,7 @@ impl Hub {
     }
     async fn activity(&self, message: &Value, state: &str) -> Result<Value, EffectError> {
         let route = &message["route"];
+        self.rooms.owner_route(route)?;
         let adapter = self.for_route(route)?;
         let key = serde_json::to_string(&[
             &route["platform"],
@@ -337,29 +379,39 @@ impl Hub {
         }
         result
     }
-    pub async fn effect(&self, op: &str, args: &[Value]) -> Result<Value, EffectError> {
+
+    pub(crate) fn authorize_effect<'a>(&self, op: &str, args: &'a [Value]) -> Result<&'a Value, EffectError> {
         let arg = args
             .first()
             .ok_or_else(|| EffectError::rejected("Missing messenger arguments"))?;
         let route = match op {
-            "send" | "showApproval" | "dismissApproval" | "discordPurpose" => &arg["route"],
+            "send" | "showApproval" | "dismissApproval" | "discordPurpose" | "setActivity" => &arg["route"],
+            "assertRoute" | "canCreateThread" | "createThread" | "inspectThread" | "updateThread"
+            | "inspectDiscordContext" | "fetchAfter" => arg,
+            _ => return Err(EffectError::rejected("Unknown messenger operation")),
+        };
+        self.rooms.owner_route(route)?;
+        Ok(route)
+    }
+
+    pub(crate) async fn send_group(&self, output: Value) -> Result<Value, EffectError> {
+        let adapter = self.for_route(&output["route"])?;
+        adapter.effect("sendGroup", &[output]).await
+    }
+
+    pub async fn effect(&self, op: &str, args: &[Value]) -> Result<Value, EffectError> {
+        let route = self.authorize_effect(op, args)?;
+        match op {
             "setActivity" => {
                 return self
-                    .activity(arg, args.get(1).and_then(Value::as_str).unwrap_or(""))
+                    .activity(&args[0], args.get(1).and_then(Value::as_str).unwrap_or(""))
                     .await;
             }
             "assertRoute" if !self.started.load(Ordering::Acquire) => {
                 return Err(EffectError::rejected("Messenger not ready"));
             }
-            "assertRoute"
-            | "canCreateThread"
-            | "createThread"
-            | "inspectThread"
-            | "updateThread"
-            | "inspectDiscordContext"
-            | "fetchAfter" => arg,
-            _ => return Err(EffectError::rejected("Unknown messenger operation")),
-        };
+            _ => {}
+        }
         if route["platform"] != "discord"
             && ((op == "canCreateThread" && args.len() > 1)
                 || (op == "createThread" && args.len() > 3))
@@ -375,6 +427,7 @@ impl Hub {
         route: &Value,
         file: &Value,
     ) -> Result<reqwest::Response, EffectError> {
+        self.rooms.owner_route(route)?;
         self.for_route(route)?.attachment(route, file).await
     }
 }

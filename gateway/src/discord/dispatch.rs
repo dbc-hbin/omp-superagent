@@ -54,6 +54,7 @@ pub(super) enum Intake {
     Message {
         data: Value,
         create: bool,
+        live: bool,
     },
     Voice {
         data: Value,
@@ -186,7 +187,11 @@ impl Dispatcher {
                     }
                     return Ok(());
                 }
-                self.enqueue(Intake::Message { data, create })?;
+                self.enqueue(Intake::Message {
+                    data,
+                    create,
+                    live: connection.fresh && connection.admission_ready,
+                })?;
                 return Ok(());
             }
             "INTERACTION_CREATE" => {
@@ -270,7 +275,7 @@ pub(super) async fn ordered_intake(
     }
     while let Some(event) = incoming.recv().await {
         let result = match event {
-            Intake::Message { data, create } => state.message_dispatch(data, create).await,
+            Intake::Message { data, create, live } => state.message_dispatch(data, create, live).await,
             Intake::Voice { data, connection } => state.voice_message(&data, &connection).await,
             Intake::Reconnect => state.admit(json!({ "kind": "reconnect" })),
         };

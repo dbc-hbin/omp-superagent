@@ -1,5 +1,6 @@
 import type { DialogResponse, GatewayRestartNotice, GatewayRestartRecord, Inbound, Route } from "./contracts";
 import type { ManagedUlwStatus } from "./managed-ulw";
+import type { GroupRequest } from "./group-policy";
 
 export type HeadInitialization = {
   readonly sessionId: string;
@@ -33,6 +34,7 @@ export type GatewayStatus = {
 
 export type GatewayEvent =
   | { readonly kind: "message"; readonly input: Inbound }
+  | { readonly kind: "group"; readonly request: GroupRequest }
   | { readonly kind: "answer"; readonly approvalId: string; readonly response: DialogResponse; readonly route: Route }
   | ({ readonly kind: "restart" } & GatewayRestartNotice)
   | { readonly kind: "reconnect"; readonly barrier?: string };

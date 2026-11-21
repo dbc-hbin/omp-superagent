@@ -136,10 +136,15 @@ impl Adapter for Discord {
         let state = &self.state;
         match (operation, args) {
             ("assertRoute", [route]) => {
-                state.assert_route(&read(route)?)?;
+                let route: Route = read(route)?;
+                state.assert_route(&route)?;
+                if route.thread_id.is_some() && state.ctx.has_group_guild(route.guild_id.as_deref()) {
+                    state.channel(&route, false).await?;
+                }
                 Ok(Value::Null)
             }
             ("send", [output]) => state.send(&read(output)?).await.map(Value::String),
+            ("sendGroup", [output]) => state.send_group(read(output)?).await.map(Value::String),
             ("setActivity", [message, activity]) => {
                 state.activity(&read(message)?, read(activity)?).await?;
                 Ok(Value::Null)
@@ -191,6 +196,10 @@ impl Adapter for Discord {
 }
 
 impl State {
+    fn group_route(&self, route: &Route) -> bool {
+        self.ctx.group_room(route.guild_id.as_deref(), &route.channel_id).is_some()
+    }
+
     fn allowed_guild(&self, guild: Option<&str>) -> bool {
         guild.is_none_or(|id| self.config.allowed_guild_ids.contains(id))
     }

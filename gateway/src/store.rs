@@ -47,6 +47,11 @@ impl Store {
                delivered_at INTEGER, delivery_error TEXT, attempted_at INTEGER
              );
              CREATE INDEX IF NOT EXISTS gateway_events_pending ON gateway_events(delivered_at, sequence);
+             CREATE INDEX IF NOT EXISTS gateway_events_group_day ON gateway_events(
+               json_extract(data,'$.request.route.platform'),
+               json_extract(data,'$.request.route.guildId'),
+               json_extract(data,'$.request.route.channelId'), received_at
+             ) WHERE identity LIKE 'group:%';
              CREATE TABLE IF NOT EXISTS gateway_effects (
                id TEXT PRIMARY KEY, operation TEXT NOT NULL, arguments TEXT NOT NULL,
                state TEXT NOT NULL CHECK(state IN ('attempted','complete')),

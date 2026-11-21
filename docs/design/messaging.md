@@ -23,6 +23,51 @@ topic is a binding key, not a fabricated conversation or thread ID.
 | [Telegram](../../gateway/src/telegram.rs) | Bot API `getMe` identifies the bot. Use the configured real owner and allowed chats; anonymous, forwarded, bot-mediated and business identities do not confer authority. Long poll only after startup approval reconciliation; refuse an active webhook without removing it. |
 | [Slack](../../gateway/src/slack.rs) | Socket Mode and the Web API, with bot/workspace and active human owner checks and actual channel membership. No group DMs or public HTTP endpoint. Known-route history is limited by cursors, scopes, membership, retention and rate limits. |
 
+## Restricted group rooms
+
+`groupRooms` opts a specific server/workspace/chat and parent channel into a
+different scope. Its existing platform allowlist and an explicit, nonempty
+allowlist of stable human user IDs must both match. Child threads and forum
+topics inherit the parent policy. The owner is not privileged in that room;
+the owner DM and other owner-authorized routes remain unchanged. A platform
+administrator, moderator, mention, quoted sender, forwarded message, bot, or
+webhook is not an operator grant. There are no wildcard or open group grants.
+
+| Room mode | Explicit input | Authority and output |
+| --- | --- | --- |
+| `request` | `!request TEXT` | Save the original request in the local operator inbox and post only a receipt. No inference, approval, assignment, or execution. |
+| `chat` | `!ask TEXT` | One fresh tool-free OMP turn with the dedicated group model; only its bounded text answer can return to the original scope. No owner context, transcript, resources, or attachments. |
+| `work` | `!work TEXT` | One bounded stock OMP run in a new detached Git worktree for the configured repository, with only scoped file operations. No shell, Git mutation, external tools, approvals, or access to owner sessions. The room gets fixed status text, not the model's answer, file paths, diffs, or artifacts. The operator inspects the local worktree. |
+
+Telegram also accepts a real bot-command entity `/request@BotUsername`,
+`/ask@BotUsername` or `/work@BotUsername` addressed to the authenticated bot.
+No unrestricted conversation, owner slash controls, card actions, edited
+messages, or owner history backfill. Only original messages within the live
+five-minute admission window can become new group work; after durable admission,
+local recovery uses the original request rather than platform history.
+
+A separate ingress event records the authenticated user as well as the immutable
+physical route, original message ID and normalized policy revision. It cannot
+be delivered to owner intake. The room and sender are checked again before
+execution and sending. Only the matching registered controller may request a
+group reply; the Gateway takes its destination from the original durable group
+event. Per-room daily admission caps and one active restricted runner bound
+work. A work request must receive a confirmed kickoff before the runner starts.
+Persist the execution claim and response attempt before starting them;
+an interrupted runner or ambiguous send is never replayed. `omp-sa group`
+reads this local record without a model turn. This is an application-level
+boundary: a worktree is not an OS sandbox, and approved repository data may
+be sent to the configured group model. Do not authorize a private repository
+or provider that should not see this data.
+
+Stock OMP can expand inline file references even with no tools enabled. The
+[restricted runner](../../src/group-runner.ts) therefore sends group input as
+JSON-quoted data with file-reference characters escaped. A fresh private
+profile and scratch cwd exclude owner settings and session context; worktree
+access goes only through the dedicated file tools. Process exit alone is not
+a successful group turn: the runner also requires a matching terminal native
+result.
+
 ## Durable admission and recovery
 
 ```mermaid
@@ -215,6 +260,16 @@ approval.
   follow redirects on private file downloads. Enforce byte limits end to end;
   an unknown size is not zero and a known size must match the bytes received.
   The adapters preserve audio metadata; they do not transcribe attachments.
+- An owner can authorize one specific result file with a standalone leading
+  `attach: workspace/relative-file.ext` line. `result_attach` stages the exact
+  allowed regular file from that source's working directory; arbitrary model
+  prose cannot attach it. Files must be nonempty and at most 8 MiB; symlinks,
+  hard links, dot paths and managed private state are excluded. Delivery uses
+  the original authorized topic and stable outbox identity, with no destination
+  override and no replay of uncertain sends. Restricted group rooms cannot
+  use this feature. The private controller outbox stores the bounded immutable
+  bytes; the Gateway attempt ledger stores their fingerprint and the receipt,
+  not a second copy of the file.
 - Long outputs use a single bounded text attachment where supported. Discord
   first splits an over-limit reply at paragraph, line, then space boundaries
   into at most five ordered messages, closing and reopening a code fence that

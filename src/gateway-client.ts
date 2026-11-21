@@ -1,10 +1,12 @@
 import type { IncomingMessage } from "node:http";
 import { Readable, Transform } from "node:stream";
 import type { Config } from "./config";
+import { createHash } from "node:crypto";
 import type { Approval, Attachment, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "./contracts";
 import { DeliveryError } from "./delivery";
 import { gatewayCall, gatewayPaths, gatewayRequest, MAX_GATEWAY_ATTACHMENT, MAX_GATEWAY_FRAME, readGatewayJson, type GatewayResult } from "./gateway-protocol";
 import type { GatewayReceipt, QueuedEvent } from "./gateway-wire";
+import type { GroupReply } from "./group-policy";
 
 export interface GatewayHeadMessenger extends Messenger {
   assertRoute(route: Route): Promise<void>;
@@ -105,6 +107,10 @@ class GatewayMessenger implements GatewayHeadMessenger {
           try {
             const event = frame.event;
             if (event.kind === "message") await this.handlers.message(event.input);
+            else if (event.kind === "group") {
+              if (!this.handlers.group) throw new DeliveryError("Restricted group ingress is not enabled", "rejected");
+              await this.handlers.group(event.request);
+            }
             else if (event.kind === "answer") {
               const reconciled = frame.reconciliation
                 ? await this.handlers.reconcileAnswer?.(event.approvalId, event.route) ?? "unresolved" : "retry";
@@ -137,8 +143,23 @@ class GatewayMessenger implements GatewayHeadMessenger {
   private effect<T>(operation: string, args: unknown[]): Promise<T> {
     return this.call<T>("/effect", { id: crypto.randomUUID(), operation, args });
   }
+  sendGroup(reply: GroupReply): Promise<string> {
+    const hash = createHash("sha256").update(JSON.stringify(["group-reply", reply.sourceId, reply.outcome])).digest("hex");
+    const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+    return this.call<string>("/effect", { id, operation: "sendGroup", args: [reply] });
+  }
   requestRestart(request: GatewayRestartRequest): Promise<GatewayRestartRecord> { return this.call("/restart", request); }
-  send(output: OutputRecord): Promise<string> { return this.effect("send", [output]); }
+  send(output: OutputRecord): Promise<string> {
+    const { resultAttachment } = output;
+    if (!resultAttachment) return this.effect("send", [output]);
+    // Stable across client reattachment; the Gateway journals the one attempt.
+    const hash = createHash("sha256").update(JSON.stringify(["result-attachment", output.id])).digest("hex");
+    const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+    // The adapter needs bytes and filename, not filesystem paths or native IDs.
+    return this.call<string>("/effect", { id, operation: "send", args: [{
+      id: output.id, route: output.route, text: output.text, replyTo: output.replyTo, resultAttachment: resultAttachment.payload,
+    }] });
+  }
   assertRoute(route: Route): Promise<void> { return this.call("/route", { route }, AbortSignal.timeout(1000)); }
   setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     return this.effect("setActivity", [{ route: message.route, messageId: message.messageId }, activity]);

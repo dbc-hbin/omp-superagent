@@ -1,15 +1,18 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
+use reqwest::Method;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::mpsc;
 
-use super::outputs::attachment_url;
-use super::rest::broken;
+use crate::group::{Candidate, Output as GroupOutput};
+
+use super::outputs::{attachment_url, nonce};
+use super::rest::{Rest, broken, no_mentions};
 use super::voice::Command;
 use super::{
     Effect, EffectError, State,
     model::{
-        Channel, Message, ReferencedMessage, Route, User, actual_guild, hash, snowflake,
+        Channel, Message, ReferencedMessage, RemoteMessage, Route, User, actual_guild, hash, snowflake,
         snowflake_time,
     },
 };
@@ -93,22 +96,26 @@ impl State {
         let Some(channel_id) = raw["channel_id"].as_str().filter(|id| snowflake(id)) else {
             return false;
         };
+        let raw_guild = raw["guild_id"].as_str();
         if !raw["id"].as_str().is_some_and(snowflake)
-            || !self.allowed_guild(raw["guild_id"].as_str())
+            || !self.allowed_guild(raw_guild)
             || raw["webhook_id"].is_string()
         {
             return false;
         }
-        match raw.get("author") {
-            Some(raw)
-                if !serde_json::from_value::<User>(raw.clone())
-                    .is_ok_and(|user| user.id == self.config.owner_id && !user.bot) =>
-            {
-                return false;
+        let author = match raw.get("author") {
+            Some(raw) => {
+                let Ok(user) = User::deserialize(raw) else { return false };
+                if user.bot || (user.id != self.config.owner_id
+                    && !(create && self.ctx.has_group_actor(raw_guild, &user.id)))
+                {
+                    return false;
+                }
+                Some(user.id)
             }
             None if create => return false,
-            Some(_) | None => (),
-        }
+            None => None,
+        };
         // Most message updates are its system-owned renders or pin changes.
         // Keep only candidates that actually report editing user content/files,
         // including partial edit events with no author or message payload.
@@ -127,7 +134,12 @@ impl State {
                 let known_guild = raw["guild_id"].as_str();
                 let exact = create || raw.get("guild_id").is_some();
                 (!exact || channel.guild_id.as_deref() == known_guild)
-                    && self.route_for(channel).is_ok()
+                    && self.route_for(channel).is_ok_and(|route| {
+                        match self.ctx.group_room(route.guild_id.as_deref(), &route.channel_id) {
+                            Some(room) => create && author.as_deref().is_some_and(|id| room.permits(id)),
+                            None => author.as_deref().is_none_or(|id| id == self.config.owner_id),
+                        }
+                    })
             })
     }
 
@@ -215,6 +227,9 @@ impl State {
             return Ok(());
         };
         let route = self.route_for(&channel)?;
+        if self.group_route(&route) {
+            return Ok(());
+        }
         let Some(mut input) = message_input(&message, &route) else {
             return Ok(());
         };
@@ -242,7 +257,7 @@ impl State {
         Ok(())
     }
 
-    pub(super) async fn message_dispatch(&self, raw: Value, create: bool) -> Effect<()> {
+    pub(super) async fn message_dispatch(&self, raw: Value, create: bool, live: bool) -> Effect<()> {
         let Some(channel_id) = raw["channel_id"].as_str().filter(|id| snowflake(id)) else {
             return Ok(());
         };
@@ -252,9 +267,6 @@ impl State {
         let guild = raw["guild_id"].as_str();
         if !self.allowed_guild(guild)
             || raw["webhook_id"].is_string()
-            || (raw["author"].is_object()
-                && !User::deserialize(&raw["author"])
-                    .is_ok_and(|user| user.id == self.config.owner_id && !user.bot))
         {
             return Ok(());
         }
@@ -270,6 +282,18 @@ impl State {
         let Ok(route) = self.route_for(&channel) else {
             return Ok(());
         };
+        if self.group_route(&route) {
+            if create && live {
+                self.group_message(&route, &raw)?;
+            }
+            return Ok(());
+        }
+        if raw["author"].is_object()
+            && !User::deserialize(&raw["author"])
+                .is_ok_and(|user| user.id == self.config.owner_id && !user.bot)
+        {
+            return Ok(());
+        }
         let (message, fetched_raw) = match Message::deserialize(&raw) {
             Ok(message)
                 if create
@@ -306,6 +330,53 @@ impl State {
         Ok(())
     }
 
+    fn group_message(&self, route: &Route, raw: &Value) -> Effect<()> {
+        let Ok(message) = Message::deserialize(raw) else { return Ok(()) };
+        if message.author.bot
+            || raw["author"]["system"] == true
+            || !snowflake(&message.author.id)
+            || message.author.id == route.account_id
+            || message.webhook_id.is_some()
+            || !matches!(message.kind, 0 | 19)
+            || message.edited_timestamp.is_some()
+            || !message.attachments.is_empty()
+            || message.flags & (1 << 13) != 0
+            || !message.matches(route)
+            || ["message_snapshots", "sticker_items", "stickers", "poll", "application_id", "interaction_metadata"]
+                .iter().any(|key| raw.get(*key).is_some_and(|value| {
+                    !value.is_null() && !value.as_array().is_some_and(Vec::is_empty)
+                }))
+        {
+            return Ok(());
+        }
+        let Some(sent_ms) = snowflake_time(&message.id).and_then(|ms| i64::try_from(ms).ok()) else {
+            return Ok(());
+        };
+        self.ctx.admit_group(json!(route), Candidate {
+            message_id: &message.id,
+            user_id: &message.author.id,
+            text: &message.content,
+            sent_ms,
+            qualified_command: None,
+        }).map_err(|_| broken("Discord group admission could not be confirmed"))
+    }
+
+    pub(super) async fn send_group(&self, output: GroupOutput<Route>) -> Effect<String> {
+        let channel = self.destination(&output.route).await?;
+        let nonce = nonce(&output.id, &output.route, 0);
+        let request = self.rest.request(Method::POST, &format!("channels/{}/messages", channel.id))
+            .json(&json!({
+                "content": output.text, "allowed_mentions": no_mentions(), "flags": 4,
+                "nonce": nonce, "enforce_nonce": true,
+                "message_reference": {"message_id": output.message_id, "fail_if_not_exists": true},
+            }));
+        let receipt: RemoteMessage = Rest::response(request).await?;
+        if !receipt.belongs(&output.route) || !snowflake(&receipt.id) {
+            return Err(broken("Discord group reply receipt could not be verified"));
+        }
+        Ok(receipt.id)
+    }
+
     async fn with_context(
         &self,
         message: &Message,
@@ -327,6 +398,9 @@ impl State {
             ));
         }
         let route = route.physical();
+        if self.group_route(&route) {
+            return Err(EffectError::rejected("Discord group rooms do not allow history recovery"));
+        }
         let channel = self.destination(&route).await?;
         let mut after = cursor.to_owned();
         let mut inputs = Vec::new();

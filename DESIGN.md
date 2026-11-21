@@ -158,3 +158,13 @@ for design ideas, not a promise of compatibility or permission to copy code. The
 were compared at branch snapshots on 2026-11-13 (exact revisions not recorded).
 Their embedded agent paths do not establish the separate native Host failure
 boundary described here.
+
+Restricted group design was compared against
+[OpenClaw `6978b40e`](https://github.com/openclaw/openclaw/tree/6978b40e9d3812083064c97e24de00454d6bf868/docs/gateway/security)
+and [Hermes `242315ce`](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/gateway/authz_mixin.py)
+([published docs source `aeb5a071`](https://github.com/NousResearch/hermes-agent/tree/aeb5a071069dbd85d85f2c8d44337f16df29d475/website/docs/user-guide)).
+We use separate channel, sender and capability gates without dynamic role
+names, wildcard grants, mention bypasses, or a command-only admin check.
+[Gajae Way `31fa12d`](https://github.com/Yeachan-Heo/gajae-way/tree/31fa12d829ee68a34b6420c451462bf45168bb54)
+is an AGPL-3.0 behavioral reference for result attachments only; no upstream
+code is reused.
