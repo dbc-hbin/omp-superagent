@@ -402,9 +402,9 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       await processExited(firstLane.pid!);
       await processExited(closingState.adapterOwnerPid);
       await expect(fs.lstat(firstLane.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
-      // Process/socket observations precede the controller's durable release
-      // reconciliation; ACK alone must never clear native ownership.
-      await runtime.kick();
+      // The controller observes its own connection closing, independently of
+      // the probe above. Wait for its durable release, not a single pump cycle.
+      await until(() => store.lane(created.id)?.runtimeState === "unloaded", "controller records native lane release");
       expect(store.lane(created.id)).toMatchObject({ workState: "completed", runtimeState: "unloaded", pid: null,
         model: laneModel, modelReason, modelPreset: "middle", modelPresetSnapshot: middlePreset,
         sessionId: firstLane.sessionId, sessionFile: firstLane.sessionFile });
