@@ -16,6 +16,7 @@ import { HostConnection } from "../../src/host";
 import { nativeDisabledProviders } from "./native-extension";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { nativeTestArgv } from "./native-command";
+import { nativeJournalDispatches } from "./native-tool-transport";
 
 interface Event {
   readonly kind: string;
@@ -712,11 +713,12 @@ try {
   });
   assert.deepEqual(envelopes.map(envelope => envelope.sourceId), survivingLane ? ["904", "901", "903", "report:handoff:904:lane"] : ["901", "903"],
     "No original user prompt or /restart prompt may be replayed; native goal RPC supplies continuation");
-  const calls = entries.flatMap(entry => entry.type === "message" && entry.message.role === "assistant"
-    ? entry.message.content.filter(part => part.type === "toolCall") : []);
-  assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "create").length, 1);
-  assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "complete").length, 1);
-  assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "resume").length, 0, "The provider must not substitute a model tool call for the controller's goal RPC");
+  const dispatches = nativeJournalDispatches(entries);
+  assert.deepEqual(dispatches.filter(call => call.name === "goal" && call.mode === "execute")
+    .map(call => ({ op: call.args?.op, ok: call.ok })), [{ op: "create", ok: true }, { op: "complete", ok: true }],
+  "The provider creates and completes one goal; only the controller's native RPC may resume it");
+  const effect = dispatches.filter(call => call.name === "bash" && call.args?.command === "printf 'completed-once\\n' >> completed-effect.log");
+  assert.deepEqual(effect.map(call => call.ok), [true], "The persisted file must have exactly one successful native execution receipt");
   const modes = entries.filter(entry => entry.type === "mode_change");
   const paused = modes.findIndex(entry => entry.mode === "goal_paused");
   assert(paused >= 0 && modes.slice(paused + 1).some(entry => entry.mode === "goal"), "The native journal must record pause followed by resume");

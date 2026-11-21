@@ -354,6 +354,10 @@ export default function hostExtension(pi: ExtensionAPI): void {
       // idle receipt. Disposal still requires the stock RPC settlement check.
       return {
         model: session.model, thinkingLevel: session.thinkingLevel,
+        ...(command.thinkingLevels === true ? {
+          configuredThinkingLevel: session.configuredThinkingLevel() ?? null,
+          thinkingLevels: session.getAvailableEffortSelectors(),
+        } : {}),
         isStreaming: session.isStreaming, isCompacting: session.isCompacting,
         steeringMode: session.steeringMode, followUpMode: session.followUpMode,
         interruptMode: session.interruptMode, sessionFile: session.sessionFile,

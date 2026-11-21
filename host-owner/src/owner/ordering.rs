@@ -137,6 +137,57 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn native_forms_are_cancelled_without_a_peer_and_never_forwarded_or_reanswered() {
+    let mut fixture = Fixture::new().await;
+    fixture.peer.output.shutdown().await.unwrap();
+    assert_eq!(fixture.peer.read().await, None);
+
+    for id in ["detached-form", "attached-form"] {
+        fixture
+            .native
+            .send(json!({
+                "type": "extension_ui_request",
+                "method": "form",
+                "id": id,
+                "html": "<form><input name=\"secret\"></form>",
+            }))
+            .await;
+        assert_eq!(
+            fixture.native.frame().await,
+            json!({"type": "extension_ui_response", "id": id, "cancelled": true})
+        );
+        if id == "detached-form" {
+            fixture.peer = Fixture::connect(&fixture.owner).await;
+        }
+    }
+    let next = json!({"type": "extension_ui_request", "method": "notify", "message": "next"});
+    fixture.native.send(next.clone()).await;
+    assert_eq!(fixture.peer.frame().await, next);
+
+    for id in ["detached-form", "attached-form"] {
+        fixture
+            .peer
+            .send(json!({"type": "extension_ui_response", "id": id, "data": {"secret": "late"}}))
+            .await;
+    }
+    fixture
+        .peer
+        .send(json!({"type": "get_messages", "id": "still-connected"}))
+        .await;
+    let query = fixture.native.frame().await;
+    assert_eq!(query["type"], "get_messages");
+    fixture
+        .native
+        .reply(&query, json!({"success": true, "data": {"messages": []}}))
+        .await;
+    assert_eq!(
+        fixture.peer.frame().await,
+        json!({"type": "response", "command": "get_messages", "id": "still-connected",
+            "success": true, "data": {"messages": []}})
+    );
+}
+
+#[tokio::test]
 async fn stock_state_cannot_advertise_an_unattested_journal_cursor() {
     let mut fixture = Fixture::new().await;
     assert!(

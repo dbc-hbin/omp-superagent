@@ -9,6 +9,7 @@ import { HostConnection } from "../../src/host";
 import type { GatewayService } from "../oracles/bun-gateway/gateway";
 import { waitForFixtureProcessExit } from "./host-fixture-processes";
 import { nativeRequestEnvelope } from "./native-request-envelope";
+import { nativeJournalDispatches } from "./native-tool-transport";
 
 type Evidence = { role: string; requestId: string; policyCount: number; sessionId: string; notices: string[]; directives: string[]; activeTools: string[] };
 
@@ -101,6 +102,13 @@ export async function runNativeUlwProof(options: {
   const laneRequests = userRequests(laneEntries);
   assert.deepEqual(headRequests.map(request => request.id).sort(), [...inputs.map(item => item.id), `report:${firstHandoff}`, `report:${secondHandoff}`, `report:${bulkHandoff}`].sort());
   assert.deepEqual(laneRequests.map(request => request.id), [firstHandoff, secondHandoff, bulkHandoff]);
+  const management = nativeJournalDispatches(headEntries)
+    .filter(call => call.mode === "execute" && (call.name === "lane_start" || call.name === "lane_message"));
+  assert.deepEqual(management.map(({ name, args, ok }) => ({ name, sourceId: args?.sourceId, ok })), [
+    { name: "lane_start", sourceId: "303", ok: true },
+    { name: "lane_message", sourceId: "307", ok: true },
+    { name: "lane_message", sourceId: "308", ok: true },
+  ], "Workflow handoffs require actual completed manager dispatch in the head's native journal");
   for (const item of inputs) {
     const original = headRequests.find(request => request.id === item.id)!;
     // Native specialised invocation may insert its default keyword immediately

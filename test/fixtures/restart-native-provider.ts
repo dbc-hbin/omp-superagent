@@ -10,6 +10,7 @@ import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mo
 import { HostConnection } from "../../src/host";
 import superagentExtension from "../../src/extension";
 import { nativeRequestEnvelope } from "./native-request-envelope";
+import { nativeToolExchanges, nativeToolTurn } from "./native-tool-transport";
 
 export default function restartNativeProvider(pi: ExtensionAPI): void {
   const root = process.env.OMP_RESTART_NATIVE_ROOT;
@@ -175,11 +176,11 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
       if (role === "lane") {
         const detached = scenario === "lane-failure" || scenario === "lane-abort" || recoveryWindow;
         if (detached) {
-          const created = context.messages.some(message => message.role === "toolResult" && message.toolName === "goal" && !message.isError);
-          if (!created) {
-            assert(context.tools?.some(tool => tool.name === "goal"), "The independent native lane must expose the actual goal tool");
-            return { content: [{ type: "toolCall", id: "restart-native:lane-goal", name: "goal",
-              arguments: { op: "create", objective: "Yield the first lane turn successfully, then retain the actual detached continuation outcome." } }] };
+          const turn = nativeToolTurn(pi, context, nativeToolExchanges(context.messages));
+          assert.deepEqual(turn.failed, [], "A production native lane tool failed");
+          if (!turn.succeeded("goal", "create")) {
+            return turn.invoke("goal", { op: "create",
+              objective: "Yield the first lane turn successfully, then retain the actual detached continuation outcome." }, "restart-native:lane-goal");
           }
           // Native hidden goal continuation reaches the provider as a developer message.
           const continuing = context.messages.at(-1)?.role === "developer";
@@ -212,27 +213,17 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
       if (user.sourceId === "903") return { content: ["QUEUED_DELIVERED_ONCE"] };
       assert(user.sourceId === "901" || user.sourceId === "904");
       const messages = context.messages.slice(user.index + 1);
-      const calls = new Map(messages.flatMap(message => message.role === "assistant"
-        ? message.content.flatMap(part => part.type === "toolCall" ? [[part.id, part] as const] : []) : []));
-      const results = messages.filter(message => message.role === "toolResult");
-      const logical = (id: string) => {
-        const call = calls.get(id);
-        return call?.name === "write" && typeof call.arguments.path === "string" && call.arguments.path.startsWith("xd://")
-          ? call.arguments.path.slice(5) : call?.name;
-      };
-      const failed = results.filter(result => result.isError && logical(result.toolCallId) !== "fixture_restart_hold");
-      assert.deepEqual(failed, [], "A production native tool failed");
-      const succeeded = (name: string, op?: string) => results.some(result => !result.isError && logical(result.toolCallId) === name
-        && (op === undefined || calls.get(result.toolCallId)?.arguments.op === op));
-      const tools = new Set(context.tools?.map(tool => tool.name));
-      const invoke = (name: string, args: Record<string, unknown>): MockResponse => {
-        const id = `restart-native:${process.pid}:${name}:${context.messages.length}`;
-        if (tools.has(name)) return { content: [{ type: "toolCall", id, name, arguments: args }] };
-        const documented = results.some(result => result.toolName === "read" && calls.get(result.toolCallId)?.arguments.path === `xd://${name}`);
-        return documented
-          ? { content: [{ type: "toolCall", id, name: "write", arguments: { path: `xd://${name}`, content: JSON.stringify(args) } }] }
-          : { content: [{ type: "toolCall", id, name: "read", arguments: { path: `xd://${name}` } }] };
-      };
+      const exchanges = nativeToolExchanges(messages);
+      const turn = nativeToolTurn(pi, context, exchanges);
+      // Native abort may leave the intentional hold's error in the restored
+      // conversation; no other failed or unpaired result is an expected effect.
+      const heldErrors = new Set(turn.failed.filter(result => result.name === "fixture_restart_hold").map(result => result.result));
+      assert.deepEqual(messages.filter(message => message.role === "toolResult" && message.isError && !heldErrors.has(message)),
+        [], "A production native tool failed");
+      assert.deepEqual(turn.failed.filter(result => result.name !== "fixture_restart_hold"), [], "A production native dispatch failed");
+      const { succeeded } = turn;
+      const invoke = (name: string, args: Record<string, unknown>): MockResponse =>
+        turn.invoke(name, args, `restart-native:${process.pid}:${name}:${context.messages.length}`);
       if (user.sourceId === "904") {
         if (!succeeded("lane_start")) return invoke("lane_start", {
           sourceId: "904", title: "Surviving isolated work", cwd: join(root, "lane"),
@@ -243,7 +234,6 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
         return { content: ["LANE_STARTED"] };
       }
       if (!succeeded("goal", "create")) {
-        assert(tools.has("goal"), "The managed HEAD must expose the real native goal tool");
         return invoke("goal", { op: "create", objective: "Preserve one completed file effect across owner restart, then finish the entrusted objective." });
       }
       if (!succeeded("bash")) return invoke("bash", { command: "printf 'completed-once\\n' >> completed-effect.log", timeout: 10 });

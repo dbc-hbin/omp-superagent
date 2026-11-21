@@ -103,6 +103,7 @@ pub(crate) struct State {
     pub(crate) goal_resumes: Vec<GoalResume>,
     pub(crate) generation: u64,
     pub(crate) active_commands: usize,
+    stock_thinking_levels: bool,
     pub(crate) serial: Option<Barrier>,
     pub(crate) dispatch: Option<Barrier>,
     pub(crate) interrupts: Option<Barrier>,
@@ -446,6 +447,16 @@ impl Owner {
     }
 
     async fn native_event(&self, mut frame: Value) -> Result<()> {
+        if frame["type"] == "extension_ui_request" && frame["method"] == "form" {
+            // Managed Hosts have no safe HTML renderer. Answer stock RPC
+            // before translating IDs or queuing anything for a socket peer.
+            if let Some(id) = frame["id"].as_str() {
+                self.native.send(json!({
+                    "type": "extension_ui_response", "id": id, "cancelled": true,
+                }))?;
+            }
+            return Ok(());
+        }
         if frame["type"] == "extension_error"
             && frame["extensionPath"]
                 .as_str()
@@ -580,9 +591,19 @@ impl Owner {
     pub(crate) async fn snapshot(&self) -> Result<Value> {
         self.observations_flushed().await?;
         let control = self.control()?;
-        let active = self.state()?.active_commands != 0;
+        let (active, stock_thinking_levels) = {
+            let state = self.state()?;
+            (state.active_commands != 0, state.stock_thinking_levels)
+        };
         let rpc = if active { control } else { &self.native };
-        let native = data(rpc.request(json!({"type": "get_state"})).await?)?;
+        // The busy bridge should advertise only selectors that this CLI puts
+        // into ordinary get_state. Older stock Hosts still use separate discovery.
+        let request = if active && stock_thinking_levels {
+            json!({"type": "get_state", "thinkingLevels": true})
+        } else {
+            json!({"type": "get_state"})
+        };
+        let native = data(rpc.request(request).await?)?;
         let owned = data(control.request(json!({"type": "snapshot"})).await?)?;
         let identity = self.validate_control_identity(&owned)?;
         if owned.get("sessionId") != native.get("sessionId")
@@ -598,9 +619,15 @@ impl Owner {
         let Value::Object(mut native) = native else {
             return Err(Error::Unavailable("Native state is unavailable"));
         };
-        let Value::Object(owned) = owned else {
+        let Value::Object(mut owned) = owned else {
             return Err(Error::Unavailable("Native state is unavailable"));
         };
+        if native.contains_key("thinkingLevels") {
+            // Keep the configured selector paired with the native model and
+            // effective level, not a later observation from the ownership probe.
+            owned.remove("configuredThinkingLevel");
+            native.entry("configuredThinkingLevel").or_insert(Value::Null);
+        }
         native.extend(owned);
         // Only publish the capability attested by this owner's private launch control.
         native.remove("journalCursorControlVersion");
@@ -899,6 +926,7 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
         .await
         .context("Native RPC state is unavailable")?;
     require_success(&state).context("Native RPC state is unavailable")?;
+    owner.state()?.stock_thinking_levels = state["data"].get("thinkingLevels").is_some();
     let ask = owner
         .native
         .request(json!({"type": "set_ask_dialog", "enabled": true}))

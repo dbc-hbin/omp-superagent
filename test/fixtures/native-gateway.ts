@@ -16,6 +16,7 @@ import { runNativeUlwProof } from "./native-ulw-proof";
 import { runNativeRecoveryProof } from "./native-recovery-proof";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { nativeTestCommand } from "./native-command";
+import { nativeJournalDispatches } from "./native-tool-transport";
 
 type Handlers = Parameters<Messenger["start"]>[0];
 const interrupted = new AbortController();
@@ -95,28 +96,6 @@ function requestIds(entries: readonly FileEntry[]): string[] {
   });
 }
 
-function nativeToolResults(entries: readonly FileEntry[], name: string) {
-  // A restarted local provider may reuse its wire call IDs. Correlate each
-  // result with the preceding invocation, never a session-wide ID-only set.
-  const calls = new Map<string, string>();
-  return entries.flatMap(entry => {
-    if (entry.type !== "message") return [];
-    if (entry.message.role === "assistant") {
-      for (const part of entry.message.content) {
-        if (part.type !== "toolCall") continue;
-        const device = part.name === "write" && typeof part.arguments.path === "string" && part.arguments.path.startsWith("xd://")
-          ? part.arguments.path.slice("xd://".length) : part.name;
-        calls.set(part.id, device);
-      }
-      return [];
-    }
-    if (entry.message.role !== "toolResult") return [];
-    const device = calls.get(entry.message.toolCallId);
-    calls.delete(entry.message.toolCallId);
-    return device === name ? [entry.message] : [];
-  });
-}
-
 const root = process.env.OMP_NATIVE_GATEWAY_ROOT;
 assert(root && path.isAbsolute(root), "Native Gateway proof needs a private absolute root");
 const presetScenario = process.env.OMP_NATIVE_GATEWAY_PRESETS ?? "create";
@@ -142,10 +121,13 @@ for (const directory of [agent, headCwd, laneCwd]) privateDirectory(directory);
 const model = "gateway-native/local";
 const settings = {
   disabledProviders: nativeDisabledProviders, modelRoles: { default: model, judge: model },
+  eval: { js: true, py: false },
+  // Keep the actual tool result attached to its call when steering arrives
+  // during manager dispatch. A background job's admission is not settlement.
+  bash: { autoBackground: { enabled: false } },
   // Explicitly grant only the native keyword settings this proof exercises;
   // native task capability requirements still control orchestration notices.
-  ...(ulwEntrypoint ? { magicKeywords: { enabled: true, ultrathink: true, orchestrate: true, jevify: true },
-    eval: { js: true, py: false } } : {}),
+  ...(ulwEntrypoint ? { magicKeywords: { enabled: true, ultrathink: true, orchestrate: true, jevify: true } } : {}),
   ...(["valid", "recovery"].includes(presetScenario) || ulwEntrypoint ? {
     modelPresets: Object.fromEntries(["high", "middle", "low"].map(name => [name, { modelRoles: { default: model, judge: model } }])),
   } : {}),
@@ -356,9 +338,10 @@ try {
   assert.equal(operator.head.pid, gateway.status().head.pid);
   assert.equal((await bootstrapEntries()).length, 1);
   const initializedEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
-  const initializations = nativeToolResults(initializedEntries, "lane_init_presets");
+  const initializations = nativeJournalDispatches(initializedEntries)
+    .filter(call => call.name === "lane_init_presets" && call.mode === "execute");
   assert.equal(initializations.length, 1, "Only the actual existing head chooses and persists native presets once");
-  assert.notEqual(initializations[0]!.isError, true);
+  assert.equal(initializations[0]?.ok, true);
   const initialized = Bun.YAML.parse(await fs.readFile(path.join(agent, "config.yml"), "utf8")) as {
     modelRoles: Record<string, string>; modelPresets: Record<string, { modelRoles: Record<string, string> }>;
   };
@@ -404,7 +387,7 @@ try {
   const observationStatusId = "native-observation-status";
   for (const item of inputs.slice(0, 3)) {
     await messenger.deliver(item);
-    if (item.id === "202" && presetScenario === "valid") {
+    if (item.id === "202") {
       await until(() => lane()?.observation?.waiting !== undefined && lane()?.observation?.waiting !== null,
         "real native lane_report waiting reaches the durable head ledger");
       const waiting = lane()!.observation!;
@@ -414,7 +397,7 @@ try {
       await until(() => messenger.sent.some(output => output.text === "OBSERVATION:202:waiting"),
         "head-only waiting update delivered before lane completion");
       observationOutputs.push(messenger.sent.find(output => output.text === "OBSERVATION:202:waiting")!);
-      await messenger.deliver({ id: observationStatusId, route: thread, messageId: "208", text: "/status",
+      await messenger.deliver({ id: observationStatusId, route: thread, messageId: "211", text: "/status",
         receivedAt: Date.now(), attachments: [] });
       await until(() => messenger.sent.some(output => output.sourceId === observationStatusId), "actual owner status reports the native wait");
       const status = messenger.sent.find(output => output.sourceId === observationStatusId)!.text;
@@ -426,6 +409,7 @@ try {
         "real native report resolves only its original wait and records evidence");
       const resolved = lane()!.observation!;
       const evidence = await fs.readFile(path.join(laneCwd, "native-observation-evidence.txt"));
+      assert.equal(evidence.toString("utf8"), "Native Gateway's observation evidence\n");
       assert.equal(resolved.lastEvidence?.fingerprint, createHash("sha256").update(evidence).digest("hex"));
       assert.equal(resolved.lastEvidence?.ref, path.join(laneCwd, "native-observation-evidence.txt"));
       await until(() => messenger.sent.some(output => output.text === "OBSERVATION:202:resolved"),
@@ -491,7 +475,7 @@ try {
   }
   await until(() => {
     const receipts = db.query("SELECT state FROM outputs ORDER BY sequence").all() as Array<{ state: string }>;
-    return receipts.length === 4 + observationOutputs.length + (presetScenario === "valid" ? 1 : 0) && receipts.every(receipt => receipt.state === "sent") &&
+    return receipts.length === 5 + observationOutputs.length && receipts.every(receipt => receipt.state === "sent") &&
       gateway!.status().gateway.pendingEvents === 0;
   }, "initial head replies and durable external receipts settle before forced head loss");
 
@@ -557,26 +541,31 @@ try {
   const laneEntries = parseSessionEntries(await fs.readFile(firstLane.sessionFile, "utf8"));
   const laneIds = requestIds(laneEntries);
   assert.deepEqual(laneIds, expectedLaneRequests);
-  const managementCalls = headEntries.flatMap(entry => entry.type === "message" && entry.message.role === "assistant"
-    ? entry.message.content.flatMap(part => {
-      if (part.type !== "toolCall") return [];
-      if (["lane_start", "lane_message"].includes(part.name)) return [{ name: part.name, sourceId: part.arguments.sourceId }];
-      if (part.name !== "write" || !["xd://lane_start", "xd://lane_message"].includes(String(part.arguments.path))) return [];
-      const args = JSON.parse(String(part.arguments.content)) as { sourceId: string };
-      return [{ name: String(part.arguments.path).slice("xd://".length), sourceId: args.sourceId }];
-    }) : []);
+  const headDispatches = nativeJournalDispatches(headEntries);
+  const laneDispatches = nativeJournalDispatches(laneEntries);
+  const managementCalls = headDispatches.filter(call => call.mode === "execute" && ["lane_start", "lane_message"].includes(call.name))
+    .map(call => ({ name: call.name, sourceId: call.args?.sourceId, ok: call.ok }));
   assert.deepEqual(managementCalls, [
-    { name: "lane_start", sourceId: "202" }, ...inputs.slice(2, 6).map(item => ({ name: "lane_message", sourceId: item.id })),
-  ], "Every lane dispatch must be an actual manager tool issued by the head after original user intake");
-  const laneManagerCalls = laneEntries.flatMap(entry => entry.type === "message" && entry.message.role === "assistant"
-    ? entry.message.content.flatMap(part => part.type === "toolCall" && part.name.startsWith("lane_") ? [part] : []) : []);
-  assert.deepEqual(laneManagerCalls, [], "Actual separate lane may not load or use head manager authority");
-  const deniedLaneCalls = nativeToolResults(laneEntries, "lane_message");
-  assert.equal(deniedLaneCalls.length, laneIds.length, "Each actual lane request probes the real manager device authority boundary");
-  for (const denied of deniedLaneCalls) {
-    assert.equal(denied.isError, true);
-    assert(JSON.stringify(denied.content).includes("No such tool: xd://lane_message"), "Native manager device must actually reject lane execution");
-  }
+    { name: "lane_start", sourceId: "202", ok: true },
+    ...inputs.slice(2, 6).map(item => ({ name: "lane_message", sourceId: item.id, ok: true })),
+  ], "Every lane dispatch must have an actual successful manager result in the original head journal");
+  const laneAuthority = laneEntries.flatMap(entry => entry.type === "custom" && entry.customType === "native-gateway:lane-authority"
+    ? [entry.data] : []);
+  assert.deepEqual(laneAuthority, laneIds.map(requestId => ({ requestId, registered: [], enabled: [], advertised: [] })),
+    "Every lane request must lack head management in the registry, enabled capabilities, and native provider payload");
+  const artifactDispatches = laneDispatches.filter(call => call.name === "fixture_gateway_artifact");
+  assert.deepEqual(artifactDispatches.map(call => ({ mode: call.mode, ok: call.ok })), [
+    { mode: "help", ok: true }, { mode: "execute", ok: true },
+  ], "The native lane must discover and execute its mounted artifact tool exactly once");
+  const [artifactHelp, artifactExecution] = artifactDispatches;
+  assert(artifactHelp?.presentation === artifactExecution?.presentation && artifactExecution?.presentation !== "direct");
+  assert.deepEqual(artifactExecution?.details, { path: path.join(laneCwd, "native-observation-evidence.txt") });
+  assert.deepEqual(laneDispatches.filter(call => call.mode === "execute" &&
+    (call.name === "lane_report" || call.name === "eval" && call.args?.title === "Native lane resolved report"))
+    .map(({ name, ok }) => ({ name, ok })), [{ name: "lane_report", ok: true }, { name: "eval", ok: true }]);
+  const laneReports = laneEntries.flatMap(entry => entry.type === "custom" && entry.customType === "superagent-lane-report"
+    ? [(entry.data as { report: { status: string } }).report.status] : []);
+  assert.deepEqual(laneReports, ["waiting", "resolved"], "The mounted artifact must resolve the original wait through the actual Eval bridge");
   for (const item of inputs.slice(1, 6)) {
     const handoffId: string = item.id === "202" ? firstHandoff : `handoff:${item.id}:${firstLane.id}`;
     const owner = reportOwners.get(handoffId)!;
@@ -606,8 +595,7 @@ try {
   assert.deepEqual(kickoff[0]?.route, thread);
   assert.equal(kickoff[0]?.sourceId, firstHandoff);
   assert(kickoff[0]?.text.trim());
-  const observationSources = new Set([...observationOutputs.map(output => output.sourceId),
-    ...(presetScenario === "valid" ? [observationStatusId] : [])]);
+  const observationSources = new Set([...observationOutputs.map(output => output.sourceId), observationStatusId]);
   const expectedOutputSources = ["201", firstHandoff, ...expectedReports, "207", ...observationSources];
   assert.deepEqual(messenger.sent.map(output => output.sourceId).sort(), [...expectedOutputSources].sort());
   assert.deepEqual(messenger.sent.filter(output => output.id !== "202:kickoff" && !observationSources.has(output.sourceId)).flatMap(output => output.text.split("\n")).sort(), inputs.map(item => `HEAD:${item.id}`).sort(),
@@ -629,9 +617,9 @@ try {
   const outputs = db.query("SELECT id,source_id,state,remote_id FROM outputs ORDER BY sequence").all() as Array<{ id: string; source_id: string; state: string; remote_id: string }>;
   assert.deepEqual(outputs.map(output => output.source_id).sort(), [...expectedOutputSources].sort());
   assert(outputs.every(output => output.state === "sent" && output.remote_id === `gateway-native-receipt:${output.id}`));
-  const boardPosts = [...nativeToolResults(headEntries, "board_post"), ...nativeToolResults(laneEntries, "board_post")];
-  const posted = boardPosts.map(post => {
-    assert.notEqual(post.isError, true);
+  const boardPosts = [...headDispatches, ...laneDispatches].filter(call => call.name === "board_post" && call.mode === "execute");
+  const posted = boardPosts.map(({ ok, result: post }) => {
+    assert.equal(ok, true);
     const value = JSON.parse(post.content.filter(part => part.type === "text").map(part => part.text).join("")) as {
       id: number; actor: string; role: string; sessionId: string; channel: string; text: string; mentions: string[];
     };
@@ -647,8 +635,8 @@ try {
   assert.equal(new Set(posted.map(value => value.id)).size, posted.length, "No native post may appear twice under the same board ID");
   assert.equal(new Set(posted.map(value => JSON.stringify([value.sessionId, value.toolCallId]))).size, posted.length,
     "Every request-bearing post must originate from one unique native session/tool execution");
-  const headReads = nativeToolResults(headEntries, "board_read");
-  const laneReads = nativeToolResults(laneEntries, "board_read");
+  const headReads = headDispatches.filter(call => call.name === "board_read" && call.mode === "execute" && call.ok);
+  const laneReads = laneDispatches.filter(call => call.name === "board_read" && call.mode === "execute" && call.ok);
   assert.equal(headReads.length, expectedReports.length);
   assert.equal(laneReads.length, laneIds.length);
   if (presetScenario === "create") {

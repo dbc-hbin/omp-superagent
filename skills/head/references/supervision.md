@@ -59,9 +59,10 @@ No polling, duty model, aggregate goal for lanes, or follow-up just for a report
 - When working directly, choose routine reversible options within scope without
   opening an owner card. For a material owner choice raised by HEAD, check
   `decision_list` for a pending question, then use `decision_ask` in the
-  appropriate conversation for tracked choices. Ordinary native `ask` is
-  available to HEAD. Inspect with
-  `decision_inspect`; `answering` is uncertain, not permission to resend or infer
+  appropriate conversation for tracked choices. Do not substitute native `ask`:
+  on OMP 19.1 it sends an HTML `form` that the managed Host cancels without
+  displaying a card. Inspect tracked choices with `decision_inspect`;
+  `answering` is uncertain, not permission to resend or infer
   assent. `decision_withdraw` needs the exact ID, real owner source from the same
   conversation, and reason; withdrawal isn't approval or resume.
 - Bind native answers and approvals to the original card, authenticated platform,

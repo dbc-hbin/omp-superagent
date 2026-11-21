@@ -37,10 +37,10 @@ an active session in response.
    Catalog context, modalities, reasoning and price are facts, not a benchmark,
    quota, total predicted cost, or spending authorization.
 3. Normally consult native `eval` judge for a substantive choice with meaningful
-   alternatives or an ambiguous capability/risk/brief. Read `xd://eval/judge` for
-   the live contract. Supply only necessary factual requirements, uncertainties and
-   safe candidate metadata: no transcripts, secrets, credentials, endpoints or
-   unrelated private data. For independent parallel lane comparisons use
+   alternatives or an ambiguous capability/risk/brief. Read the judge help topic
+   advertised by `eval` (`help://eval/judge` on OMP 19.1). Supply only necessary
+   requirements, uncertainties and candidate metadata: no transcripts, secrets,
+   credentials, endpoints or unrelated private data. For independent parallel lane comparisons use
    `judge_batch`/`judgeBatch` under that contract when it helps, with compatible
    questions and real candidate labels in each input; inspect individual errors
    and continue or wait for native results, not poll. Advice isn't authorization or

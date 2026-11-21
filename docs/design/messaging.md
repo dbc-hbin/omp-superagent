@@ -230,7 +230,10 @@ free-form drafts in native modals without echoing their contents on the channel
 card. Unsupported or secret input is not approximated or auto-approved: cancel
 the native request and direct the operator to the appropriate local UI.
 
-[`decision_ask`](../../src/decision-tool.ts) uses native `askDialog`; it is not a
+OMP 19.1 sends a built-in `ask` as one HTML `form`. The stdio owner cancels
+that exact request because the messenger adapters do not render arbitrary HTML;
+it does not forward the HTML, submit defaults or wait for a connected head.
+[`decision_ask`](../../src/decision-tool.ts) uses the separate native `askDialog`; it is not a
 parallel approval engine. [Decision records](../../src/decisions.ts) link the
 native tool call, original source and original question/card. `answering` is an
 attempt, not the `answered` state confirmed by native settlement. A lane's
@@ -263,7 +266,10 @@ approval.
 - An owner can authorize one specific result file with a standalone leading
   `attach: workspace/relative-file.ext` line. `result_attach` stages the exact
   allowed regular file from that source's working directory; arbitrary model
-  prose cannot attach it. Files must be nonempty and at most 8 MiB; symlinks,
+  prose cannot attach it. A lane calls this tool directly, including in code
+  mode: the head matches the live native execution start and result before it
+  queues the file. An Eval result or a replayed journal entry is not a delivery
+  request. Files must be nonempty and at most 8 MiB; symlinks,
   hard links, dot paths and managed private state are excluded. Delivery uses
   the original authorized topic and stable outbox identity, with no destination
   override and no replay of uncertain sends. Restricted group rooms cannot

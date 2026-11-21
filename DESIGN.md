@@ -99,6 +99,8 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
   The Gateway's one-shot successor waits for the old lifetime lock to release.
   A later operator stop invalidates the restart and prevents successor revival.
 - Restore the exact head native session and saved model/effort and reconcile approvals.
+  If the checkpoint recorded `auto`, verify the restored configured selector
+  rather than requiring OMP to choose the same effective level again.
   For the same model identified as non-reasoning by both Hosts, stock OMP can
   represent inactive effort as either absent or `off`. Any other effort mismatch
   keeps intake held; a configured default is not evidence of active effort.

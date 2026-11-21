@@ -44,6 +44,8 @@ export interface RuntimeState {
   readonly journalCursorVersion?: 1;
   model?: LaneModel | null;
   thinkingLevel?: string;
+  configuredThinkingLevel?: string | null;
+  thinkingLevels?: readonly string[];
   isCompacting?: boolean;
   queuedMessageCount?: number;
   contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null } | null;
@@ -150,6 +152,7 @@ interface HeadRestart extends GatewayRestartRequest {
     goalActive: boolean;
     model: (LaneModel & { reasoning?: boolean }) | null;
     thinkingLevel?: string;
+    configuredThinkingLevel?: string | null;
     residents: Array<{
       id: string; generation: number; pid: number; sessionId: string;
       inputId?: string; requestIds: string[];
@@ -161,23 +164,24 @@ interface HeadRestart extends GatewayRestartRequest {
   };
 }
 
-function restartSelection({ model, thinkingLevel }: RuntimeState) {
+function restartSelection({ model, thinkingLevel, configuredThinkingLevel }: RuntimeState) {
   return {
     model: isLaneModel(model) ? { provider: model.provider, id: model.id,
       ...("reasoning" in model && typeof model.reasoning === "boolean" ? { reasoning: model.reasoning } : {}) } : null,
-    thinkingLevel,
+    thinkingLevel, configuredThinkingLevel,
   };
 }
 
 function matchesRestartSelection(checkpoint: NonNullable<HeadRestart["checkpoint"]>, state: RuntimeState): boolean {
   const resumed = restartSelection(state);
   if (!sameLaneModel(checkpoint.model, resumed.model)) return false;
-  if (checkpoint.thinkingLevel === resumed.thinkingLevel) return true;
-  // Stock OMP can omit effort on a fresh non-reasoning model and report "off"
-  // on resume. Never equate missing effort with "off" on a reasoning or unknown model.
-  return checkpoint.model?.reasoning === false && resumed.model?.reasoning === false
-    && ((checkpoint.thinkingLevel === undefined && resumed.thinkingLevel === "off")
-      || (checkpoint.thinkingLevel === "off" && resumed.thinkingLevel === undefined));
+  const inactive = checkpoint.model?.reasoning === false && resumed.model?.reasoning === false;
+  const sameEffort = (before: string | null | undefined, after: string | null | undefined) =>
+    before === after || inactive && (before ?? "off") === "off" && (after ?? "off") === "off";
+  if (checkpoint.configuredThinkingLevel !== undefined
+    && !sameEffort(checkpoint.configuredThinkingLevel, resumed.configuredThinkingLevel)) return false;
+  // Auto can choose a different effective level; older checkpoints know only the effective level.
+  return checkpoint.configuredThinkingLevel === "auto" || sameEffort(checkpoint.thinkingLevel, resumed.thinkingLevel);
 }
 
 export interface LaneStart extends LaneModelChoice {
@@ -3283,18 +3287,36 @@ export class Superagent {
 
   private headStatus(state: RuntimeState): string {
     const model = isLaneModel(state.model) ? JSON.stringify(laneModelArgument(state.model)) : "unavailable";
-    const effort = typeof state.thinkingLevel === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(state.thinkingLevel)
+    const effective = this.isEffortLevel(state.thinkingLevel)
       ? state.thinkingLevel : state.thinkingLevel === undefined ? "model default" : "unavailable";
+    const configured = state.configuredThinkingLevel;
+    const effort = configured == null || configured === state.thinkingLevel ? effective
+      : `${this.isEffortLevel(configured) ? configured : "unavailable"} (effective: ${effective})`;
     return `model: ${model}; effort: ${effort}`;
   }
 
-  private async thinkingLevels(live: Live): Promise<string[]> {
-    const data = successful(await live.connection.request({ type: "get_available_thinking_levels" }), "get_available_thinking_levels");
-    if (!this.current(live) || !Array.isArray(data.levels)
-      || !data.levels.every(level => typeof level === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(level))) {
+  private isEffortLevel(level: unknown): level is string {
+    return typeof level === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(level);
+  }
+
+  private selectableEfforts(levels: unknown): string[] {
+    if (!Array.isArray(levels) || !levels.every(this.isEffortLevel)) {
       throw new Error("Native selectable effort levels are unavailable");
     }
-    return [...new Set(data.levels as string[])];
+    return [...new Set(levels)];
+  }
+
+  private async effortState(live: Live, state: RuntimeState): Promise<{ state: RuntimeState; levels: string[] }> {
+    if (state.thinkingLevels !== undefined) {
+      return { state, levels: this.selectableEfforts(state.thinkingLevels) };
+    }
+    // Older stock RPC has a separate discovery command, which does not list Auto.
+    const data = successful(await live.connection.request({ type: "get_available_thinking_levels" }), "get_available_thinking_levels");
+    const actual = await this.state(live);
+    if (isLaneModel(state.model) && !sameLaneModel(state.model, actual.model)) {
+      throw new Error("Native model changed while reading effort capabilities");
+    }
+    return { state: actual, levels: this.selectableEfforts(actual.thinkingLevels === undefined ? data.levels : actual.thinkingLevels) };
   }
 
   private stopTarget(input: Inbound, command: HeadCommand, bound?: Lane | null): string | null {
@@ -3558,15 +3580,14 @@ export class Superagent {
           await this.state(live);
           reply(models.length ? `Available chat models:\n${models.map(model => JSON.stringify(laneModelArgument(model))).join("\n")}` : "No available native chat models.");
         } else if (command.name === "effort") {
-          const model = state.model;
-          const levels = await this.thinkingLevels(live);
-          state = await this.state(live);
-          if (isLaneModel(model) && !sameLaneModel(model, state.model)) throw new Error("Native model changed while reading effort capabilities");
-          reply(`${this.headStatus(state)}. Selectable effort levels: ${levels.join(", ") || "none"}. Native auto mode is not exposed by this query.`, "done",
+          const { state: observed, levels } = await this.effortState(live, state);
+          const { model, configuredThinkingLevel, thinkingLevel } = observed;
+          const current = configuredThinkingLevel === undefined ? thinkingLevel : configuredThinkingLevel;
+          reply(`${this.headStatus(observed)}. Selectable effort levels: ${levels.join(", ") || "none"}.`, "done",
             levels.length && isLaneModel(model) ? {
-              kind: "effort", forModel: { provider: model.provider, id: model.id }, sessionId: state.sessionId,
+              kind: "effort", forModel: { provider: model.provider, id: model.id }, sessionId: observed.sessionId,
               generation: live.generation, expiresAt: Date.now() + headPickerLifetimeMs,
-              ...(state.thinkingLevel ? { current: state.thinkingLevel } : {}),
+              ...(this.isEffortLevel(current) && levels.includes(current) ? { current } : {}),
               groups: [{ label: "Effort", options: levels }],
             } : undefined);
         } else if (command.name === "model") {
@@ -3622,7 +3643,7 @@ export class Superagent {
       const capabilityModel = isLaneModel(state.model) ? { provider: state.model.provider, id: state.model.id } : null;
       let model: LaneModel | undefined;
       let preset: ResolvedLanePreset | undefined;
-      let levels: string[] | undefined;
+      let legacyEfforts: string[] | undefined;
       if (presetCommand) {
         const name = presetCommand.name;
         if (!name || !this.adapters.resolvePreset) { reply("Use /model preset list or /model preset <exact-name> [--global] for an existing native preset.", "cancelled"); return; }
@@ -3642,9 +3663,9 @@ export class Superagent {
           model = available.find(candidate => candidate.provider === group?.label && laneModelArgument(candidate) === identity);
         } else model = available.find(candidate => laneModelArgument(candidate) === command.argument);
         if (!model) { reply("Unknown model. Use /model list, then /model <exact provider/id> with one advertised chat identity.", "cancelled"); return; }
-      } else if (command.name === "effort") {
-        levels = await this.thinkingLevels(live);
-        if (!levels.includes(command.argument)) { reply(`Unsupported effort. Selectable effort levels: ${levels.join(", ") || "none"}. Use /effort <level> exactly.`, "cancelled"); return; }
+      } else if (command.name === "effort" && state.thinkingLevels === undefined) {
+        const observed = await this.effortState(live, state);
+        if (observed.state.thinkingLevels === undefined) legacyEfforts = observed.levels;
       }
       // Capability reads can yield to autonomous native work or an operator.
       // Recheck identity, ownership and isolation on this same connection before
@@ -3656,12 +3677,19 @@ export class Superagent {
       }
       if (busy(state)) { reply("HEAD became busy; no change was made. Send a new command after it is idle.", "cancelled"); return; }
       if (state.settingsScope !== "session") { reply("Native session-only settings scope could not be verified; no change was made.", "cancelled"); return; }
-      if (command.name === "effort" && !sameLaneModel(capabilityModel, state.model)) {
-        reply("Native model changed while reading selectable effort levels; no change was made. Query /effort again.", "cancelled"); return;
-      }
       const beforeModel = isLaneModel(state.model) ? { provider: state.model.provider, id: state.model.id } : null;
-      if (command.name === "effort" && !beforeModel) {
-        reply("Native model state could not be verified; no change was made.", "cancelled"); return;
+      if (command.name === "effort") {
+        if (!capabilityModel || !beforeModel) {
+          reply("Native model state could not be verified; no change was made.", "cancelled"); return;
+        }
+        if (!sameLaneModel(capabilityModel, beforeModel)) {
+          reply("Native model changed while reading selectable effort levels; no change was made. Query /effort again.", "cancelled"); return;
+        }
+        const levels = state.thinkingLevels === undefined ? legacyEfforts ?? [] : this.selectableEfforts(state.thinkingLevels);
+        if (!levels.includes(command.argument)) {
+          reply(`Unsupported effort. Selectable effort levels: ${levels.join(", ") || "none"}. Use /effort <level> exactly.`, "cancelled");
+          return;
+        }
       }
       const requestId = `sg-head-${key(input.id)}-${live.generation}`;
       if (!this.store.submit(input.id, requestId, live.generation)) return;
@@ -3713,12 +3741,27 @@ export class Superagent {
           .filter(role => !Object.hasOwn(actual.modelSettings!.modelRoles, role));
         this.store.setMeta(settingsKey, JSON.stringify({ settings: actual.modelSettings, clearedRoles }));
       }
-      if (!model) {
-        levels = await this.thinkingLevels(live);
-        if (typeof actual.thinkingLevel !== "string" || !levels.includes(actual.thinkingLevel)) throw new Error("Native effective effort was not advertised");
-        const confirmed = await this.state(live);
+      if (command.name === "effort") {
+        if (state.thinkingLevels !== undefined && actual.thinkingLevels === undefined) {
+          throw new Error("Native effort capability disappeared during confirmation");
+        }
+        const { state: confirmed, levels } = await this.effortState(live, actual);
+        const effective = confirmed.thinkingLevel;
+        const configured = confirmed.configuredThinkingLevel;
         if (confirmed.settingsScope !== "session" || !sameLaneModel(confirmed.model, actual.model)
-          || confirmed.thinkingLevel !== actual.thinkingLevel) throw new Error("Native effort readback changed during confirmation");
+          || effective !== actual.thinkingLevel || configured !== actual.configuredThinkingLevel) {
+          throw new Error("Native effort readback changed during confirmation");
+        }
+        const automatic = command.argument === "auto";
+        const advertisedEffective = this.isEffortLevel(effective) && effective !== "auto" && levels.includes(effective);
+        if (automatic
+          ? configured !== "auto" || !levels.includes("auto") || effective !== undefined && !advertisedEffective
+          : !advertisedEffective || (confirmed.thinkingLevels !== undefined || configured !== undefined) && configured !== effective) {
+          throw new Error("Native effort readback did not verify the requested selector");
+        }
+        const difference = !automatic && effective !== command.argument ? " (native effective effort differs from the requested level)" : "";
+        reply(`Changed effort; ${this.headStatus(confirmed)}${difference}.`);
+        return;
       }
       if (preset) {
         const change = `Preset ${JSON.stringify(preset.preset)}: previous ${this.headStatus(state)} -> actual ${this.headStatus(actual)}.`;
@@ -3740,7 +3783,7 @@ export class Superagent {
         } else reply(`${change} Session applied; session-only (global defaults not saved). Existing lanes unchanged.`);
         return;
       }
-      reply(`Changed ${command.name}; ${this.headStatus(actual)}${!model && actual.thinkingLevel !== command.argument ? " (native effective effort differs from the requested level)" : ""}.`);
+      reply(`Changed ${command.name}; ${this.headStatus(actual)}.`);
     } catch {
       reply(submitted
         ? "The native change outcome is uncertain. It was not repeated; later HEAD work is held. Use /model or /effort to inspect the actual state and reconcile the original request."
