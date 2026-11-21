@@ -79,6 +79,12 @@ impl Ts {
         // Lossy presentation time only; source IDs and pagination use the exact decimal.
         self.0.parse::<f64>().unwrap_or_default() * 1_000.0
     }
+
+    pub(super) fn whole_millis(&self) -> Option<i64> {
+        let (seconds, micros) = self.0.split_once('.')?;
+        let millis = micros.get(..3)?.parse::<i64>().ok()?;
+        seconds.parse::<i64>().ok()?.checked_mul(1000)?.checked_add(millis)
+    }
 }
 
 impl<'de> Deserialize<'de> for Ts {

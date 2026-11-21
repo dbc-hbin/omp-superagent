@@ -19,6 +19,7 @@ use crate::{
     store::Store,
 };
 
+mod group;
 mod restart;
 
 struct SocketDir(PathBuf);
@@ -118,6 +119,15 @@ impl GatewayClient {
                     local_url: url.clone(),
                 }))
             })?;
+        Self::with_adapters(root, store, service, adapters).await
+    }
+
+    async fn with_adapters(
+        root: &SocketDir,
+        store: Arc<Store>,
+        service: Arc<dyn Service>,
+        adapters: Arc<AdapterHub>,
+    ) -> Result<Self> {
         let hub = Arc::new(Hub::new(store.clone(), service, adapters));
         let socket = root.0.join("g.sock");
         let server = Server::listen(&socket, hub).await?;
@@ -174,6 +184,36 @@ impl GatewayClient {
         );
         Ok(response)
     }
+}
+
+#[tokio::test]
+async fn result_attachment_attempt_ledger_retains_only_fingerprint_and_rejects_changed_bytes() -> Result<()> {
+    let root = SocketDir::new()?;
+    let fixture = GatewayClient::connect(&root, String::new()).await?;
+    let id = Uuid::new_v4().to_string();
+    let route = json!({"platform":"telegram","accountId":"bot","authorityId":"owner",
+        "guildId":null,"channelId":"chat","threadId":null});
+    let request = |data: &str| json!({"id":id,"operation":"send","args":[{
+        "id":"attachment-effect","route":route,"text":"",
+        "resultAttachment":{"name":"result.bin","data":data},
+    }]});
+    let bytes = "AEJDCg==";
+    let first = fixture.call("/effect", &request(bytes)).await?;
+    assert_eq!(first["error"], "Fixture accepts attachments only");
+    assert_eq!(fixture.call("/effect", &request(bytes)).await?, first);
+    let changed = fixture.call("/effect", &request("AQID")).await?;
+    assert_eq!(changed["certainty"], "uncertain", "the same effect ID cannot change its bytes");
+    let db = rusqlite::Connection::open(root.0.join("coordination.sqlite"))?;
+    let saved: String = db.query_row(
+        "SELECT arguments FROM gateway_effects WHERE id = ?",
+        [&id],
+        |row| row.get(0),
+    )?;
+    let saved: Value = serde_json::from_str(&saved)?;
+    let argument = saved[0].as_object().context("Gateway effect fingerprint")?;
+    assert_eq!(argument.len(), 1, "the Gateway need not retain the attachment payload");
+    assert_eq!(argument["resultAttachmentEffectSha256"].as_str().map(str::len), Some(64));
+    fixture.server.close().await
 }
 
 #[tokio::test]

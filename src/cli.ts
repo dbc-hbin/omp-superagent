@@ -20,6 +20,7 @@ Usage:
   omp-sa install --config FILE
   omp-sa uninstall --config FILE
   omp-sa status --config FILE
+  omp-sa group [REQUEST_ID] --config FILE
   omp-sa stop [main|LANE_ID] --config FILE
   omp-sa doctor --config FILE
   omp-sa discord-commands --config FILE [--apply]
@@ -37,6 +38,7 @@ Setup and service lifecycle:
   start can return before HEAD can accept work. Check head.ready and head.initialization in the start response
   (gateway.head in status); initial high/middle/low model presets must be verified before queued work runs.
   status shows live Gateway/HEAD readiness when reachable, login launcher status, and saved lane IDs, models and states.
+  group reads the private group request inbox, including restricted worktree paths, without starting the bot.
   A saved lane state does not prove its Host is running or that the work completed.
   stop main shuts down the Gateway and HEAD; a busy Host can refuse. Bare CLI stop also targets main.
   stop LANE_ID requests shutdown of just that managed lane Host. It does not delete the lane or its session.
@@ -141,7 +143,7 @@ function laneRows(stateDir: string): Lane[] {
 export async function main(args = process.argv.slice(2)): Promise<void> {
   if (!args.length || args.includes("--help") || args[0] === "help") { console.log(HELP); return; }
   const [command] = args;
-  if (!["setup", "start", "install", "uninstall", "status", "stop", "doctor", "discord-commands", "telegram-commands", "slack-commands"].includes(command!)) throw new Error(`Unknown command: ${command}`);
+  if (!["setup", "start", "install", "uninstall", "status", "group", "stop", "doctor", "discord-commands", "telegram-commands", "slack-commands"].includes(command!)) throw new Error(`Unknown command: ${command}`);
   const configAt = args.indexOf("--config");
   if (configAt < 0 || !args[configAt + 1]) throw new Error("--config FILE is required");
   if (command === "install" || command === "uninstall") {
@@ -193,6 +195,14 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   const config = await loadConfig(args[configAt + 1]!);
+  if (command === "group") {
+    if (!((configAt === 1 && args.length === 3) || (configAt === 2 && args.length === 4 && !args[1]?.startsWith("-")))) {
+      throw new Error("Usage: group [REQUEST_ID] --config FILE");
+    }
+    const { groupRequests } = await import("./group-access");
+    console.log(JSON.stringify(groupRequests(config.stateDir, configAt === 2 ? args[1] : undefined), null, 2));
+    return;
+  }
   const target = args[1] && !args[1]!.startsWith("-") ? args[1]! : "main";
   const paths = hostPaths(config, target);
   if (command === "doctor") {

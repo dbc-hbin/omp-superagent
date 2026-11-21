@@ -110,7 +110,7 @@ impl Hub {
                 pending.result.clone()
             } else {
                 let value = json!({"requestId": request.id, "inputId": request.input_id, "ackOutputId": request.ack_id});
-                self.store.validate_restart(&value).map_err(|error| {
+                let input = self.store.validate_restart(&value).map_err(|error| {
                     if error
                         .downcast_ref::<crate::store::AuthorityError>()
                         .is_some()
@@ -120,6 +120,7 @@ impl Hub {
                         uncertain("Gateway restart request failed")
                     }
                 })?;
+                self.adapters.rooms.owner_route(&input["route"])?;
                 let (send, result) = watch::channel(None);
                 restarts.pending.insert(
                     request.id.to_owned(),

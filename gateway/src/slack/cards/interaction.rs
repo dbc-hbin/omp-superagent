@@ -87,6 +87,9 @@ impl Inner {
             || !same_optional(&body["user"], "team_id", &self.team)
             || !same_optional(body, "api_app_id", &identity.app_id)
             || !same_optional(body, "app_id", &identity.app_id)
+            || body["channel"]["id"].as_str().is_some_and(|channel| {
+                self.ctx.group_room(Some(&self.team), channel).is_some()
+            })
         {
             return ack.send(None).await;
         }
@@ -114,6 +117,10 @@ impl Inner {
         else {
             return ack.send(None).await;
         };
+        let route = &pending.approval.route;
+        if self.ctx.group_room(route.guild_id.as_deref(), &route.channel_id).is_some() {
+            return ack.send(None).await;
+        }
         let identity = callback.identity(control, &ack.id);
         if matches!(&pending.claimed, Some(Claim::Failed(original)) if original == &identity) {
             return Err(EffectError::uncertain(

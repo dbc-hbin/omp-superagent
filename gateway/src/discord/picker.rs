@@ -50,7 +50,8 @@ impl State {
                 let Ok(route) = read::<Route>(route) else {
                     return false;
                 };
-                self.assert_route(&route).is_ok()
+                !self.group_route(&route)
+                    && self.assert_route(&route).is_ok()
                     && interaction.guild_id == route.guild_id
                     && interaction.channel_id() == Some(route.destination())
                     && interaction.message.as_ref().is_some_and(|source| {

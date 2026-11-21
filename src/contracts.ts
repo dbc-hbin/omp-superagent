@@ -1,6 +1,8 @@
 import type { ModelPreset as NativeModelPreset } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import type { LaneEvidence, LaneReport, LaneWaitTarget } from "./lane-report";
 import type { CronUpdate } from "./cron-jobs";
+import type { GroupReply, GroupRequest } from "./group-policy";
+import type { StagedResultAttachment } from "./result-attachment";
 
 /** Coordination records only. OMP owns transcripts and execution state. */
 export type Platform = "discord" | "telegram" | "slack";
@@ -215,6 +217,7 @@ export interface OutputRecord {
   /** Durable original owner message, only in the same physical conversation. */
   replyTo?: MessageReference;
   readonly picker?: HeadPicker;
+  readonly resultAttachment?: StagedResultAttachment;
   text: string;
   state: OutputState;
   remoteId: string | null;
@@ -395,6 +398,7 @@ export interface Messenger {
     /** Authenticate first; do not consume inbound events until native approvals are reconciled. */
     ready?: Promise<void>;
     message(input: Inbound): Promise<void>;
+    group?(request: GroupRequest): Promise<void>;
     answer(approvalId: string, response: DialogResponse, route: Route): Promise<void>;
     /** Reconcile a previously attempted answer before retrying its native effect. */
     reconcileAnswer?(approvalId: string, route: Route): Promise<"retry" | "accepted" | "rejected" | "unresolved">;
@@ -403,6 +407,7 @@ export interface Messenger {
     restart?(notice: GatewayRestartNotice): Promise<void>;
   }): Promise<void>;
   send(output: OutputRecord): Promise<string>;
+  sendGroup?(reply: GroupReply): Promise<string>;
   /** Verify against the currently authenticated adapter without sending or fetching messages. */
   assertRoute?(route: Route): void | Promise<void>;
   /** Cosmetic own reactions on the original message; never an admission or completion receipt. */

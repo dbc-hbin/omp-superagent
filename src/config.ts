@@ -2,6 +2,7 @@ import { chmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { physicalRoute, type Platform, type Route } from "./contracts";
 import { resolveOmpCommand } from "./installed-omp";
+import { groupRoom, parseGroupRooms, type GroupRoom } from "./group-policy";
 
 export interface DiscordConfig {
   tokenEnv: string;
@@ -59,6 +60,7 @@ export interface Config {
   discord?: DiscordConfig;
   telegram?: TelegramConfig;
   slack?: SlackConfig;
+  groupRooms?: readonly GroupRoom[];
 }
 
 function record(value: unknown, name: string): Record<string, unknown> {
@@ -219,7 +221,7 @@ export function parseConfig(value: unknown, path: string): Config {
         throw new Error('discord.voice.auth must be "api" or "subscription"');
     }
   }
-  return {
+  const config: Config = {
     path: absolute,
     stateDir: pathValue(raw.stateDir, "stateDir"),
     headCwd,
@@ -248,6 +250,7 @@ export function parseConfig(value: unknown, path: string): Config {
       allowedChannelIds: ids(slack.allowedChannelIds, "slack.allowedChannelIds", /^[CG][A-Z0-9]+$/),
     } } : {}),
   };
+  return raw.groupRooms === undefined ? config : { ...config, groupRooms: parseGroupRooms(raw.groupRooms, config, base) };
 }
 
 /** No caller can turn a shared/symlink directory into a trusted socket directory. */

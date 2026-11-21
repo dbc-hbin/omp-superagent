@@ -6,12 +6,13 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
 use crate::picker::Picker;
+use crate::result_attachment::ResultAttachment;
 
 use super::picker::components as picker_components;
 use super::rest::{FILE_LIMIT, Rest, broken, no_mentions};
 use super::{
     Effect, EffectError, State, markdown,
-    model::{RemoteMessage, Route, hash, snowflake, utf16},
+    model::{RemoteAttachment, RemoteMessage, Route, hash, snowflake, utf16},
 };
 
 const MESSAGE_LIMIT: usize = 2_000;
@@ -28,6 +29,7 @@ pub(super) struct Output {
     text: String,
     reply_to: Option<MessageReference>,
     picker: Option<Picker>,
+    result_attachment: Option<ResultAttachment>,
 }
 
 #[derive(Deserialize)]
@@ -80,7 +82,7 @@ pub(super) fn attachment_url(value: &str) -> Option<Url> {
 
 pub(super) struct Payload {
     pub body: Value,
-    file: Option<(String, String)>,
+    file: Option<(String, Vec<u8>)>,
 }
 
 impl Payload {
@@ -110,11 +112,18 @@ impl Payload {
             return Ok(chunks.into_iter().map(Self::text).collect());
         }
         let name = format!("omp-{nonce}.txt");
-        let mut payload =
-            Self::text("Full text is attached (exceeds Discord's message limit).".to_owned());
+        Ok(vec![Self::attachment(
+            "Full text is attached (exceeds Discord's message limit).",
+            name,
+            rendered.into_owned().into_bytes(),
+        )])
+    }
+
+    fn attachment(content: &str, name: String, bytes: Vec<u8>) -> Self {
+        let mut payload = Self::text(content.to_owned());
         payload.body["attachments"] = json!([{ "id": 0, "filename": name }]);
-        payload.file = Some((name, rendered.into_owned()));
-        Ok(vec![payload])
+        payload.file = Some((name, bytes));
+        payload
     }
 
     pub fn new(text: &str, nonce: &str, components: Option<Value>) -> Effect<Self> {
@@ -139,12 +148,12 @@ impl Payload {
     pub fn apply(self, request: RequestBuilder) -> RequestBuilder {
         match self.file {
             None => request.json(&self.body),
-            Some((name, text)) => request.multipart(
+            Some((name, bytes)) => request.multipart(
                 multipart::Form::new()
                     .text("payload_json", self.body.to_string())
                     .part(
                         "files[0]",
-                        multipart::Part::bytes(text.into_bytes()).file_name(name),
+                        multipart::Part::bytes(bytes).file_name(name),
                     ),
             ),
         }
@@ -161,12 +170,48 @@ impl State {
                 "Discord reply requires a real message in the exact destination conversation",
             ));
         }
+        let attachment = if let Some(file) = &output.result_attachment {
+            if output.route.authority_id != self.config.owner_id || output.picker.is_some() || !output.text.is_empty() {
+                return Err(EffectError::rejected("Discord result attachments require owner authority and a standalone file"));
+            }
+            Some((file, file.bytes()?))
+        } else {
+            None
+        };
         let not_started =
             || EffectError::rejected("Discord output deadline expired before sending");
         let channel = timeout_at(deadline, self.destination(&output.route))
             .await
             .map_err(|_| not_started())??;
         let first_nonce = nonce(&output.id, &output.route, 0);
+        if let Some((file, bytes)) = attachment {
+            #[derive(Deserialize)]
+            struct Receipt {
+                #[serde(flatten)]
+                message: RemoteMessage,
+                attachments: Vec<RemoteAttachment>,
+            }
+            let size = bytes.len();
+            let mut payload = Payload::attachment("", file.name.clone(), bytes);
+            payload.create(&first_nonce);
+            if let Some(reply) = &output.reply_to {
+                payload.body["message_reference"] =
+                    json!({"message_id": reply.message_id, "fail_if_not_exists": false});
+            }
+            let request = payload.apply(self.rest.request(
+                Method::POST, &format!("channels/{}/messages", channel.id),
+            ));
+            if Instant::now() >= deadline {
+                return Err(not_started());
+            }
+            let sent: Receipt = Rest::response_before(request, deadline).await?;
+            if !sent.message.belongs(&output.route) || !snowflake(&sent.message.id)
+                || !matches!(sent.attachments.as_slice(), [item] if snowflake(&item.id)
+                    && item.filename == file.name && usize::try_from(item.size) == Ok(size)) {
+                return Err(broken("Discord result attachment receipt could not be verified"));
+            }
+            return Ok(sent.message.id);
+        }
         let _delivery = match &output.picker {
             Some(_) => Some(self.ctx.pickers.delivery().await),
             None => None,

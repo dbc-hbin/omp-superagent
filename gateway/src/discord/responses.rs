@@ -185,6 +185,20 @@ impl State {
         let Ok(interaction) = serde_json::from_value::<Interaction>(raw) else {
             return Ok(());
         };
+        let guild = interaction.guild_id.as_deref();
+        if self.ctx.has_group_guild(guild) {
+            let Some(channel_id) = interaction.channel_id() else { return Ok(()) };
+            if self.ctx.group_room(guild, channel_id).is_some() {
+                return Ok(());
+            }
+            // A control's channel may be a thread whose policy belongs to its parent.
+            let Ok(channel) = self.channel_by_id(channel_id, false).await else { return Ok(()) };
+            if channel.guild_id.as_deref() != guild
+                || self.route_for(&channel).is_ok_and(|route| self.group_route(&route))
+            {
+                return Ok(());
+            }
+        }
         if interaction.kind == 2 {
             if interaction
                 .data
@@ -263,6 +277,9 @@ impl State {
                 .await;
         }
         let route = &pending.approval.route;
+        if self.group_route(route) {
+            return Ok(());
+        }
         if interaction.guild_id != route.guild_id
             || interaction.channel_id() != Some(route.destination())
             || !interaction

@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{adapter::EffectError, commands::accepts_text, picker::PREFIX, store::js_trim};
+use crate::{
+    adapter::EffectError,
+    commands::accepts_text,
+    group::{Candidate, Room},
+    picker::PREFIX,
+    store::js_trim,
+};
 
 use super::{
     Core,
@@ -42,10 +48,12 @@ pub(super) struct Message {
     forward_from: Option<Value>,
     forward_sender_name: Option<String>,
     forward_from_chat: Option<Value>,
+    forward_date: Option<u64>,
     #[serde(default)]
     is_automatic_forward: bool,
     via_bot: Option<Value>,
     business_connection_id: Option<String>,
+    sender_business_bot: Option<Value>,
     #[serde(default)]
     entities: Vec<Entity>,
     #[serde(default)]
@@ -57,6 +65,16 @@ pub(super) struct Message {
     video: Option<Media>,
     voice: Option<Media>,
     video_note: Option<Media>,
+    animation: Option<Value>,
+    sticker: Option<Value>,
+    paid_media: Option<Value>,
+    contact: Option<Value>,
+    location: Option<Value>,
+    venue: Option<Value>,
+    dice: Option<Value>,
+    story: Option<Value>,
+    poll: Option<Value>,
+    game: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -252,9 +270,15 @@ fn command(text: &str, entities: &[Entity], bot: Option<&str>) -> Option<String>
 }
 
 impl Core {
-    pub(super) async fn process(&self, update: Update) -> Result<(), EffectError> {
+    pub(super) async fn process(&self, update: Update, group_since: u64) -> Result<(), EffectError> {
         let me = self.identity().await?;
         if let Some(callback) = update.callback_query {
+            if callback.message.as_ref().is_some_and(|message| {
+                let chat = message.chat.id.to_string();
+                self.ctx.group_room(Some(&chat), &chat).is_some()
+            }) {
+                return Ok(());
+            }
             if let Some(control) = callback
                 .data
                 .as_deref()
@@ -264,9 +288,18 @@ impl Core {
             }
             return self.handle_callback(&me, &callback).await;
         }
+        let initial = update.message.is_some();
         let Some(message) = update.message.or(update.edited_message) else {
             return Ok(());
         };
+        if let Some(route) = self.policy.route(&me, &message.chat, message.message_thread_id)
+            && let Some(room) = self.ctx.group_room(route.guild_id.as_deref(), &route.channel_id)
+        {
+            if initial && message.date >= group_since {
+                self.group_message(&me, room, route, &message)?;
+            }
+            return Ok(());
+        }
         let Some(input) = normalize(&self.policy, &me, &message) else {
             return Ok(());
         };
@@ -277,5 +310,49 @@ impl Core {
             attachment.save(self, &input.route)?;
         }
         self.admit(json!({"kind":"message","input":input}))
+    }
+
+    fn group_message(&self, me: &Identity, room: &Room, route: Route, message: &Message) -> Result<(), EffectError> {
+        let (Some(sender), Some(text)) = (message.from, message.text.as_deref()) else {
+            return Ok(());
+        };
+        if sender.is_bot || sender.id == me.id || !(1..=SAFE_INTEGER).contains(&sender.id)
+            || !(1..=SAFE_INTEGER).contains(&message.message_id)
+            || message.edit_date.is_some()
+            || message.sender_chat.is_some() || message.is_automatic_forward
+            || message.forward_origin.is_some() || message.forward_from.is_some()
+            || message.forward_sender_name.is_some() || message.forward_from_chat.is_some()
+            || message.forward_date.is_some()
+            || message.via_bot.is_some() || message.business_connection_id.is_some()
+            || message.sender_business_bot.is_some() || message.caption.is_some()
+            || !message.photo.is_empty() || message.document.is_some() || message.audio.is_some()
+            || message.video.is_some() || message.voice.is_some() || message.video_note.is_some()
+            || [
+                &message.animation, &message.sticker, &message.paid_media, &message.contact,
+                &message.location, &message.venue, &message.dice, &message.story, &message.poll, &message.game,
+            ].iter().any(|field| field.is_some())
+        {
+            return Ok(());
+        }
+        let qualified_command = message.entities.iter().find_map(|entity| {
+            if entity.kind != "bot_command" || entity.offset != 0 {
+                return None;
+            }
+            let token = text.get(..entity.length)?.strip_prefix('/')?;
+            let (name, username) = token.split_once('@')?;
+            (name == room.mode.command() && me.username.as_deref().is_some_and(|own| {
+                username.eq_ignore_ascii_case(own)
+            })).then(|| &text[..entity.length])
+        });
+        let Some(sent_ms) = i64::try_from(message.date).ok().and_then(|date| date.checked_mul(1000)) else {
+            return Ok(());
+        };
+        self.ctx.admit_group(json!(route), Candidate {
+            message_id: &message.message_id.to_string(),
+            user_id: &sender.id.to_string(),
+            text,
+            sent_ms,
+            qualified_command,
+        }).map_err(|_| super::ledger_error())
     }
 }

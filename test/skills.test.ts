@@ -62,11 +62,11 @@ test.each(cases)("native packaged skills, scoped tools, and preserved selections
     if (selection === "narrow") expect(proof.active).not.toContain("bash");
     else expect(proof.active).toContain("bash");
     if (role === "lane") {
-      expect(Object.keys(proof.schemas)).toEqual(["lane_report", "decision_ask"]);
+      expect(Object.keys(proof.schemas)).toEqual(["result_attach", "lane_report", "decision_ask"]);
       if (kind === "sub" || selection === "narrow") expect(proof.active).not.toContain("lane_report");
       else expect(proof.active).toContain("lane_report");
     } else {
-      expect(Object.keys(proof.schemas).sort()).toEqual(["cron_create", "decision_ask", "decision_inspect", "decision_list", "decision_withdraw", "discord_context", "discord_purpose_clear", "discord_purpose_list", "discord_purpose_set", "head_recovery", "head_set_model", "lane_close", "lane_init_presets", "lane_inspect", "lane_message", "lane_models", "lane_pause", "lane_resume", "lane_review_decision", "lane_set_model", "lane_start", "lane_thread_update", "pr_watch", "pr_watch_list", "thread_inspect"]);
+      expect(Object.keys(proof.schemas).sort()).toEqual(["cron_create", "decision_ask", "decision_inspect", "decision_list", "decision_withdraw", "discord_context", "discord_purpose_clear", "discord_purpose_list", "discord_purpose_set", "head_recovery", "head_set_model", "lane_close", "lane_init_presets", "lane_inspect", "lane_message", "lane_models", "lane_pause", "lane_resume", "lane_review_decision", "lane_set_model", "lane_start", "lane_thread_update", "pr_watch", "pr_watch_list", "result_attach", "thread_inspect"]);
       if (kind === "sub") expect(proof.active).not.toContain("head_recovery");
       if (kind === "sub") expect(proof.active).not.toContain("head_set_model");
       else expect(proof.active).toContain("head_set_model");
@@ -82,6 +82,8 @@ test.each(cases)("native packaged skills, scoped tools, and preserved selections
     if (kind === "sub" || selection === "narrow") expect(proof.active).not.toContain("decision_ask");
     else expect(proof.active).toContain("decision_ask");
     if (kind === "sub") expect(proof.active.some(name => name.startsWith("decision_"))).toBe(false);
+    if (kind === "sub" || selection === "narrow") expect(proof.active).not.toContain("result_attach");
+    else expect(proof.active).toContain("result_attach");
   } finally {
     clearTimeout(timeout);
     if (child.exitCode === null) child.kill("SIGKILL");

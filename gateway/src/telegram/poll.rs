@@ -57,6 +57,7 @@ impl Cursor {
         core: &Core,
         update: Value,
         observed_at: u64,
+        group_since: u64,
     ) -> Result<(), EffectError> {
         let invalid = || EffectError::rejected("Telegram supplied an invalid update ID or payload");
         let id = update
@@ -71,7 +72,7 @@ impl Cursor {
             return Ok(());
         }
         let update: Update = serde_json::from_value(update).map_err(|_| invalid())?;
-        core.process(update).await?;
+        core.process(update, group_since).await?;
         // Remote ACK is the following getUpdates request. Offset first: an
         // interrupted paired write never gives an old high offset a fresh age.
         core.set(&self.offset_key, &next.to_string())?;
@@ -108,9 +109,13 @@ pub(super) async fn run(core: Arc<Core>, mut cursor: Cursor, mut stop: watch::Re
         return;
     }
     let mut recovering = false;
+    let mut group_since = u64::MAX;
     while !*stop.borrow() {
         let delay = match cursor.request(&core) {
             Ok(body) => {
+                if group_since == u64::MAX || recovering {
+                    group_since = wall_time().map_or(u64::MAX, |now| now / 1000);
+                }
                 let response: Result<Vec<Value>, ApiError> = tokio::select! {
                     biased;
                     _ = stop.changed() => return,
@@ -119,7 +124,7 @@ pub(super) async fn run(core: Arc<Core>, mut cursor: Cursor, mut stop: watch::Re
                 match response {
                     Ok(updates) => {
                         let result =
-                            process_batch(&core, &mut cursor, updates, recovering, &stop).await;
+                            process_batch(&core, &mut cursor, updates, recovering, group_since, &stop).await;
                         if result.is_ok() {
                             recovering = false;
                             continue;
@@ -163,6 +168,7 @@ async fn process_batch(
     cursor: &mut Cursor,
     updates: Vec<Value>,
     recovering: bool,
+    group_since: u64,
     stop: &watch::Receiver<bool>,
 ) -> Result<(), EffectError> {
     let observed_at = wall_time()?;
@@ -173,7 +179,7 @@ async fn process_batch(
         if *stop.borrow() {
             break;
         }
-        cursor.consume(core, update, observed_at).await?;
+        cursor.consume(core, update, observed_at, group_since).await?;
     }
     Ok(())
 }

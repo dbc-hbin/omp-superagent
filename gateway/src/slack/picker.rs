@@ -120,6 +120,9 @@ impl Inner {
         let Some(click) = Click::parse(self, identity, body, action) else {
             return ack.send(None).await;
         };
+        if self.ctx.group_room(click.route.guild_id.as_deref(), &click.route.channel_id).is_some() {
+            return ack.send(None).await;
+        }
         self.destination(&click.route).await?;
         let change = {
             let _delivery = self.ctx.pickers.delivery().await;

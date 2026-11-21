@@ -5,6 +5,7 @@ import type { ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import { type LaneEvidence, type LaneReportEvent, parseLaneReportResult } from "./lane-report";
+import { registerResultAttach, RESULT_ATTACH_TOOL } from "./result-attachment";
 import { registerDecisionAsk } from "./decision-tool";
 
 const instructions = readFileSync(new URL("../skills/lane/SKILL.md", import.meta.url), "utf8");
@@ -29,7 +30,7 @@ const parameters = Type.Union([
   Type.Object({ status: Type.Literal("resolved"), summary, waiting, evidence: requiredEvidence },
     { additionalProperties: false }),
 ]);
-const coordinationTool = (name: string) => name === "lane_report" || name.startsWith("board_");
+const coordinationTool = (name: string) => name === "lane_report" || name === RESULT_ATTACH_TOOL || name.startsWith("board_");
 const record = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
@@ -122,6 +123,7 @@ function toolEvidence(id: string, records: ReturnType<typeof toolRecords>): Lane
 export default function laneExtension(pi: ExtensionAPI): void {
   if (process.env.OMP_SUPERAGENT_ROLE !== "lane") return;
   registerDecisionAsk(pi);
+  registerResultAttach(pi);
   let approvalSessionId: string | undefined;
   const pendingApprovals = new Set<string>();
   const approvals = (ctx: ExtensionContext) => {
@@ -137,7 +139,8 @@ export default function laneExtension(pi: ExtensionAPI): void {
     if (ctx.agent.kind !== "main") {
       // Subtract only our tool; never re-enable an operator-excluded native tool.
       const active = pi.getActiveTools();
-      if (active.includes("lane_report")) await pi.setActiveTools(active.filter(name => name !== "lane_report"));
+      const scoped = active.filter(name => name !== "lane_report" && name !== RESULT_ATTACH_TOOL);
+      if (scoped.length !== active.length) await pi.setActiveTools(scoped);
     }
   });
   pi.on("tool_call", (event, ctx) => {

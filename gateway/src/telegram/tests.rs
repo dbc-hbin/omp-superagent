@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -30,7 +31,9 @@ use super::Telegram;
 
 mod contract;
 mod faults;
+mod group;
 mod picker;
+mod result_attachment;
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -63,6 +66,7 @@ struct Remote {
     card: Arc<Mutex<Option<Value>>>,
     card_writes: Arc<AtomicUsize>,
     card_fault: Arc<Mutex<Option<CardFault>>>,
+    group_reply: Arc<Mutex<Option<Value>>>,
 }
 
 struct CardFault {
@@ -103,6 +107,9 @@ async fn telegram_http(
             }
         }
         "sendMessage" | "editMessageText" => {
+            if body.get("reply_parameters").is_some() {
+                *remote.group_reply.lock().expect("group reply payload") = Some(body.clone());
+            }
             remote.card_writes.fetch_add(1, Ordering::Relaxed);
             let fault = remote.card_fault.lock().expect("card fault").take();
             let mut card = remote.card.lock().expect("card state");
@@ -153,6 +160,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Result<Self> {
+        Self::start_with(&json!({"telegram":{}})).await
+    }
+
+    async fn start_with(config: &Value) -> Result<Self> {
         let scratch = Scratch::new()?;
         let store = Arc::new(Store::open(&scratch.0)?);
         let (tx, calls) = mpsc::channel(4);
@@ -161,10 +172,12 @@ impl Fixture {
             card: Arc::default(),
             card_writes: Arc::default(),
             card_fault: Arc::default(),
+            group_reply: Arc::default(),
         };
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let base = format!("http://{}", listener.local_addr()?);
         let service = Router::new()
+            .route("/bot900:LOCAL_TEST_ONLY/sendDocument", post(result_attachment::document))
             .route("/bot900:LOCAL_TEST_ONLY/{method}", post(telegram_http))
             .with_state(remote.clone());
         let mut server = JoinSet::new();
@@ -173,7 +186,7 @@ impl Fixture {
                 .await
                 .expect("Telegram fixture HTTP server");
         });
-        let hub = test_hub(&store, &base).await?;
+        let hub = test_hub_with(&store, &base, config).await?;
         Ok(Self {
             hub,
             store,
@@ -233,8 +246,12 @@ impl Fixture {
 }
 
 async fn test_hub(store: &Arc<Store>, base: &str) -> Result<Arc<Hub>> {
+    test_hub_with(store, base, &json!({"telegram":{}})).await
+}
+
+async fn test_hub_with(store: &Arc<Store>, base: &str, config: &Value) -> Result<Arc<Hub>> {
     let hub = Hub::with_factory(
-        &json!({"telegram":{}}),
+        config,
         store.clone(),
         |platform, _, ctx| {
             ensure!(platform == "telegram");

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{adapter::EffectError, store::js_trim};
+use crate::{adapter::EffectError, group::Output as GroupOutput, store::js_trim};
 
 use super::{
     Core,
@@ -64,6 +64,7 @@ impl Core {
                     .await
                     .map(Value::String)
             }
+            ("sendGroup", [output]) => self.send_group(&me, decode(output)?).await.map(Value::String),
             ("setActivity", [message, activity]) => {
                 self.set_activity(&me, decode(message)?, decode(activity)?)
                     .await?;
@@ -93,6 +94,20 @@ impl Core {
             )),
             _ => Err(EffectError::rejected("Unsupported Telegram effect")),
         }
+    }
+
+    async fn send_group(&self, me: &Identity, output: GroupOutput<Route>) -> Result<String, EffectError> {
+        let route = &output.route;
+        self.destination(me, route).await?;
+        let mut body = topic_payload(route);
+        body["text"] = json!(output.text);
+        body["reply_parameters"] = json!({
+            "message_id": message_id(&output.message_id)?, "allow_sending_without_reply": false
+        });
+        body["link_preview_options"] = json!({"is_disabled": true});
+        body["allow_paid_broadcast"] = json!(false);
+        let sent: Message = self.api.call("sendMessage", &body).await?;
+        self.receipt(me, route, &sent)
     }
 
     pub(super) async fn destination(

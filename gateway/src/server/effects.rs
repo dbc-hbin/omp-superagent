@@ -1,20 +1,25 @@
 use std::sync::Arc;
 
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use super::{
     Hub,
     protocol::{Fault, WireResult, effect_id, object, rejected},
 };
-use crate::store::{EffectStart, PHYSICAL_ROUTE_FIELDS, js_trim};
+use crate::{
+    group::Reply as GroupReply,
+    store::{EffectStart, PHYSICAL_ROUTE_FIELDS, js_trim},
+};
 
 impl Hub {
     pub(super) async fn effect(
         self: &Arc<Self>,
         mut data: Map<String, Value>,
     ) -> WireResult<Value> {
-        let (id, operation, args) = match (
+        let (id, operation, mut args) = match (
             data.remove("id"),
             data.remove("operation"),
             data.remove("args"),
@@ -28,6 +33,7 @@ impl Hub {
         };
         let allowed = match operation.as_str() {
             "send"
+            | "sendGroup"
             | "showApproval"
             | "dismissApproval"
             | "inspectThread"
@@ -41,7 +47,35 @@ impl Hub {
         if !allowed {
             return Err(rejected("Unknown Gateway effect"));
         }
-        if let EffectStart::Previous(result) = self.store.begin_effect(&id, &operation, &args)? {
+        let group_output = if operation == "sendGroup" {
+            let reply = GroupReply::deserialize(&args[0]).map_err(|_| rejected("Invalid group reply"))?;
+            let request = self.store.group_request(&reply.source_id)?
+                .filter(|request| self.adapters.rooms.current_request(request))
+                .ok_or_else(|| rejected("Group reply source is unavailable or no longer authorized"))?;
+            let text = request.reply_text(&reply)?;
+            Some(json!({
+                "id": id, "route": request.route, "messageId": request.message_id, "text": text
+            }))
+        } else {
+            self.adapters.authorize_effect(&operation, &args)?;
+            None
+        };
+        // The controller outbox owns the immutable staged file. The Gateway
+        // needs only an exact attempt fingerprint and receipt, not another
+        // durable copy of the disclosed bytes.
+        let digest = if matches!((operation.as_str(), args.as_slice()),
+            ("send", [output]) if output.get("resultAttachment").is_some())
+        {
+            for arg in &mut args {
+                arg.sort_all_objects();
+            }
+            let encoded = serde_json::to_vec(&args).map_err(anyhow::Error::from)?;
+            Some([json!({ "resultAttachmentEffectSha256": hex::encode(Sha256::digest(encoded)) })])
+        } else {
+            None
+        };
+        let ledger_args = digest.as_ref().map_or(args.as_slice(), |value| value.as_slice());
+        if let EffectStart::Previous(result) = self.store.begin_effect(&id, &operation, ledger_args)? {
             return Ok(result);
         }
         let (send, result) = oneshot::channel();
@@ -49,7 +83,11 @@ impl Hub {
         // An HTTP cancellation is not permission to cancel a remote mutation
         // after its attempt has been journaled. Shutdown drains this task too.
         drop(self.effects.spawn(async move {
-            let result = match hub.dispatch_effect(&operation, &args).await {
+            let dispatched = match group_output {
+                Some(output) => hub.adapters.send_group(output).await.map_err(Fault::from),
+                None => hub.dispatch_effect(&operation, &args).await,
+            };
+            let result = match dispatched {
                 Ok(value)
                     if value.is_null()
                         && matches!(operation.as_str(), "setActivity" | "dismissApproval") =>

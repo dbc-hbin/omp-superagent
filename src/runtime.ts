@@ -10,6 +10,10 @@ import { authorizeDiscordPurpose, discordPurposeRequest } from "./discord-contex
 import { HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type HeadModelChange, type HeadPicker } from "./contracts";
 import { authorizeRoute, credentialEnvNames, type Config, hostPaths, privateDirectory } from "./config";
 import { DeliveryError } from "./delivery";
+import { GroupAccess } from "./group-access";
+import { groupRoom } from "./group-policy";
+import { isOriginalAttachmentMessage, readResultAttachmentIntent, readResultAttachmentStart,
+  requestedResultPath, ResultAttachmentError, stageResultAttachment, type ResultAttachmentIntent } from "./result-attachment";
 import { HostConnection, type HostOptions, startHost } from "./host";
 import { compareMessageIds } from "./message-order";
 import { codingModels, isLaneModel, laneModelArgument, resolveLaneModelChoice, sameLaneModel, type LaneModelCandidate } from "./lane-models";
@@ -118,6 +122,12 @@ interface Live {
   goalId?: string;
   observationCursor?: string | null;
   observationSync?: Promise<void>;
+  resultAttachmentStarts?: Map<string, {
+    readonly ownerRequestId: string;
+    readonly sourceId: string;
+    readonly path: string;
+    readonly toolName: unknown;
+  }>;
   unsubscribe: () => void;
 }
 interface AttachmentData {
@@ -315,12 +325,19 @@ export class Superagent {
     if (this.stopped) throw new Error("Controller is stopped");
     try {
       for (const directory of ["run", "sessions", "logs", "attachments"]) privateDirectory(join(this.config.stateDir, directory));
+      if (this.config.groupRooms?.length) this.groups = new GroupAccess(this.config, this.messenger);
       this.store.recoverDeliveries();
       // Snapshot before streaming intake can advance a cursor past an offline gap.
       const cursors = this.cursors();
       await this.messenger.start({
         ready: this.intakeReady.promise,
         message: input => this.intake(() => this.receive(input)),
+        group: request => this.intake(() => {
+          if (this.stopped) throw new Error("Controller is stopped");
+          if (!this.groups) throw new DeliveryError("Restricted group ingress is not enabled", "rejected");
+          this.groups.accept(request);
+          return Promise.resolve();
+        }),
         answer: (id, response, route) => this.intake(() => this.answer(id, response, route)),
         reconcileAnswer: (id, route) => this.intake(() => this.reconcileAnswer(id, route)),
         restart: notice => this.intake(() => this.restartNotice(notice)),
@@ -418,6 +435,9 @@ export class Superagent {
         void this.kick().catch(this.report);
         this.observePrs();
         this.observePresetRoles();
+        if (this.groups && !this.stopped && !this.restartFence()) {
+          this.groups.tick(!this.headStopping && this.residentHosts().size < this.config.maxHosts, this.report);
+        }
       }, 1000);
       this.timer.unref?.();
       await this.kick();
@@ -945,6 +965,93 @@ export class Superagent {
     return { status: "scheduled", model: exact, detail: "Not applied yet. The runtime will report the verified result after this turn settles." };
   }
 
+  private authorizeResultOwner(route: Route): void {
+    // Route eligibility can include restricted group members. Only the
+    // configured platform owner can disclose files from the local filesystem.
+    if (route.authorityId !== this.config[route.platform]?.ownerId) {
+      throw new ResultAttachmentError("Result attachments require the configured messenger owner");
+    }
+    this.authorized(route);
+  }
+
+  requestResultAttachment(intent: ResultAttachmentIntent): string {
+    const { source, ownerId } = this.currentOwnerSource(intent.sourceId, "Result attachment");
+    const live = this.live.get("main");
+    if (!live || live.input?.id !== ownerId) throw new ResultAttachmentError("No current native HEAD request");
+    return this.queueResultAttachment(live, intent, {
+      source, input: source, outputSourceId: source.id, route: source.route,
+    });
+  }
+
+  private queueResultAttachment(live: Live, intent: ResultAttachmentIntent, binding: {
+    source: InputRecord;
+    input: InputRecord;
+    outputSourceId: string;
+    route: Route;
+  }): string {
+    const { source, input, outputSourceId, route } = binding;
+    const lane = live.id === "main" ? null : this.requireLane(live.id);
+    const sessionFile = lane?.sessionFile ?? hostPaths(this.config, "main").sessionFile;
+    if (this.restartFence() || !this.current(live) || !live.running || live.ownedRuns !== 1 || live.result || live.recovery
+      || (lane && lane.workState !== "open") || intent.sessionFile !== sessionFile || intent.sessionId !== live.sessionId
+      || input.state !== "submitted" || input.generation !== live.generation || input.target !== live.id || !input.requestId
+      || live.admitted.get(input.requestId)?.input.id !== input.id || source.state === "cancelled" || source.state === "uncertain"
+      || this.store.getMeta(`user-source:${source.id}`) !== "true" || !isOriginalAttachmentMessage(source)) {
+      throw new ResultAttachmentError("Result attachments require the original owner input in the current native run");
+    }
+    this.authorizeResultOwner(source.route);
+    this.authorizeResultOwner(route);
+    if (requestedResultPath(source.text) !== intent.path)
+      throw new ResultAttachmentError("The owner did not explicitly request this exact result file in the current message");
+    const id = `result-attachment:${source.id}`;
+    const existing = this.store.output(id);
+    if (existing) return `Result attachment ${id} is ${existing.state}; no new attempt was made.`;
+    const agentDb = getAgentDbPath();
+    const payload = stageResultAttachment(intent.path, {
+      cwd: lane?.cwd ?? this.config.headCwd,
+      privatePaths: [this.config.stateDir, this.config.path, `${this.config.path}.env`, getAgentDir(), sessionFile,
+        agentDb, `${agentDb}-wal`, `${agentDb}-shm`, `${agentDb}-journal`],
+    });
+    this.store.queueOutput({
+      id, sourceId: outputSourceId, route, text: "",
+      resultAttachment: {
+        payload, sourceId: source.id, inputId: input.id, requestId: input.requestId,
+        generation: live.generation, sessionId: live.sessionId, sessionFile, toolCallId: intent.toolCallId,
+      },
+    });
+    this.background(this.flushOutputs());
+    return `Result attachment ${id} was durably queued to the original topic, not yet confirmed delivered.`;
+  }
+
+  private observeResultAttachment(live: Live, frame: Record<string, unknown>): void {
+    const ownerRequestId = live.input?.requestId;
+    if (live.id === "main" || !ownerRequestId || !live.running || live.ownedRuns !== 1 || live.recovery
+      || typeof frame.toolCallId !== "string") return;
+    if (frame.type === "tool_execution_start") {
+      const args = readResultAttachmentStart(frame);
+      if (args) {
+        live.resultAttachmentStarts ??= new Map();
+        live.resultAttachmentStarts.set(frame.toolCallId, { ...args, ownerRequestId, toolName: frame.toolName });
+      }
+      return;
+    }
+    const start = live.resultAttachmentStarts?.get(frame.toolCallId);
+    live.resultAttachmentStarts?.delete(frame.toolCallId);
+    if (!start || start.ownerRequestId !== ownerRequestId || start.toolName !== frame.toolName) return;
+    const intent = readResultAttachmentIntent(frame);
+    if (!intent || intent.sourceId !== start.sourceId || intent.path !== start.path) return;
+    // Only matched live execution events may introduce a file effect. The
+    // journal is not permission to reopen a path or replay after disconnect.
+    for (const { input } of live.admitted.values()) {
+      const native = this.store.input(input.id);
+      const topic = native && this.store.resultAttachmentDelivery(native.id);
+      if (!native || topic?.source.id !== intent.sourceId) continue;
+      try { this.queueResultAttachment(live, intent, { ...topic, input: native }); }
+      catch (error) { this.report(error); }
+      return;
+    }
+  }
+
   private async requireAvailableModel(model: LaneModel): Promise<void> {
     if (!(await this.availableModels()).some(candidate => sameLaneModel(candidate, model))) {
       throw new Error(`Selected lane model ${laneModelArgument(model)} is not an available native chat model; restore its availability or choose a new lane explicitly`);
@@ -1436,6 +1543,9 @@ export class Superagent {
 
   async receive(input: Inbound): Promise<void> {
     if (this.stopped) throw new Error("Controller is stopped");
+    if (groupRoom(this.config, input.route)) {
+      throw new DeliveryError("Operator intake is not authorized in a restricted group room", "rejected");
+    }
     this.authorized(input.route);
     const selection = input.pickerSelection;
     if (selection) {
@@ -2759,13 +2869,13 @@ export class Superagent {
     const existing = this.live.get(lane.id);
     if (existing) return existing.releasing ? null : existing;
     if ((this.blocked.has(lane.id) && !explicitRetry && authorizedResume === undefined) || this.connecting.has(lane.id)) return null;
-    if (!this.residentHosts().has(lane.id) && this.residentHosts().size >= this.config.maxHosts) {
+    if (!this.residentHosts().has(lane.id) && this.residentHosts().size + Number(this.groups?.running ?? false) >= this.config.maxHosts) {
       const candidates = [...this.live.values()].filter(host => host.id !== "main" && !host.input && !host.busy)
         .sort((left, right) => left.lastActivity - right.lastActivity);
       let released = false;
       for (const candidate of candidates) if (await this.release(candidate)) { released = true; break; }
       if (!released) return null;
-      if (this.residentHosts().size >= this.config.maxHosts) return null;
+      if (this.residentHosts().size + Number(this.groups?.running ?? false) >= this.config.maxHosts) return null;
     }
     this.connecting.add(lane.id);
     const restoringResumed = (workState: Lane["workState"]) => (workState === "paused" || workState === "completed")
@@ -2964,7 +3074,7 @@ export class Superagent {
     // Pending/uncertain inputs and resident lane execution are durable state to
     // recover, not reasons to refuse a service lifecycle operation.
     return this.connecting.size > 0 || this.operations.size > 0 || this.laneMutations > 0
-      || this.modelChanges.size > 0 || this.callbacks.size > 0
+      || this.modelChanges.size > 0 || this.callbacks.size > 0 || this.groups?.busy === true
       || [...this.live.values()].some(live => live.preparing > 0 || !!live.releasing);
   }
 
@@ -3384,6 +3494,15 @@ export class Superagent {
       if (!receipt) {
         const live = this.live.get("main");
         if (!live || this.pidAlive(restart.ownerPid) || !["checking", "acknowledging"].includes(restart.state)) return;
+        const input = this.store.input(restart.inputId);
+        if (!input) return;
+        if (groupRoom(this.config, input.route)) {
+          // An ACK sent under an older policy cannot authorize a new checkpoint
+          // after this route becomes a restricted room. No notice goes there.
+          this.store.settle(restart.inputId, "cancelled");
+          this.saveRestart({ ...restart, state: "refused" }, false);
+          return;
+        }
         const actual = await this.state(live);
         const owner = JSON.parse(this.store.getMeta("gateway:head") ?? "null") as { pid: number; sessionId: string; sessionFile: string } | null;
         if (actual.hostPid !== process.pid || actual.hostPid !== owner?.pid || actual.sessionId !== restart.sessionId
@@ -3394,8 +3513,7 @@ export class Superagent {
         const rebound = { ...restart, ownerPid: process.pid };
         this.saveRestart(rebound);
         this.restartActive = restart.inputId;
-        const input = this.store.input(restart.inputId);
-        if (input) await this.runHeadRestart(input);
+        await this.runHeadRestart(input);
         return;
       }
       if (!this.matchingRestart(restart, receipt)) return;
@@ -3424,7 +3542,10 @@ export class Superagent {
         this.store.settle(restart.inputId, "done");
         this.restartResult(restart, "Gateway AND HEAD were replaced and the replacement HEAD is initialized and ready. The same native session, transcript, original conversation route and lane board were restored; no model turn was used for /restart.");
         this.saveRestart({ ...restart, state: "ready" }, false);
-        const source = restart.checkpoint?.goalSourceId ? this.headGoalSource(live, restart.checkpoint.goalId) : null;
+        const goalSource = restart.checkpoint?.goalSourceId ? this.headGoalSource(live, restart.checkpoint.goalId) : null;
+        const restartSource = this.store.input(restart.inputId);
+        const source = goalSource && restartSource
+          && !groupRoom(this.config, goalSource.route) && !groupRoom(this.config, restartSource.route) ? goalSource : null;
         if (restart.checkpoint?.goalActive && source && actual.goal?.goal?.status === "paused"
           && actual.goal.goal.id === restart.checkpoint.goalId && source.id === restart.checkpoint.goalSourceId
           && !this.store.inputs("main").some(input => input.state === "submitted" || input.state === "uncertain")) {
@@ -4757,6 +4878,7 @@ export class Superagent {
       }
     }
     if (frame.type === "agent_start") {
+      live.resultAttachmentStarts = undefined;
       live.busy = true;
       if (live.input) {
         live.ownedRuns++;
@@ -4765,13 +4887,18 @@ export class Superagent {
       }
       for (const { input } of live.admitted.values()) this.activity(input, true);
     }
-    if (frame.type === "agent_end") live.running = false;
+    if (frame.type === "agent_end") {
+      live.running = false;
+      live.resultAttachmentStarts = undefined;
+    }
     if (live.id !== "main" && live.input && !this.stopped) {
       try {
         let changed = false;
         if (frame.type === "tool_execution_start" && typeof frame.toolCallId === "string") {
+          this.observeResultAttachment(live, frame);
           changed = this.store.resolveLaneWaiting(live.input.id, live.generation, live.sessionId, "approval", frame.toolCallId);
         } else if (frame.type === "tool_execution_end" && typeof frame.toolCallId === "string") {
+          this.observeResultAttachment(live, frame);
           changed = this.store.resolveLaneWaiting(live.input.id, live.generation, live.sessionId, "tool", frame.toolCallId);
           changed = this.store.resolveLaneWaiting(live.input.id, live.generation, live.sessionId, "approval", frame.toolCallId) || changed;
         } else if (frame.type === "extension_ui_request" && frame.method === "cancel" && typeof frame.targetId === "string") {
@@ -4946,7 +5073,8 @@ export class Superagent {
     const ids = new Set(state.pendingUiRequests.map(frame => frame.id));
     for (const approval of this.store.approvals(live.id)) {
       if (approval.generation !== live.generation || !ids.has(approval.requestId)) {
-        if (this.store.resolveApproval(approval.id, approval.generation, "cancelled")) await this.messenger.dismissApproval(approval);
+        if (this.store.resolveApproval(approval.id, approval.generation, "cancelled")
+          && !groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
       }
     }
     for (const decision of this.listDecisions("all", live.id)) {
@@ -4964,7 +5092,8 @@ export class Superagent {
     if (live.id === "main" && this.headRecoveryActive()) return;
     if (frame.method === "cancel") {
       const approval = this.store.approvals(live.id).find(approval => approval.generation === live.generation && approval.requestId === frame.targetId);
-      if (approval && this.store.resolveApproval(approval.id, live.generation, "cancelled")) await this.messenger.dismissApproval(approval);
+      if (approval && this.store.resolveApproval(approval.id, live.generation, "cancelled")
+        && !groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
       return;
     }
     if (!dialogs.has(String(frame.method)) || typeof frame.id !== "string") return;
@@ -5147,7 +5276,16 @@ export class Superagent {
           for (const output of outputs) {
             if (this.stopped || !this.store.claimOutput(output.id)) continue;
             let remoteId: string;
-            try { remoteId = await this.messenger.send(output); }
+            try {
+              if (groupRoom(this.config, output.route)) {
+                throw new DeliveryError("Owner output is not authorized in a restricted group room", "rejected");
+              }
+              if (output.resultAttachment) {
+                try { this.authorizeResultOwner(output.route); }
+                catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }
+              }
+              remoteId = await this.messenger.send(output);
+            }
             catch (error) {
               const rejected = error instanceof DeliveryError && error.certainty === "rejected";
               this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
@@ -5182,7 +5320,7 @@ export class Superagent {
     for (const live of this.live.values()) {
       for (const { input } of live.admitted.values()) this.activity(input, false);
     }
-    await Promise.allSettled([this.prObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values()]);
+    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values()]);
     await this.messenger.stop();
     await Promise.allSettled([...this.live.values()].map(async live => { live.unsubscribe(); await live.connection.close(); }));
     this.live.clear();

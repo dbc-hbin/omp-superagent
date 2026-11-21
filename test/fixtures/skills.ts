@@ -138,7 +138,7 @@ try {
 
   if (selection === "narrow") {
     await session.setActiveToolsByName(session.getEnabledToolNames().filter(name =>
-      name !== "bash" && name !== "lane_message" && name !== "lane_report" && name !== "decision_ask"));
+      name !== "bash" && name !== "lane_message" && name !== "lane_report" && name !== "decision_ask" && name !== "result_attach"));
   }
   const before = session.getEnabledToolNames();
   const errors: Array<{ event: string; error: string }> = [];
@@ -153,7 +153,8 @@ try {
     assert.deepEqual(errors, [], "Task/lane sessions must never attempt head startup");
   }
   const expectedActive = kind === "sub"
-    ? before.filter(name => name !== "decision_ask" && (role === "head" ? !managerNames.includes(name) : name !== "lane_report")) : before;
+    ? before.filter(name => name !== "decision_ask" && name !== "result_attach"
+      && (role === "head" ? !managerNames.includes(name) : name !== "lane_report")) : before;
   assert.deepEqual(session.getEnabledToolNames(), expectedActive);
   if (selection === "narrow") assert(!session.getEnabledToolNames().includes("bash"));
 
@@ -288,7 +289,7 @@ try {
     reads.push(uri);
   }
 
-  const schemas = Object.fromEntries([...managerNames, "lane_report", "decision_ask"].flatMap(name => {
+  const schemas = Object.fromEntries([...managerNames, "result_attach", "lane_report", "decision_ask"].flatMap(name => {
     const info = session.getAllToolInfos().find(tool => tool.name === name);
     return info ? [[name, toolWireSchema(info)]] : [];
   }));
@@ -298,6 +299,13 @@ try {
     if (valid) assert.doesNotThrow(validate, `${name} schema validation`);
     else assert.throws(validate, /Validation failed for tool/, `${name} schema validation: ${JSON.stringify(input)}`);
   };
+  check("result_attach", { sourceId: "owner-source", path: "output/result.bin" }, true);
+  check("result_attach", { path: "output/result.bin" }, false);
+  const attach = runner.getRegisteredTool("result_attach")!.definition;
+  assert.equal(attach.approval, "exec");
+  await assert.rejects(() => attach.execute("child-attachment", { sourceId: "owner-source", path: "output/result.bin" },
+    undefined, undefined, { ...runner.createContext(), agent: { kind: "sub", id: "advisor", name: "advisor", depth: 0 } }),
+  /restricted to the root native session/);
   const question = { question: "Select a release route", header: "Release", options: [
     { label: "Local", description: "Keep the work local", preview: "No deployment" },
     { label: "Review", description: "Prepare a review" },
@@ -514,7 +522,7 @@ try {
       assert(!session.getEnabledToolNames().includes("lane_message"));
     }
   } else {
-    assert.deepEqual(Object.keys(schemas), ["lane_report", "decision_ask"]);
+    assert.deepEqual(Object.keys(schemas), ["result_attach", "lane_report", "decision_ask"]);
     const definition = runner.getRegisteredTool("lane_report")!.definition;
     assert.equal(definition.loadMode, "essential");
     assert.equal(definition.approval, "read");

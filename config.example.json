@@ -5,6 +5,7 @@
   "maxHosts": 4,
   "maxSubagents": 8,
   "idleMs": 300000,
+  "groupRooms": [],
   "discord": {
     "tokenEnv": "DISCORD_BOT_TOKEN",
     "ownerId": "REPLACE_WITH_OWNER_USER_ID",

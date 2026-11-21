@@ -169,6 +169,7 @@ impl Adapter for Slack {
                 }
                 self.inner.send(decode(output)?).await.map(Value::String)
             }
+            ("sendGroup", [output]) => self.inner.send_group(decode(output)?).await.map(Value::String),
             ("setActivity", [message, activity]) => {
                 self.inner
                     .activity(decode(message)?, decode(activity)?)
