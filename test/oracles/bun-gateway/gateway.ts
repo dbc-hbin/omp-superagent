@@ -15,7 +15,8 @@ import { gatewayCall, gatewayPaths, gatewayStatus } from "../../../src/gateway-p
 import type { GatewayStatus } from "../../../src/gateway-wire";
 import { GatewayServer } from "./gateway-server";
 import { GatewayStore } from "./gateway-store";
-import { readRestartPlan, restartConfigHash, validateRestartPlan, type RestartPlan } from "./gateway-restart";
+import { readRestartConfig, readRestartPlan, restartCompatible, restartConfigHash, validateRestartPlan,
+  type RestartPlan } from "./gateway-restart";
 import { connect, HostConnection, startHost } from "../../../src/host";
 import { createMessenger } from "./messengers";
 import { activeManagedUlw, managedUlwStatus, readUlwManifest, updateManagedUlw, validateManagedUlwPackage,
@@ -43,6 +44,11 @@ type EndpointCleanup = { readonly kind: "gateway" } | {
 };
 
 const HEAD_EXIT_TIMEOUT_MS = 15_000;
+const RESTART_CONFIG_CHANGED = "Gateway configuration changed after restart acceptance; no process was stopped.";
+
+async function acceptedConfigIsCurrent(plan: RestartPlan): Promise<boolean> {
+  return await restartConfigHash(plan.configPath).then(hash => hash === plan.configHash, () => false);
+}
 
 function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
@@ -110,7 +116,6 @@ export class GatewayService {
   private restartRunning?: Promise<void>;
   private restartAccepting = false;
   private stopGeneration = 0;
-  private configHash?: string;
   private readonly signal = () => { void this.stop().catch(this.report); };
 
   constructor(readonly config: Config, private readonly options: GatewayOptions = {}) {
@@ -135,7 +140,6 @@ export class GatewayService {
 
   async start(): Promise<void> {
     try {
-      this.configHash = await restartConfigHash(this.config.path);
       if (this.options.restartRequestId) await this.validateReplacement();
       else {
         const active = this.store.getMeta("gateway:restart-active");
@@ -426,10 +430,13 @@ export class GatewayService {
       const stat = await lstat(gatewayPaths(this.config).socketPath);
       if (!socket || socket.pid !== process.pid || socket.dev !== stat.dev || socket.ino !== stat.ino)
         return refuse("Gateway endpoint ownership could not be verified; no process was stopped.");
+      const candidate = await readRestartConfig(this.config.path).catch(() => null);
+      if (!candidate) return refuse("The current Gateway configuration could not be validated; no process was stopped.");
+      if (!restartCompatible(this.config, candidate.config))
+        return refuse("Gateway configuration changed the instance, native HEAD profile, or messenger authorization; no process was stopped.");
       const plan: RestartPlan = { configPath: this.config.path, stateDir: this.config.stateDir,
-        configHash: await restartConfigHash(this.config.path), socket, head };
-      if (plan.configHash !== this.configHash)
-        return refuse("Gateway configuration changed since activation; no process was stopped or successor authorized.");
+        configHash: candidate.configHash, normalizedConfigHash: candidate.normalizedConfigHash, socket, head };
+      if (!await acceptedConfigIsCurrent(plan)) return refuse(RESTART_CONFIG_CHANGED);
       const currentFence = JSON.parse(this.store.getMeta("head:restart-fence") ?? "null") as typeof fence;
       if (stopGeneration !== this.stopGeneration || this.store.getMeta("gateway:operator-stop") !== (fence.stopBoundary ?? null)
         || !currentFence || currentFence.requestId !== request.requestId || currentFence.ownerPid !== head.pid)
@@ -461,6 +468,8 @@ export class GatewayService {
       const plan = readRestartPlan(this.store, record.requestId);
       if (!plan || !this.sameHead(actual, plan.head))
         throw new DeliveryError("Native HEAD ownership changed; restart was refused without a shutdown", "rejected");
+      if (!await acceptedConfigIsCurrent(plan))
+        throw new DeliveryError(RESTART_CONFIG_CHANGED, "rejected");
       const paths = gatewayPaths(this.config);
       const log = await open(paths.logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
       try {
@@ -497,6 +506,8 @@ export class GatewayService {
       const prepared = this.store.getRestart(record.requestId)?.state;
       if (prepared === "refused") return;
       if (prepared !== "accepted") throw new Error("Successor preparation authority changed");
+      if (!await acceptedConfigIsCurrent(plan))
+        throw new DeliveryError(RESTART_CONFIG_CHANGED, "rejected");
       // Reuse the supervised shutdown boundary only after the one-shot successor
       // durably confirms its own identity. Its ambiguous outcome never authorizes a launch.
       await this.stopHead();
@@ -508,7 +519,8 @@ export class GatewayService {
       const saved = this.store.getRestart(record.requestId);
       if (!saved || saved.state === "refused") return;
       const refused = error instanceof DeliveryError && error.certainty === "rejected";
-      const reason = refused ? "Restart preparation or native shutdown was refused; no replacement Gateway was launched."
+      const reason = refused ? error.message === RESTART_CONFIG_CHANGED ? RESTART_CONFIG_CHANGED
+        : "Restart preparation or native shutdown was refused; no replacement Gateway was launched."
         : "Restart shutdown or successor spawn outcome is uncertain; no automatic retry or forced kill is authorized.";
       this.store.setRestart({ ...saved, state: refused ? "refused" : "uncertain", reason });
       if (refused) this.store.setMeta("gateway:restart-active", "");

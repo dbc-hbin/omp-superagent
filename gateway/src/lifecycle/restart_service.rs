@@ -7,7 +7,7 @@ use tokio::time::{Instant, sleep};
 use crate::{adapter::EffectError, store::AuthorityError};
 
 use super::{
-    Lifecycle, Phase,
+    Lifecycle, LifecycleConfig, Phase,
     fs::{EXIT_TIMEOUT, Endpoint, WAIT_SLICE, alive, socket_stat},
     handoff::spawn_runner,
     host_rpc::Head,
@@ -20,6 +20,14 @@ use super::{
 const OWNERSHIP_PROBE: &str =
     "Native idle or ownership probe was unavailable; no shutdown was requested.";
 const STOP_SUPERSEDED: &str = "An explicit operator stop superseded this original restart intent; no successor is authorized.";
+const CONFIG_INVALID: &str =
+    "The current Gateway configuration could not be validated; no process was stopped.";
+const CONFIG_INCOMPATIBLE: &str =
+    "Gateway configuration changed the instance, native HEAD profile, or messenger authorization; no process was stopped.";
+const CONFIG_CHANGED: &str =
+    "Gateway configuration changed after restart acceptance; no process was stopped.";
+const RUNNER_REJECTED: &str =
+    "Successor configuration, credentials, native profile, or ownership could not be prepared; no process was stopped.";
 
 impl Lifecycle {
     pub(super) async fn validate_replacement(&self, id: &str) -> Result<()> {
@@ -103,6 +111,9 @@ impl Lifecycle {
                 return self.outcome(record, Stage::Refused,
                     "An explicit operator stop superseded restart acceptance; no successor was authorized.");
             }
+            if !self.0.config.matches_config_hash(&plan.config_hash) {
+                return self.outcome(record, Stage::Refused, CONFIG_CHANGED);
+            }
             // A partially persisted acceptance cannot later be retried.
             store.set_meta(
                 &plan_key(&record.request.request_id),
@@ -154,18 +165,19 @@ impl Lifecycle {
             socket.pid == process::id() && socket.dev == stat.dev() && socket.ino == stat.ino(),
             Refusal("Gateway endpoint ownership could not be verified; no process was stopped.")
         );
-        let config_hash = config.config_hash()?;
+        let (_, candidate) = LifecycleConfig::load(&config.path)
+            .await
+            .map_err(|_| Refusal(CONFIG_INVALID))?;
         ensure!(
-            self.0.config_hash.get() == Some(&config_hash),
-            Refusal(
-                "Gateway configuration changed since activation; no process was stopped or successor authorized."
-            )
+            config.restart_compatible(&candidate),
+            Refusal(CONFIG_INCOMPATIBLE)
         );
         Ok((
             Plan {
                 config_path: config.path.clone(),
                 state_dir: config.state_dir.clone(),
-                config_hash,
+                config_hash: candidate.source_hash,
+                normalized_config_hash: candidate.normalized_hash,
                 socket,
                 head: head.clone(),
                 runner_pid: None,
@@ -238,12 +250,13 @@ impl Lifecycle {
                 "Native HEAD ownership changed; restart was refused without a shutdown"
             )
         );
-        let (mut runner, runner_pid) = {
+        let mut runner = {
             let state = self.state()?;
             if state.phase != Phase::Accepted || !self.is_accepted(id)? {
                 return Ok(());
             }
-            let runner = spawn_runner(config, id).map_err(|_| {
+            self.check_accepted_config(&plan)?;
+            let runner = spawn_runner(config, id, &plan.config_hash).map_err(|_| {
                 EffectError::rejected(
                     "Successor could not be spawned; native shutdown was not requested",
                 )
@@ -253,7 +266,7 @@ impl Lifecycle {
                 .context("Successor runner has no process identity")?;
             plan.runner_pid = Some(pid);
             store.set_meta(&plan_key(id), &serde_json::to_string(&plan)?)?;
-            (runner, pid)
+            runner
         };
         let deadline = Instant::now() + EXIT_TIMEOUT;
         loop {
@@ -262,6 +275,10 @@ impl Lifecycle {
             if saved.state == Stage::Refused {
                 return Ok(());
             }
+            self.check_accepted_config(&plan)?;
+            if saved.state == Stage::Failed {
+                return Err(Refusal(RUNNER_REJECTED).into());
+            }
             ensure!(
                 saved.state == Stage::Accepted,
                 "Successor preparation failed or lost its durable request"
@@ -269,33 +286,22 @@ impl Lifecycle {
             let prepared =
                 restart::plan(store, id)?.context("Successor preparation plan was lost")?;
             ensure!(
-                prepared.runner_pid == Some(runner_pid)
-                    && prepared.head.same(&plan.head)
-                    && prepared.socket == plan.socket
-                    && prepared.config_hash == plan.config_hash,
+                plan.matches_preparation(&prepared),
                 "Successor preparation authority changed"
             );
+            ensure!(runner.try_wait()?.is_none(), Refusal(RUNNER_REJECTED));
             if prepared.runner_ready == Some(true) {
                 let session_file = super::rotation::session_file(config, store)?;
                 restart::validate_identity(config, &saved, &prepared, &session_file)?;
                 break;
             }
             ensure!(
-                runner.try_wait()?.is_none(),
-                EffectError::rejected(
-                    "Successor exited before preparation; native shutdown was not requested"
-                )
-            );
-            ensure!(
                 Instant::now() < deadline,
                 "Successor preparation outcome is unresolved"
             );
             sleep(WAIT_SLICE).await;
         }
-        if !self.is_accepted(id)? {
-            return Ok(());
-        }
-        self.shutdown_owned_head(Some((&plan.head, record))).await?;
+        self.shutdown_owned_head(Some((&plan, record))).await?;
         let state = self.state()?;
         if state.phase != Phase::Accepted || !self.is_accepted(id)? {
             return Ok(());
@@ -315,6 +321,23 @@ impl Lifecycle {
             }))
     }
 
+    pub(super) fn check_accepted_config(&self, plan: &Plan) -> Result<()> {
+        ensure!(
+            self.0.config.matches_config_hash(&plan.config_hash),
+            Refusal(CONFIG_CHANGED)
+        );
+        Ok(())
+    }
+
+    pub(super) fn check_runner_rejection(&self, record: &Record) -> Result<()> {
+        ensure!(
+            !restart::record(&self.0.store, Some(&record.request.request_id))?
+                .is_some_and(|record| record.state == Stage::Failed),
+            Refusal(RUNNER_REJECTED)
+        );
+        Ok(())
+    }
+
     fn failed_restart(&self, original: &Record, error: &anyhow::Error) -> Result<()> {
         let mut state = self.state()?;
         if *self.0.closing.borrow() {
@@ -327,9 +350,15 @@ impl Lifecycle {
         if saved.state == Stage::Refused {
             return Ok(());
         }
-        if is_refusal(error) {
-            self.outcome(saved, Stage::Refused,
-                "Restart preparation or native shutdown was refused; no replacement Gateway was launched.")?;
+        let refusal = error.downcast_ref::<Refusal>().map(|refusal| refusal.0);
+        if refusal.is_some() || is_refusal(error) {
+            self.outcome(
+                saved,
+                Stage::Refused,
+                refusal.unwrap_or(
+                    "Restart preparation or native shutdown was refused; no replacement Gateway was launched.",
+                ),
+            )?;
             store.set_meta(ACTIVE, "")?;
             if state.phase == Phase::Accepted {
                 state.phase = Phase::Running;

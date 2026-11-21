@@ -1,8 +1,7 @@
 use std::{
     env,
     os::unix::process::CommandExt,
-    path::{Path, PathBuf},
-    process::Stdio,
+    path::PathBuf,
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -10,8 +9,6 @@ use omp_gateway::{
     adapter, daemon,
     lifecycle::{self, LifecycleConfig},
 };
-use serde_json::Value;
-use tokio::process::Command;
 
 const USAGE: &str = "omp-gateway (managed by omp-sa)\n\
     launch --config FILE\n    serve --config FILE [--restart-request ID]\n\
@@ -76,44 +73,18 @@ fn parse(cmd: &str, mut args: impl Iterator<Item = String>) -> Result<Args> {
     })
 }
 
-async fn normalized_config(file: &Path) -> Result<Value> {
-    let root = PathBuf::from(env::var_os("OMP_SUPERAGENT_ROOT").context("Missing package root")?);
-    let bun = PathBuf::from(env::var_os("OMP_SUPERAGENT_BUN").context("Missing installed Bun")?);
-    ensure!(
-        root.is_absolute() && bun.is_absolute(),
-        "Package root and Bun must be absolute"
-    );
-    let config = std::path::absolute(file)?;
-    let output = Command::new(bun)
-        .args(["--no-env-file", "--no-install"])
-        .arg(root.join("src/gateway-config.ts"))
-        .arg(config)
-        .current_dir(root)
-        .env_clear()
-        .env("PATH", env::var_os("PATH").unwrap_or_default())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    ensure!(
-        output.status.success(),
-        "Gateway configuration could not be loaded"
-    );
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
 async fn run(args: Args) -> Result<()> {
     let result = async {
-        let config = normalized_config(&args.config).await?;
+        let (config, lifecycle) = LifecycleConfig::load(&args.config).await?;
         if let Some(original) = &args.state_dir {
             ensure!(
-                config["stateDir"].as_str().map(Path::new) == Some(original.as_path()),
+                lifecycle.state_dir == *original,
                 "Restart state directory changed"
             );
         }
-        let lifecycle = LifecycleConfig::new(&config)?;
-        if let Err(error) = lifecycle.require_mnemopi().await {
+        if !matches!(args.kind, CommandKind::ValidatedRunner)
+            && let Err(error) = lifecycle.require_mnemopi().await
+        {
             eprintln!(
                 "Managed sessions require effective native OMP Mnemopi (memory.backend=mnemopi). \
                  Run omp-sa doctor with the same configuration and native profile."

@@ -2,7 +2,7 @@
   { "name": "help", "description": "Show Superagent commands and their scope." },
   { "name": "head", "description": "Send a request to the global Superagent coordination session.", "text": "Request for the global head, for example to compare two work topics." },
   { "name": "status", "description": "Inspect Superagent HEAD and this conversation's lane, including while busy." },
-  { "name": "restart", "description": "Restart Superagent Gateway and HEAD together when idle, preserving the session." },
+  { "name": "restart", "description": "Interrupt HEAD work and restart Superagent Gateway and HEAD with the same session and memory." },
   { "name": "context", "description": "Inspect Superagent HEAD context without starting a model turn." },
   { "name": "usage", "description": "Show Superagent's OMP account quotas and reset times." },
   { "name": "cron", "description": "Schedule and manage Superagent jobs in this conversation.", "text": "Use help, add, list, show, edit, pause, resume, run or remove." },

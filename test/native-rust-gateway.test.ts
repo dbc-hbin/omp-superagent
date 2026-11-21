@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { test } from "bun:test";
@@ -162,7 +163,7 @@ nativeTest("native Gateway stops only settled work and resumes the original stoc
     await verifyTranscript(fixture, [first.head, second.head], ["201", "207"]);
   }), 300_000);
 
-nativeTest("authorized messenger /restart hands off once to a native runner and resumes the same stock session", () =>
+nativeTest("authorized messenger /restart accepts compatible config drift and hands off once to the same stock session", () =>
   withNativeRustGateway(async fixture => {
     const first = await fixture.start();
     await fixture.deliver(headInput("201"));
@@ -170,6 +171,12 @@ nativeTest("authorized messenger /restart hands off once to a native runner and 
     const cold = await fixture.observeModel();
     assert.deepEqual(cold.head, first.head);
 
+    // Change a real native launch setting after the original daemon loaded it.
+    const originalConfig = await readFile(fixture.config, "utf8");
+    const nextConfig = JSON.stringify({ ...JSON.parse(originalConfig), maxSubagents: 4 });
+    assert.notEqual(nextConfig, originalConfig);
+    await writeFile(fixture.config, nextConfig);
+    const acceptedHash = createHash("sha256").update(nextConfig).digest("hex");
     const restart = input("211", "/restart");
     await fixture.deliver(restart);
     assert.match(await verifyDelivery(fixture, restart.id, "211:restart-ack"), /ACK, not restart completion/);
@@ -190,7 +197,8 @@ nativeTest("authorized messenger /restart hands off once to a native runner and 
     const runner = ledger(fixture, db => {
       const saved = meta(db, `gateway:restart-plan:${handoff.requestId}`);
       assert(saved);
-      const plan: { runnerPid: number; runnerReady: boolean; launchPid: number } = JSON.parse(saved);
+      const plan: { configHash: string; runnerPid: number; runnerReady: boolean; launchPid: number } = JSON.parse(saved);
+      assert.equal(plan.configHash, acceptedHash);
       assert.equal(plan.runnerReady, true);
       assert.equal(plan.launchPid, handoff.successorPid);
       return plan.runnerPid;

@@ -149,7 +149,10 @@ impl Lifecycle {
     pub async fn prepare(&self, request: Option<&str>) -> Result<()> {
         let store = &self.0.store;
         let config = &self.0.config;
-        let hash = config.config_hash()?;
+        ensure!(
+            config.matches_config_hash(&config.source_hash),
+            "Gateway configuration changed during startup"
+        );
         if let Some(id) = request {
             self.validate_replacement(id).await?;
         } else {
@@ -163,7 +166,8 @@ impl Lifecycle {
         ulw.package()?;
         let status = ulw.status()?;
         ensure!(
-            self.0.ulw.set(ulw).is_ok() && self.0.config_hash.set(hash).is_ok(),
+            self.0.ulw.set(ulw).is_ok()
+                && self.0.config_hash.set(config.source_hash.clone()).is_ok(),
             "Gateway lifecycle was already prepared"
         );
         self.0
@@ -188,7 +192,7 @@ impl Lifecycle {
             }
             return Ok(());
         }
-        self.ensure_head().await?;
+        self.ensure_head(request).await?;
         if let Some(id) = request {
             let store = &self.0.store;
             let state = self.state()?;
@@ -198,6 +202,8 @@ impl Lifecycle {
                 .context("Replacement native HEAD is unavailable")?;
             let mut record =
                 restart_record::record(store, Some(id))?.context("Missing replacement receipt")?;
+            let plan = restart_record::plan(store, id)?.context("Missing replacement plan")?;
+            restart_record::validate_config(&self.0.config, &plan)?;
             ensure!(
                 record.state == Stage::HeadStopped
                     && record.successor_pid == Some(os_process::id())
@@ -224,7 +230,7 @@ impl Lifecycle {
     async fn reconcile_head(&self, controller_ready: bool) -> Result<()> {
         let result = async {
             self.monitor_rotation(controller_ready).await?;
-            self.ensure_head().await
+            self.ensure_head(None).await
         }.await;
         if let Err(error) = result {
             self.state()?.head_error = Some("Head ownership/startup requires reconciliation");

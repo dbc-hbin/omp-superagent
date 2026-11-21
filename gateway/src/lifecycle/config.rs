@@ -9,9 +9,21 @@ use std::{
     fs,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
+use tokio::process::Command;
 
-use super::fs::private_directory;
+use super::{fs::private_directory, stock_ops::capture};
+
+pub(super) const RESTART_CONFIG_ENV: &str = "OMP_SUPERAGENT_RESTART_CONFIG_SHA256";
+pub(super) const RUNNER_CONFIG_ENV: &str = "OMP_SUPERAGENT_RUNNER_CONFIG_SHA256";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Snapshot {
+    config: Value,
+    source_hash: String,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,10 +82,38 @@ pub struct LifecycleConfig {
     pub(super) gateway_log: PathBuf,
     messenger_credentials: Vec<String>,
     voice_credential: Option<String>,
+    pub(super) source_hash: String,
+    pub(super) normalized_hash: String,
+    restart_context: Value,
 }
 
 impl LifecycleConfig {
+    /// Parse and hash the same on-disk bytes using the operator config parser.
+    pub async fn load(file: &Path) -> Result<(Value, Self)> {
+        let root = launcher_path("OMP_SUPERAGENT_ROOT")?;
+        let bun = launcher_path("OMP_SUPERAGENT_BUN")?;
+        let mut command = Command::new(bun);
+        command
+            .args(["--no-env-file", "--no-install"])
+            .arg(root.join("src/gateway-config.ts"))
+            .arg(std::path::absolute(file)?)
+            .current_dir(root)
+            .env_clear()
+            .env("PATH", env::var_os("PATH").unwrap_or_default());
+        let Snapshot { config, source_hash } = serde_json::from_slice(
+            &capture(command, None, Duration::from_secs(10)).await?,
+        )?;
+        let lifecycle = Self::from_normalized(&config, source_hash)?;
+        Ok((config, lifecycle))
+    }
+
+    /// Construct from an already normalized fixture configuration.
     pub fn new(config: &Value) -> Result<Self> {
+        let path = Path::new(config["path"].as_str().context("Missing config path")?);
+        Self::from_normalized(config, hash_file(path)?)
+    }
+
+    fn from_normalized(config: &Value, source_hash: String) -> Result<Self> {
         let raw =
             Normalized::deserialize(config).context("Invalid normalized Gateway configuration")?;
         let bun = launcher_path("OMP_SUPERAGENT_BUN")?;
@@ -105,6 +145,18 @@ impl LifecycleConfig {
         if let Some(slack) = raw.slack {
             credentials.extend([slack.bot_token_env, slack.app_token_env]);
         }
+        let mut restart_context = config.clone();
+        restart_context.sort_all_objects();
+        let normalized_hash = hex::encode(Sha256::digest(serde_json::to_vec(&restart_context)?));
+        let context = restart_context
+            .as_object_mut()
+            .context("Invalid normalized Gateway configuration")?;
+        // Only these settings can change without changing the identity, native
+        // launch profile or authority of a resumed session. The model default
+        // is only a bootstrap selector; the resumed session keeps its own model.
+        for field in ["maxHosts", "maxSubagents", "idleMs", "model"] {
+            context.remove(field);
+        }
         Ok(Self {
             path: raw.path,
             cwd: raw.head_cwd,
@@ -121,7 +173,14 @@ impl LifecycleConfig {
             state_dir: raw.state_dir,
             messenger_credentials: credentials,
             voice_credential,
+            source_hash,
+            normalized_hash,
+            restart_context,
         })
+    }
+
+    pub(super) fn restart_compatible(&self, candidate: &Self) -> bool {
+        self.restart_context == candidate.restart_context
     }
 
     pub(super) fn prepare_directories(&self) -> Result<()> {
@@ -157,6 +216,8 @@ impl LifecycleConfig {
             "OMP_SUPERAGENT_NATIVE_SOCKET",
             "OMP_SUPERAGENT_HOST_CONFIG",
             "OMP_SUPERAGENT_GATEWAY_TOKEN",
+            RESTART_CONFIG_ENV,
+            RUNNER_CONFIG_ENV,
         ] {
             environment.remove(&OsString::from(name));
         }
@@ -164,8 +225,16 @@ impl LifecycleConfig {
     }
 
     pub(super) fn config_hash(&self) -> Result<String> {
-        Ok(hex::encode(Sha256::digest(fs::read(&self.path)?)))
+        hash_file(&self.path)
     }
+
+    pub(super) fn matches_config_hash(&self, expected: &str) -> bool {
+        self.config_hash().is_ok_and(|actual| actual == expected)
+    }
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(fs::read(path)?)))
 }
 
 pub(super) fn launcher_path(name: &str) -> Result<PathBuf> {

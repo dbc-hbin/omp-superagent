@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { Type } from "@sinclair/typebox";
-import { configuredPlatforms, loadConfig } from "./config";
+import { configuredPlatforms, loadConfigSnapshot } from "./config";
 import { createGatewayMessenger } from "./gateway-client";
 import { Superagent } from "./runtime";
 import { Store } from "./store";
@@ -425,7 +425,11 @@ export default function superagentExtension(pi: ExtensionAPI): void {
       if (timer || loading || closed) return;
       timer = setTimeout(() => {
       loading = (async () => {
-        const config = await loadConfig(configPath);
+        const { config, sourceHash } = await loadConfigSnapshot(configPath);
+        const restartHash = process.env.OMP_SUPERAGENT_RESTART_CONFIG_SHA256;
+        if (restartHash !== undefined && restartHash !== sourceHash)
+          throw new Error("Gateway configuration changed before replacement HEAD initialization");
+        delete process.env.OMP_SUPERAGENT_RESTART_CONFIG_SHA256;
         const store = new Store(join(config.stateDir, "coordination.sqlite"));
         let messenger: ReturnType<typeof createGatewayMessenger>;
         try {
@@ -443,6 +447,22 @@ export default function superagentExtension(pi: ExtensionAPI): void {
           inspectPresets: async () => (await nativePresets(ctx)).inspect(),
           syncPresetRoles: async canWrite => (await nativePresets(ctx)).syncRoles(store, canWrite, () => ctx.modelRegistry.refresh("offline")),
           persistPreset: async selection => (await nativePresets(ctx)).persistSelection(selection),
+          reapHeadJobs: async ({ sessionId, sessionFile }) => {
+            const root = pi.pi.AgentRegistry.global().get(pi.pi.MAIN_AGENT_ID);
+            const session = root?.session;
+            if (ctx.agent.id !== root?.id || !(session instanceof pi.pi.AgentSession)
+              || session.sessionManager.getSessionId() !== sessionId || session.sessionManager.getSessionFile() !== sessionFile)
+              throw new Error("Native HEAD job ownership changed before restart");
+            const manager = session.asyncJobManager;
+            if (typeof manager?.cancelAndReapOwnerJobs !== "function") {
+              // Stock builds without owner-scoped reaping may still restart
+              // an idle session. Never substitute a global async-job manager.
+              return !session.getAsyncJobSnapshot({ recentLimit: 0 })?.running.length;
+            }
+            // Match stock OMP's Task abort cleanup grace. On timeout keep the
+            // original Host fenced; do not treat cancellation as process exit.
+            return (await manager.cancelAndReapOwnerJobs(root.id, Date.now() + 10_000)).settled;
+          },
           requestRestart: request => messenger.requestRestart(request),
         });
         try {

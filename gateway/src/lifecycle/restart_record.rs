@@ -92,6 +92,7 @@ pub(super) struct Plan {
     pub config_path: PathBuf,
     pub state_dir: PathBuf,
     pub config_hash: String,
+    pub normalized_config_hash: String,
     pub socket: Endpoint,
     pub head: Head,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,6 +105,18 @@ pub(super) struct Plan {
 
 pub(super) fn plan_key(id: &str) -> String {
     format!("gateway:restart-plan:{id}")
+}
+
+impl Plan {
+    pub fn matches_preparation(&self, prepared: &Self) -> bool {
+        self.runner_pid == prepared.runner_pid
+            && self.head.same(&prepared.head)
+            && self.socket == prepared.socket
+            && self.config_path == prepared.config_path
+            && self.state_dir == prepared.state_dir
+            && self.config_hash == prepared.config_hash
+            && self.normalized_config_hash == prepared.normalized_config_hash
+    }
 }
 
 pub(super) fn meta<T: serde::de::DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {
@@ -137,12 +150,13 @@ pub(super) async fn validate_plan(
     session_file: &Path,
 ) -> Result<()> {
     validate_identity(config, record, plan, session_file)?;
+    validate_config(config, plan)?;
     ensure!(
         session_id(config, &record.session_file).await?.as_deref()
             == Some(record.session_id.as_str()),
         "Restart session identity changed; no replacement is authorized"
     );
-    Ok(())
+    validate_config(config, plan)
 }
 
 pub(super) fn validate_identity(
@@ -165,8 +179,14 @@ pub(super) fn validate_identity(
             && same_path(&record.session_file, session_file),
         "Restart durable ownership does not match the original configuration and session"
     );
+    Ok(())
+}
+
+pub(super) fn validate_config(config: &LifecycleConfig, plan: &Plan) -> Result<()> {
     ensure!(
-        config.config_hash()? == plan.config_hash,
+        config.source_hash == plan.config_hash
+            && config.normalized_hash == plan.normalized_config_hash
+            && config.matches_config_hash(&plan.config_hash),
         "Restart configuration changed; no replacement is authorized"
     );
     Ok(())

@@ -2515,12 +2515,10 @@ describe("controlled Gateway AND HEAD restart", () => {
       await runtime.start();
       Object.assign(target === "main" ? main.state : laneHost.state, patch);
       await admit(runtime, message(`restart-guard-owner-${index}`, route(), "/restart"));
-      const unsafe = Object.hasOwn(patch, "hostPid") || patch.sessionId !== undefined
-        || target === "main" && (patch.hasPendingAsyncWork !== undefined && patch.hasPendingAsyncWork
-        || patch.hasOwnedRunningWork === true || Object.hasOwn(patch, "hasPendingAsyncWork") && patch.hasPendingAsyncWork === undefined
-        );
-      expect(requests).toHaveLength(unsafe ? 0 : 1);
-      expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe(unsafe ? "failed" : "accepted");
+      const identityFailure = Object.hasOwn(patch, "hostPid") || patch.sessionId !== undefined;
+      const blocked = target === "main" && (Object.hasOwn(patch, "hasPendingAsyncWork") || patch.hasOwnedRunningWork === true);
+      expect(requests).toHaveLength(identityFailure || blocked ? 0 : 1);
+      expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe(identityFailure ? "failed" : blocked ? "checkpoint-blocked" : "accepted");
       expect(store.output(`restart-guard-owner-${index}:restart-ack`)?.state).toBe("sent");
       expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("secret-native-token");
       expect(main.prompts).toEqual([]);
@@ -2528,6 +2526,26 @@ describe("controlled Gateway AND HEAD restart", () => {
       expect(laneHost.abortCount).toBe(0);
       expect([...main.commands, ...laneHost.commands].some(command => command.type === "shutdown_host")).toBe(false);
     }
+  });
+
+  test("only a fresh owner restart can take over a checkpoint blocked before handoff", async () => {
+    const { runtime, main, store, requests } = restartFixture();
+    await runtime.start();
+    main.state.hasOwnedRunningWork = true;
+    const original = message("restart-while-job-drains", route(), "/restart");
+    await admit(runtime, original);
+    const first = JSON.parse(store.getMeta("head:restart-fence")!);
+    expect(first.state).toBe("checkpoint-blocked");
+    main.state.hasOwnedRunningWork = false;
+    await admit(runtime, original);
+    expect(requests).toHaveLength(0);
+    const next = message("restart-after-job-drained", route("other-owner-room"), "/restart");
+    await admit(runtime, next);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.inputId).toBe(next.id);
+    expect(requests[0]?.requestId).not.toBe(first.requestId);
+    expect(store.output(`${next.id}:restart-ack`)).toMatchObject({ state: "sent", route: next.route });
+    expect(JSON.parse(store.getMeta("head:restart-fence")!)).toMatchObject({ state: "accepted", checkpoint: first.checkpoint });
   });
 
   test.each(["pending", "submitted", "uncertain"] as const)("durable %s work in either HEAD or a lane survives restart admission without replay", async state => {
@@ -2872,7 +2890,8 @@ describe("controlled Gateway AND HEAD restart", () => {
     await admit(runtime, original);
     const request = requests[0]!;
     const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
-      sessionId: "session-main", sessionFile: hostPaths(runtime.config, "main").sessionFile, state: "refused" };
+      sessionId: "session-main", sessionFile: hostPaths(runtime.config, "main").sessionFile, state: "refused",
+      reason: "Gateway configuration changed after restart acceptance; no process was stopped." };
     store.setMeta(`gateway:restart:${request.requestId}`, JSON.stringify(receipt));
     await messenger.handlers!.restart!({ requestId: "other-request", outcome: "refused", reason: "not this owner" });
     expect(store.getMeta("head:restart-fence")).toBeTruthy();
@@ -2881,6 +2900,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     await messenger.handlers!.restart!(notice);
     expect(store.getMeta("head:restart-fence")).toBe("");
     expect(messenger.sent.filter(output => output.id === `${original.id}:restart-result`)).toMatchObject([{ route: original.route, sourceId: original.id }]);
+    expect(store.output(`${original.id}:restart-result`)?.text).toContain(receipt.reason!);
     expect(store.output(`${original.id}:restart-result`)?.text).not.toContain("secret native refusal");
     expect(requests).toHaveLength(1);
   });

@@ -11,7 +11,8 @@ import { hostPaths, type Config } from "../src/config";
 import type { GatewayRestartRecord, GatewayRestartRequest, Inbound } from "../src/contracts";
 import { launchGateway } from "./oracles/bun-gateway/gateway";
 import { gatewayPaths } from "../src/gateway-protocol";
-import { processAlive, restartConfigHash, runGatewayRestart, type RestartPlan } from "./oracles/bun-gateway/gateway-restart";
+import { normalizedRestartConfigHash, processAlive, restartConfigHash, runGatewayRestart,
+  type RestartPlan } from "./oracles/bun-gateway/gateway-restart";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import type { ManagedUlwStatus } from "../src/managed-ulw";
 import { Store } from "../src/store";
@@ -267,6 +268,53 @@ test("restart execution distinguishes spawn failure, native refusal and ambiguou
   }
 }, STARTUP_MS + RPC_MS + 2 * RESTART_SHUTDOWN_MS + 15_000);
 
+test("restart accepts safe config drift but refuses invalid policy and changes after acceptance without touching HEAD", async () => {
+  let spawns = 0;
+  const f = await fixture({ launchRestartRunner() {
+    spawns++;
+    throw new Error("Config rejection must precede runner spawn");
+  } });
+  const sessionFile = hostPaths(f.config, "main").sessionFile;
+  const pid = f.service.status().head.pid;
+  const discord = f.config.discord;
+  if (!pid || !discord) throw new Error("Expected a running Discord HEAD fixture");
+  const head = { pid, sessionFile, sessionId: await sessionId(sessionFile) };
+  const originalHash = await restartConfigHash(f.config.path);
+  for (const [name, config, reason] of [
+    ["invalid", { ...f.config, idleMs: -1 }, "configuration could not be validated"],
+    ["instance", { ...f.config, stateDir: join(f.root, "new-instance") }, "changed the instance"],
+    ["profile", { ...f.config, command: [...f.config.command, "--profile", "new-profile"] }, "native HEAD profile"],
+    ["owner", { ...f.config, discord: { ...discord, ownerId: "9" } }, "messenger authorization"],
+    ["credential", { ...f.config, discord: { ...discord, tokenEnv: "OTHER_BOT_TOKEN" } }, "messenger authorization"],
+  ] as const) {
+    await writeFile(f.config.path, JSON.stringify(config));
+    const request = seedRestart(f.root, input(`config-${name}`, "/restart"), head);
+    expect(await f.service.restart(request)).toMatchObject({ state: "refused", reason: expect.stringContaining(reason) });
+    expect(restartPlan(f.root, request.requestId)).toBeNull();
+    f.service.runRestart(request.requestId);
+  }
+
+  const candidate = { ...f.config, maxSubagents: f.config.maxSubagents + 2 };
+  await writeFile(f.config.path, JSON.stringify(candidate));
+  const request = seedRestart(f.root, input("config-after-acceptance", "/restart"), head);
+  expect(await f.service.restart(request)).toMatchObject({ state: "accepted" });
+  const acceptedHash = await restartConfigHash(f.config.path);
+  expect(acceptedHash).not.toBe(originalHash);
+  expect(restartPlan(f.root, request.requestId)?.configHash).toBe(acceptedHash);
+  await writeFile(f.config.path, JSON.stringify({ ...candidate, idleMs: f.config.idleMs + 1 }));
+  f.service.runRestart(request.requestId);
+  const refusal = await until("accepted config drift refusal", RPC_MS, () => {
+    const record = restartRecord(f.root, request.requestId);
+    return record?.state === "refused" && record;
+  });
+  expect(refusal.reason).toContain("configuration changed after restart acceptance");
+  expect(await f.service.restart(request)).toEqual(refusal);
+  expect(f.service.status()).toMatchObject({ gateway: { stopping: false }, head: { pid: head.pid, ready: true } });
+  expect(spawns).toBe(0);
+  expect(existsSync(join(f.root, "shutdowns.jsonl"))).toBe(false);
+  expect(await launches(f.root)).toHaveLength(1);
+}, STARTUP_MS + 2 * RPC_MS);
+
 for (const failure of ["live predecessor", "missing configuration"] as const) {
   test(`one-shot runner records a sanitized failure without launch or kill: ${failure}`, async () => {
     const { config, root } = await configFixture();
@@ -275,6 +323,7 @@ for (const failure of ["live predecessor", "missing configuration"] as const) {
     const head = { ...previous, ownerPid: previous.pid, dev: 0, ino: 0 };
     const request = seedRestart(root, input(failure, "/restart"), head);
     const plan = { configPath: config.path, stateDir: root, configHash: await restartConfigHash(config.path),
+      normalizedConfigHash: normalizedRestartConfigHash(config),
       socket, head, runnerPid: process.pid, runnerReady: true } satisfies RestartPlan;
     const gateway = new GatewayStore(root);
     try {

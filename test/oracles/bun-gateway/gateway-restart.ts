@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { hostPaths, loadConfig, requireMessengerCredentials, type Config } from "../../../src/config";
+import { hostPaths, loadConfig, loadConfigSnapshot, requireMessengerCredentials, type Config } from "../../../src/config";
 import { loadCredentials } from "../../../src/credentials";
 import type { GatewayRestartRecord } from "../../../src/contracts";
 import { GatewayStore } from "./gateway-store";
@@ -14,6 +14,7 @@ export interface RestartPlan {
   configPath: string;
   stateDir: string;
   configHash: string;
+  normalizedConfigHash: string;
   socket: { pid: number; dev: number; ino: number };
   head: { pid: number; ownerPid: number; sessionId: string; sessionFile: string; dev: number; ino: number };
   runnerPid?: number;
@@ -32,6 +33,21 @@ export async function restartConfigHash(path: string): Promise<string> {
   return createHash("sha256").update(await readFile(path)).digest("hex");
 }
 
+export function normalizedRestartConfigHash(config: Config): string {
+  return createHash("sha256").update(JSON.stringify(config)).digest("hex");
+}
+
+export async function readRestartConfig(path: string) {
+  const { config, sourceHash } = await loadConfigSnapshot(path);
+  return { config, configHash: sourceHash,
+    normalizedConfigHash: normalizedRestartConfigHash(config) };
+}
+
+export function restartCompatible(active: Config, candidate: Config): boolean {
+  const context = ({ maxHosts, maxSubagents, idleMs, model, ...context }: Config) => context;
+  return JSON.stringify(context(active)) === JSON.stringify(context(candidate));
+}
+
 /** Durable identity, not a caller-supplied PID, grants permission to resume this exact session. */
 export async function validateRestartPlan(config: Config, record: GatewayRestartRecord | null, plan: RestartPlan | null): Promise<void> {
   if (!record || !plan || resolve(plan.configPath) !== resolve(config.path) || resolve(plan.stateDir) !== resolve(config.stateDir) ||
@@ -40,7 +56,8 @@ export async function validateRestartPlan(config: Config, record: GatewayRestart
       record.sessionId !== plan.head.sessionId || resolve(record.sessionFile) !== resolve(plan.head.sessionFile) ||
       resolve(record.sessionFile) !== resolve(hostPaths(config, "main").sessionFile))
     throw new Error("Restart durable ownership does not match the original configuration and session");
-  if (await restartConfigHash(config.path) !== plan.configHash)
+  if (normalizedRestartConfigHash(config) !== plan.normalizedConfigHash ||
+      await restartConfigHash(config.path) !== plan.configHash)
     throw new Error("Restart configuration changed; no replacement is authorized");
   // Static native imports run OMP's dotenv loader before the explicit credential boundary.
   const { readSessionHeaderId } = await import("@oh-my-pi/pi-coding-agent/session/session-loader");
@@ -81,7 +98,7 @@ export async function runGatewayRestart(configPath: string, requestId: string, o
   };
   let lock: GatewayStore | undefined;
   try {
-    const config = await loadConfig(configPath);
+    const { config, configHash } = await readRestartConfig(configPath);
     if (resolve(config.stateDir) !== resolve(stateDir)) throw new Error("Restart state directory changed");
     // Resolve credentials before any native module may run its own dotenv loader.
     loadCredentials(config);
@@ -92,6 +109,8 @@ export async function runGatewayRestart(configPath: string, requestId: string, o
     for (;;) {
       record = JSON.parse(metadata.getMeta(`gateway:restart:${requestId}`) ?? "null") as GatewayRestartRecord | null;
       plan = readRestartPlan(metadata, requestId);
+      if (plan?.configHash !== configHash)
+        throw new Error("Restart configuration changed; no replacement is authorized");
       await validateRestartPlan(config, record, plan);
       if (!record || !plan || (record.state !== "accepted" && record.state !== "head-stopped")) return;
       if (metadata.getMeta("gateway:restart-active") !== requestId) throw new Error("Restart is not the active owned intent");

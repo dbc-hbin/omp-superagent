@@ -1,4 +1,4 @@
-/** Local model transport and one explicit private-socket fault; native goals and UI remain authoritative. */
+/** Local model transport and one explicit private-socket fault; native work and memory remain authoritative. */
 import assert from "node:assert/strict";
 import { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, readFileSync, watch } from "node:fs";
@@ -19,11 +19,49 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
   assert.equal(process.env.OMP_RESTART_NATIVE_DUMMY_TOKEN, undefined, "Gateway credentials must not reach native HEAD");
   const scenario = process.env.OMP_RESTART_NATIVE_SCENARIO;
   const recoveryWindow = scenario === "lane-failure-recovery-window" || scenario === "lane-abort-recovery-window";
+  const busyHead = role === "head" && scenario === "busy";
+  const memoryKey = "emberstation";
+  const memorySource = "native-restart-proof";
   let current: ExtensionContext | undefined;
   let recordedResume = false;
+  let stopObservingJob: (() => void) | undefined;
   const record = (kind: string, fields: Record<string, unknown> = {}) => {
     appendFileSync(join(root, "native-events.jsonl"), `${JSON.stringify({ kind, at: Date.now(), pid: process.pid, ...fields })}\n`, { mode: 0o600 });
   };
+  const readAck = () => {
+    using db = new Database(join(root, "coordination.sqlite"), { readonly: true, strict: true });
+    return db.query<{ state: string; remote_id: string | null }, []>(
+      "SELECT state,remote_id FROM outputs WHERE id='902:restart-ack'",
+    ).get();
+  };
+  const readMemoryProfile = async (ctx: ExtensionContext) => {
+    assert(ctx.agent.kind === "main" && ctx.cwd === join(root, "head")
+      && process.env.PI_CODING_AGENT_DIR === join(root, "agent"));
+    assert(ctx.memory, "Stock OMP must expose structured native memory");
+    const status = await ctx.memory.status();
+    assert(status.backend === "mnemopi" && status.active && status.writable && status.searchable
+      && status.scope === "per-project" && status.retainBank && status.recallBanks?.length === 1
+      && status.recallBanks[0] === status.retainBank
+      && status.database?.startsWith(`${join(root, "agent", "restart-memory", "banks")}/`),
+    `Expected one isolated native Mnemopi bank: ${JSON.stringify(status)}`);
+    const profile = { backend: status.backend, scope: status.scope, database: status.database,
+      retainBank: status.retainBank, recallBanks: status.recallBanks };
+    return { memory: ctx.memory, profile, sessionId: ctx.sessionManager.getSessionId() };
+  };
+  if (busyHead) {
+    pi.registerCommand("fixture-seed-restart-memory", {
+      description: "Seed the private native restart bank without a model turn",
+      handler: async (args, ctx) => {
+        assert.equal(args.trim(), "");
+        const { memory, profile, sessionId } = await readMemoryProfile(ctx);
+        const content = readFileSync(join(root, "restart-memory-seed.txt"), "utf8");
+        const saved = await memory.save({ content, source: memorySource });
+        assert(saved.backend === "mnemopi" && saved.stored === 1 && saved.ids?.length === 1 && saved.ids[0],
+          `Native Mnemopi seed failed: ${JSON.stringify(saved)}`);
+        record("native-memory-saved", { sessionId, profile, memoryId: saved.ids[0] });
+      },
+    });
+  }
   if (role === "head" && process.env.OMP_RESTART_NATIVE_SCENARIO === "quarantine") {
     // Lose one actual UI response at the local socket boundary, not its native
     // pending-request state or the controller's pre-effect answered marker.
@@ -114,7 +152,10 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
     const envelope = nativeRequestEnvelope(event.text);
     record("native-input", { requestId: envelope?.requestId, sourceId: envelope?.sourceId, text: event.text });
   });
-  pi.on("session_shutdown", () => { record("native-shutdown"); });
+  pi.on("session_shutdown", () => {
+    stopObservingJob?.();
+    record("native-shutdown");
+  });
   pi.registerTool({
     name: "fixture_restart_hold", label: "Hold isolated restart work",
     description: "Keep this native execution active until the owner's restart interrupts it.",
@@ -123,18 +164,32 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
       assert(signal, "The real native executor must provide an AbortSignal");
       const stopped = Promise.withResolvers<void>();
       const abort = () => {
-        const db = new Database(join(root, "coordination.sqlite"), { readonly: true, strict: true });
-        try {
-          const ack = db.query<{ state: string; remote_id: string | null }, []>(
-            "SELECT state,remote_id FROM outputs WHERE id='902:restart-ack'",
-          ).get();
-          record("native-aborted", { ack });
-        } finally { db.close(); }
+        record("native-aborted", { ack: readAck() });
         stopped.resolve();
       };
       signal.addEventListener("abort", abort, { once: true });
       const watcher = watch(root, () => { if (existsSync(join(root, "cleanup"))) stopped.resolve(); });
       try {
+        if (busyHead) {
+          const { AgentRegistry, MAIN_AGENT_ID, AgentSession } = pi.pi;
+          const session = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
+          const sessionId = ctx.sessionManager.getSessionId();
+          assert(session instanceof AgentSession && session.sessionManager.getSessionId() === sessionId);
+          const manager = session.asyncJobManager;
+          const jobs = session.getAsyncJobSnapshot()?.running;
+          const job = jobs?.[0];
+          assert(manager && jobs?.length === 1 && job?.type === "bash" && job.ownerId === MAIN_AGENT_ID,
+            `Expected one running background Bash job scoped to the exact native HEAD: ${JSON.stringify(jobs)}`);
+          stopObservingJob = manager.onJobSettled(() => {
+            const settled = manager.getJob(job.id);
+            if (!settled || settled.endTime === undefined) return;
+            const { id, ownerId, type, status, endTime } = settled;
+            record("native-job-settled", { sessionId, job: { id, ownerId, type, status, endTime },
+              ack: readAck(), duringCleanup: existsSync(join(root, "cleanup")) });
+            stopObservingJob?.();
+          });
+          record("native-job-running", { sessionId, job });
+        }
         record("held", { sessionId: ctx.sessionManager.getSessionId() });
         if (signal.aborted) abort();
         if (process.env.OMP_RESTART_NATIVE_SCENARIO === "approval" || process.env.OMP_RESTART_NATIVE_SCENARIO === "quarantine") {
@@ -262,7 +317,16 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
       }
       const held = history.find(event => event.kind === "held");
       if (process.env.OMP_RESTART_NATIVE_SCENARIO !== "settled-goal") {
-        if (!held) return invoke("fixture_restart_hold", {});
+        if (!held) {
+          if (busyHead && !results.some(result => logical(result.toolCallId) === "bash" && result.details
+            && typeof result.details === "object" && "async" in result.details)) {
+            // This subprocess may exit naturally only during fixture teardown.
+            // An unnamed async Bash call uses the session manager, not the service broker.
+            return invoke("bash", { async: true, timeout: 0,
+              command: `/bin/sh -c 'printf "%s\\n" "$$" > restart-job.pid; while [ ! -e ../cleanup ]; do /bin/sleep 0.05; done; printf "returned\\n" > restart-job-returned'` });
+          }
+          return invoke("fixture_restart_hold", {});
+        }
         assert.notEqual(process.pid, held.pid, "The original active turn may only continue in the replacement HEAD");
       }
       if (succeeded("goal", "complete")) return { content: ["GOAL_COMPLETED_AFTER_NATIVE_RESTART"] };
@@ -270,6 +334,11 @@ export default function restartNativeProvider(pi: ExtensionAPI): void {
         recordedResume = true;
         const mode = current.sessionManager.getBranch().findLast(entry => entry.type === "mode_change");
         assert(mode?.type === "mode_change" && mode.mode === "goal", "Only actual RPC goal resume may reactivate the paused goal");
+        if (busyHead) {
+          const { memory, profile, sessionId } = await readMemoryProfile(current);
+          const recalled = await memory.search(memoryKey, { limit: 2 });
+          record("native-memory-recalled", { sessionId, profile, recalled });
+        }
         record("resumed", { sessionId: current.sessionManager.getSessionId(), mode: mode.mode, goal: mode.data?.goal });
       }
       assert(options?.signal, "The local provider continuation gate must remain abortable");

@@ -120,14 +120,22 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
 
 - Durably fence new dispatch and confirm a `sent` acknowledgement on the original
   route before handing off the restart. Checkpoint with native APIs: cancel the
-  head's pending cards by their original IDs, abort/clear queued native work and
-  pause the active head goal as appropriate. Require actual quiescence before
-  normal shutdown; do not force-kill when effects or ownership remain unclear.
+  head's pending cards by their original IDs, abort/clear queued native work,
+  pause the active head goal and cancel and reap the root's native background
+  jobs. Cancellation alone is not an exit receipt. If the final checkpoint is
+  still busy, a **new** owner `/restart` can continue from the saved checkpoint
+  on that same head; a duplicate command or uncertain handoff cannot. Require
+  actual quiescence before shutdown; never signal a PID to bypass ownership.
 - Bind one durable lifecycle request to the original owner input, acknowledgement
   and current process identity. Duplicate delivery does not start another replacement.
+  Compatible edits to runtime limits or the default model can take effect on
+  restart. Pin the accepted configuration for the handoff; changes to instance,
+  native profile or messenger authority are not a restart of the same service.
   The Gateway's one-shot successor waits for the old lifetime lock to release.
   A later operator stop invalidates the restart and prevents successor revival.
 - Restore the exact head native session and saved model/effort and reconcile approvals.
+  The replacement uses the same native profile and workspace to reopen the
+  existing Mnemopi memory, not a copy of memory in the Gateway database.
   For the same model identified as non-reasoning by both Hosts, stock OMP can
   represent inactive effort as either absent or `off`. Any other effort mismatch
   keeps intake held; a configured default is not evidence of active effort.

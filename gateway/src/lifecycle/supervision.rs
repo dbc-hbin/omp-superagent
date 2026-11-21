@@ -9,7 +9,7 @@ use super::{
     fs::{alive, remove_dead_socket},
     host_launch::PreparedHost,
     host_rpc::{Head, PROBE_TIMEOUT, Probe, ShutdownRefused, confirmed_exit},
-    restart_record::{self, ACTIVE, FENCE, Fence, HEAD, Record, STOP, Stage},
+    restart_record::{self, ACTIVE, FENCE, Fence, HEAD, Plan, Record, STOP, Stage},
     rotation::{self, Stage as RotationStage},
 };
 
@@ -46,7 +46,7 @@ impl Lifecycle {
         Ok(())
     }
 
-    pub(super) async fn ensure_head(&self) -> Result<()> {
+    pub(super) async fn ensure_head(&self, restart_request: Option<&str>) -> Result<()> {
         let _supervising = self.0.supervision.lock().await;
         let mut rotation = self.rotation()?;
         if rotation.as_ref().is_some_and(|plan| plan.stage == RotationStage::Stopping) {
@@ -89,6 +89,12 @@ impl Lifecycle {
             }
         }
         let config = &self.0.config;
+        let restart_plan = restart_request
+            .map(|id| restart_record::plan(&self.0.store, id)?.context("Missing replacement plan"))
+            .transpose()?;
+        if let Some(plan) = &restart_plan {
+            restart_record::validate_config(config, plan)?;
+        }
         remove_dead_socket(
             &config.head_socket,
             head.as_ref().map(Head::endpoint),
@@ -117,12 +123,18 @@ impl Lifecycle {
             if state.phase != Phase::Running || *self.0.closing.borrow() {
                 return Ok(());
             }
+            if let Some(plan) = &restart_plan {
+                restart_record::validate_config(config, plan)?;
+            }
             if let Some(plan) = &mut replacement {
                 plan.stage = RotationStage::Launching;
                 plan.replacement_session_id = Some(prepared.expected_session_id().context("Fresh HEAD session ID missing")?.to_owned());
                 self.0.store.set_meta(HEAD_ROTATION, &serde_json::to_string(plan)?)?;
             }
-            let owner = prepared.spawn(config)?;
+            let owner = prepared.spawn(
+                config,
+                restart_plan.as_ref().map(|plan| plan.config_hash.as_str()),
+            )?;
             state.launching_owner = Some(owner.pid);
             owner
         };
@@ -209,7 +221,7 @@ impl Lifecycle {
 
     pub(super) async fn shutdown_owned_head(
         &self,
-        restart: Option<(&Head, &Record)>,
+        restart: Option<(&Plan, &Record)>,
     ) -> Result<()> {
         let (attempt, pending) = {
             let state = self.state()?;
@@ -283,7 +295,7 @@ impl Lifecycle {
                 return Ok(());
             }
             ensure!(
-                head.as_ref().is_some_and(|head| head.same(expected)),
+                head.as_ref().is_some_and(|head| head.same(&expected.head)),
                 EffectError::rejected(
                     "Native HEAD ownership changed; restart was refused without a shutdown"
                 )
@@ -345,9 +357,14 @@ impl Lifecycle {
         Ok(())
     }
 
-    fn restart_still_authorized(&self, head: &Head, record: &Record) -> Result<bool> {
+    fn restart_still_authorized(&self, plan: &Plan, record: &Record) -> Result<bool> {
         let state = self.state()?;
-        if state.phase != Phase::Accepted || !self.is_accepted(&record.request.request_id)? {
+        if state.phase != Phase::Accepted {
+            return Ok(false);
+        }
+        if !self.is_accepted(&record.request.request_id)? {
+            self.check_accepted_config(plan)?;
+            self.check_runner_rejection(record)?;
             return Ok(false);
         }
         let store = &self.0.store;
@@ -355,15 +372,17 @@ impl Lifecycle {
         let stop = store.get_meta(STOP)?;
         ensure!(
             fence.is_some_and(
-                |fence| fence.matches(&record.request, head) && fence.stop_boundary == stop
+                |fence| fence.matches(&record.request, &plan.head) && fence.stop_boundary == stop
             ),
             EffectError::rejected("HEAD restart fence changed before native shutdown")
         );
-        let hash = self.0.config.config_hash()?;
+        let prepared = restart_record::plan(store, &record.request.request_id)?;
         ensure!(
-            self.0.config_hash.get() == Some(&hash),
-            EffectError::rejected("Gateway configuration changed before native shutdown")
+            prepared.is_some_and(|ready| ready.runner_ready == Some(true)
+                && plan.matches_preparation(&ready)),
+            EffectError::rejected("Successor preparation changed before native shutdown")
         );
+        self.check_accepted_config(plan)?;
         Ok(true)
     }
 }

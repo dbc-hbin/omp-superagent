@@ -21,7 +21,7 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    LifecycleConfig, fs as owned,
+    LifecycleConfig, config::RESTART_CONFIG_ENV, fs as owned,
     host_rpc::Probe,
     process::{ChildKind, detached, host_owner_executable},
     rotation::{self, Rotation},
@@ -239,11 +239,18 @@ impl PreparedHost {
         self.session_id.as_deref()
     }
 
-    pub fn spawn(mut self, config: &LifecycleConfig) -> Result<LaunchedHost> {
+    pub fn spawn(
+        mut self,
+        config: &LifecycleConfig,
+        restart_config_hash: Option<&str>,
+    ) -> Result<LaunchedHost> {
         ensure!(
             Instant::now() < self.deadline,
             "Native Host startup timed out before launch"
         );
+        if let Some(hash) = restart_config_hash {
+            self.environment.insert(RESTART_CONFIG_ENV.into(), hash.into());
+        }
         let mut command = detached(ChildKind::HeadOwner, &self.log)?;
         command
             .arg(self.files.directory.join("owner.json"))

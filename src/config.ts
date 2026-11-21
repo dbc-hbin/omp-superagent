@@ -166,8 +166,17 @@ export function isConfiguredRoute(config: Config, route: Route): boolean {
 }
 
 export async function loadConfig(path: string): Promise<Config> {
+  return (await loadConfigSnapshot(path)).config;
+}
+
+/** Bind lifecycle authority to the same bytes that produced the normalized configuration. */
+export async function loadConfigSnapshot(path: string) {
   const absolute = resolve(path);
-  return parseConfig(await Bun.file(absolute).json(), absolute);
+  const bytes = await Bun.file(absolute).arrayBuffer();
+  return {
+    config: parseConfig(await new Blob([bytes]).json(), absolute),
+    sourceHash: Bun.CryptoHasher.hash("sha256", bytes, "hex"),
+  };
 }
 
 /** Validate an in-memory setup candidate with exactly the same policy as a saved config. */

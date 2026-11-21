@@ -47,6 +47,12 @@ interface Event {
   readonly bytes?: string;
   readonly connected?: boolean;
   readonly error?: string;
+  readonly job?: { readonly id: string; readonly type: string; readonly ownerId: string; readonly status: string; readonly endTime?: number };
+  readonly duringCleanup?: boolean;
+  readonly profile?: { readonly backend: string; readonly scope: string; readonly database: string;
+    readonly retainBank: string; readonly recallBanks: readonly string[] };
+  readonly memoryId?: string;
+  readonly recalled?: { readonly backend: string; readonly items: readonly { readonly id?: string; readonly content: string; readonly source?: string }[] };
 }
 interface InputRow { readonly state: string; readonly request_id: string | null }
 interface OwnedProcess { readonly pid: number; readonly group: number; readonly argv: string; readonly native: boolean; readonly runner: boolean }
@@ -58,6 +64,12 @@ const scenario = process.env.OMP_RESTART_NATIVE_SCENARIO;
 assert(scenario === "busy" || scenario === "approval" || scenario === "lane" || scenario === "stop" || scenario === "ack-interrupted"
   || scenario === "settled-goal" || scenario === "quarantine" || scenario === "operator-stop" || scenario === "lane-failure" || scenario === "lane-abort"
   || scenario === "lane-failure-recovery-window" || scenario === "lane-abort-recovery-window");
+const busy = scenario === "busy";
+const memoryCanary = crypto.randomUUID();
+const memoryFact = `The restart emberstation keeps this private mnemonic: ${memoryCanary}.`;
+const memorySeedPath = path.join(root, "restart-memory-seed.txt");
+const jobPidPath = path.join(root, "head", "restart-job.pid");
+const jobNormalExitPath = path.join(root, "head", "restart-job-returned");
 const recoveryWindow = scenario === "lane-failure-recovery-window" || scenario === "lane-abort-recovery-window";
 const abortedLane = scenario === "lane-abort" || scenario === "lane-abort-recovery-window";
 const detachedLane = scenario === "lane-failure" || scenario === "lane-abort" || recoveryWindow;
@@ -92,6 +104,8 @@ for (const name of ["agent", "head", "lane"]) privateDirectory(path.join(root, n
 const model = "restart-native/local";
 await fs.writeFile(path.join(root, "agent/config.yml"), JSON.stringify({
   ...offlineMnemopi,
+  ...(busy ? { async: { enabled: true }, mnemopi: { ...offlineMnemopi.mnemopi, scoping: "per-project",
+    dbPath: path.join(root, "agent", "restart-memory", "mnemopi.db") } } : {}),
   disabledProviders: nativeDisabledProviders, modelRoles: { default: model, judge: model }, defaultThinkingLevel: "low",
   ...(detachedLane ? { retry: { enabled: false } } : {}),
   modelPresets: Object.fromEntries(["high", "middle", "low"].map(name => [name, { modelRoles: { default: model, judge: model }, defaultThinkingLevel: "low" }])),
@@ -161,6 +175,14 @@ async function ownedProcesses(): Promise<OwnedProcess[]> {
     return gateway || native ? [{ pid: Number(pid), group: Number(group), argv, native, runner: gateway && argv.includes("--runner ") }] : [];
   });
 }
+async function fixtureJobPid(): Promise<number | undefined> {
+  if (!existsSync(jobPidPath)) return undefined;
+  const value = (await fs.readFile(jobPidPath, "utf8")).trim();
+  if (!/^[1-9][0-9]*$/.test(value)) return undefined;
+  const pid = Number(value);
+  assert(Number.isSafeInteger(pid) && pid > 1);
+  return pid;
+}
 async function cleanup() {
   const startedAt = Date.now();
   await fs.writeFile(path.join(root, "cleanup"), "Only this fixture's private processes may stop.\n", { mode: 0o600 });
@@ -204,6 +226,8 @@ async function cleanup() {
     remainingProcesses = await ownedProcesses();
     return remainingProcesses.length === 0;
   }, "all fixture-owned detached processes exited", true);
+  const jobPid = await fixtureJobPid();
+  if (jobPid !== undefined) await until(() => !processAlive(jobPid), "fixture background Bash process exited", true);
   ledger?.close();
   ledger = undefined;
   for (const name of ["release-ack", "release-resume", "release-lane", "release-reconnect", "release-successor-launch", "release-lane-outcome",
@@ -219,6 +243,21 @@ try {
   ledger = new Database(path.join(root, "coordination.sqlite"), { readonly: true, strict: true });
   const old = await HostConnection.connect(mainPaths.socketPath);
   connections.add(old);
+  let memorySeed: Event | undefined;
+  if (busy) {
+    await fs.writeFile(memorySeedPath, memoryFact, { flag: "wx", mode: 0o600 });
+    // Only the local command name crosses RPC. The canary cannot be restored from the journal.
+    const reply = await old.request({ type: "prompt", message: "/fixture-seed-restart-memory" }, "restart-native-memory-seed");
+    assert(reply.success && reply.command === "prompt", JSON.stringify(reply));
+    assert.notEqual(reply.data?.agentInvoked, true);
+    await until(async () => (await events("native-events.jsonl")).some(event => event.kind === "native-memory-saved")
+      && (await old.client.getState()).isSettled, "settled native HEAD Mnemopi save without a model turn");
+    memorySeed = (await events("native-events.jsonl")).find(event => event.kind === "native-memory-saved");
+    assert(memorySeed?.profile && memorySeed.memoryId);
+    assert.equal(memorySeed.pid, beforeGateway.head.pid);
+    assert.equal(await fs.realpath(memorySeed.profile.database), memorySeed.profile.database);
+    await fs.unlink(memorySeedPath);
+  }
   let survivingLane: Lane | undefined;
   let laneSource: Inbound | undefined;
   let detachedLaneReceipt: Record<string, unknown> | undefined;
@@ -251,6 +290,19 @@ try {
   assert.equal(before.goal?.goal.status, "active");
   assert.equal(before.thinkingLevel, "low");
   assert.deepEqual(before.model && { provider: before.model.provider, id: before.model.id }, { provider: "restart-native", id: "local" });
+  let runningJob: Event | undefined;
+  let jobPid: number | undefined;
+  if (busy) {
+    assert.equal(memorySeed?.sessionId, before.sessionId);
+    runningJob = (await events("native-events.jsonl")).find(event => event.kind === "native-job-running");
+    assert(runningJob?.job && runningJob.job.status === "running" && runningJob.job.type === "bash" && runningJob.job.ownerId);
+    assert.equal(runningJob.pid, before.hostPid);
+    assert.equal(runningJob.sessionId, before.sessionId);
+    assert.equal(before.hasOwnedRunningWork, true, "The stock native job independently blocks a quiescent restart");
+    await until(async () => (await fixtureJobPid()) !== undefined, "real background Bash subprocess started");
+    jobPid = await fixtureJobPid();
+    assert(jobPid !== undefined && jobPid !== before.hostPid && processAlive(jobPid));
+  }
   const originalAdmission = stateOf(original.id);
   assert(originalAdmission?.request_id);
   assert.equal(originalAdmission.state, scenario === "settled-goal" ? "done" : "submitted");
@@ -285,7 +337,13 @@ try {
   assert.deepEqual(ack.output.route, restartRoute);
   assert.equal(ack.headPid, before.hostPid);
   assert.equal(ack.headAlive, true);
-  assert.equal((await old.client.getState()).isStreaming, scenario !== "settled-goal", "Native work cannot be interrupted before the ACK send returns");
+  const ackPendingNative = await old.client.getState();
+  assert.equal(ackPendingNative.isStreaming, scenario !== "settled-goal", "Native work cannot be interrupted before the ACK send returns");
+  if (busy) {
+    assert.equal(ackPendingNative.hasOwnedRunningWork, true);
+    assert(jobPid !== undefined && processAlive(jobPid), "The owned job cannot be cancelled before the ACK send returns");
+    assert.deepEqual((await events("native-events.jsonl")).filter(event => event.kind === "native-job-settled"), []);
+  }
   if (scenario === "quarantine") {
     await until(async () => {
       const transport = await events("transport-events.jsonl");
@@ -618,6 +676,48 @@ try {
     assert.equal(aborted.pid, before.hostPid);
     assert.deepEqual(aborted.ack, { state: "sent", remote_id: "restart-native-remote:902:restart-ack" }, "The native AbortSignal may fire only after a durable sent ACK receipt");
   }
+  let busyRecovery: Record<string, unknown> | undefined;
+  if (busy) {
+    assert(runningJob?.job && jobPid !== undefined);
+    const native = await events("native-events.jsonl");
+    const settled = native.filter(event => event.kind === "native-job-settled");
+    assert.equal(settled.length, 1, "The predecessor must drain exactly its original native job");
+    const cancelled = settled[0];
+    assert(cancelled?.job?.endTime !== undefined);
+    assert.equal(cancelled.pid, before.hostPid);
+    assert.equal(cancelled.sessionId, before.sessionId);
+    assert.equal(cancelled.job.id, runningJob.job.id);
+    assert.equal(cancelled.job.ownerId, runningJob.job.ownerId);
+    assert.equal(cancelled.job.type, runningJob.job.type);
+    assert.equal(cancelled.job.status, "cancelled", "Normal completion or expiry must not count as restart cancellation");
+    assert.equal(cancelled.duringCleanup, false);
+    assert.deepEqual(cancelled.ack, { state: "sent", remote_id: "restart-native-remote:902:restart-ack" },
+      "Even the independently running job must not be interrupted until the ACK is durable");
+    const oldShutdown = native.find(event => event.kind === "native-shutdown" && event.pid === before.hostPid);
+    assert(oldShutdown && native.indexOf(cancelled) < native.indexOf(oldShutdown),
+      "The native job's run must settle before the old HEAD's normal shutdown");
+    assert.equal(after.hasOwnedRunningWork, false, "The replacement must not own or recreate the predecessor's job");
+    assert.equal(processAlive(jobPid), false, "No predecessor Bash subprocess may survive replacement");
+    assert.equal(existsSync(jobNormalExitPath), false);
+
+    const recalled = native.filter(event => event.kind === "native-memory-recalled");
+    assert.equal(recalled.length, 1, "Only the replacement should search for the retained fact");
+    const remembered = recalled[0];
+    assert(remembered?.profile && remembered.recalled && memorySeed?.profile && memorySeed.memoryId);
+    assert.equal(remembered.pid, after.hostPid);
+    assert.equal(remembered.sessionId, before.sessionId);
+    assert.deepEqual(remembered.profile, memorySeed.profile, "The successor must reopen the same native Mnemopi bank");
+    assert.equal(remembered.recalled.backend, "mnemopi");
+    assert.equal(native.filter(event => event.kind === "native-memory-saved").length, 1, "Only the predecessor may seed the native bank");
+    const memoryId = memorySeed.memoryId;
+    assert.deepEqual(remembered.recalled.items.filter(item => item.id === memoryId)
+      .map(({ id, content, source }) => ({ id, content, source })), [
+      { id: memoryId, content: memoryFact, source: "native-restart-proof" },
+    ], "The replacement must retrieve the exact fact by its pre-restart native memory ID");
+    busyRecovery = { job: { running: runningJob, ownedWhileAckPending: ackPendingNative.hasOwnedRunningWork,
+      cancelled, shellPid: jobPid, shellExited: true },
+      memory: { saved: memorySeed, recalled: remembered } };
+  }
   const nativeEntries = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
   const journal = nativeEntries.filter(entry => entry.type === "custom" && entry.customType === "rpc_prompt_result").map(entry => {
     assert(entry.type === "custom");
@@ -720,6 +820,19 @@ try {
   assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "create").length, 1);
   assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "complete").length, 1);
   assert.equal(calls.filter(call => call.name === "goal" && call.arguments.op === "resume").length, 0, "The provider must not substitute a model tool call for the controller's goal RPC");
+  if (busy) {
+    const bashIds = new Set(calls.filter(call => call.name === "bash" && call.arguments.async === true
+      && call.arguments.name === undefined && call.arguments.timeout === 0).map(call => call.id));
+    const results = entries.flatMap(entry => entry.type === "message" && entry.message.role === "toolResult"
+      && bashIds.has(entry.message.toolCallId) ? [entry.message] : []);
+    assert.equal(bashIds.size, 1, "No background Bash job may be replayed by restart");
+    assert.equal(results.length, 1);
+    const details = results[0]?.details;
+    assert(!results[0]?.isError && details && typeof details === "object" && "async" in details);
+    assert.deepEqual(details.async, { state: "running", jobId: runningJob?.job?.id, type: "bash" });
+    assert(!(await fs.readFile(mainPaths.sessionFile, "utf8")).includes(memoryCanary),
+      "The retained secret must never come from the restored transcript");
+  }
   const modes = entries.filter(entry => entry.type === "mode_change");
   const paused = modes.findIndex(entry => entry.mode === "goal_paused");
   assert(paused >= 0 && modes.slice(paused + 1).some(entry => entry.mode === "goal"), "The native journal must record pause followed by resume");
@@ -782,6 +895,7 @@ try {
   };
   evidence = {
     scenario, requestId: receipt.requestId, gatewayRestartReceipt: receipt, survivingLane: laneReadback,
+    ...(busyRecovery ? { busyRecovery } : {}),
     processes: { oldGatewayPid: beforeGateway.gateway.pid, gatewayPid: afterGateway.gateway.pid,
       oldHeadPid: before.hostPid, headPid: after.hostPid },
     native: { sessionId: before.sessionId, sessionFile: before.sessionFile,

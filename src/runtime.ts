@@ -94,6 +94,7 @@ export interface RuntimeAdapters {
   inspectPresets?: () => Promise<NativePresetInspection>;
   syncPresetRoles?: (canWrite: () => boolean) => Promise<void>;
   persistPreset?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot>;
+  reapHeadJobs?: (identity: Pick<HeadRestart, "sessionId" | "sessionFile">) => Promise<boolean>;
   requestRestart?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord>;
   readPrSnapshot?: typeof readPrSnapshot;
   readOmpUsage: typeof readOmpUsage;
@@ -159,7 +160,7 @@ interface HeadRestart extends GatewayRestartRequest {
   sessionId: string;
   sessionFile: string;
   stopBoundary?: string | null;
-  state: "checking" | "acknowledging" | "handoff" | "accepted" | "refused" | "uncertain" | "failed" | "ready";
+  state: "checking" | "acknowledging" | "checkpoint-blocked" | "handoff" | "accepted" | "refused" | "uncertain" | "failed" | "ready";
   checkpoint?: {
     goalSourceId?: string;
     goalId?: string;
@@ -3082,19 +3083,26 @@ export class Superagent {
 
   private admitRestart(input: InputRecord, command: HeadCommand): boolean {
     if (this.store.getMeta(`head:restart:${input.id}`)) return false;
-    if (command.argument || !this.adapters.requestRestart || this.restartFence()) {
+    const prior = this.restartFence();
+    const live = this.live.get("main");
+    // Only a *new* owner command can supersede a completed checkpoint whose
+    // final idle readback was negative. Never repeat an ambiguous handoff.
+    const blockedCheckpoint = prior?.state === "checkpoint-blocked" && !this.restartActive
+      && prior.ownerPid === process.pid && prior.sessionId === live?.sessionId
+      && prior.stopBoundary === this.store.getMeta("gateway:operator-stop")
+      && !this.store.getMeta(`gateway:restart:${prior.requestId}`) ? prior.checkpoint : undefined;
+    if (command.argument || !this.adapters.requestRestart || prior && !blockedCheckpoint) {
       this.controlReply(input, `Gateway AND HEAD restart refused. ${command.argument ? "Use /restart with no arguments."
         : !this.adapters.requestRestart ? "The managed Gateway restart transport is unavailable." : "An earlier restart is still held; inspect its original checkpoint/lifecycle receipt."} No process was stopped.`, "cancelled");
       return false;
     }
-    const live = this.live.get("main");
     if (!live || !this.current(live)) {
       this.controlReply(input, "Gateway AND HEAD restart held: native HEAD ownership is unavailable. Inspect its native socket/session identity; no process was stopped.", "cancelled");
       return false;
     }
     const restart: HeadRestart = { requestId: crypto.randomUUID(), inputId: input.id,
       ackOutputId: `${input.id}:restart-ack`, ownerPid: process.pid, sessionId: live.sessionId,
-      sessionFile: this.headSessionFile(), state: "checking" };
+      sessionFile: this.headSessionFile(), state: "checking", checkpoint: blockedCheckpoint };
     restart.stopBoundary = this.store.getMeta("gateway:operator-stop");
     // Reserve the entire service synchronously, before native reads, deliveries,
     // lane dispatch or a second owner command can cross an asynchronous boundary.
@@ -3260,13 +3268,18 @@ export class Superagent {
       this.assertRestartCurrent(restart);
       restart = await this.checkpointRestart(restart);
       this.assertRestartCurrent(restart);
-      const idle = await this.restartIdle(restart);
+      // A foreground abort does not reap root-owned background jobs. A
+      // cancelled job row alone is not evidence its process has exited.
+      const reaped = this.adapters.reapHeadJobs ? await this.adapters.reapHeadJobs(restart) : true;
+      this.assertRestartCurrent(restart);
+      const idle = reaped && await this.restartIdle(restart);
       this.assertRestartCurrent(restart);
       if (!idle) {
-        this.saveRestart({ ...restart, state: "failed" });
         const head = this.live.get("main");
         const actual = head ? this.nativeStatus(await this.state(head)) : "original HEAD is unavailable";
-        this.restartResult(restart, `Restart checkpoint is held: ${actual}. Inspect the original native HEAD's owned jobs/services or in-flight controller mutation. Queued intake and uncertain effects remain preserved; no shutdown or prompt replay was attempted.`);
+        this.assertRestartCurrent(restart);
+        this.saveRestart({ ...restart, state: "checkpoint-blocked" });
+        this.restartResult(restart, `Restart checkpoint is held: ${actual}. No shutdown was requested. After the remaining native work or controller mutation settles, send a new /restart. Queued intake and uncertain effects remain preserved.`);
         return;
       }
       restart = { ...restart, state: "handoff" };
@@ -3278,7 +3291,7 @@ export class Superagent {
       // terminal refusal or uncertainty with a late acceptance response.
       const current = this.restartFence();
       if (current?.requestId !== restart.requestId || current.state === "uncertain") return;
-      if (receipt.state === "refused") this.refuseRestart(restart, "Gateway refused the idle/ownership check; no restart was performed.");
+      if (receipt.state === "refused") this.refuseRestart(restart, receipt.reason ?? "Gateway declined the restart.");
       else if (["accepted", "head-stopped", "started"].includes(receipt.state)) this.saveRestart({ ...restart, state: "accepted" });
       else {
         this.saveRestart({ ...restart, state: "uncertain" });
@@ -3321,7 +3334,7 @@ export class Superagent {
       const ownsRestored = !this.pidAlive(restart.ownerPid) && actual.hostPid === owner?.pid
         && owner?.sessionId === restart.sessionId && owner.sessionFile === restart.sessionFile;
       if ((!ownsOriginal && !ownsRestored) || actual.sessionId !== restart.sessionId || actual.sessionFile !== restart.sessionFile) return;
-      this.refuseRestart(restart, "Gateway refused the idle/ownership check; no restart was performed.");
+      this.refuseRestart(restart, receipt.reason ?? "Gateway declined the restart.");
     } else {
       this.saveRestart({ ...restart, state: "uncertain" });
       this.restartResult(restart, "Gateway AND HEAD restart outcome is uncertain. The service remains held, no completion is claimed and no shutdown/restart will be blindly retried.", true);

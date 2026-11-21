@@ -11,6 +11,7 @@ use crate::store::Store;
 
 use super::{
     LifecycleConfig,
+    config::RUNNER_CONFIG_ENV,
     fs::{EXIT_TIMEOUT, Endpoint, WAIT_SLICE, alive, log, metadata, socket_stat},
     process::{ChildKind, detached},
     restart_record::{self as restart, ACTIVE, HEAD, Plan, Record, SOCKET, Stage, plan_key},
@@ -67,6 +68,7 @@ pub(super) async fn wait_launch_receipt(config: &LifecycleConfig, id: &str) -> R
     let pid = std::process::id();
     loop {
         let (record, plan) = read_pair(&db, id)?;
+        restart::validate_config(config, &plan)?;
         ensure!(
             record.state == Stage::HeadStopped
                 && get_meta(&db, ACTIVE)?.as_deref() == Some(id)
@@ -122,15 +124,17 @@ pub fn record_runner_failure(dir: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn mark_ready(db: &mut Connection, id: &str) -> Result<()> {
+fn mark_ready(db: &mut Connection, config: &LifecycleConfig, id: &str, expected: &Plan) -> Result<()> {
     let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (record, mut plan) = read_pair(&transaction, id)?;
     ensure!(
         record.state.pending()
             && get_meta(&transaction, ACTIVE)?.as_deref() == Some(id)
-            && plan.runner_pid == Some(std::process::id()),
+            && plan.runner_pid == Some(std::process::id())
+            && expected.matches_preparation(&plan),
         "Successor preparation lost request ownership"
     );
+    restart::validate_config(config, &plan)?;
     plan.runner_ready = Some(true);
     transaction.execute(
         "UPDATE metadata SET value=?1 WHERE key=?2",
@@ -153,6 +157,7 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
             config, get_meta(&db, crate::store::HEAD_SESSION_FILE)?,
         )?;
         restart::validate_identity(config, &record, &plan, &session_file)?;
+        restart::validate_config(config, &plan)?;
         ensure!(
             get_meta(&db, ACTIVE)?.as_deref() == Some(id),
             "Restart is not the active owned intent"
@@ -164,12 +169,13 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
         );
         if plan.runner_pid == Some(std::process::id()) && plan.runner_ready != Some(true) {
             restart::validate_plan(config, &record, &plan, &session_file).await?;
+            config.require_mnemopi().await?;
             let socket = socket_stat(&config.gateway_socket, false)?;
             ensure!(
                 plan.socket.matches(&socket),
                 "Predecessor Gateway endpoint changed before successor preparation"
             );
-            mark_ready(&mut db, id)?;
+            mark_ready(&mut db, config, id, &plan)?;
         }
         if record.state == Stage::HeadStopped {
             ensure!(
@@ -240,6 +246,7 @@ async fn spawn_successor(
         status_or_recorded_stale(config).await?.is_none(),
         "Restart cannot adopt an existing Gateway endpoint"
     );
+    restart::validate_config(config, &plan)?;
     let child = spawn_gateway(config, Some(&record.request.request_id))?;
     let pid = child.id().context("Restart successor PID is unavailable")?;
     plan.launch_pid = Some(pid);
@@ -274,7 +281,11 @@ fn spawn_gateway(config: &LifecycleConfig, request: Option<&str>) -> Result<Chil
     Ok(Command::from(command).spawn()?)
 }
 
-pub(super) fn spawn_runner(config: &LifecycleConfig, request: &str) -> Result<Child> {
+pub(super) fn spawn_runner(
+    config: &LifecycleConfig,
+    request: &str,
+    config_hash: &str,
+) -> Result<Child> {
     let mut command = detached(ChildKind::RestartRunner, &log(&config.gateway_log)?)?;
     command
         .arg("--config")
@@ -283,6 +294,7 @@ pub(super) fn spawn_runner(config: &LifecycleConfig, request: &str) -> Result<Ch
         .arg(request)
         .arg("--state-dir")
         .arg(&config.state_dir)
+        .env(RUNNER_CONFIG_ENV, config_hash)
         .current_dir(&config.cwd);
     Ok(Command::from(command).spawn()?)
 }

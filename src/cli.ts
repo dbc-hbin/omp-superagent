@@ -80,8 +80,8 @@ Owner controls in chat (not shell commands):
   /stop [head|LANE_ID]          Stop HEAD work or pause a lane, NOT the service. With no argument, pause
                                 the lane bound to this chat, or stop HEAD work if there is no bound lane.
   /resume                       Resume the lane bound to this chat, not HEAD.
-  /restart                      Safely replace Gateway and HEAD while preserving the session; no forced kill
-                                or automatic prompt replay. Independent lane Hosts stay running.
+  /restart                      Interrupt HEAD work and restart Gateway and HEAD with the same session and
+                                memory profile. Independent lanes stay running; interrupted prompts are not replayed.
   /resolve [INPUT_ID]           Close one uncertain HEAD input without retrying it. Use /status to find its ID;
                                 the ID is required if several are held. This does not establish task success.
   /resolve --lane INPUT_ID      Close one exact uncertain input in this chat's bound lane, without replay.
