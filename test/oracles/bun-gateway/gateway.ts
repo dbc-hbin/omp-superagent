@@ -6,6 +6,7 @@ import { constants, existsSync } from "node:fs";
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RpcCommandError } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { credentialEnvNames, hostPaths, loadConfig, privateDirectory, requireMessengerCredentials, type Config } from "../../../src/config";
 import type { GatewayRestartRecord, GatewayRestartRequest, LanePresetSnapshot, Messenger } from "../../../src/contracts";
@@ -37,6 +38,9 @@ export interface GatewayOptions {
 }
 interface HeadIdentity { pid: number; ownerPid: number; sessionId: string; sessionFile: string; dev: number; ino: number }
 interface SocketIdentity { pid: number; ownerPid?: number; dev: number; ino: number }
+type EndpointCleanup = { readonly kind: "gateway" } | {
+  readonly kind: "host"; readonly disconnectedProbe?: RpcCommandError;
+};
 
 const HEAD_EXIT_TIMEOUT_MS = 15_000;
 
@@ -47,23 +51,32 @@ function alive(pid: number): boolean {
     throw error;
   }
 }
-async function removeDeadSocket(socketPath: string, identity: SocketIdentity | null, kind: "gateway" | "host"): Promise<void> {
+async function removeDeadSocket(socketPath: string, identity: SocketIdentity | null, cleanup: EndpointCleanup): Promise<void> {
   const deadline = Date.now() + HEAD_EXIT_TIMEOUT_MS;
+  const disconnectedProbe = cleanup.kind === "host" ? cleanup.disconnectedProbe : undefined;
   while (true) {
     let stat;
     try { stat = await lstat(socketPath); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (kind === "host" && identity && alive(identity.pid) ||
-        stat && (!identity || alive(identity.pid) || !stat.isSocket() || stat.uid !== process.getuid?.() ||
-          stat.dev !== identity.dev || stat.ino !== identity.ino))
-      throw new Error("Existing endpoint ownership is unresolved; no socket was removed or second host started");
-    if (kind === "host" && identity) {
+    if (stat && (!identity || !stat.isSocket() || stat.uid !== process.getuid?.() ||
+        stat.dev !== identity.dev || stat.ino !== identity.ino))
+      throw new Error("Existing endpoint ownership is unresolved; no socket was removed or second host started", { cause: disconnectedProbe });
+    if (identity && (cleanup.kind === "host" || stat) && alive(identity.pid)) {
+      if (!disconnectedProbe)
+        throw new Error("Existing endpoint ownership is unresolved; no socket was removed or second host started");
+      if (Date.now() >= deadline) throw disconnectedProbe;
+      // The owner's read-only RPC can see native pipe EOF before it reaps the PID.
+      // Wait for actual exit; a disconnect alone never authorizes replacement.
+      await Bun.sleep(25);
+      continue;
+    }
+    if (cleanup.kind === "host" && identity) {
       const ownerPid = identity.ownerPid;
       if (typeof ownerPid !== "number" || !Number.isSafeInteger(ownerPid) || ownerPid < 1)
         throw new Error("Existing adapter ownership is unresolved; no socket was removed or second host started");
       if (alive(ownerPid)) {
         if (Date.now() >= deadline)
-          throw new Error("Owned adapter exit is pending; no socket was removed or second host started");
+          throw new Error("Owned adapter exit is pending; no socket was removed or second host started", { cause: disconnectedProbe });
         // Native death precedes the pipe owner's durable receipt and socket cleanup.
         await Bun.sleep(25);
         continue;
@@ -144,7 +157,7 @@ export class GatewayService {
       }
       const path = gatewayPaths(this.config).socketPath;
       const previous = JSON.parse(this.store.getMeta("gateway:socket") ?? "null") as SocketIdentity | null;
-      await removeDeadSocket(path, previous, "gateway");
+      await removeDeadSocket(path, previous, { kind: "gateway" });
       await this.server.listen();
       await this.messenger.start({
         ready: this.server.initialReady.promise,
@@ -230,6 +243,7 @@ export class GatewayService {
   }
   private async reconcileHead(): Promise<void> {
     const paths = hostPaths(this.config, "main");
+    let disconnectedProbe: RpcCommandError | undefined;
     if (this.head && alive(this.head.pid)) {
       // A live PID alone is not adoption authority. Probe the saved session and
       // inode each time; a PID reuse or replaced socket is never a second writer.
@@ -240,12 +254,15 @@ export class GatewayService {
         this.error = null;
         return;
       } catch (error) {
-        // Losing a probe while this exact owned process dies is normal recovery,
-        // not a fatal adapter/ownership error. A still-live PID remains blocked.
-        if (alive(known.pid)) throw error;
+        if (error instanceof RpcCommandError && error.command === "get_state" &&
+            error.message === "Host disconnected; request outcome may be unknown") {
+          disconnectedProbe = error;
+        } else if (alive(known.pid)) {
+          throw error;
+        }
       }
     }
-    await removeDeadSocket(paths.socketPath, this.head, "host");
+    await removeDeadSocket(paths.socketPath, this.head, { kind: "host", disconnectedProbe });
     this.head = null;
     this.store.setMeta("gateway:head", "null");
     const env = Object.fromEntries(Object.entries(this.options.headEnvironment ?? process.env)
