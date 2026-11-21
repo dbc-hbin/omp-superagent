@@ -211,21 +211,11 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
     cwd: string; managedUlwPath: string; extensionPaths: string[]; configPath: string;
     commandArgs: string[]; launchArgs: string[];
   };
-  // Match cli.ts: choose the profile before importing pi-utils/env or any
-  // discovery/settings module that can eagerly read the agent directory.
+  const { parseNativeLaunch } = await import("./native-launch-profile");
+  const parsed = await parseNativeLaunch(input.launchArgs);
   const { extractProfileFlags } = await import("@oh-my-pi/pi-coding-agent/cli/profile-bootstrap");
-  const { setProfile, resolveProfileEnv, getProjectDir } = await import("@oh-my-pi/pi-utils/dirs");
-  const bootstrap = extractProfileFlags(input.launchArgs);
-  setProfile(bootstrap.profile ?? resolveProfileEnv(process.env.OMP_PROFILE, process.env.PI_PROFILE));
-  if (bootstrap.aliasName !== undefined) throw new Error("Managed ULW discovery requires a launch, not --alias installation");
-  const { isNativeShell } = await import("@oh-my-pi/pi-coding-agent/cli/native-shell");
-  if (isNativeShell(bootstrap.argv[0])) throw new Error("Managed ULW discovery requires native OMP launch argv, not a shell command");
-  const { resolveCliArgv } = await import("@oh-my-pi/pi-coding-agent/cli-commands");
-  const resolved = resolveCliArgv(bootstrap.argv);
-  if ("error" in resolved) throw new Error(resolved.error);
-  if (resolved.argv[0] !== "launch") throw new Error("Managed ULW discovery requires native OMP launch argv");
+  const { getProjectDir } = await import("@oh-my-pi/pi-utils/dirs");
   const { parseArgs } = await import("@oh-my-pi/pi-coding-agent/cli/args");
-  const parsed = parseArgs(resolved.argv.slice(1));
   const command = parseArgs(extractProfileFlags(input.commandArgs).argv);
   if (parsed.trustedExtensions?.length) {
     throw new Error("Stock OMP --trusted-extension cannot preserve managed ULW package resources");
@@ -246,9 +236,11 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
   const { homedir } = await import("node:os");
   if (parsed.pluginDirs?.length) await injectPluginDirRoots(homedir(), parsed.pluginDirs, cwd);
   else await preloadPluginRoots(homedir(), cwd);
-  const settings = await Settings.loadReadOnly({
-    cwd, agentDir: getAgentDir(), configFiles: parsed.config,
-  });
+  const { effectiveMnemopi, memoryBlockReason } = await import("./managed-memory");
+  const settings = await Settings.loadReadOnly({ cwd, agentDir: getAgentDir(), configFiles: parsed.config })
+    .catch(() => { throw new Error(memoryBlockReason({ status: "unknown" })); });
+  const memory = await effectiveMnemopi(settings).catch(() => ({ status: "unknown" } as const));
+  if (memory.status !== "enabled") throw new Error(memoryBlockReason(memory));
   const restore = initializeWithSettings(settings);
   try {
     const managed = validateManagedUlwPackage(input.managedUlwPath);

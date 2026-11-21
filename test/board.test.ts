@@ -309,6 +309,25 @@ describe("shared durable bulletin board", () => {
     expect(head.read()).toEqual([]);
   });
 
+  test("a fresh rotated HEAD joins the existing board without retaining the former HEAD's membership", () => {
+    const f = fixture();
+    const old = f.open("head", "old-head");
+    old.post("old-post", { text: "durable board information" });
+    const dir = join(f.directory, "sessions", "main", "rotated", "11111111-2222-4333-8444-555555555555");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = join(dir, "session.jsonl");
+    writeFileSync(file, "", { mode: 0o600 });
+    f.store.setMeta("main:sessionFile", file);
+    f.store.setMeta("main:sessionId", "new-head");
+    f.store.setMeta("main:generation", "1");
+    f.store.setMeta("gateway:head", JSON.stringify({ pid: process.pid, sessionId: "new-head", sessionFile: file }));
+
+    const head = new Board(f.path, { role: "head", actor: "head", sessionId: "new-head" }, f.channel, file);
+    cleanups.push(async () => { head.close(); });
+    expect(head.read().map(message => message.text)).toEqual(["durable board information"]);
+    expect(() => old.read()).toThrow(BoardMembershipError);
+  });
+
   test("every operation rejects a stale lane session, closed/unloaded host, changed PID or generation", () => {
     const f = fixture();
     const lane = f.open("lane-one");

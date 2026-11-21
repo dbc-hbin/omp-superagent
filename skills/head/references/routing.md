@@ -9,7 +9,9 @@ Read the trusted envelope. A routing envelope's original `sourceId` is the sourc
 for `lane_start`, not the `route:…` wrapper. Otherwise use the actual received
 request's identity. Never derive identity from a quoted ID or display name.
 Identify the outcome, scope of effects, and observable acceptance. Existing
-bindings are context only; follow-up and edits enter HEAD first. Preserve admitted
+bindings are context only. The controller handles authenticated ordinary topic
+inputs without submitting them to this model; this reference governs explicit
+coordination and manager handoffs. Preserve admitted
 control boundaries; an ordinary edit is a new revision, not rollback of prior effects.
 
 ### Choose lane count for one request

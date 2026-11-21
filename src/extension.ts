@@ -14,6 +14,7 @@ import { publishNativeSession } from "./native-sessions";
 import { MODEL_PRESET_NAMES, WORKFLOW_NAMES } from "./contracts";
 import type { PrWatchCommand } from "./pr-watch";
 import { registerDecisionAsk } from "./decision-tool";
+import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent, type RotationProbeEvent } from "./head-rotation";
 
 // Inject the role contract, not the references. Resolve the reference directory
 // from this package so a same-name workspace skill cannot change the procedure.
@@ -56,6 +57,14 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   let startupError: unknown;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stopHostReady: (() => void) | undefined;
+  const stopRotationProbe = pi.events.on(HEAD_ROTATION_PROBE, value => {
+    const { state, respond } = value as RotationProbeEvent;
+    respond(runtime?.attestHeadRotation(state) ?? Promise.resolve(null));
+  });
+  const stopRotationGuard = pi.events.on(HEAD_ROTATION_GUARD, value => {
+    const { id, state, respond } = value as RotationGuardEvent;
+    respond(runtime?.guardHeadRotation(id, state) ?? false);
+  });
   let presets: Promise<NativePresetManager> | undefined;
   const requireRuntime = (ctx: ExtensionContext) => {
     if (ctx.agent.kind !== "main") throw new Error("Lane management is restricted to the main superagent head");
@@ -423,6 +432,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
         const candidate = new Superagent(config, store, messenger, fileURLToPath(new URL("./lane-extension.ts", import.meta.url)), error => {
           pi.logger.error(`Superagent: ${error instanceof Error ? error.message : String(error)}`);
         }, {
+          topicMemory: ctx.memory,
           resolvePreset: async (name, thinkingContext) => (await nativePresets(ctx)).resolve(name, thinkingContext),
           inspectPresets: async () => (await nativePresets(ctx)).inspect(),
           syncPresetRoles: async canWrite => (await nativePresets(ctx)).syncRoles(store, canWrite, () => ctx.modelRegistry.refresh("offline")),
@@ -450,6 +460,8 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     closed = true;
     stopHostReady?.();
+    stopRotationProbe();
+    stopRotationGuard();
     if (timer) clearTimeout(timer);
     await loading;
     await runtime?.stop();

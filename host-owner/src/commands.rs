@@ -45,7 +45,7 @@ impl Command {
     }
 
     fn priority_query(&self) -> bool {
-        matches!(self.name.as_str(), "get_state" | "get_session_stats")
+        matches!(self.name.as_str(), "get_state" | "get_session_stats" | "get_head_rotation")
     }
 
     fn goal_stop(&self) -> bool {
@@ -423,7 +423,7 @@ async fn execute(
             response["data"] = owner.snapshot().await?;
             return Ok(response);
         }
-        "get_session_stats" => {
+        "get_session_stats" | "get_head_rotation" => {
             let mut response = owner
                 .control()?
                 .request(std::mem::take(&mut command.frame))

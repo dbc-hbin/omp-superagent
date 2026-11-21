@@ -17,6 +17,7 @@ use super::{
     config::same_path,
     fs::{self, EXIT_TIMEOUT, Endpoint, WAIT_SLICE, alive, socket_stat},
     rpc_wire::frame,
+    rotation::Attestation,
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -162,9 +163,28 @@ impl Probe {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        self.shutdown_with(Value::Null).await
+    }
+
+    pub async fn shutdown_rotation(&mut self, id: &str) -> Result<()> {
+        self.shutdown_with(json!({ "headRotation": id })).await
+    }
+
+    pub async fn rotation_attestation(&mut self) -> Result<Option<Attestation>> {
         let response = timeout(
             RPC_TIMEOUT,
-            request(&mut self.stream, "shutdown_host", Value::Null),
+            request(&mut self.stream, "get_head_rotation", Value::Null),
+        ).await.context("HEAD rotation attestation timed out")??;
+        if response["success"] != true {
+            return Ok(None);
+        }
+        Ok(Option::<Attestation>::deserialize(&response["data"])?)
+    }
+
+    async fn shutdown_with(&mut self, body: Value) -> Result<()> {
+        let response = timeout(
+            RPC_TIMEOUT,
+            request(&mut self.stream, "shutdown_host", body),
         )
         .await
         .context("Owned shutdown request outcome is unresolved")??;

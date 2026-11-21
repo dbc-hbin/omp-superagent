@@ -48,7 +48,7 @@ export async function runNativeUlwProof(options: {
     "jevify inspect native bulk classification activation in the main conversation.",
   ];
   const inputs = texts.map((text, index) => ({ id: String(301 + index), messageId: String(301 + index),
-    route: index === 2 || index === 6 || index === 7 ? thread : route, text, receivedAt: Date.now() + index, attachments: [],
+    route: index === 2 || index === 6 || index === 7 ? thread : route, text: `/head ${text}`, receivedAt: Date.now() + index, attachments: [],
   } satisfies Inbound));
   const input = (id: string) => {
     const row = db.query("SELECT data,target,state FROM inputs WHERE id=?").get(id) as { data: string; target: string; state: InputRecord["state"] } | null;
@@ -101,11 +101,11 @@ export async function runNativeUlwProof(options: {
   const laneRequests = userRequests(laneEntries);
   assert.deepEqual(headRequests.map(request => request.id).sort(), [...inputs.map(item => item.id), `report:${firstHandoff}`, `report:${secondHandoff}`, `report:${bulkHandoff}`].sort());
   assert.deepEqual(laneRequests.map(request => request.id), [firstHandoff, secondHandoff, bulkHandoff]);
-  for (const item of inputs) {
+  for (const [index, item] of inputs.entries()) {
     const original = headRequests.find(request => request.id === item.id)!;
     // Native specialised invocation may insert its default keyword immediately
     // after the alias; the complete original task arguments must remain once.
-    const originalTask = item.text.replace(/^ulw-(?:plan|execute)\s+/, "");
+    const originalTask = texts[index]!.replace(/^ulw-(?:plan|execute)\s+/, "");
     assert.equal(original.text.split(originalTask).length - 1, 1, "Original user task must occur exactly once in its native envelope");
     assert.equal(input(item.id)?.target, "main");
     assert.equal(input(item.id)?.record.text, item.text, "Durable original text remains immutable across native keyword expansion and replay");
@@ -150,9 +150,9 @@ export async function runNativeUlwProof(options: {
   assert.equal(plain.policyCount, 1);
   assert.deepEqual(plain.notices, []);
   assert.deepEqual(plain.directives, []);
-  assert.equal(laneRequests[0]!.text.split(inputs[2]!.text).length - 1, 1, "Explicit initial lane workflow retains its original task once");
-  assert.equal(laneRequests[1]!.text.split(inputs[6]!.text).length - 1, 1, "Explicit lane follow-up retains its original task once");
-  assert.equal(laneRequests[2]!.text.split(inputs[7]!.text).length - 1, 1, "Native bulk selection retains its original task once");
+  assert.equal(laneRequests[0]!.text.split(texts[2]!).length - 1, 1, "Explicit initial lane workflow retains its original task once");
+  assert.equal(laneRequests[1]!.text.split(texts[6]!).length - 1, 1, "Explicit lane follow-up retains its original task once");
+  assert.equal(laneRequests[2]!.text.split(texts[7]!).length - 1, 1, "Native bulk selection retains its original task once");
   assert(laneRequests[2]!.text.startsWith("jevify\n\n"));
   for (const [records, selected] of [[headEvidence, { "305": "ultrathink-notice", "306": "orchestrate-notice", "309": "jevify-notice" }],
     [laneEvidence, { [firstHandoff]: "ultrathink-notice", [secondHandoff]: "orchestrate-notice", [bulkHandoff]: "jevify-notice" }]] as const) {

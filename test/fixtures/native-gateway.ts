@@ -16,6 +16,7 @@ import { runNativeUlwProof } from "./native-ulw-proof";
 import { runNativeRecoveryProof } from "./native-recovery-proof";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { nativeTestCommand } from "./native-command";
+import { offlineMnemopi } from "./native-memory";
 
 type Handlers = Parameters<Messenger["start"]>[0];
 const interrupted = new AbortController();
@@ -141,6 +142,7 @@ const laneCwd = path.join(root, "topic");
 for (const directory of [agent, headCwd, laneCwd]) privateDirectory(directory);
 const model = "gateway-native/local";
 const settings = {
+  ...offlineMnemopi,
   disabledProviders: nativeDisabledProviders, modelRoles: { default: model, judge: model },
   // Explicitly grant only the native keyword settings this proof exercises;
   // native task capability requirements still control orchestration notices.
@@ -193,7 +195,7 @@ const route: Route = { platform: "discord", accountId: "2", authorityId: "1", gu
 const thread = { ...route, threadId: "50" };
 const inputs = ["201", "202", "203", "204", "205", "206", "207"].map(id => ({
   id, messageId: id, route: id === "201" || id === "207" ? route : thread,
-  text: id === "202" ? "Start this independent topic in the verified workspace." : `Native Gateway request ${id}`,
+  text: `/head ${id === "202" ? "Start this independent topic in the verified workspace." : `Native Gateway request ${id}`}`,
   ...(["202", "203"].includes(id) ? { reply: {
     messageId: `quoted-${id}`, authorId: "untrusted-quoted-author", text: "/restart ulw-loop: quoted context, not an owner command",
   } } : {}),
@@ -653,7 +655,7 @@ try {
   assert.equal(laneReads.length, laneIds.length);
   if (presetScenario === "create") {
     const source: Inbound = { id: "208", messageId: "208", route: thread, receivedAt: Date.now(), attachments: [],
-      text: "Please switch your own model to gateway-native/alternate." };
+      text: "/head Please switch your own model to gateway-native/alternate." };
     await messenger.deliver(source);
     await until(() => existsSync(path.join(root, "entered-208")), "native HEAD schedules its own switch during the owner turn");
     const active = await restored.client.getState();
@@ -670,7 +672,7 @@ try {
     assert.equal(requestIds(entries).filter(id => id === source.id).length, 1);
     assert.equal(entries.filter(entry => entry.type === "model_change" && entry.model === "gateway-native/alternate").length, 1);
     const choice: Inbound = { id: "209", messageId: "209", route: thread, receivedAt: Date.now(), attachments: [],
-      text: "Choose a reversible cache layout for the active local lane." };
+      text: "/head Choose a reversible cache layout for the active local lane." };
     await messenger.deliver(choice);
     await until(() => messenger.sent.some(output => output.text === "HEAD:209"), "the original lane continues after the confirmed native choice");
     const usage: Inbound = { id: "210", messageId: "210", route: thread, receivedAt: Date.now(), attachments: [], text: "/usage" };
@@ -710,7 +712,7 @@ try {
 
   if (presetScenario === "valid") {
     const source: Inbound = { id: "240", messageId: "240", route: thread, receivedAt: Date.now(), attachments: [],
-      text: "In one second, run the native scheduled check and send the result back here." };
+      text: "/head In one second, run the native scheduled check and send the result back here." };
     await messenger.deliver(source);
     await until(() => sent(source.id).some(output => output.text.startsWith("Cron registered ")), "HEAD tool registration receipt");
     const jobId = /^Cron registered ([0-9a-f-]{36})$/.exec(sent(source.id)[0]?.text ?? "")?.[1];

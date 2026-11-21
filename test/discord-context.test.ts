@@ -108,7 +108,7 @@ function fixture() {
 test("HEAD and explicit lane handoffs receive original Discord snapshots only as inert runtime context", async () => {
   const { runtime, store, main, hosts, directory, messenger, errors } = fixture();
   await runtime.start();
-  const original = source("100", { discordContext: context });
+  const original = source("100", { text: "/head Inspect the requested change.", discordContext: context });
   await runtime.receive(original);
   await runtime.kick();
   const headMessage = String(main.prompts[0]?.message);

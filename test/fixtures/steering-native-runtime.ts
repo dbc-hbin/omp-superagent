@@ -13,6 +13,7 @@ import { nativeDisabledProviders } from "./native-extension";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { steeringModel, steeringRecord } from "./steering-native-extension";
 import { nativeTestCommand } from "./native-command";
+import { offlineMnemopi } from "./native-memory";
 
 type Handlers = Parameters<Messenger["start"]>[0];
 type Trace = { sequence: number; socketPath: string; frame: HostFrame; inputStates?: Record<string, string> };
@@ -103,7 +104,7 @@ export async function nativeSteeringRuntime(): Promise<void> {
   const headCwd = path.join(root, "head");
   const workspaces = [path.join(root, "one"), path.join(root, "two")];
   for (const directory of [home, agent, headCwd, ...workspaces, path.join(root, "run"), path.join(root, "logs"), path.join(root, "sessions/main")]) privateDirectory(directory);
-  await fs.writeFile(path.join(agent, "config.yml"), JSON.stringify({ disabledProviders: nativeDisabledProviders }), { mode: 0o600 });
+  await fs.writeFile(path.join(agent, "config.yml"), JSON.stringify({ ...offlineMnemopi, disabledProviders: nativeDisabledProviders }), { mode: 0o600 });
   await fs.writeFile(path.join(agent, "models.yml"), "providers: {}\n", { mode: 0o600 });
   const settingsBefore = await Promise.all(["config.yml", "models.yml"].map(async name => ({ name, bytes: await fs.readFile(path.join(agent, name)) })));
   const barrierPath = path.join(root, "barrier.sock");
@@ -212,6 +213,7 @@ export async function nativeSteeringRuntime(): Promise<void> {
   const entries = async (sessionFile = mainPaths.sessionFile) => parseSessionEntries(await fs.readFile(sessionFile, "utf8"));
   const healthy = () => { if (errors.length) throw new AggregateError(errors, "Native steering runtime reported an error"); };
   const wait = (predicate: () => boolean | Promise<boolean>, label: string) => until(async () => { healthy(); return predicate(); }, label);
+  const headInput = (id: string, destination: Route, task: string) => inbound(id, destination, `/head ${task}`);
   const done = (...ids: string[]) => ids.every(id => store.input(id)?.state === "done");
   const results = (id: string) => trace.filter(event => event.frame.type === "prompt_result" && event.frame.id === store.input(id)?.requestId);
   const checkpoint = async (connection: HostConnection, count: number) => {
@@ -249,9 +251,9 @@ export async function nativeSteeringRuntime(): Promise<void> {
       isSettled: true, settingsScope: "session", model: steeringModel });
     await runtime.start();
 
-    const first = inbound("101", route, "First head request [native-barrier:head-live]");
-    const follow = inbound("102", route, "Ordinary same-route followup [native-follow]");
-    const cross = inbound("103", otherRoute, "Independent cross-topic request [native-cross]");
+    const first = headInput("101", route, "First head request [native-barrier:head-live]");
+    const follow = headInput("102", route, "Ordinary same-route followup [native-follow]");
+    const cross = headInput("103", otherRoute, "Independent cross-topic request [native-cross]");
     await messenger.deliver(first);
     const firstGate = await gate("head-live");
     expect(firstGate).toMatchObject({ pid: started.pid, sessionId: mainIdentity.sessionId, run: 1 });
@@ -307,8 +309,8 @@ export async function nativeSteeringRuntime(): Promise<void> {
       { requestId: first.id, sourceId: first.id }, { requestId: follow.id, sourceId: follow.id }, { requestId: cross.id, sourceId: cross.id },
     ]);
 
-    const sourceOne = inbound("201", route, "[native-delegate] Topic one [native-barrier:lane-one]");
-    const sourceTwo = inbound("202", route, "[native-delegate] Topic two [native-barrier:lane-two]");
+    const sourceOne = headInput("201", route, "[native-delegate] Topic one [native-barrier:lane-one]");
+    const sourceTwo = headInput("202", route, "[native-delegate] Topic two [native-barrier:lane-two]");
     await messenger.deliver(sourceOne);
     await wait(() => done(sourceOne.id), "first explicit lane source reaches head");
     const selection = (sourceId: string, index: number) => ({ sourceId, title: `Native topic ${index + 1}`, kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: workspaces[index]!,
@@ -336,7 +338,7 @@ export async function nativeSteeringRuntime(): Promise<void> {
     const laneConnectionTwo = await HostConnection.connect(laneStateTwo.socketPath);
     connections.add(laneConnectionOne);
     connections.add(laneConnectionTwo);
-    const laneFollow = inbound("203", laneStateOne.route, "[native-delegate] Explicitly send an update to running topic one");
+    const laneFollow = headInput("203", laneStateOne.route, "[native-delegate] Explicitly send an update to running topic one");
     await messenger.deliver(laneFollow);
     await wait(() => done(laneFollow.id) && messenger.sent.some(output => output.sourceId === laneFollow.id),
       "bound-route ordinary message is acknowledged by head, not automatically dispatched");
@@ -408,8 +410,8 @@ export async function nativeSteeringRuntime(): Promise<void> {
     expect(store.input(follow.id)?.state).toBe("done");
     expect(store.input(laneJoined)?.state).toBe("done");
 
-    const stopping = inbound("301", route, "Cancelable owner [native-barrier:head-stop]");
-    const withdrawn = inbound("302", route, "This queued steer must never become a new turn [native-withdrawn]");
+    const stopping = headInput("301", route, "Cancelable owner [native-barrier:head-stop]");
+    const withdrawn = headInput("302", route, "This queued steer must never become a new turn [native-withdrawn]");
     const stop = inbound("303", route, "/stop");
     await messenger.deliver(stopping);
     await gate("head-stop");
@@ -442,8 +444,8 @@ export async function nativeSteeringRuntime(): Promise<void> {
     expect((await main.client.getState()).queuedMessageCount).toBe(0);
     expect(trace.filter(event => event.socketPath === mainPaths.socketPath && event.frame.type === "agent_start")).toHaveLength(beforeStopRunCount);
 
-    const interruptedOwner = inbound("401", route, "Crash-interrupted owner [native-barrier:head-crash]");
-    const interruptedSteer = inbound("402", route, "Admitted steer must not replay after native process death [native-crash-follow]");
+    const interruptedOwner = headInput("401", route, "Crash-interrupted owner [native-barrier:head-crash]");
+    const interruptedSteer = headInput("402", route, "Admitted steer must not replay after native process death [native-crash-follow]");
     await messenger.deliver(interruptedOwner);
     await gate("head-crash");
     await messenger.deliver(interruptedSteer);

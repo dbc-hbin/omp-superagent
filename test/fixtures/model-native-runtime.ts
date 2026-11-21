@@ -18,6 +18,7 @@ import { modelAbortMarker, modelCompactAbortInstructions, modelCompactInstructio
   modelFixtureModels, modelFixtureProvider, modelJudgeMarker, modelRolesMarker } from "./model-selection-extension";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { nativeTestCommand } from "./native-command";
+import { offlineMnemopi } from "./native-memory";
 
 const selectionProviderFixture = path.resolve(import.meta.dir, "model-selection-extension.ts");
 const networkGuardFixture = path.resolve(import.meta.dir, "native-extension.ts");
@@ -161,6 +162,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
   // Production lane launches add a task-budget overlay, preserving this private
   // base policy. Never probe bundled providers or local model servers in smoke QA.
   const agentConfig = {
+    ...offlineMnemopi,
     disabledProviders: nativeDisabledProviders,
     ...(modelSelection ? {
       modelRoles: { default: `${mainModel.provider}/${mainModel.id}`, judge: `${modelFixtureProvider}/${modelFixtureModels.judge.id}` },
@@ -259,14 +261,17 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
   const report = (id: string) => `report:${id}`;
   const route: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: "3", channelId: "4", threadId: null };
   const inbound = (id: string, destination: Route, text: string): Inbound => ({ id, messageId: id, route: destination, text, receivedAt: Date.now(), attachments: [] });
-  const ordinary = inbound("101", route, "Answer this ordinary head request using the local fixture.");
+  const headInput = (id: string, destination: Route, task: string) => inbound(id, destination, `/head ${task}`);
+  const ordinary = headInput("101", route, "Answer this ordinary head request using the local fixture.");
   const threadRoute = { ...route, threadId: "50" };
   messenger.thread = { route: threadRoute, title: "Independent topic", archived: false,
     requiresTag: true, appliedTags: ["101"], availableTags: [{ id: "101", name: "Work", moderated: false }] };
-  const topic = inbound("102", threadRoute, "Handle this independent topic in its own workspace.");
-  const followup = inbound("103", threadRoute, "Continue this independent topic in the same native session.");
-  const modelChangeSource = inbound("104", route, "Explicitly change the idle independent lane to the native low preset.");
-  const changedFollowup = inbound("105", threadRoute, "Continue this independent topic after its explicit model change.");
+  const topic = headInput("102", threadRoute, "Handle this independent topic in its own workspace.");
+  const followupTask = "Continue this independent topic in the same native session.";
+  const followup = headInput("103", threadRoute, followupTask);
+  const modelChangeSource = headInput("104", route, "Explicitly change the idle independent lane to the native low preset.");
+  const changedFollowupTask = "Continue this independent topic after its explicit model change.";
+  const changedFollowup = headInput("105", threadRoute, changedFollowupTask);
   const expectedDelivered = [ordinary, { ...topic, id: report(firstHandoff) }];
   let initialHeadRoles: Record<string, unknown> | undefined;
   let advisoryUsageIds: string[] = [];
@@ -432,7 +437,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     expect(store.input(followup.id)).toMatchObject({ target: "main", state: "done", route: threadRoute, generation: 0 });
     expect(requestIds(parseSessionEntries(await fs.readFile(firstLane.sessionFile, "utf8")))).toEqual([firstHandoff]);
     const followupHandoff = `handoff:${followup.id}:${created.id}`;
-    await runtime.messageLane(created.id, followup.text, followup.id);
+    await runtime.messageLane(created.id, followupTask, followup.id);
     if (modelSelection) await until(() => messenger.thread?.title === "⏳ Independent topic", "resumed work replaces the completed title marker");
     await until(() => delivered(report(followupHandoff)), "explicit follow-up report and head answer settlement");
     expectedDelivered.push({ ...followup, id: report(followupHandoff) });
@@ -485,7 +490,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       await until(() => store.input(changedFollowup.id)?.state === "done", "changed-model follow-up reaches head first");
       expect(store.input(changedFollowup.id)).toMatchObject({ target: "main", state: "done", generation: 0, route: threadRoute });
       const changedHandoff = `handoff:${changedFollowup.id}:${created.id}`;
-      await runtime.messageLane(created.id, changedFollowup.text, changedFollowup.id);
+      await runtime.messageLane(created.id, changedFollowupTask, changedFollowup.id);
       await until(() => delivered(report(changedHandoff)), "new selected model reply returns to head before delivery");
       expect(store.input(changedHandoff)).toMatchObject({ target: created.id, state: "done", generation: finalLane.generation, route: threadRoute });
       expect(await initial.client.getState()).toMatchObject({ model: mainModel, sessionId: headState.sessionId, modelSettings: headState.modelSettings });
@@ -688,7 +693,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
         } catch { /* Only this provider readiness notification unblocks stop. */ }
       });
       const laneBeforeStop = structuredClone(store.lane(finalLane.id));
-      const blocked = inbound("301", threadRoute, "Wait in the local provider until the native head abort signal fires.");
+      const blocked = headInput("301", threadRoute, "Wait in the local provider until the native head abort signal fires.");
       try {
         await messenger.deliver(blocked);
         await within(ready.promise, 10_000, "Native provider did not publish abort-signal readiness");
@@ -720,7 +725,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       expect(messenger.sent.length).toBe(deliveriesAfterStop);
       expect(messenger.sent.some(output => output.sourceId === blocked.id)).toBe(false);
 
-      const fresh = inbound("303", route, "Answer this fresh request after stopping the previous head task.");
+      const fresh = headInput("303", route, "Answer this fresh request after stopping the previous head task.");
       await messenger.deliver(fresh);
       await until(() => delivered(fresh.id), "fresh native head request after stop");
       expect(messenger.sent.find(output => output.sourceId === fresh.id)?.text).toBe(reply);

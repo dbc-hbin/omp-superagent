@@ -12,7 +12,7 @@ export interface Route {
   guildId: string | null;
   channelId: string;
   threadId: string | null;
-  /** Coordination-only DM topic; never a platform channel/thread identifier. */
+  /** Coordination-only topic (DM or supported owner parent channel), never a physical channel/thread ID. */
   topicId?: string;
 }
 
@@ -281,13 +281,22 @@ export interface StorePort {
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   ownerSource(id: string): InputRecord | null;
+  /** Exact original owner and authorized delivery route for a topic-owned lane input. */
+  topicDelivery(id: string): { readonly source: InputRecord; readonly route: Route; readonly outputSourceId: string } | null;
+  /** Whether an unowned dialog could belong to a durable topic admission on this native generation. */
+  hasTopicAdmission(target: string, generation: number): boolean;
   inputs(target?: string, state?: ActiveInputState): InputRecord[];
   hasInput(target: string, state: ActiveInputState): boolean;
   /** An uncertain HEAD input with a nonempty original native-owner record. */
   hasHeadRecoveryInput(): boolean;
+  /** No automatic head replacement while an original HEAD delivery is unresolved. */
+  hasUnresolvedHeadDelivery(): boolean;
   kickoffHold(target: string): KickoffHold | null;
   /** The first authorized revision on the physical route, even after settlement. */
   firstAdmittedMessage(route: Route, messageId: string): InputRecord | null;
+  /** Workspace evidenced by a placed owner message or a confirmed bot reply on this physical route. */
+  repliedTopicWorkspace(route: Route, messageId: string): string | null;
+  sentOutputForMessage(route: Route, messageId: string): OutputRecord | null;
   /** Actual authorized message IDs in durable admission order; not invocation or edit IDs. */
   admittedMessageIds(route: Route): Iterable<string>;
   bindInput(id: string, target: string): void;
@@ -318,7 +327,7 @@ export interface StorePort {
   adoptLaneModel(id: string, generation: number, model: LaneModel, reason: string): boolean;
   changeLaneModel(id: string, generation: number, expected: LaneModel | null, model: LaneModel, reason: string,
     preset: ModelPreset | null, snapshot: LanePresetSnapshot | null, metadata?: Readonly<Record<string, string>>): boolean;
-  putApproval(approval: Approval): void;
+  putApproval(approval: Approval, ownerInputId?: string): void;
   approval(id: string): Approval | null;
   approvals(target?: string): Approval[];
   resolveApproval(id: string, generation: number, state: "answered" | "cancelled", resolution?: ApprovalResolution): boolean;

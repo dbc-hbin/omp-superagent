@@ -9,6 +9,7 @@ import { hostPaths, loadConfig } from "../../src/config";
 import type { Messenger } from "../../src/contracts";
 import { loadCredentials } from "../../src/credentials";
 import type { GatewayService } from "../oracles/bun-gateway/gateway";
+import { offlineMnemopi } from "./native-memory";
 
 const root = (() => {
   const value = process.env.OMP_AUTOSTART_NATIVE_ROOT;
@@ -184,7 +185,7 @@ try {
   const disabledBefore = await checked(["/bin/launchctl", "print-disabled", domain]);
   assert(!disabledBefore.includes(`"${label}"`), "Refusing a preexisting override for the unique test label");
   await fs.mkdir(path.join(root, "agent"), { mode: 0o700 });
-  await fs.writeFile(path.join(root, "agent/config.yml"), "{}\n", { mode: 0o600 });
+  await fs.writeFile(path.join(root, "agent/config.yml"), JSON.stringify(offlineMnemopi), { mode: 0o600 });
   await fs.writeFile(path.join(root, "agent/models.yml"), "providers: {}\n", { mode: 0o600 });
   const executable = path.join(root, "omp.ts");
   await fs.writeFile(configPath, JSON.stringify({

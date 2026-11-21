@@ -11,6 +11,7 @@ import { workflowContext } from "../../src/workflow";
 import { nativeDisabledProviders } from "./native-extension";
 import { autonomyModel } from "./autonomy-native-extension";
 import { nativeTestCommand } from "./native-command";
+import { offlineMnemopi } from "./native-memory";
 
 async function within<T>(promise: Promise<T>, label: string): Promise<T> {
   const timeout = Promise.withResolvers<never>();
@@ -61,6 +62,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     privateDirectory(dir);
   const settingsPath = path.join(agentDir, "config.yml");
   const settings = JSON.stringify({
+    ...offlineMnemopi,
     disabledProviders: nativeDisabledProviders,
     compaction: { methodOrder: ["soft"], keepRecentTokens: 1, autoContinue: false },
   });
@@ -69,7 +71,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
   const disabledAgent = path.join(root, "disabled-agent");
   privateDirectory(disabledAgent);
   await fs.writeFile(path.join(disabledAgent, "config.yml"), JSON.stringify({
-    disabledProviders: nativeDisabledProviders, goal: { enabled: false },
+    ...offlineMnemopi, disabledProviders: nativeDisabledProviders, goal: { enabled: false },
   }), { mode: 0o600 });
   await fs.writeFile(path.join(disabledAgent, "models.yml"), "providers: {}\n", { mode: 0o600 });
   const disabledCwd = path.join(root, "disabled-work");
@@ -136,13 +138,14 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     });
     const headConnection = await HostConnection.connect(main.socketPath);
     connections.add(headConnection);
+    const headInput = (id: string, destination: Route, task: string) => input(id, destination, `/head ${task}`);
     const headRoute = { ...route, threadId: "9010" };
     const nextHeadRoute = { ...route, threadId: "9011" };
     const headTask = "Verify retained head reply 050";
     const headReply = "HEAD_TODO_REPLY 050";
     const headOutputStart = messenger.sent.length;
     const headFrameStart = frames.length;
-    await runtime.receive(input("050", headRoute, "Prove native TODO continuation retains this head answer [head-todo-empty-tail]"));
+    await runtime.receive(headInput("050", headRoute, "Prove native TODO continuation retains this head answer [head-todo-empty-tail]"));
     await runtime.kick();
     await until(() => store.input("050")?.state === "done" && store.output("050:answer")?.state === "sent",
       "head reply survives native empty TODO continuation");
@@ -191,7 +194,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     expect(store.input("050")).toMatchObject({ id: "050", route: headRoute, target: "main", state: "done" });
     expect(store.output("050:answer")).toMatchObject({ sourceId: "050", route: headRoute, text: headReply, state: "sent" });
 
-    await runtime.receive(input("051", nextHeadRoute, "Return an ordinary head answer after the TODO continuation."));
+    await runtime.receive(headInput("051", nextHeadRoute, "Return an ordinary head answer after the TODO continuation."));
     await runtime.kick();
     await until(() => store.input("051")?.state === "done" && store.output("051:answer")?.state === "sent",
       "subsequent ordinary head request does not duplicate or inherit the retained reply");
@@ -213,7 +216,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     const directProgressRoute = { ...route, threadId: "9012" };
     const directProgressStart = messenger.sent.length;
     const directFrameStart = frames.length;
-    await runtime.receive(input("052", directProgressRoute, "Prove direct native head progress [head-progress]"));
+    await runtime.receive(headInput("052", directProgressRoute, "Prove direct native head progress [head-progress]"));
     await runtime.kick();
     await until(() => messenger.sent.some(output => output.id.startsWith("progress:052:")
       && output.text.includes("HEAD_PROGRESS 052"))
@@ -239,7 +242,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
       expect.objectContaining({ id: "052:answer", sourceId: "052", route: directProgressRoute, text: "HEAD_FINAL 052" }),
     ]);
 
-    await runtime.receive(input("500", route, "Prove intermediate work-thread delivery [lane-progress]"));
+    await runtime.receive(headInput("500", route, "Prove intermediate work-thread delivery [lane-progress]"));
     await runtime.kick();
     await until(() => store.input("500")?.state === "done", "progress scenario head intake");
     const laneProgressStart = messenger.sent.length;
@@ -307,7 +310,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
       && event.frame.type === "agent_start")).toHaveLength(1);
     expect(messenger.sent.slice(directProgressStart).some(output => output.text.includes("PRIVATE_"))).toBe(false);
 
-    await runtime.receive(input("100", route, "Finish the entrusted two-turn objective"));
+    await runtime.receive(headInput("100", route, "Finish the entrusted two-turn objective"));
     await runtime.kick();
     await until(() => store.input("100")?.state === "done", "head intake");
     const first = await runtime.startLane({
@@ -392,7 +395,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
       .toEqual([expect.objectContaining({ content: "Preserve admitted internal context without a model turn.", display: true })]);
 
     const secondRoute = { ...route, threadId: "9002" };
-    await runtime.receive(input("200", secondRoute, "Continue entrusted work [pause-goal]"));
+    await runtime.receive(headInput("200", secondRoute, "Continue entrusted work [pause-goal]"));
     await runtime.kick();
     await until(() => store.input("200")?.state === "done", "second head intake");
     const second = await runtime.startLane({
@@ -413,8 +416,9 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     expect(store.lane(second.id)?.workState).toBe("paused");
     expect(store.input("report:handoff:200:lane")).toBeNull();
     expect(frames.filter(event => event.socketPath === second.socketPath && event.frame.type === "agent_start")).toHaveLength(2);
+    const correctionTask = "Resume, but apply this full correction [resume-correction].";
     const correction: Inbound = {
-      ...input("202", second.route, "Resume, but apply this full correction [resume-correction]."),
+      ...headInput("202", second.route, correctionTask),
       attachments: [{ id: "correction", name: "correction.txt", url: "adapter-file:resume-correction",
         size: Buffer.byteLength("Apply the exact owner correction.\n"), contentType: "text/plain" }],
     };
@@ -430,17 +434,17 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     expect(store.input("handoff:200:lane")?.state).toBe("cancelled");
     expect(frames.filter(event => event.socketPath === second.socketPath && event.frame.type === "agent_start")).toHaveLength(3);
     const downloadsBeforeCorrection = messenger.downloads.length;
-    await runtime.messageLane(second.id, correction.text, correction.id);
+    await runtime.messageLane(second.id, correctionTask, correction.id);
     await until(() => store.input(`handoff:202:${second.id}`)?.state === "done", "full source correction and attachment delivery");
-    expect(store.input(`handoff:202:${second.id}`)).toMatchObject({ text: correction.text, attachments: correction.attachments });
+    expect(store.input(`handoff:202:${second.id}`)).toMatchObject({ text: correctionTask, attachments: correction.attachments });
     expect(store.input(`report:handoff:202:${second.id}`)?.text).toContain("CORRECTION_APPLIED 202");
     expect(messenger.downloads.slice(downloadsBeforeCorrection)).toEqual([{ route: correction.route, attachment: correction.attachments[0] }]);
     await runtime.resume(second.id, correction.id);
-    await runtime.messageLane(second.id, correction.text, correction.id);
+    await runtime.messageLane(second.id, correctionTask, correction.id);
     await secondConnection.client.getState();
     expect(frames.filter(event => event.socketPath === second.socketPath && event.frame.type === "agent_start")).toHaveLength(4);
     const disabledRoute = { ...route, threadId: "9003" };
-    await runtime.receive(input("300", disabledRoute, "Report native capability [goal-disabled]"));
+    await runtime.receive(headInput("300", disabledRoute, "Report native capability [goal-disabled]"));
     await runtime.kick();
     await until(() => store.input("300")?.state === "done", "disabled goal head intake");
     const disabled = await runtime.startLane({
@@ -452,7 +456,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
     expect(store.input("report:handoff:300:lane")?.text).toContain("NATIVE_GOAL_DISABLED");
     expect(frames.filter(event => event.socketPath === disabled.socketPath && event.frame.type === "agent_start")).toHaveLength(1);
     const excludedRoute = { ...route, threadId: "9004" };
-    await runtime.receive(input("400", excludedRoute, "Report explicit tool selection [goal-disabled]"));
+    await runtime.receive(headInput("400", excludedRoute, "Report explicit tool selection [goal-disabled]"));
     await runtime.kick();
     await until(() => store.input("400")?.state === "done", "excluded goal head intake");
     const excluded = await runtime.startLane({

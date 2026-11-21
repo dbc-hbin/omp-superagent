@@ -5,11 +5,13 @@ import { rename, writeFile } from "node:fs/promises";
 import type { RpcAbortAndRestoreQueueResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import type { HostOptions } from "./host";
 import type { Frame } from "./host-protocol";
+import type { RotationSelection } from "./head-rotation";
 
 type Manifest = {
   readonly options: Omit<HostOptions, "env">;
   readonly args: string[];
   readonly processBackend: "broker" | "daemon";
+  readonly headRotationSelection?: RotationSelection;
 };
 type Exit = {
   readonly pid: number; readonly ownerPid: number; readonly code: number | null; readonly signal: string | null;
@@ -71,6 +73,11 @@ async function run(operation: string | undefined, manifest: Manifest, input: unk
         const session = SessionManager.create(options.cwd, dirname(options.sessionFile));
         try {
           await session.setSessionFile(options.sessionFile);
+          const selection = manifest.headRotationSelection;
+          if (selection) {
+            session.appendModelChange(`${selection.provider}/${selection.modelId}`);
+            session.appendThinkingLevelChange(selection.thinkingLevel ?? undefined, selection.configuredThinkingLevel ?? undefined);
+          }
           await session.ensureOnDisk();
           session.flushSync();
         } finally { await session.close(); }

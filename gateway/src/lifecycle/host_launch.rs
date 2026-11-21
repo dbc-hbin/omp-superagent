@@ -22,8 +22,9 @@ use uuid::Uuid;
 
 use super::{
     LifecycleConfig, fs as owned,
-    host_rpc::{Head, Probe},
+    host_rpc::Probe,
     process::{ChildKind, detached, host_owner_executable},
+    rotation::{self, Rotation},
     stock_ops::{bun, capture, inspect_omp, session_id, tagged_output},
     ulw::Ulw,
 };
@@ -92,7 +93,7 @@ struct Preparation {
 }
 
 impl PreparedHost {
-    pub async fn prepare(config: &LifecycleConfig, store: &Store, ulw: &Ulw) -> Result<Self> {
+    pub async fn prepare(config: &LifecycleConfig, store: &Store, ulw: &Ulw, rotation: Option<&Rotation>) -> Result<Self> {
         let package = ulw.package()?;
         let source = config.root.join("src");
         let extension = match env::var_os("OMP_SUPERAGENT_TEST_EXTENSION_PATH") {
@@ -121,36 +122,39 @@ impl PreparedHost {
             "OMP_SUPERAGENT_MANAGED_ULW_PATH".into(),
             package.as_os_str().to_os_string(),
         );
-        let session_dir = config
-            .head_session
-            .parent()
-            .context("HEAD session directory missing")?;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(session_dir)?;
-        let restoring = owned::metadata(&config.head_session)?.is_some();
-        let session_id = if restoring {
-            session_id(config, &config.head_session).await?
-        } else {
-            None
-        };
+        let session_file = rotation::session_file(config, store)?;
+        if session_file != config.head_session {
+            // Rotated sessions live under a unique trusted directory, never
+            // under a reused journal pathname or a symlink.
+            owned::private_directory(config.head_session.parent().context("HEAD session directory missing")?)?;
+            owned::private_directory(&config.state_dir.join("sessions/main/rotated"))?;
+        }
+        owned::private_directory(session_file.parent().context("HEAD session directory missing")?)?;
+        let restoring = owned::metadata(&session_file)?.is_some();
+        let mut expected_id = if restoring { session_id(config, &session_file).await? } else { None };
         if let Some(expected) = store
             .get_meta("main:sessionId")?
             .filter(|id| !id.is_empty())
         {
             ensure!(
-                session_id.as_deref() == Some(expected.as_str()),
+                expected_id.as_deref() == Some(expected.as_str()),
                 "Stored head settings belong to a different native session; refusing startup"
             );
         }
-        let settings = match &session_id {
+        let settings_key = rotation.map(|plan| &plan.original.session_id).or(expected_id.as_ref());
+        let mut settings = match settings_key {
             Some(id) => store
                 .get_meta(&format!("head:model-settings:{id}"))?
                 .map(|value| serde_json::from_str::<SavedSettings>(&value))
                 .transpose()?,
             None => None,
         };
+        if let Some(plan) = rotation {
+            settings = Some(SavedSettings {
+                settings: plan.attestation.selection.model_settings.clone(),
+                cleared_roles: settings.map_or_else(Vec::new, |previous| previous.cleared_roles),
+            });
+        }
         ensure!(
             owned::metadata(&config.head_socket)?.is_none(),
             "Existing HEAD endpoint requires explicit adoption"
@@ -170,7 +174,7 @@ impl PreparedHost {
         let log = owned::log(&config.head_log)?;
         let config_data = settings_config(config, settings.as_ref(), restoring)?;
         owned::private_json(&config_path, &config_data)?;
-        let default_args = host_args(config, &config_path, &extensions, false);
+        let default_args = host_args(config, (&config_path, &session_file), &extensions, false);
         let (_, prefix) = command
             .split_first()
             .context("No OMP executable provided")?;
@@ -188,7 +192,7 @@ impl PreparedHost {
         )?;
         let args = host_args(
             config,
-            &config_path,
+            (&config_path, &session_file),
             &discovery.extension_paths,
             discovery.no_extensions,
         );
@@ -196,11 +200,14 @@ impl PreparedHost {
         let native_socket = run_dir.join(format!(".n-{}.sock", &socket_id[..8]));
         let helper = source.join("host-sdk-helper.ts");
         let mut manifest = json!({
-            "options": { "command": command, "cwd": config.cwd, "sessionFile": config.head_session,
+            "options": { "command": command, "cwd": config.cwd, "sessionFile": session_file,
                 "socketPath": config.head_socket, "modelSettings": settings.as_ref().map(|saved| &saved.settings) },
             "args": args, "configPath": config_path, "processBackend": backend,
             "helperPath": helper, "nativeSocket": native_socket,
         });
+        if let Some(plan) = rotation {
+            manifest["headRotationSelection"] = serde_json::to_value(&plan.attestation.selection)?;
+        }
         let deadline = Instant::now() + START_TIMEOUT;
         let mut prepare = bun(config, &environment);
         prepare.arg(helper).arg("prepare");
@@ -211,6 +218,11 @@ impl PreparedHost {
         manifest["toolsExplicitlySelected"] = json!(flags.tools_explicitly_selected);
         manifest["noTools"] = json!(flags.no_tools);
         manifest["inventory"] = json!(flags.inventory);
+        if let Some(plan) = rotation {
+            expected_id = session_id(config, &session_file).await?;
+            ensure!(expected_id.as_ref().is_some_and(|id| id != &plan.original.session_id),
+                "Fresh native HEAD identity was not prepared");
+        }
         owned::private_json(&files.directory.join("owner.json"), &manifest)?;
         let token = store.token()?;
         environment.insert("OMP_SUPERAGENT_GATEWAY_TOKEN".into(), token.into());
@@ -219,8 +231,12 @@ impl PreparedHost {
             files,
             log,
             deadline,
-            session_id,
+            session_id: expected_id,
         })
+    }
+
+    pub fn expected_session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     pub fn spawn(mut self, config: &LifecycleConfig) -> Result<LaunchedHost> {
@@ -254,7 +270,7 @@ impl PreparedHost {
 }
 
 impl LaunchedHost {
-    pub async fn identify(&mut self, config: &LifecycleConfig) -> Result<Head> {
+    pub async fn identify(&mut self, config: &LifecycleConfig, session_file: &Path) -> Result<Probe> {
         let mut observed_socket = None;
         while Instant::now() < self.deadline {
             ensure!(
@@ -274,11 +290,11 @@ impl LaunchedHost {
                 if stat.mode() & 0o777 == 0o600 {
                     let probe = Probe::open(
                         &config.head_socket,
-                        &config.head_session,
+                        session_file,
                         self.deadline.saturating_duration_since(Instant::now()),
                     )
                     .await?;
-                    let head = probe.head;
+                    let head = &probe.head;
                     ensure!(
                         (head.dev, head.ino) == inode && head.owner_pid == self.pid,
                         "Endpoint does not belong to the launched pipe owner"
@@ -293,7 +309,7 @@ impl LaunchedHost {
                         self.child.try_wait()?.is_none(),
                         "Owned OMP host exited during startup; inspect private log"
                     );
-                    return Ok(head);
+                    return Ok(probe);
                 }
             } else {
                 ensure!(
@@ -374,7 +390,7 @@ fn settings_config(
 
 fn host_args(
     config: &LifecycleConfig,
-    path: &Path,
+    files: (&Path, &Path),
     extensions: &[PathBuf],
     no_extensions: bool,
 ) -> Vec<String> {
@@ -382,7 +398,7 @@ fn host_args(
         "--mode".into(),
         "rpc-ui".into(),
         "--session".into(),
-        config.head_session.to_string_lossy().into_owned(),
+        files.1.to_string_lossy().into_owned(),
         "--cwd".into(),
         config.cwd.to_string_lossy().into_owned(),
     ];
@@ -392,6 +408,6 @@ fn host_args(
     for extension in extensions {
         args.extend(["-e".into(), extension.to_string_lossy().into_owned()]);
     }
-    args.extend(["--config".into(), path.to_string_lossy().into_owned()]);
+    args.extend(["--config".into(), files.0.to_string_lossy().into_owned()]);
     args
 }

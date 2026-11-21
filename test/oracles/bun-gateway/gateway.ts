@@ -26,6 +26,8 @@ export interface GatewayOptions {
   extensionPath?: string;
   /** Isolated fixture package injection. */
   managedUlwPath?: string;
+  /** Isolated fixture environment for its native root. */
+  headEnvironment?: NodeJS.ProcessEnv;
   /** Controlled source-refresh fixture; defaults to updateManagedUlw. */
   updateManagedUlw?: () => Promise<ManagedUlwStatus>;
   /** Isolated subprocess fixture seam; defaults to the fixed one-shot helper. */
@@ -246,7 +248,8 @@ export class GatewayService {
     await removeDeadSocket(paths.socketPath, this.head, "host");
     this.head = null;
     this.store.setMeta("gateway:head", "null");
-    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+    const env = Object.fromEntries(Object.entries(this.options.headEnvironment ?? process.env)
+      .filter((entry): entry is [string, string] => entry[1] !== undefined));
     for (const name of credentialEnvNames(this.config)) delete env[name];
     delete env.OMP_RPC_SOCKET;
     delete env.OMP_SUPERAGENT_HOST_SOCKET;

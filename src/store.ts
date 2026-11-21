@@ -68,6 +68,7 @@ const SCHEMA = `
     remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT
   );
   CREATE INDEX IF NOT EXISTS outputs_queue ON outputs(state, sequence);
+  CREATE INDEX IF NOT EXISTS outputs_sent_message ON outputs(remote_id) WHERE state = 'sent' AND remote_id IS NOT NULL;
   CREATE TABLE IF NOT EXISTS approvals (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
     target TEXT NOT NULL, generation INTEGER NOT NULL, request_id TEXT NOT NULL, data TEXT NOT NULL,
@@ -237,7 +238,8 @@ export class Store implements StorePort {
       if (workflow !== null) {
         workflowChoice({ name: workflow.name, reason: workflow.reason });
         if (workflow.provenance === "user") {
-          if (workflow.sourceId !== input.id || metadata[`user-source:${input.id}`] !== "true" || target !== "main") {
+          if (workflow.sourceId !== input.id || metadata[`user-source:${input.id}`] !== "true"
+            || !(target === "main" || target === null && metadata[`topic-owner:${input.id}`])) {
             throw new Error("User workflow requires original authorized head intake");
           }
         } else if (workflow.provenance === "head") {
@@ -268,6 +270,44 @@ export class Store implements StorePort {
       source = linked ? this.input(linked) : null;
     }
     return source;
+  }
+
+  private topicOwner(input: InputRecord): InputRecord | null {
+    if (!input.target || input.target === "main") return null;
+    let source: InputRecord | null = input;
+    while (source && this.getMeta(`user-source:${source.id}`) !== "true") {
+      const linked: string | null = this.getMeta(`handoff-source:${source.id}`);
+      source = linked ? this.input(linked) : null;
+    }
+    return source && this.getMeta(`topic-owner:${source.id}`) === input.target ? source : null;
+  }
+
+  topicDelivery(id: string) {
+    const input = this.input(id);
+    const source = input && this.topicOwner(input);
+    if (!input || !source) return null;
+    const revisionOf = this.getMeta(`topic-revision:${source.id}`);
+    const original = revisionOf === null ? source : source.messageId === null ? null : this.firstAdmittedMessage(source.route, source.messageId);
+    if (!original || revisionOf !== null && (original.id !== revisionOf || original.id === source.id
+      || routeKey(original.route) !== routeKey(source.route) || this.getMeta(`topic-owner:${original.id}`) !== input.target)) {
+      throw new Error(`Invalid topic revision ancestry: ${source.id}`);
+    }
+    const route = this.deliveryRoute(original, input.target);
+    // Preserve the original identity on its own route. A selected work thread
+    // uses its exact handoff (which still links to the original owner source).
+    const outputSourceId = routeKey(route) === routeKey(source.route) ? source.id : input.id;
+    if (outputSourceId === input.id && routeKey(route) !== routeKey(input.route)) {
+      throw new Error(`Topic delivery route differs from its handoff: ${input.id}`);
+    }
+    return { source, route, outputSourceId };
+  }
+
+  hasTopicAdmission(target: string, generation: number): boolean {
+    const rows = this.db.query<InputRow, [string, number]>(
+      "SELECT * FROM inputs WHERE target = ? AND generation = ? AND request_id IS NOT NULL",
+    ).iterate(target, generation);
+    for (const row of rows) if (this.topicOwner(toInput(row))) return true;
+    return false;
   }
 
   inputs(target?: string, state?: ActiveInputState): InputRecord[] {
@@ -312,6 +352,33 @@ export class Store implements StorePort {
         ORDER BY inputs.sequence LIMIT 1`,
     ).get(route.platform, route.channelId, route.accountId, route.authorityId, route.guildId, route.threadId, messageId);
     return row ? toInput(row) : null;
+  }
+
+  sentOutputForMessage(route: Route, messageId: string): OutputRecord | null {
+    const part = route.platform === "discord" ? this.getMeta(`discord:output-part:${messageId}`) : null;
+    const rows = this.db.query<OutputRow, [string, string | null]>(
+      "SELECT * FROM outputs WHERE state = 'sent' AND (remote_id = ? OR id = ?)",
+    ).all(messageId, part);
+    const scoped = rows.map(toOutput).filter(output => physicalRouteKey(output.route) === physicalRouteKey(route));
+    return scoped.length === 1 ? scoped[0]! : null;
+  }
+
+  repliedTopicWorkspace(route: Route, messageId: string): string | null {
+    const original = this.firstAdmittedMessage(route, messageId);
+    const output = this.sentOutputForMessage(route, messageId);
+    const source = output && this.ownerSource(output.sourceId);
+    const sourceIds = new Set([original?.id, source?.id]);
+    const workspaces = new Set<string>();
+    for (const id of sourceIds) {
+      if (!id) continue;
+      const owner = this.getMeta(`topic-owner:${id}`);
+      if (!owner) continue;
+      const creation = this.getMeta(`topic-creator:${id}`);
+      if (this.input(`handoff:${id}:${creation ? "lane" : owner}`)?.target !== owner) continue;
+      const lane = this.lane(owner);
+      if (lane) workspaces.add(lane.cwd);
+    }
+    return workspaces.size === 1 ? [...workspaces][0]! : null;
   }
 
   *admittedMessageIds(route: Route): Iterable<string> {
@@ -380,6 +447,17 @@ export class Store implements StorePort {
       if (input.target === "main") {
         this.setMeta(`progress-output:${receiptId}`, JSON.stringify(context));
         return this.queueOutput({ id: receiptId, sourceId: id, route: input.route, text });
+      }
+      const topic = this.topicDelivery(id);
+      if (topic) {
+        if (topic.source.state === "cancelled" || topic.source.state === "uncertain") return false;
+        const pendingKey = `topic-progress-pending:${id}`;
+        const previous = this.getMeta(pendingKey);
+        if (previous) this.db.query("UPDATE outputs SET state = 'failed', error = ? WHERE id = ? AND state = 'pending'")
+          .run("Nonterminal progress superseded", previous);
+        this.setMeta(pendingKey, receiptId);
+        this.setMeta(`progress-output:${receiptId}`, JSON.stringify(context));
+        return this.queueOutput({ id: receiptId, sourceId: topic.outputSourceId, route: topic.route, text });
       }
       const lane = this.requireLane(input.target!);
       const sourceId = this.getMeta(`handoff-source:${id}`);
@@ -456,9 +534,9 @@ export class Store implements StorePort {
       this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
         .run(JSON.stringify({ ...lane, observation }), lane.id, generation);
       this.setMeta(seen, serialized);
-      // Only a new evidence snapshot or waiting transition needs a head turn.
-      // Repeated reports remain inspectable without manufacturing progress.
-      if (changed) this.progress(id, generation, sessionId, `structured:${eventId}`, [
+      // Topic evidence stays inspectable; only assistant commentary is delivered.
+      // Legacy HEAD review needs a new evidence snapshot or waiting transition.
+      if (changed && !this.topicOwner(input)) this.progress(id, generation, sessionId, `structured:${eventId}`, [
         `Structured lane observation: ${JSON.stringify(observation)}`,
         "Evidence is observed/worker-selected, not verified acceptance. Waiting and its resolution grant no dispatch, approval or resume authority.",
       ].join("\n\n"));
@@ -480,7 +558,7 @@ export class Store implements StorePort {
       this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
         .run(JSON.stringify({ ...lane, observation: resolved }), lane.id, generation);
       // Completion/cancellation of a wait is not evidence of successful work.
-      this.progress(id, generation, sessionId, `resolved:${JSON.stringify([kind, nativeId, waiting.since])}`, [
+      if (!this.topicOwner(input)) this.progress(id, generation, sessionId, `resolved:${JSON.stringify([kind, nativeId, waiting.since])}`, [
         `Native waiting target finished or was cancelled: ${JSON.stringify(waiting.target)}.`,
         `Structured lane observation: ${JSON.stringify(resolved)}`,
         "This clears only the matching wait observation. It does not verify success, answer an approval, or resume work.",
@@ -498,7 +576,16 @@ export class Store implements StorePort {
       const progress = this.getMeta(`progress-source:${id}`);
       if (progress && !this.progressOpen(JSON.parse(progress))) output = undefined;
       // An uncertain request can only be resolved explicitly, never resubmitted.
-      if (output && input.target && input.target !== "main") {
+      const topic = output && this.topicDelivery(id);
+      if (output && topic) {
+        if (output.text.trim() && (topic.source.id === id
+          || topic.source.state !== "cancelled" && topic.source.state !== "uncertain")) {
+          this.queueOutput({
+            ...output, id: input.state === "uncertain" ? `${output.id}:${state}` : output.id,
+            sourceId: topic.outputSourceId, route: topic.route,
+          });
+        }
+      } else if (output && input.target && input.target !== "main") {
         const lane = this.requireLane(input.target);
         const sourceId = this.getMeta(`handoff-source:${id}`);
         const source = sourceId ? this.requireInput(sourceId) : input;
@@ -636,13 +723,13 @@ export class Store implements StorePort {
     }).immediate();
   }
 
-  private deliveryRoute(source: InputRecord): Route {
+  private deliveryRoute(source: InputRecord, expectedLane?: string | null): Route {
     const stored = this.getMeta(`head-delivery:${source.id}`);
     if (!stored) return source.route;
     const decision = JSON.parse(stored) as { source: Route; destination: Route; laneId: string };
     const lane = this.lane(decision.laneId);
     const handoff = this.input(`handoff:${source.id}:lane`);
-    if (!lane || routeKey(decision.source) !== routeKey(source.route)
+    if (!lane || expectedLane !== undefined && lane.id !== expectedLane || routeKey(decision.source) !== routeKey(source.route)
       || !handoff || handoff.target !== lane.id || this.getMeta(`handoff-source:${handoff.id}`) !== source.id
       || routeKey(handoff.route) !== routeKey(lane.route) || routeKey(decision.destination) !== routeKey(lane.route)) {
       throw new Error(`Invalid head-selected delivery binding: ${source.id}`);
@@ -686,6 +773,13 @@ export class Store implements StorePort {
   outputs(): OutputRecord[] {
     return (this.db.query("SELECT * FROM outputs WHERE state = 'pending' ORDER BY sequence")
       .all() as OutputRow[]).map(toOutput);
+  }
+
+  hasUnresolvedHeadDelivery(): boolean {
+    return this.db.query(`SELECT 1 FROM outputs
+      LEFT JOIN inputs ON inputs.id = outputs.source_id
+      WHERE outputs.state IN ('sending','uncertain') AND
+        (inputs.target IS NULL OR inputs.target = 'main') LIMIT 1`).get() !== null;
   }
 
   claimOutput(id: string): boolean {
@@ -832,7 +926,7 @@ export class Store implements StorePort {
     }).immediate();
   }
 
-  putApproval(approval: Approval): void {
+  putApproval(approval: Approval, ownerInputId?: string): void {
     this.db.transaction(() => {
       const existing = this.approval(approval.id);
       if (existing) {
@@ -841,7 +935,14 @@ export class Store implements StorePort {
         }
         return; // Re-observation cannot undo a previous answer/cancellation.
       }
-      this.checkTarget(approval.target, approval.route);
+      if (ownerInputId) {
+        const owner = this.input(ownerInputId);
+        const topic = owner?.target === approval.target && owner.generation === approval.generation
+          ? this.topicDelivery(owner.id) : null;
+        if (!topic || routeKey(topic.route) !== routeKey(approval.route))
+          throw new Error(`Approval does not match its topic source: ${approval.id}`);
+        this.setMeta(`topic-approval:${approval.id}`, topic.source.id);
+      } else this.checkTarget(approval.target, approval.route);
       const lane = this.lane(approval.target);
       if (lane && lane.generation !== approval.generation) throw new Error("Stale approval generation");
       this.db.query("INSERT INTO approvals(id, target, generation, request_id, data, state, remote_id) VALUES (?, ?, ?, ?, ?, ?, ?)")

@@ -26,6 +26,51 @@ impl Drop for StateDir {
 }
 
 #[test]
+fn rotation_keeps_later_input_durable_without_redelivering_preceding_input() -> Result<()> {
+    let root = StateDir::new()?;
+    let route = json!({"platform":"telegram","accountId":"bot","authorityId":"owner",
+        "guildId":null,"channelId":"chat","threadId":null,"topicId":"original"});
+    let answer = |id| json!({"kind":"answer","approvalId":id,"route":route,"response":{"confirmed":true}});
+    let stopping = json!({"stage":"stopping"}).to_string();
+    {
+        let store = Store::open(&root.0)?;
+        assert!(store.admit(&answer("old"))?);
+        assert!(!store.begin_rotation(None, None, &stopping)?);
+        let event = store.next(None)?.context("Prior event not delivered")?;
+        store.receipt(event.sequence, GatewayReceipt::Accepted)?;
+        assert!(store.begin_rotation(None, None, &stopping)?);
+        assert!(store.admit(&answer("during-rotation"))?);
+        assert!(store.next(None)?.is_none());
+    }
+    let store = Store::open(&root.0)?;
+    assert_eq!(store.pending()?, 1);
+    assert!(store.next(None)?.is_none());
+    store.finish_rotation(
+        &json!({"sessionId":"new"}),
+        &json!({"stage":"complete","original":{"sessionId":"old"},
+            "attestation":{"selection":{"modelSettings":{}}}}).to_string(),
+    )?;
+    let event = store.next(None)?.context("Durable rotation input was lost")?;
+    assert_eq!(event.event["approvalId"], "during-rotation");
+    store.receipt(event.sequence, GatewayReceipt::Accepted)?;
+    assert!(store.next(None)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn rotation_shutdown_authority_is_refused_after_an_operator_lifecycle_fence() -> Result<()> {
+    let root = StateDir::new()?;
+    let store = Store::open(&root.0)?;
+    let stopping = json!({"stage":"stopping"}).to_string();
+    store.set_meta("gateway:operator-stop", "explicit-stop")?;
+    assert!(!store.begin_rotation(None, None, &stopping)?);
+    store.set_meta("head:restart-fence", "{}")?;
+    assert!(!store.begin_rotation(None, Some("explicit-stop"), &stopping)?);
+    assert!(store.get_meta(super::HEAD_ROTATION)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn legacy_pending_and_generic_error_callbacks_require_original_state_reconciliation() -> Result<()>
 {
     let root = StateDir::new()?;

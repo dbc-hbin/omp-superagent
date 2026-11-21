@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "../../src/config";
@@ -12,6 +12,7 @@ import { processAlive, type RestartPlan } from "../oracles/bun-gateway/gateway-r
 import type { GatewayStatus } from "../../src/gateway-wire";
 import { stopHostFixtures } from "./host-fixture-processes";
 import { writeStockHostExecutable } from "./stock-host";
+import { offlineMnemopi } from "./native-memory";
 
 // Match the actual operation windows (host owner exit, restart preparation,
 // Gateway wire, and the detached launch receipt), not a global test timeout.
@@ -83,6 +84,16 @@ export async function configFixture() {
     await rm(root, { recursive: true, force: true });
   });
   await chmod(root, 0o700);
+  const home = join(root, "home");
+  const agent = join(root, "agent");
+  await mkdir(home, { mode: 0o700 });
+  await mkdir(agent, { mode: 0o700 });
+  await writeFile(join(agent, "config.yml"), JSON.stringify(offlineMnemopi), { mode: 0o600 });
+  const headEnvironment = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, USERPROFILE: home,
+    PI_CODING_AGENT_DIR: agent, XDG_CONFIG_HOME: join(home, "config"), XDG_DATA_HOME: join(home, "data"),
+    XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache"),
+    ...(process.env.PI_NATIVES_DIR ? { PI_NATIVES_DIR: process.env.PI_NATIVES_DIR } : {}),
+  };
   const path = join(root, "config.json");
   const executable = join(root, "omp.ts");
   await writeStockHostExecutable(executable, `
@@ -92,7 +103,8 @@ import ${JSON.stringify(fileURLToPath(new URL("./gateway-host.ts", import.meta.u
     command: [executable], model: "provider/initial-model",
     discord: { tokenEnv: "GATEWAY_TEST_BOT_TOKEN", ownerId: "2", allowedGuildIds: [], allowedChannelIds: [] } }));
   await writeFile(`${path}.env`, `GATEWAY_TEST_BOT_TOKEN=${token}\n`, { mode: 0o600 });
-  return { root, config: await loadConfig(path), beforeRemoval: (cleanup: () => Promise<void>) => { beforeRemoval = cleanup; } };
+  return { root, headEnvironment, config: await loadConfig(path),
+    beforeRemoval: (cleanup: () => Promise<void>) => { beforeRemoval = cleanup; } };
 }
 
 export async function withFixtureToken<T>(work: () => Promise<T>): Promise<T> {
@@ -117,7 +129,7 @@ export async function fixture(options: Pick<GatewayOptions, "updateManagedUlw" |
     async openAttachment() { return new Response("fixture"); },
   };
   const errors: unknown[] = [];
-  const starting = withFixtureToken(() => startGateway(f.config, { messenger, managedUlwPath,
+  const starting = withFixtureToken(() => startGateway(f.config, { messenger, managedUlwPath, headEnvironment: f.headEnvironment,
     onError: error => errors.push(error), ...options }));
   f.beforeRemoval(async () => {
     // Stop supervision before the fixture cleanup runs, even if readiness or
@@ -143,7 +155,7 @@ export async function fixture(options: Pick<GatewayOptions, "updateManagedUlw" |
 export async function detachedFixture() {
   const f = await configFixture();
   const child: ChildProcess = spawn(process.execPath, ["--no-env-file", fixtureProcess, "--config", f.config.path],
-    { cwd: f.root, stdio: ["ignore", "ignore", "ignore"] });
+    { cwd: f.root, env: f.headEnvironment, stdio: ["ignore", "ignore", "ignore"] });
   let outcome: string | undefined;
   child.once("error", error => { outcome = String(error); });
   child.once("exit", (code, sig) => { outcome = `exit ${code ?? sig}`; });

@@ -149,7 +149,10 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
         if !record.state.pending() {
             return Ok(());
         }
-        restart::validate_identity(config, &record, &plan)?;
+        let session_file = super::rotation::session_file_from_meta(
+            config, get_meta(&db, crate::store::HEAD_SESSION_FILE)?,
+        )?;
+        restart::validate_identity(config, &record, &plan, &session_file)?;
         ensure!(
             get_meta(&db, ACTIVE)?.as_deref() == Some(id),
             "Restart is not the active owned intent"
@@ -160,7 +163,7 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
             "Restart runner identity changed"
         );
         if plan.runner_pid == Some(std::process::id()) && plan.runner_ready != Some(true) {
-            restart::validate_plan(config, &record, &plan).await?;
+            restart::validate_plan(config, &record, &plan, &session_file).await?;
             let socket = socket_stat(&config.gateway_socket, false)?;
             ensure!(
                 plan.socket.matches(&socket),
@@ -193,7 +196,8 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
     };
     let record = restart::record(&store, Some(id))?.context("Missing durable restart record")?;
     let plan = restart::plan(&store, id)?.context("Missing durable restart plan")?;
-    restart::validate_plan(config, &record, &plan).await?;
+    let session_file = super::rotation::session_file(config, &store)?;
+    restart::validate_plan(config, &record, &plan, &session_file).await?;
     if record.state != Stage::HeadStopped
         || plan.runner_pid != Some(std::process::id())
         || store.get_meta(ACTIVE)?.as_deref() != Some(id)

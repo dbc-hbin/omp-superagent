@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Lane } from "./contracts";
+import { HEAD_SESSION_FILE_KEY, activeHeadSessionFile } from "./head-rotation";
 
 export interface BoardIdentity {
   role: "head" | "lane";
@@ -405,6 +406,8 @@ export class Board {
         .get() as { value: string } | null;
       const currentGeneration = this.db.query("SELECT value FROM metadata WHERE key = 'main:generation'")
         .get() as { value: string } | null;
+      const currentSessionFile = this.db.query<{ value: string }, [string]>("SELECT value FROM metadata WHERE key = ?")
+        .get(HEAD_SESSION_FILE_KEY)?.value ?? null;
       const owner = this.db.query("SELECT value FROM metadata WHERE key = 'gateway:head'")
         .get() as { value: string } | null;
       let ownedHead: { pid?: number; sessionId?: string; sessionFile?: string } | null;
@@ -417,8 +420,10 @@ export class Board {
           typeof ownedHead.sessionFile !== "string" || canonicalSessionFile(ownedHead.sessionFile) !== this.sessionFile) {
         throw new BoardMembershipError();
       }
-      if (session?.value !== this.identity.sessionId || this.sessionFile !==
-          canonicalSessionFile(join(this.stateDirectory, "sessions", "main", "session.jsonl"))) throw new BoardMembershipError();
+      let registeredFile: string;
+      try { registeredFile = canonicalSessionFile(activeHeadSessionFile(this.stateDirectory, currentSessionFile)); }
+      catch { throw new BoardMembershipError(); }
+      if (session?.value !== this.identity.sessionId || this.sessionFile !== registeredFile) throw new BoardMembershipError();
       generation = Number(currentGeneration?.value ?? "0");
     } else {
       if (!tables.some(table => table.name === "lanes")) throw new BoardMembershipError();

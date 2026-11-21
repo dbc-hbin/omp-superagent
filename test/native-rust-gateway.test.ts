@@ -68,9 +68,11 @@ function sampleIdleMemory(gatewayPid: number, head: Head): void {
   console.log(JSON.stringify({ idleMemory: { gateway: role(gatewayPid), rustOwner: role(head.ownerPid), stockOmp: role(head.pid) } }));
 }
 
-function input(id: string, text = `Native lifecycle request ${id}`): Inbound {
+function input(id: string, text: string): Inbound {
   return { id, messageId: id, route, text, receivedAt: Date.now(), attachments: [] };
 }
+
+const headInput = (id: string) => input(id, `/head Native lifecycle request ${id}`);
 
 function ledger<T>(fixture: NativeRustGateway, inspect: (db: Database) => T): T {
   const db = new Database(join(fixture.root, "coordination.sqlite"), { readonly: true, strict: true });
@@ -130,7 +132,7 @@ nativeTest("native Gateway stops only settled work and resumes the original stoc
     const reused = JSON.parse((await fixture.run([await requireGateway(), "launch", "--config", fixture.config])).stdout) as GatewayStatus;
     assert.equal(reused.gateway.pid, first.gatewayPid);
     assert.equal(reused.head.pid, first.head.pid);
-    await fixture.deliver(input("201"));
+    await fixture.deliver(headInput("201"));
     assert.equal(await verifyDelivery(fixture, "201"), "HEAD:201");
     assert.deepEqual(await fixture.snapshot("settled"), first.head);
     await fixture.stop(first);
@@ -140,7 +142,7 @@ nativeTest("native Gateway stops only settled work and resumes the original stoc
     assert.notEqual(second.head.ownerPid, first.head.ownerPid);
     assert.equal(second.head.sessionId, first.head.sessionId);
     sampleIdleMemory(second.gatewayPid, second.head);
-    await fixture.deliver(input("207"));
+    await fixture.deliver(headInput("207"));
     await until(() => existsSync(join(fixture.root, "entered-207")) || undefined, "the held offline model turn");
     assert.deepEqual(await fixture.snapshot("streaming"), second.head);
     const refusal = await fixture.cli("stop", 1);
@@ -163,7 +165,7 @@ nativeTest("native Gateway stops only settled work and resumes the original stoc
 nativeTest("authorized messenger /restart hands off once to a native runner and resumes the same stock session", () =>
   withNativeRustGateway(async fixture => {
     const first = await fixture.start();
-    await fixture.deliver(input("201"));
+    await fixture.deliver(headInput("201"));
     assert.equal(await verifyDelivery(fixture, "201"), "HEAD:201");
     const cold = await fixture.observeModel();
     assert.deepEqual(cold.head, first.head);
@@ -212,7 +214,7 @@ nativeTest("authorized messenger /restart hands off once to a native runner and 
 
     // Redeliver the exact authorized wire event after the replacement is ready.
     await fixture.deliver(restart);
-    await fixture.deliver(input("212"));
+    await fixture.deliver(headInput("212"));
     assert.equal(await verifyDelivery(fixture, "212"), "HEAD:212");
     assert.deepEqual(await fixture.snapshot("settled"), successor.head);
     await fixture.stop(successor);

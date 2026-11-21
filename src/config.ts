@@ -1,6 +1,6 @@
 import { chmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import type { Platform, Route } from "./contracts";
+import { physicalRoute, type Platform, type Route } from "./contracts";
 import { resolveOmpCommand } from "./installed-omp";
 
 export interface DiscordConfig {
@@ -127,6 +127,11 @@ export function requireMessengerCredentials(config: Config): void {
 
 /** Configuration policy; each adapter additionally checks authenticated account identity. */
 export function authorizeRoute(config: Config, route: Route): boolean {
+  if (route.guildId !== null && route.topicId !== undefined
+    && (route.platform === "telegram" || route.platform === "discord")) {
+    return route.threadId === null && typeof route.topicId === "string" && route.topicId.length > 0 && route.topicId.length <= 128
+      && authorizeRoute(config, physicalRoute(route));
+  }
   if (!route.accountId || !route.channelId || !route.authorityId) return false;
   if (route.topicId !== undefined && (route.guildId !== null || route.threadId !== null || !route.topicId || route.topicId.length > 128)) return false;
   switch (route.platform) {

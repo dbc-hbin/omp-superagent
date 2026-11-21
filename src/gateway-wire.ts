@@ -1,4 +1,5 @@
 import type { DialogResponse, GatewayRestartNotice, GatewayRestartRecord, Inbound, Route } from "./contracts";
+import type { HeadRotation } from "./head-rotation";
 import type { ManagedUlwStatus } from "./managed-ulw";
 
 export type HeadInitialization = {
@@ -26,6 +27,9 @@ export type GatewayStatus = {
     readonly socketPath: string;
     readonly error: string | null;
     readonly initialization?: HeadInitialization;
+    readonly rotation?: Pick<HeadRotation, "id" | "stage" | "replacementSessionId"> & {
+      readonly previousSessionId: string;
+    };
   };
   readonly ulw?: ManagedUlwStatus;
   readonly restart?: Omit<GatewayRestartRecord, "sessionFile">;

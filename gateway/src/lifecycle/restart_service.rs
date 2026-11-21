@@ -26,7 +26,8 @@ impl Lifecycle {
         let store = &self.0.store;
         let record = restart::record(store, Some(id))?.context("Missing durable restart record")?;
         let plan = restart::plan(store, id)?.context("Missing durable restart plan")?;
-        restart::validate_plan(&self.0.config, &record, &plan).await?;
+        let session_file = super::rotation::session_file(&self.0.config, store)?;
+        restart::validate_plan(&self.0.config, &record, &plan, &session_file).await?;
         let pid = Some(process::id());
         ensure!(
             record.state == Stage::HeadStopped
@@ -275,7 +276,8 @@ impl Lifecycle {
                 "Successor preparation authority changed"
             );
             if prepared.runner_ready == Some(true) {
-                restart::validate_identity(config, &saved, &prepared)?;
+                let session_file = super::rotation::session_file(config, store)?;
+                restart::validate_identity(config, &saved, &prepared, &session_file)?;
                 break;
             }
             ensure!(

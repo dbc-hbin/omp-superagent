@@ -12,7 +12,7 @@ import {
   assertCredentialsUnchanged, readCredentialFile, serializeCredentials, stagePrivateFile,
   validateCredential, writeCredentials,
 } from "./credentials";
-import { saveMnemopiPreference } from "./setup-memory";
+import { applyConsentedMnemopi, canEnableGlobalMemory, inspectManagedMnemopi, memoryBlockReason } from "./managed-memory";
 import { inspectNativeJudge } from "./setup-judge";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -172,13 +172,12 @@ export async function setup(configPath: string): Promise<void> {
     const previousCredentials = readCredentialFile(path);
     let config: Config;
     let text: string | undefined;
-    let recommendMemory = false;
     if (previousConfig) {
       let value: unknown;
       try { value = JSON.parse(previousConfig.toString("utf8")); }
       catch { throw new Error("Existing configuration is not valid JSON; it was not modified"); }
       config = parseConfig(value, path);
-      console.log("Existing configuration preserved; only its configured credentials will be prompted.");
+      console.log("Existing configuration preserved; setup will check its configured credentials and native memory.");
     } else {
       ({ config, text } = await newConfig(terminal, path));
     }
@@ -207,13 +206,18 @@ export async function setup(configPath: string): Promise<void> {
     }
     serializeCredentials(values); // Prove lossless encoding before any persistent write.
     if (replacing) await terminal.confirm("Replace existing credential values?");
-    if (!previousConfig) {
-      console.log("Recommended: native OMP Mnemopi memory persists across conversations (project-scoped by default).");
-      console.log("This saves OMP's global memory.backend preference only; existing memory options stay unchanged.");
+    const initialMemory = await inspectManagedMnemopi(config);
+    let memoryConsent: Parameters<typeof applyConsentedMnemopi>[1] | undefined;
+    if (canEnableGlobalMemory(initialMemory)) {
+      console.log("Managed sessions require native OMP Mnemopi memory, which persists across conversations (project-scoped by default).");
+      console.log(`This would change OMP's global memory.backend preference for ${initialMemory.agentDir}; existing memory options stay unchanged.`);
       console.log("Depending on existing native settings, later memory use may process conversations with models and download models.");
       console.log("Setup does not start memory or OMP; it activates on later OMP startup. Running OMP instances may apply native settings reloads.");
-      recommendMemory = /^y(es)?$/i.test((await terminal.ask("Enable native Mnemopi memory after saving setup? [y/N]: ")).trim());
-      if (!recommendMemory) console.log("Native memory settings will not be changed.");
+      if (/^y(es)?$/i.test((await terminal.ask("Enable native Mnemopi memory after saving setup? [y/N]: ")).trim())) {
+        memoryConsent = initialMemory;
+      } else {
+        console.log("Native memory settings will not be changed.");
+      }
     }
     console.log(`Configuration: ${path}\nPrivate credentials: ${path}.env`);
     const profilePlatforms = (["discord", "telegram"] as const).filter(platform => config[platform]);
@@ -248,19 +252,16 @@ export async function setup(configPath: string): Promise<void> {
     }
     terminal.saved = true;
     console.log(`Saved configuration: ${path}\nPrivate credentials: ${path}.env (0600)`);
-    if (recommendMemory) {
-      const memory = await saveMnemopiPreference(config.headCwd);
-      if (memory.status === "failed") {
-        console.log("Setup saved, but native Mnemopi could not be saved or verified; memory activation is not confirmed. No service was started by setup.");
-      } else if (memory.status === "not-saved") {
-        console.log("Setup saved, but native persistence did not retain memory.backend=mnemopi; Mnemopi was not enabled by setup. Concurrent native settings were preserved.");
-      } else if (memory.status === "shadowed") {
-        console.log(`Saved native memory.backend=mnemopi in OMP agent settings: ${memory.agentDir}`);
-        console.log(`Mnemopi is not effective for the head workspace (${memory.source} settings take precedence); those settings were preserved. No service was started by setup.`);
-      } else {
-        console.log(`Saved native memory.backend=mnemopi in OMP agent settings: ${memory.agentDir}`);
-        console.log("Mnemopi is configured for the head workspace on later OMP startup; no service was started by setup.");
-      }
+    terminal.check();
+    const { memory, updated } = memoryConsent ? await applyConsentedMnemopi(config, memoryConsent)
+      : { memory: await inspectManagedMnemopi(config), updated: false };
+    terminal.check();
+    if (updated) console.log("Saved native memory.backend=mnemopi in OMP agent settings.");
+    if (memory.status === "enabled") {
+      console.log(`Mnemopi is configured for the head workspace (${memory.source} settings); no service was started by setup.`);
+    } else {
+      console.log(`Setup saved but is incomplete. ${memoryBlockReason(memory)} No service was started by setup.`);
+      process.exitCode = 1;
     }
     if (createdConfig) {
       const judge = await inspectNativeJudge(config.headCwd);
@@ -292,7 +293,8 @@ export async function setup(configPath: string): Promise<void> {
       console.log(`Slack app icon file: ${join(root, "assets", "superagent-avatar.jpg")}`);
     }
     const cli = `${shellQuote(process.execPath)} --no-env-file ${shellQuote(join(root, "src", "cli.ts"))}`;
-    console.log(`Next: ${cli} doctor --config ${shellQuote(path)}\nStart explicitly: ${cli} start --config ${shellQuote(path)}`);
+    console.log(`Next: ${cli} doctor --config ${shellQuote(path)}`);
+    if (memory.status === "enabled") console.log(`Start explicitly: ${cli} start --config ${shellQuote(path)}`);
   } finally {
     try { if (configTemporary) unlinkSync(configTemporary); }
     finally { await terminal.close(); }

@@ -5,6 +5,7 @@ import { HostConnection, startHost, type HostFrame } from "../src/host";
 import { BoardFixture } from "./fixtures/board";
 import { nativeDisabledProviders } from "./fixtures/native-extension";
 import { nativeTestCommand } from "./fixtures/native-command";
+import { offlineMnemopi } from "./fixtures/native-memory";
 
 const nativeTest = process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 
@@ -17,7 +18,7 @@ nativeTest("actual unrelated OMP sessions with copied head/lane environment cann
   const agent = join(f.directory, "agent");
   mkdirSync(home, { mode: 0o700 });
   mkdirSync(agent, { mode: 0o700 });
-  writeFileSync(join(agent, "config.yml"), JSON.stringify({ disabledProviders: nativeDisabledProviders }), { mode: 0o600 });
+  writeFileSync(join(agent, "config.yml"), JSON.stringify({ ...offlineMnemopi, disabledProviders: nativeDisabledProviders }), { mode: 0o600 });
   writeFileSync(join(agent, "models.yml"), "providers: {}\n", { mode: 0o600 });
   const command = [...nativeCommand, "-e", resolve(import.meta.dir, "fixtures/native-extension.ts")];
   const config = {

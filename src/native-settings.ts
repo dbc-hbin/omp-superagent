@@ -62,7 +62,7 @@ function valueAt(record: unknown, path: readonly string[]): unknown {
  * A stale key is preserved while disjoint keys are merged from the locked file.
  */
 export async function editNativeGlobalConfig(settings: Settings, edits: readonly GlobalEdit[],
-  accept?: (actual: Settings) => boolean): Promise<boolean[]> {
+  accept?: (actual: Settings) => boolean | Promise<boolean>): Promise<boolean[]> {
   const agentDir = settings.getAgentDir();
   if (await hasUnresolvedNativeLegacy(agentDir)) throw new Error("Native global settings require legacy migration");
   let configPath = join(agentDir, MAIN_CONFIG_FILENAMES[0]);
@@ -87,7 +87,7 @@ export async function editNativeGlobalConfig(settings: Settings, edits: readonly
   return withFileLock(writePath, async () => {
     const actual = await readNativeSettings(settings);
     if (await hasUnresolvedNativeLegacy(agentDir)) throw new Error("Native global settings require legacy migration");
-    if (accept && !accept(actual)) return edits.map(() => false);
+    if (accept && !await accept(actual)) return edits.map(() => false);
     for (const filename of MAIN_CONFIG_FILENAMES) {
       const candidate = join(agentDir, filename);
       if (await isPresent(candidate)) {
@@ -105,6 +105,7 @@ export async function editNativeGlobalConfig(settings: Settings, edits: readonly
     if (raw === null || raw === undefined) raw = {};
     if (!isRecord(raw)) throw new Error("Native global config must be a mapping");
     const global = raw;
+    const actualGlobal = actual.getGlobalSettings();
     const updated = structuredClone(global);
     const applied = edits.map(edit => {
       const path = edit.path.split(".");
@@ -114,7 +115,12 @@ export async function editNativeGlobalConfig(settings: Settings, edits: readonly
             actual.getOwnedModelPreset(name) ||
             [actual.mirrorState().overrides, actual.mirrorState().configOverlay].some(layer =>
               isRecord(layer.modelPresets) && Object.hasOwn(layer.modelPresets, name))) return false;
-      } else if (!Bun.deepEquals(valueAt(global, path), valueAt(baseline, path))) return false;
+      } else {
+        // Native Settings interprets legacy `memories.enabled` in modern YAML
+        // as a backend. Compare that effective global value while editing raw YAML.
+        const latest = edit.path === "memory.backend" ? actualGlobal : global;
+        if (!Bun.deepEquals(valueAt(latest, path), valueAt(baseline, path))) return false;
+      }
       let target = updated;
       for (const segment of path.slice(0, -1)) {
         if (!isRecord(target[segment])) target[segment] = {};

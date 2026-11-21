@@ -16,6 +16,7 @@ import { HostConnection } from "../../src/host";
 import { nativeDisabledProviders } from "./native-extension";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { nativeTestArgv } from "./native-command";
+import { offlineMnemopi } from "./native-memory";
 
 interface Event {
   readonly kind: string;
@@ -90,6 +91,7 @@ const events = async (name: string): Promise<Event[]> => {
 for (const name of ["agent", "head", "lane"]) privateDirectory(path.join(root, name));
 const model = "restart-native/local";
 await fs.writeFile(path.join(root, "agent/config.yml"), JSON.stringify({
+  ...offlineMnemopi,
   disabledProviders: nativeDisabledProviders, modelRoles: { default: model, judge: model }, defaultThinkingLevel: "low",
   ...(detachedLane ? { retry: { enabled: false } } : {}),
   modelPresets: Object.fromEntries(["high", "middle", "low"].map(name => [name, { modelRoles: { default: model, judge: model }, defaultThinkingLevel: "low" }])),
@@ -119,9 +121,10 @@ const route: Route = { platform: "discord", accountId: "2", authorityId: "1", gu
 const restartRoute: Route = { ...route, channelId: "5", threadId: "20" };
 const queuedRoute: Route = { ...route, channelId: "5", threadId: "21" };
 const input = (id: string, text: string, destination: Route): Inbound => ({ id, text, route: destination, messageId: id, attachments: [], receivedAt: Date.now() });
-const original = input("901", "Finish the entrusted native goal, keeping the completed file effect exactly once across my restart.", route);
+const headInput = (id: string, task: string, destination: Route) => input(id, `/head ${task}`, destination);
+const original = headInput("901", "Finish the entrusted native goal, keeping the completed file effect exactly once across my restart.", route);
 const restart = input("902", "/restart", restartRoute);
-const queued = input("903", "Deliver this never-submitted queued request exactly once after the native goal finishes.", queuedRoute);
+const queued = headInput("903", "Deliver this never-submitted queued request exactly once after the native goal finishes.", queuedRoute);
 const deliver = async (message: Inbound, expectedPid?: number): Promise<void> => {
   const ingress = path.join(root, "ingress.jsonl");
   // Count actual log positions, including raw answers and duplicate source IDs.
@@ -220,7 +223,7 @@ try {
   let laneSource: Inbound | undefined;
   let detachedLaneReceipt: Record<string, unknown> | undefined;
   if (scenario === "lane" || detachedLane) {
-    laneSource = input("904", "Start the independent local fixture lane at the explicitly provided destination.", { ...route, threadId: "30" });
+    laneSource = headInput("904", "Start the independent local fixture lane at the explicitly provided destination.", { ...route, threadId: "30" });
     await deliver(laneSource);
     await until(async () => (await events("native-events.jsonl")).some(event => event.kind === "lane-held"), "independent native lane execution");
     const row = ledger.query<{ data: string }, []>("SELECT data FROM lanes").get();

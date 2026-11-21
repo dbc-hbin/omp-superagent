@@ -22,7 +22,7 @@ export function registerDecisionAsk(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "decision_ask", label: "Request a tracked decision", approval: "read", loadMode: "essential",
     description: (role === "lane"
-      ? "Send structured questions to the HEAD first. The HEAD can select routine options within the original assignment; important or unresolved choices go to the owner. A submitted answer is not necessarily from the owner and does not grant execution approval or expand scope. "
+      ? "In topic reply mode, ask only when the owner must decide. In manager handoff mode, HEAD can select routine options within the original assignment; important or unresolved choices go to the owner. A submitted answer does not grant execution approval or expand scope. "
       : "Ask the owner structured questions on this managed session's native UI. ") +
       "Returns a stable decision id and the actual submitted answers or cancellation, timeout, or chat state. Recommendations, timeouts and chat are not acceptance. No default answers, timeout, messenger routing, or automatic work resume.",
     parameters: Type.Object({

@@ -356,6 +356,8 @@ const route = (threadId: string | null = "10", patch: Partial<Route> = {}): Rout
 const message = (id: string, destination = route(), text = `task ${id}`): Inbound & MessageReference => ({
   id, route: destination, messageId: id, text, receivedAt: 100, attachments: [],
 });
+const headMessage = (id: string, destination = route(), task = `task ${id}`): Inbound & MessageReference =>
+  message(id, destination, `/head ${task}`);
 const applicationCommand = (interactionId: string, destination = route(), text = "/status"): Inbound => ({
   ...message(`interaction:${interactionId}`, destination, text), messageId: null, interactionId,
 });
@@ -388,7 +390,7 @@ function delegated(store: Store, sourceId: string) {
   return store.input(`handoff:${sourceId}:${lane.id}`);
 }
 
-function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset" | "requestRestart" | "readPrSnapshot" | "readOmpUsage">> = {}) {
+function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset" | "requestRestart" | "readPrSnapshot" | "readOmpUsage" | "topicMemory">> = {}) {
   const directory = realpathSync(mkdtempSync("/tmp/sa-runtime-"));
   const config: Config = {
     path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
@@ -480,7 +482,7 @@ test("cron controls scope job management to the original thread and send one HEA
   const run = `cron-run:${id}:206`;
   expect(store.input(run)?.state).toBe("pending");
   expect(main.prompts).toEqual([]);
-  await admit(runtime, message("216", other, "Answer this ordinary request while the route probe is unavailable"));
+  await admit(runtime, headMessage("216", other, "Answer this ordinary request while the route probe is unavailable"));
   expect(main.prompts).toHaveLength(1);
   main.complete("Ordinary result");
   await messenger.whenSent(8);
@@ -526,7 +528,7 @@ test("pausing a cron job while HEAD is busy cancels its pending execution withou
   await admit(runtime, message("211", origin, '/cron add "every 30m" Check CI'));
   const id = store.output("211:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
   if (!id) throw new Error("Cron registration did not return a job ID");
-  await admit(runtime, message("212", origin, "Investigate this first"));
+  await admit(runtime, headMessage("212", origin, "Investigate this first"));
   await admit(runtime, message("213", origin, `/cron run ${id}`));
   const runId = `cron-run:${id}:213`;
   expect(store.input(runId)?.state).toBe("pending");
@@ -544,7 +546,7 @@ test("natural-language cron registration is active-owner-bound and cannot recrea
   const { runtime, messenger, main, store } = fixture();
   await runtime.start();
   const origin = route("11");
-  const owner = message("231", origin, "Every day at 09:00 Seoul time, summarize CI here.");
+  const owner = headMessage("231", origin, "Every day at 09:00 Seoul time, summarize CI here.");
   const request = { sourceId: owner.id, schedule: "TZ=Asia/Seoul 0 9 * * *", prompt: "Summarize CI" };
   expect(() => runtime.createCronJob(request)).toThrow("current HEAD turn");
   await admit(runtime, owner);
@@ -664,7 +666,7 @@ describe("source-bound Discord topic management", () => {
       return true;
     };
     await runtime.start();
-    const original = message("tagged-topic", route(null));
+    const original = headMessage("tagged-topic", route(null));
     await admit(runtime, original);
     const start = { ...selection, sourceId: original.id, title: "Tagged topic", kickoff: "Inspect and verify.", cwd: directory,
       appliedTags: ["101"] };
@@ -682,7 +684,7 @@ describe("source-bound Discord topic management", () => {
   test("forum tags cannot silently retag an existing bound thread", async () => {
     const { runtime, directory, messenger } = fixture();
     await runtime.start();
-    const original = message("existing-topic", route("123"));
+    const original = headMessage("existing-topic", route("123"));
     await admit(runtime, original);
     await expect(runtime.startLane({ ...selection, sourceId: original.id, title: "Existing", kickoff: "Inspect.",
       cwd: directory, appliedTags: ["101"] })).rejects.toThrow("lane_thread_update");
@@ -857,7 +859,7 @@ describe("same-HEAD evidence recovery", () => {
       throw new Error("The original native result was durable before the transport acknowledgement was lost");
     };
     await runtime.start();
-    await admit(runtime, message("lost-original", route("original-recovery-route")));
+    await admit(runtime, headMessage("lost-original", route("original-recovery-route")));
     await recoveryStarted.promise;
     const value = attempt(instance, "lost-original");
     const snapshot = JSON.parse(String(main.prompts[1]!.command.message).split("\n").find(line =>
@@ -865,7 +867,7 @@ describe("same-HEAD evidence recovery", () => {
     expect(snapshot).toMatchObject({ attemptId: value.attemptId, inputId: "lost-original",
       evidenceEntryIds: value.evidenceEntryIds, evidence: { outcome: "done", receiptStatus: "completed" } });
     expect(store.input("lost-original")?.state).toBe("uncertain");
-    await admit(runtime, message("queued-after-loss", route("later-route")));
+    await admit(runtime, headMessage("queued-after-loss", route("later-route")));
     expect(store.input("queued-after-loss")?.state).toBe("pending");
     expect(main.prompts).toHaveLength(2);
     const result = await runtime.decideHeadRecovery(decision(value));
@@ -940,7 +942,7 @@ describe("same-HEAD evidence recovery", () => {
       main.emit({ type: "agent_start" });
       throw new Error("Original admission acknowledgement was lost while work continued");
     };
-    await admit(runtime, message("uncertain-approval-owner", route("original-approval")));
+    await admit(runtime, headMessage("uncertain-approval-owner", route("original-approval")));
     main.beforePrompt = undefined;
     expect(store.input("uncertain-approval-owner")?.state).toBe("uncertain");
     const request = { type: "extension_ui_request", method: "confirm", id: "original-dialog", title: "Original owner decision" };
@@ -953,7 +955,7 @@ describe("same-HEAD evidence recovery", () => {
     main.emit({ type: "goal_updated", state: { goal: { id: "original-goal" } } });
     expect(JSON.parse(store.getMeta(`head:goal-source:${main.state.sessionId}:original-goal`)!))
       .toMatchObject({ inputId: "uncertain-approval-owner", requestId: main.prompts[0]!.id });
-    await admit(runtime, message("after-uncertain-approval"));
+    await admit(runtime, headMessage("after-uncertain-approval"));
     expect(store.input("after-uncertain-approval")?.state).toBe("pending");
     expect(main.prompts).toHaveLength(1);
     expect(runtime.headRecoveryActive()).toBe(false);
@@ -1095,7 +1097,7 @@ describe("same-HEAD evidence recovery", () => {
     await runtime.start();
     expect(store.input(id)?.state).toBe("uncertain");
     expect(runtime.headRecoveryActive()).toBe(true);
-    await admit(runtime, message("after-recovery-reconnect"));
+    await admit(runtime, headMessage("after-recovery-reconnect"));
     expect(store.input("after-recovery-reconnect")?.state).toBe("pending");
     const replacement = new HostTransport(main.state.sessionFile!, main.state.sessionId);
     replacement.entries = structuredClone(main.entries);
@@ -1142,7 +1144,7 @@ describe("same-HEAD evidence recovery", () => {
     instance.main.state.hasOwnedRunningWork = false;
     instance.main.beforePrompt = undefined;
     instance.main.emit({ type: "session_settled" });
-    await admit(instance.runtime, message("work-after-abandonment"));
+    await admit(instance.runtime, headMessage("work-after-abandonment"));
     await instance.main.whenPrompts(2);
     expect(instance.runtime.headRecoveryActive()).toBe(false);
     expect(attempt(instance)).toMatchObject({ attemptId: value.attemptId, state: "held", abandonedByOwner: true });
@@ -1156,7 +1158,7 @@ describe("event-driven nonterminal progress", () => {
     const { runtime, config, store, hosts, main, messenger } = fixture();
     const lane = savedLane(store, config, "structured-progress", route("work-topic"));
     await runtime.start();
-    await admit(runtime, message("structured-busy-head", route("other-topic")));
+    await admit(runtime, headMessage("structured-busy-head", route("other-topic")));
     await delegate(runtime, message("structured-source", lane.route));
     const worker = hosts.get(lane.socketPath)!;
     const input = delegated(store, "structured-source")!;
@@ -1204,7 +1206,7 @@ describe("event-driven nonterminal progress", () => {
     const { runtime, config, store, hosts, errors } = fixture();
     const lane = savedLane(store, config, "eval-observation", route("work-topic"));
     await runtime.start();
-    await admit(runtime, message("eval-observation-head", route("other-topic")));
+    await admit(runtime, headMessage("eval-observation-head", route("other-topic")));
     await delegate(runtime, message("eval-observation-source", lane.route));
     const worker = hosts.get(lane.socketPath)!;
     const report: LaneReport = { status: "waiting", summary: "Native eval owns this dependency",
@@ -1258,7 +1260,7 @@ describe("event-driven nonterminal progress", () => {
     const { runtime, config, store, hosts, errors } = fixture();
     const lane = savedLane(store, config, "missing-observation-cursor", route("work-topic"));
     await runtime.start();
-    await admit(runtime, message("missing-observation-head", route("other-topic")));
+    await admit(runtime, headMessage("missing-observation-head", route("other-topic")));
     await delegate(runtime, message("missing-observation-source", lane.route));
     const worker = hosts.get(lane.socketPath);
     if (!worker) throw new Error("Missing native lane owner");
@@ -1286,7 +1288,7 @@ describe("event-driven nonterminal progress", () => {
     const { runtime, config, store, hosts, errors } = fixture();
     const lane = savedLane(store, config, "structured-fence", route("work-topic"));
     await runtime.start();
-    await admit(runtime, message("structured-fence-head", route("other-topic")));
+    await admit(runtime, headMessage("structured-fence-head", route("other-topic")));
     await delegate(runtime, message("structured-fence-source", lane.route));
     const worker = hosts.get(lane.socketPath)!;
     const report: LaneReport = { status: "waiting", summary: "Owner decision pending",
@@ -1322,7 +1324,7 @@ describe("event-driven nonterminal progress", () => {
   test.each(["toolUse", "commentary"] as const)("HEAD sends %s progress before completion once and never repeats it as final fallback", async kind => {
     const { runtime, main, messenger, store } = fixture();
     await runtime.start();
-    const original = message(`head-${kind}-progress`, route("original-topic"));
+    const original = headMessage(`head-${kind}-progress`, route("original-topic"));
     await admit(runtime, original);
     const progress = { role: "assistant", stopReason: kind === "toolUse" ? "toolUse" : "stop", content: [
       { type: "thinking", thinking: "Private reasoning" },
@@ -1349,7 +1351,7 @@ describe("event-driven nonterminal progress", () => {
   test("mixed native commentary and final text retain only the independent final answer", async () => {
     const { runtime, main, messenger, store } = fixture();
     await runtime.start();
-    const original = message("mixed-native-progress");
+    const original = headMessage("mixed-native-progress");
     await admit(runtime, original);
     const mixed = { role: "assistant", stopReason: "stop", content: [
       { type: "text", text: "Verification is running.", textSignature: JSON.stringify({ v: 1, id: "comment", phase: "commentary" }) },
@@ -1367,7 +1369,7 @@ describe("event-driven nonterminal progress", () => {
   test("lane progress reaches the head-selected work thread before completion and final remains independent", async () => {
     const { runtime, main, messenger, store, directory, hosts } = fixture();
     await runtime.start();
-    const original = message("progress-parent-source", route(null));
+    const original = headMessage("progress-parent-source", route(null));
     await admit(runtime, original);
     const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Progress work",
       kickoff: "I will inspect, implement, and verify this work in its own topic.", cwd: directory });
@@ -1410,7 +1412,7 @@ describe("event-driven nonterminal progress", () => {
     const { runtime, config, store, hosts, main, messenger } = fixture();
     const lane = savedLane(store, config, "busy-progress", route("work-topic"));
     await runtime.start();
-    await admit(runtime, message("busy-head-source", route("other-topic")));
+    await admit(runtime, headMessage("busy-head-source", route("other-topic")));
     await delegate(runtime, message("busy-lane-source", lane.route));
     const worker = hosts.get(lane.socketPath)!;
     for (const text of ["Initial inspection complete.", "Root cause identified.", "Fix implemented; verification running."]) {
@@ -1437,7 +1439,7 @@ describe("event-driven nonterminal progress", () => {
     const { runtime, config, store, hosts, main, messenger } = fixture();
     const lane = savedLane(store, config, "final-supersedes", route("work-topic"));
     await runtime.start();
-    await admit(runtime, message("busy-final-head", route("other-topic")));
+    await admit(runtime, headMessage("busy-final-head", route("other-topic")));
     await delegate(runtime, message("busy-final-lane", lane.route));
     const worker = hosts.get(lane.socketPath)!;
     worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Older pending progress." }] } });
@@ -1508,42 +1510,218 @@ describe("event-driven nonterminal progress", () => {
   });
 });
 
+describe("topic-owned lane delivery", () => {
+  function placeTopicInput(store: Store, lane: Lane, source: Inbound, selectedDestination = false): string {
+    const handoffId = `handoff:${source.id}:${selectedDestination ? "lane" : lane.id}`;
+    store.receive(source, null, { [`user-source:${source.id}`]: "true", [`topic-owner:${source.id}`]: lane.id });
+    store.receive({ ...source, id: handoffId, route: lane.route }, lane.id, {
+      [`handoff-source:${handoffId}`]: source.id,
+      ...(selectedDestination ? { [`head-delivery:${source.id}`]: JSON.stringify({
+        source: source.route, destination: lane.route, laneId: lane.id,
+      }) } : {}),
+    });
+    store.settle(source.id, "done");
+    return handoffId;
+  }
+
+  test("a topic sends deduplicated commentary and one consolidated answer while HEAD is busy", async () => {
+    const { runtime, config, store, hosts, main, messenger } = fixture();
+    const lane = savedLane(store, config, "topic-delivery", route("44"));
+    const original = message("topic-original", lane.route, "Check the invoice totals.");
+    await runtime.start();
+    await admit(runtime, headMessage("busy-head-manager", route(null), "Review coordination work."));
+    await admit(runtime, original);
+    const handoffId = `handoff:${original.id}:${lane.id}`;
+    const worker = hosts.get(lane.socketPath)!;
+    const report: LaneReport = { status: "waiting", summary: "Waiting on an internal artifact",
+      waiting: { kind: "dependency", target: "Verification artifact" }, evidence: [] };
+    worker.emit({ type: "message_end", message: { role: "toolResult", toolName: "lane_report", toolCallId: "wait",
+      timestamp: 1000, details: { type: "superagent-lane-report", sessionId: worker.state.sessionId, reportId: "wait", report } } });
+    const commentary = { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "The totals are being checked." }] };
+    worker.emit({ type: "message_end", message: commentary });
+    worker.emit({ type: "message_end", message: structuredClone(commentary) });
+    await messenger.whenSent(1);
+
+    const revision = message("topic-joined", lane.route, "Include the revised bill.");
+    await admit(runtime, revision);
+    const joinedId = `handoff:${revision.id}:${lane.id}`;
+    expect(worker.prompts[1]?.command.streamingBehavior).toBe("steer");
+    worker.complete("Both sets of totals match.", 0);
+    worker.complete("Both sets of totals match.", 1);
+    await messenger.whenSent(2);
+    await runtime.kick();
+
+    expect(store.lane(lane.id)?.observation?.waiting?.target).toEqual(report.waiting);
+    expect([store.input(handoffId)?.state, store.input(joinedId)?.state]).toEqual(["done", "done"]);
+    const replyTo = { route: original.route, messageId: original.messageId };
+    expect(messenger.sent).toMatchObject([
+      { sourceId: original.id, route: original.route, replyTo, text: "The totals are being checked." },
+      { id: `${handoffId}:answer`, sourceId: original.id, route: original.route, replyTo, text: "Both sets of totals match." },
+    ]);
+    expect(store.inputs("main").map(input => input.id)).toEqual(["busy-head-manager"]);
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test("pending topic commentary does not escape a newer milestone or an uncertain settlement", () => {
+    const { config, store } = fixture();
+    const lane = savedLane(store, config, "topic-held", route("44"), process.pid);
+    const original = message("topic-held-original", lane.route);
+    const inputId = placeTopicInput(store, lane, original);
+    const sessionId = `session-${lane.id}`;
+    store.submit(inputId, "native-topic-held", lane.generation);
+    store.progress(inputId, lane.generation, sessionId, "older", "Earlier milestone");
+    store.progress(inputId, lane.generation, sessionId, "newer", "Later milestone");
+    expect(store.claimOutput(`progress:${inputId}:older`)).toBe(false);
+
+    store.settle(inputId, "uncertain", { id: `${inputId}:connection`, text: "The run is held; it was not replayed." });
+
+    expect(store.claimOutput(`progress:${inputId}:newer`)).toBe(false);
+    expect(store.outputs()).toMatchObject([{ id: `${inputId}:connection`, sourceId: original.id, route: original.route,
+      text: "The run is held; it was not replayed." }]);
+    expect(store.input(inputId)?.state).toBe("uncertain");
+    expect(store.inputs("main")).toEqual([]);
+  });
+
+  test("repeated topic revisions retain the delivery selected in a sibling thread", async () => {
+    const { runtime, config, directory, store, hosts, main, messenger } = fixture();
+    const originalLane = savedLane(store, config, "revision-origin", route("44"));
+    const cwd = join(directory, "sibling-workspace");
+    mkdirSync(cwd);
+    const original = message("revision-original", originalLane.route, `cwd: ${cwd}\nInvestigate the invoice.`);
+    await runtime.start();
+    await admit(runtime, original);
+    const siblingRoute = messenger.threads[0];
+    if (!siblingRoute) throw new Error("Workspace change did not create a sibling thread");
+    const sibling = store.laneForRoute(siblingRoute);
+    if (!sibling) throw new Error("Missing sibling lane");
+    const worker = hosts.get(sibling.socketPath);
+    if (!worker) throw new Error("Missing sibling Host");
+    const baseline = messenger.sent.length;
+    worker.complete("Original invoice inspected.");
+    await messenger.whenSent(baseline + 1);
+
+    const revisions = [
+      { id: "revision-first", task: "Include the February bill.", answer: "February bill checked." },
+      { id: "revision-second", task: "Also include the March bill.", answer: "March bill checked." },
+    ];
+    for (const [index, revision] of revisions.entries()) {
+      await admit(runtime, { ...original, id: revision.id, text: `cwd: ${cwd}\n${revision.task}` });
+      await worker.whenPrompts(index + 2);
+      worker.complete(revision.answer);
+      await messenger.whenSent(baseline + index + 2);
+    }
+    await runtime.kick();
+
+    expect(messenger.sent.slice(baseline + 1).map(output => ({
+      route: output.route, sourceId: store.ownerSource(output.sourceId)?.id, replyTo: output.replyTo, text: output.text,
+    }))).toEqual(revisions.map(revision => ({
+      route: siblingRoute, sourceId: revision.id, replyTo: undefined, text: revision.answer,
+    })));
+    expect(messenger.threads).toEqual([siblingRoute]);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("a detached topic dialog without a saved card stays native-only instead of guessing the lane route", async () => {
+    const { runtime, config, store, hosts, main, messenger } = fixture();
+    const lane = savedLane(store, config, "detached-topic-card", route("44"), process.pid);
+    const original = message("original-topic-alias", route("45"));
+    const handoffId = placeTopicInput(store, lane, original);
+    store.submit(handoffId, "topic-native-request", lane.generation);
+    const worker = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    const frame = { type: "extension_ui_request", method: "confirm", id: "topic-pending-card", title: "Continue with requested changes?" };
+    worker.state.isSettled = false;
+    worker.state.pendingUiRequests = [frame];
+    hosts.set(lane.socketPath, worker);
+
+    await runtime.start();
+    await messenger.handlers!.reconnect!();
+
+    expect(store.input(handoffId)?.state).toBe("uncertain");
+    expect(store.approvals(lane.id)).toEqual([]);
+    expect(messenger.shown.size).toBe(0);
+    expect(worker.state.pendingUiRequests).toEqual([frame]);
+    expect(worker.responses).toEqual([]);
+    expect(worker.prompts).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route }]);
+  });
+
+  test.each(["original-topic", "selected-work-thread"])("a topic decision uses the exact card and final route for %s", async mode => {
+    const { runtime, config, store, hosts, main, messenger } = fixture();
+    const selected = mode === "selected-work-thread";
+    const lane = savedLane(store, config, "topic-decision", route("44"));
+    const original = message("topic-choice-original", selected ? route(null) : lane.route);
+    await runtime.start();
+    const inputId = placeTopicInput(store, lane, original, selected);
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath)!;
+    const decision = decisionId(worker.state.sessionId, "topic-choice-call");
+    const frame = { type: "extension_ui_request", method: "ask", id: "topic-choice-native",
+      questions: [{ id: `${decision}:0`, question: "Which invoice is final?", options: [{ label: "Revised" }] }] };
+    const response = { answers: [{ id: `${decision}:0`, selectedOptions: ["Revised"] }] };
+    worker.state.pendingUiRequests = [frame];
+    worker.emit(frame);
+    await messenger.whenApproval();
+    await messenger.handlers!.reconnect!();
+    const approval = runtime.inspectDecision(decision);
+    const destination = selected ? lane.route : original.route;
+
+    expect(approval).toMatchObject({ sourceId: original.id, target: lane.id, route: destination, requestId: frame.id });
+    expect(messenger.shown.get(approval.approvalId)).toMatchObject({ route: destination, request: frame });
+    await expect(messenger.handlers!.answer(approval.approvalId, response, selected ? original.route : route("45")))
+      .rejects.toMatchObject({ certainty: "rejected" });
+    expect(worker.responses).toEqual([]);
+    await messenger.handlers!.answer(approval.approvalId, response, destination);
+    worker.complete("The revised invoice is final.");
+    await messenger.whenSent(1);
+    await runtime.kick();
+
+    expect(worker.responses).toEqual([{ id: frame.id, response }]);
+    expect(runtime.inspectDecision(decision)).toMatchObject({ state: "answered", response });
+    expect(messenger.sent).toMatchObject([{ sourceId: selected ? inputId : original.id, route: destination,
+      text: "The revised invoice is final." }]);
+    expect(messenger.sent[0]?.replyTo).toEqual(selected ? undefined : { route: original.route, messageId: original.messageId });
+    expect(main.prompts).toEqual([]);
+  });
+});
+
 describe("original-message processing reactions", () => {
-  test("slash DM requests and their logical lane handoff/report never react or attempt native DM thread creation", async () => {
+  test("slash DM requests and their topic replies never react or attempt native DM thread creation", async () => {
     const { runtime, main, messenger, directory, hosts, store } = fixture();
     messenger.canCreateThread = async () => false;
     await runtime.start();
     const dm = route(null, { guildId: null });
-    const original = applicationCommand("1750000000000000001", dm, "/new inspect this repository");
+    const original = applicationCommand("1750000000000000001", dm, `/new cwd: ${directory}\ninspect this repository`);
     await admit(runtime, original);
-    expect(main.prompts[0]!.command.message).toContain("inspect this repository");
-    expect(main.prompts[0]!.command.message).not.toContain("/new inspect");
-    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Slash work", kickoff: "I will inspect the repository and report the verified result in this topic.", cwd: directory });
-    await runtime.kick();
+    expect(main.prompts).toEqual([]);
+    const [lane] = store.lanes();
+    if (!lane) throw new Error("Expected a logical lane for slash work");
+    expect(store.input(original.id)).toMatchObject({ target: null, state: "done", route: lane.route });
     expect(messenger.threadSources).toEqual([]);
     expect(store.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBeNull();
     const handoffId = `handoff:${original.id}:lane`;
     expect(store.input(handoffId)).toMatchObject({ messageId: null, interactionId: original.interactionId, target: lane.id });
-    main.complete("");
-    await runtime.kick();
     const worker = hosts.get(lane.socketPath);
     if (!worker) throw new Error("Expected active slash-created lane");
-    worker.complete("lane result");
-    await main.whenPrompts(2);
-    expect(store.input(`report:${handoffId}`)).toMatchObject({ messageId: null, interactionId: original.interactionId, state: "submitted" });
-    main.complete("verified slash answer");
-    await runtime.kick();
-    expect(messenger.sent.some(output => output.text === "verified slash answer")).toBe(true);
+    expect(worker.prompts[0]?.command.message).toContain("inspect this repository");
+    expect(worker.prompts[0]?.command.message).not.toContain("/new cwd:");
+    worker.complete("verified slash answer");
+    await messenger.whenSent(2); // Kickoff and the topic's own answer.
+    expect(store.input(handoffId)?.state).toBe("done");
+    expect(store.input(`report:${handoffId}`)).toBeNull();
+    expect(main.prompts).toEqual([]);
+    expect(messenger.sent).toContainEqual(expect.objectContaining({ id: `${handoffId}:answer`,
+      sourceId: original.id, route: lane.route, text: "verified slash answer" }));
     expect(messenger.activities).toEqual([]);
   });
 
   test("native work and joined edits retain thinking through a nonterminal yield, then clear on settlement", async () => {
     const { runtime, main, messenger } = fixture();
     await runtime.start();
-    const original = message("activity-original");
+    const original = headMessage("activity-original");
     await admit(runtime, original);
     await messenger.whenActivities(1);
-    await admit(runtime, { ...original, id: "activity-edit", text: "correction" });
+    await admit(runtime, { ...original, id: "activity-edit", text: "/head correction" });
     main.emit({ type: "agent_end", isTerminal: false, messages: [] });
     expect(messenger.activities).toEqual([{ message: { route: original.route, messageId: original.messageId }, activity: "thinking" }]);
     const steering = main.prompts[1];
@@ -1559,7 +1737,7 @@ describe("original-message processing reactions", () => {
   test.each(["stop", "disconnect", "error"] as const)("thinking clears on %s without requiring a successful reply", async outcome => {
     const { runtime, main, messenger, hosts, config } = fixture();
     await runtime.start();
-    await admit(runtime, message("activity-terminal"));
+    await admit(runtime, headMessage("activity-terminal"));
     await messenger.whenActivities(1);
     if (outcome === "stop") await admit(runtime, message("activity-stop", route(), "/stop head"));
     else if (outcome === "disconnect") {
@@ -1579,7 +1757,7 @@ describe("original-message processing reactions", () => {
   test("native approval waiting clears thinking and its exact answer restores it", async () => {
     const { runtime, main, messenger } = fixture();
     await runtime.start();
-    await admit(runtime, message("activity-question"));
+    await admit(runtime, headMessage("activity-question"));
     const frame = { type: "extension_ui_request", id: "activity-ui", method: "confirm", title: "Proceed?", message: "Owner decision" };
     main.state.pendingUiRequests = [frame];
     main.emit(frame);
@@ -1595,7 +1773,7 @@ describe("original-message processing reactions", () => {
   test("head, lane and report synthesis share the original reaction target, not the new thread or report ID", async () => {
     const { runtime, main, messenger, directory, hosts } = fixture();
     await runtime.start();
-    const original = message("activity-delegated", route(null));
+    const original = headMessage("activity-delegated", route(null));
     await admit(runtime, original);
     const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Work", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
@@ -1618,7 +1796,7 @@ describe("original-message processing reactions", () => {
     const { runtime, main, messenger, errors } = fixture();
     messenger.activityFailure = true;
     await runtime.start();
-    await admit(runtime, message("activity-permission"));
+    await admit(runtime, headMessage("activity-permission"));
     main.complete("answer despite missing reaction permissions");
     await messenger.whenSent(1);
     expect(messenger.sent[0]?.text).toBe("answer despite missing reaction permissions");
@@ -1638,7 +1816,7 @@ describe("HEAD native journal ownership", () => {
     if (leafId !== null) main.entries.push({ id: leafId, type: "custom" });
     await runtime.start();
 
-    const original = message(`native-cursor-${kind}`);
+    const original = headMessage(`native-cursor-${kind}`);
     await admit(runtime, original);
 
     expect(main.prompts).toHaveLength(1);
@@ -1658,7 +1836,7 @@ describe("HEAD native journal ownership", () => {
     main.cursorResponse = response;
     await runtime.start();
 
-    const original = message(`invalid-native-cursor-${kind}`);
+    const original = headMessage(`invalid-native-cursor-${kind}`);
     await admit(runtime, original);
 
     expect(main.prompts).toEqual([]);
@@ -1679,7 +1857,7 @@ describe("thread kickoff before execution", () => {
       reading.resolve();
       await release.promise;
     };
-    const original = message("kickoff-during-head-journal");
+    const original = headMessage("kickoff-during-head-journal");
     await runtime.receive(original);
     const draining = runtime.kick();
     await reading.promise;
@@ -1695,7 +1873,7 @@ describe("thread kickoff before execution", () => {
   test("kickoff queued during an existing output drain is actually delivered before admission returns", async () => {
     const { runtime, messenger, store, directory } = fixture();
     await runtime.start();
-    const original = message("kickoff-during-send");
+    const original = headMessage("kickoff-during-send");
     await admit(runtime, original);
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
@@ -1727,7 +1905,7 @@ describe("thread kickoff before execution", () => {
   test("a kickoff added while native dispatch is preparing fences that final submission too", async () => {
     const { runtime, messenger, directory, hosts, main } = fixture();
     await runtime.start();
-    const first = message("kickoff-race-first");
+    const first = headMessage("kickoff-race-first");
     await admit(runtime, first);
     const lane = await runtime.startLane({ ...selection, sourceId: first.id, title: "Work", cwd: directory,
       kickoff: "I will inspect the first request and verify it." });
@@ -1747,11 +1925,11 @@ describe("thread kickoff before execution", () => {
         checked.resolve();
       }
     };
-    const second = message("kickoff-race-second", lane.route);
+    const second = headMessage("kickoff-race-second", lane.route);
     await runtime.receive(second);
     const handoff = runtime.messageLane(lane.id, "Continue the work", second.id);
     await preparing.promise;
-    const third = message("kickoff-race-third", lane.route);
+    const third = headMessage("kickoff-race-third", lane.route);
     await runtime.receive(third);
     const kickoffEntered = Promise.withResolvers<void>();
     const releaseKickoff = Promise.withResolvers<void>();
@@ -1777,7 +1955,7 @@ describe("thread kickoff before execution", () => {
   test("a work topic receives its concrete kickoff before native dispatch, and identical retry sends nothing twice", async () => {
     const { runtime, messenger, main, hosts, directory, store } = fixture();
     await runtime.start();
-    const original = message("kickoff-order", route(null));
+    const original = headMessage("kickoff-order", route(null));
     await admit(runtime, original);
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
@@ -1818,7 +1996,7 @@ describe("thread kickoff before execution", () => {
   test.each(["rejected", "uncertain"] as const)("a %s kickoff holds the lane and later handoffs without automatically resending", async certainty => {
     const { runtime, messenger, directory, hosts, store } = fixture();
     await runtime.start();
-    const original = message(`kickoff-${certainty}`);
+    const original = headMessage(`kickoff-${certainty}`);
     await admit(runtime, original);
     messenger.sendError = new DeliveryError("Kickoff send failed", certainty);
     const start = { ...selection, sourceId: original.id, title: "Held work", cwd: directory, kickoff: "I will inspect the change and run its regression checks." };
@@ -1828,11 +2006,10 @@ describe("thread kickoff before execution", () => {
     const followup = message(`kickoff-later-${certainty}`, original.route, "Also check duplicates");
     await runtime.receive(followup);
     const kickoff = { outputId: `${original.id}:kickoff`, state: certainty === "rejected" ? "failed" : "uncertain" };
-    expect(await runtime.messageLane(lane.id, followup.text, followup.id)).toMatchObject({
-      state: "pending", queueHolds: { kickoff },
-    });
     expect(await runtime.inspect(lane.id)).toMatchObject({ queueHolds: { kickoff } });
     await runtime.kick();
+    expect(store.input(followup.id)).toMatchObject({ target: null, state: "done" });
+    expect(store.input(`handoff:${followup.id}:${lane.id}`)).toMatchObject({ target: lane.id, state: "pending" });
     await expect(runtime.startLane(start)).rejects.toThrow("Kickoff delivery is not confirmed");
     expect(hosts.has(lane.socketPath)).toBe(false);
     expect(messenger.attempted.map(output => output.id)).toEqual([`${original.id}:kickoff`]);
@@ -1860,8 +2037,8 @@ describe("dedicated HEAD startup preset initialization", () => {
     expect(main.prompts).toHaveLength(1);
     expect(main.prompts[0]!.id.startsWith("sg-bootstrap-")).toBe(true);
     expect(store.inputs()).toEqual([]);
-    await admit(runtime, message("bootstrap-first"));
-    await admit(runtime, message("bootstrap-second", route("other-bootstrap")));
+    await admit(runtime, headMessage("bootstrap-first"));
+    await admit(runtime, headMessage("bootstrap-second", route("other-bootstrap")));
     expect(store.inputs().map(input => [input.id, input.state])).toEqual([["bootstrap-first", "pending"], ["bootstrap-second", "pending"]]);
     expect(main.prompts).toHaveLength(1);
     created = true;
@@ -1892,7 +2069,7 @@ describe("dedicated HEAD startup preset initialization", () => {
       await admit(runtime, message(`bootstrap-status-${skipped}`, route(), "/status"));
       expect(messenger.sent.at(-1)!.text).toContain("Preset initialization: failed");
       expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).toBe("failed");
-      await admit(runtime, message(`bootstrap-held-${skipped}`));
+      await admit(runtime, headMessage(`bootstrap-held-${skipped}`));
       expect(store.input(`bootstrap-held-${skipped}`)?.state).toBe("pending");
       expect(main.prompts).toHaveLength(1);
     }
@@ -1910,7 +2087,7 @@ describe("dedicated HEAD startup preset initialization", () => {
       await runtime.start();
       expect(main.prompts).toEqual([]);
       expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).not.toBe("complete");
-      await admit(runtime, message(`restart-held-${prior}`));
+      await admit(runtime, headMessage(`restart-held-${prior}`));
       expect(store.input(`restart-held-${prior}`)?.state).toBe("pending");
     }
   });
@@ -1929,7 +2106,7 @@ describe("dedicated HEAD startup preset initialization", () => {
     await admit(runtime, message("stop-bootstrap", route(), "/stop head"));
     expect(main.responses).toContainEqual({ id: dialog.id, response: { cancelled: true } });
     expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).toBe("failed");
-    await admit(runtime, message("after-bootstrap-stop"));
+    await admit(runtime, headMessage("after-bootstrap-stop"));
     expect(store.input("after-bootstrap-stop")?.state).toBe("pending");
     expect(main.prompts).toHaveLength(1);
   });
@@ -1952,7 +2129,7 @@ describe("dedicated HEAD startup preset initialization", () => {
     expect(f.main.prompts).toEqual([]);
     expect(JSON.parse(f.store.getMeta("head:preset-bootstrap")!).state).toBe("blocked");
     expect(f.store.approval(id)?.state).toBe("pending");
-    await admit(f.runtime, message("approval-startup-held"));
+    await admit(f.runtime, headMessage("approval-startup-held"));
     expect(f.store.input("approval-startup-held")?.state).toBe("pending");
   });
 
@@ -2196,7 +2373,7 @@ describe("controlled Gateway AND HEAD restart", () => {
   test.each(["pending", "answered"] as const)("busy HEAD checkpoints its goal and archives the original %s card after confirmed route ACK", async cardState => {
     const { runtime, main, store, messenger, requests } = restartFixture();
     await runtime.start();
-    await admit(runtime, message("restart-active-head"));
+    await admit(runtime, headMessage("restart-active-head"));
     main.state.goal = { enabled: true, mode: "active", goal: { id: "original-head-goal", status: "active" } };
     main.emit({ type: "goal_updated", state: main.state.goal });
     main.state.pendingUiRequests = [{ id: "head-question", method: "confirm", title: "Continue?" }];
@@ -2254,7 +2431,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     const resident = new HostTransport(lane.sessionFile, `session-${lane.id}`);
     hosts.set(lane.socketPath, resident);
     await runtime.start();
-    await admit(runtime, message("checkpoint-running-head"));
+    await admit(runtime, headMessage("checkpoint-running-head"));
     await delegate(runtime, message(`checkpoint-running-lane-${boundary}`, lane.route));
     const entered = Promise.withResolvers<void>();
     const released = Promise.withResolvers<void>();
@@ -2289,7 +2466,7 @@ describe("controlled Gateway AND HEAD restart", () => {
       if (output.id === "operator-raced-restart:restart-ack") { sending.resolve(); await released.promise; }
     };
     await runtime.start();
-    await admit(runtime, message("operator-running-head"));
+    await admit(runtime, headMessage("operator-running-head"));
     await runtime.receive(message("operator-raced-restart", route(), "/restart"));
     await sending.promise;
     store.setMeta("gateway:operator-stop", "newer-explicit-stop-boundary");
@@ -2305,7 +2482,7 @@ describe("controlled Gateway AND HEAD restart", () => {
   test("a settled active HEAD goal retains its original source for restart from another conversation", async () => {
     const instance = restartFixture();
     const { runtime, main, store, messenger, config } = instance;
-    const original = message("settled-goal-owner", route("goal-route-A"));
+    const original = headMessage("settled-goal-owner", route("goal-route-A"));
     const control = message("settled-goal-restart", route("restart-route-B"), "/restart");
     await runtime.start();
     await admit(runtime, original);
@@ -2383,7 +2560,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     release.resolve();
     await runtime.kick();
     expect(requests).toHaveLength(1);
-    await runtime.receive(message("later-direct"));
+    await runtime.receive(headMessage("later-direct"));
     store.receive(message("later-lane", lane.route), lane.id);
     await runtime.kick();
     expect(store.input("later-direct")?.state).toBe("pending");
@@ -2449,7 +2626,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(store.input(original.id)?.state).toBe("done");
     await admit(runtime, original);
     await admit(runtime, message("restart-after-rpc-loss", route(), "/restart"));
-    await runtime.receive(message("work-after-rpc-loss"));
+    await runtime.receive(headMessage("work-after-rpc-loss"));
     await runtime.kick();
     expect(requests).toHaveLength(1);
     expect(main.prompts).toEqual([]);
@@ -2471,7 +2648,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(store.output(`${original.id}:restart-result`)?.text).toContain("No process was stopped");
     expect(store.output(`${original.id}:restart-result`)?.text).not.toContain("secret rejected response");
     await admit(runtime, original);
-    await admit(runtime, message("work-after-definitive-rejection"));
+    await admit(runtime, headMessage("work-after-definitive-rejection"));
     expect(requests).toHaveLength(1);
     expect(main.prompts).toHaveLength(1);
     expect(messenger.sent.filter(output => output.id === `${original.id}:restart-result`)).toHaveLength(1);
@@ -2527,7 +2704,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     const notice = { requestId: request.requestId, outcome: "uncertain" as const, reason: "secret shutdown response" };
     await messenger.handlers!.restart!(notice);
     await messenger.handlers!.restart!(notice);
-    await runtime.receive(message("held-after-notice"));
+    await runtime.receive(headMessage("held-after-notice"));
     await runtime.kick();
     expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("uncertain");
     expect(messenger.sent.filter(output => output.id === `${original.id}:restart-uncertain`)).toMatchObject([{ route: original.route, sourceId: original.id }]);
@@ -2918,13 +3095,15 @@ describe("controlled Gateway AND HEAD restart", () => {
   });
 
   test("invalid restart arguments and command lookalikes never acquire restart authority", async () => {
-    const { runtime, main, requests, store } = restartFixture();
+    const { runtime, main, requests, store, config, hosts } = restartFixture();
+    const lane = savedLane(store, config, "restart-lookalike", route());
     await runtime.start();
     await admit(runtime, message("invalid-restart", route(), "/restart force"));
     expect(store.input("invalid-restart")?.state).toBe("cancelled");
     expect(store.getMeta("head:restart-fence")).toBeNull();
-    await admit(runtime, message("restart-lookalike", route(), "/restarting"));
-    expect(main.prompts).toHaveLength(1);
+    await admit(runtime, message("restart-lookalike", lane.route, "/restarting"));
+    expect(hosts.get(lane.socketPath)?.prompts[0]?.command.message).toContain("/restarting");
+    expect(main.prompts).toEqual([]);
     expect(requests).toEqual([]);
   });
 });
@@ -2932,8 +3111,8 @@ describe("controlled Gateway AND HEAD restart", () => {
 describe("messenger head session controls", () => {
   test("an explicit owner request switches HEAD after settlement and before the next queued turn", async () => {
     const { runtime, main, messenger } = fixture();
-    const source = message("head-natural-model", route("original"), "Please switch your own model to fixture/efficient.");
-    const next = message("head-next-model", route("other-source"), "Continue on the new model.");
+    const source = headMessage("head-natural-model", route("original"), "Please switch your own model to fixture/efficient.");
+    const next = headMessage("head-next-model", route("other-source"), "Continue on the new model.");
     await runtime.start();
     await admit(runtime, source);
     await admit(runtime, next);
@@ -2957,7 +3136,7 @@ describe("messenger head session controls", () => {
 
   test("an internal report or old owner request cannot authorize a HEAD model change", async () => {
     const { runtime, main, store, messenger } = fixture();
-    const old = message("head-stale-model");
+    const old = headMessage("head-stale-model");
     const report = message("report:natural-head-model", route(), "Switch your own model to fixture/efficient.");
     await runtime.start();
     await admit(runtime, old);
@@ -2974,7 +3153,7 @@ describe("messenger head session controls", () => {
 
   test("stopping the originating HEAD turn cancels its scheduled model change", async () => {
     const { runtime, main, store } = fixture();
-    const source = message("head-cancel-natural-model", route(), "Switch your own model to fixture/efficient.");
+    const source = headMessage("head-cancel-natural-model", route(), "Switch your own model to fixture/efficient.");
     await runtime.start();
     await admit(runtime, source);
     runtime.requestHeadModel({ sourceId: source.id, model: otherModel });
@@ -2987,10 +3166,10 @@ describe("messenger head session controls", () => {
 
   test("an unconfirmed scheduled HEAD model change holds later turns without replay", async () => {
     const { runtime, main, messenger } = fixture();
-    const source = message("head-uncertain-natural-model", route(), "Switch your own model to fixture/efficient.");
+    const source = headMessage("head-uncertain-natural-model", route(), "Switch your own model to fixture/efficient.");
     await runtime.start();
     await admit(runtime, source);
-    await admit(runtime, message("head-followup-uncertain-model", route("other-source")));
+    await admit(runtime, headMessage("head-followup-uncertain-model", route("other-source")));
     runtime.requestHeadModel({ sourceId: source.id, model: otherModel });
     main.modelSetResult = "throw-after";
 
@@ -3006,7 +3185,7 @@ describe("messenger head session controls", () => {
     const { runtime, main, store, messenger } = fixture();
     main.models.push({ ...otherModel, apiKey: "secret-api-key", baseUrl: "https://private-endpoint", headers: { Authorization: "secret-header" } });
     await runtime.start();
-    await admit(runtime, message("head-running"));
+    await admit(runtime, headMessage("head-running"));
     for (const [index, text] of ["/model", "/model list", "/effort"].entries()) {
       await admit(runtime, message(`head-query-${index}`, route("other-source"), text));
       expect(store.input(`head-query-${index}`)?.state).toBe("done");
@@ -3200,8 +3379,13 @@ describe("messenger head session controls", () => {
     const lane = savedLane(store, config, "head-control-handoff", route("head-control-handoff"));
     await runtime.start();
     for (const [index, text] of ['"/model fixture/efficient"', "please /effort off", "/models", "/effortless"].entries()) {
-      await admit(runtime, message(`head-passive-${index}`, route(), text));
-      main.complete("Ordinary input");
+      const id = `head-passive-${index}`;
+      await admit(runtime, message(id, lane.route, text));
+      expect(store.input(id)).toMatchObject({ target: null, state: "done" });
+      const worker = hosts.get(lane.socketPath);
+      if (!worker) throw new Error("Expected ordinary lookalike work in the lane");
+      expect(worker.prompts[index]?.command.message).toContain(text);
+      worker.complete("");
       await runtime.kick();
     }
     store.receive(message("report:head-command", route(), "/model fixture/efficient"), "main");
@@ -3209,8 +3393,8 @@ describe("messenger head session controls", () => {
     main.complete("Internal report is data");
     await runtime.kick();
     await delegate(runtime, message("head-handoff-source", lane.route, "/effort off"));
-    expect(hosts.get(lane.socketPath)?.prompts).toHaveLength(1);
-    expect(main.prompts).toHaveLength(5);
+    expect(hosts.get(lane.socketPath)?.prompts).toHaveLength(5);
+    expect(main.prompts).toHaveLength(1);
     expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
     expect(main.state.model).toEqual(executionModel);
     expect(main.state.thinkingLevel).toBe("high");
@@ -3227,7 +3411,7 @@ describe("messenger head session controls", () => {
     await entered.promise;
     await runtime.receive(first);
     await runtime.receive(message("head-concurrent-effort", route(), "/effort minimal"));
-    await runtime.receive(message("head-concurrent-ordinary"));
+    await runtime.receive(headMessage("head-concurrent-ordinary"));
     release.resolve();
     await runtime.kick();
     expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level" || command.type === "prompt").map(command => command.type)).toEqual(["set_model", "set_thinking_level", "prompt"]);
@@ -3243,7 +3427,7 @@ describe("messenger head session controls", () => {
   test("mutations refuse active main input while read-only diagnostics remain available", async () => {
     const { runtime, main, store } = fixture();
     await runtime.start();
-    await admit(runtime, message("head-active-original"));
+    await admit(runtime, headMessage("head-active-original"));
     for (const [index, text] of ["/model fixture/efficient", "/effort off"].entries()) {
       await admit(runtime, message(`head-busy-input-${index}`, route(), text));
       expect(store.input(`head-busy-input-${index}`)?.state).toBe("cancelled");
@@ -3322,7 +3506,7 @@ describe("messenger head session controls", () => {
       await admit(runtime, original);
       expect(store.input(original.id)?.state).toBe("uncertain");
       await admit(runtime, original);
-      await admit(runtime, message(`head-fenced-${result}`));
+      await admit(runtime, headMessage(`head-fenced-${result}`));
       await admit(runtime, message(`head-fenced-mutation-${result}`, route(), "/effort off"));
       await admit(runtime, message(`head-diagnostic-${result}`, route(), "/model"));
       expect(store.input(`head-fenced-${result}`)?.state).toBe("pending");
@@ -3379,7 +3563,7 @@ describe("messenger head session controls", () => {
     await runtime.start();
     await admit(runtime, original);
     await admit(runtime, message("head-crashed-diagnostic", route(), "/model"));
-    await admit(runtime, message("head-crashed-later-work"));
+    await admit(runtime, headMessage("head-crashed-later-work"));
     expect(store.input(original.id)?.state).toBe("uncertain");
     expect(store.input("head-crashed-diagnostic")?.state).toBe("done");
     expect(store.input("head-crashed-later-work")?.state).toBe("pending");
@@ -3393,7 +3577,7 @@ describe("messenger head session controls", () => {
     store.receive(message("head-blocking-request"), "main");
     store.submit("head-blocking-request", "head-blocking-receipt", 0);
     store.settle("head-blocking-request", "uncertain");
-    await admit(runtime, message("head-blocked-later-work"));
+    await admit(runtime, headMessage("head-blocked-later-work"));
     expect(store.input("head-blocked-later-work")?.state).toBe("pending");
     expect(main.prompts).toEqual([]);
     // The operator must be able to discover the exact held identity from HEAD.
@@ -3423,10 +3607,10 @@ describe("messenger head session controls", () => {
       }
       throw new Error("lost native admission response");
     };
-    await admit(runtime, message("lost-native-request"));
+    await admit(runtime, headMessage("lost-native-request"));
     main.beforePrompt = undefined;
     expect(store.input("lost-native-request")?.state).toBe("uncertain");
-    await admit(runtime, message("after-lost-native-request"));
+    await admit(runtime, headMessage("after-lost-native-request"));
     if (state === "unknown") main.beforeState = () => { throw new Error("native state unavailable"); };
     await admit(runtime, message("resolve-lost-native-request", route(), "/resolve"));
     expect(store.input("lost-native-request")?.state).toBe("cancelled");
@@ -3448,15 +3632,15 @@ describe("messenger head session controls", () => {
   test("resolving a failed steering admission does not strand or cancel its running owner", async () => {
     const { runtime, store, main } = fixture();
     await runtime.start();
-    await admit(runtime, message("steering-owner"));
+    await admit(runtime, headMessage("steering-owner"));
     main.beforePrompt = () => { throw new Error("lost steering response"); };
-    await admit(runtime, message("lost-steering"));
+    await admit(runtime, headMessage("lost-steering"));
     main.beforePrompt = undefined;
     expect(store.input("lost-steering")?.state).toBe("uncertain");
     await admit(runtime, message("resolve-steering", route(), "/resolve lost-steering"));
     expect(store.input("steering-owner")?.state).toBe("submitted");
     main.complete("Owner finished", 0);
-    await admit(runtime, message("after-steering", route("another-thread")));
+    await admit(runtime, headMessage("after-steering", route("another-thread")));
     await main.whenPrompts(3);
     expect(store.input("steering-owner")?.state).toBe("done");
     expect(store.input("lost-steering")?.state).toBe("cancelled");
@@ -3565,7 +3749,7 @@ ${JSON.stringify(snapshot)}
 EOF
 `, { mode: 0o700 });
     await runtime.start();
-    await admit(runtime, message("usage-active", route("11")));
+    await admit(runtime, headMessage("usage-active", route("11")));
     const input = applicationCommand("1750000000000000001", route("12"), "/usage");
     await admit(runtime, input);
     expect(store.input(input.id)?.state).toBe("done");
@@ -3608,8 +3792,8 @@ exit ${code}
       const destination = platform === "slack"
         ? route(null, { platform, accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" }) : route();
       const current = platform === "slack"
-        ? { ...message("slack-active", destination), messageId: "1750000000.000001" }
-        : message("1750000000000000000", destination, "Active owner work");
+        ? { ...headMessage("slack-active", destination), messageId: "1750000000.000001" }
+        : headMessage("1750000000000000000", destination, "Active owner work");
       const command = platform === "slack" ? slackCommand : applicationCommand;
       await runtime.start();
       await admit(runtime, current);
@@ -3645,7 +3829,7 @@ exit ${code}
     const idle = applicationCommand("1750000000000000101", route(), "/resume");
     await admit(runtime, idle);
     expect(main.prompts).toEqual([]);
-    await admit(runtime, message("1750000000000000102"));
+    await admit(runtime, headMessage("1750000000000000102"));
     const busy = applicationCommand("1750000000000000103", route(), "/resume");
     await admit(runtime, busy);
     expect(main.prompts).toHaveLength(1);
@@ -3661,7 +3845,7 @@ exit ${code}
     main.state.pendingUiRequests = [{ id: "native-ui", method: "unknown", prompt: "secret native prompt", token: "secret-token" }];
     await runtime.start();
     main.state.pendingUiRequests = [];
-    await admit(runtime, message("query-active", lane.route));
+    await admit(runtime, headMessage("query-active", lane.route));
     main.state.pendingUiRequests = [{ id: "native-ui", method: "unknown", prompt: "secret native prompt" }];
     for (const [index, text] of ["/help", "/status", "/context", "/usage", "/model preset", "/model preset list"].entries()) {
       await admit(runtime, message(`priority-query-${index}`, lane.route, text));
@@ -3680,8 +3864,8 @@ exit ${code}
   test("head stop cancels only its durable ordinary boundary and drains native work without revival", async () => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    await admit(runtime, message("stop-current"));
-    await runtime.receive(message("stop-queued"));
+    await admit(runtime, headMessage("stop-current"));
+    await runtime.receive(headMessage("stop-queued"));
     store.receive(message("historical-uncertain"), "main");
     store.submit("historical-uncertain", "historical-request", 0);
     store.settle("historical-uncertain", "uncertain");
@@ -3691,7 +3875,7 @@ exit ${code}
     store.putApproval({ id: "original-approval", target: "main", generation: 0, requestId: "original-ui", route: route(), request: { method: "confirm" }, state: "pending", remoteId: "card" });
     const stop = message("stop-boundary", route(), "/stop head");
     await runtime.receive(stop);
-    await runtime.receive(message("stop-later"));
+    await runtime.receive(headMessage("stop-later"));
     await runtime.kick();
     expect(store.input("stop-current")?.state).toBe("cancelled");
     expect(store.input("stop-queued")?.state).toBe("cancelled");
@@ -3715,10 +3899,10 @@ exit ${code}
     const lane = savedLane(store, config, "stop-bound", route("stop-bound"));
     const other = savedLane(store, config, "stop-unrelated", route("stop-unrelated"));
     await runtime.start();
-    await admit(runtime, message("ordinary-before-stop", route("unbound")));
+    await admit(runtime, headMessage("ordinary-before-stop", route("unbound")));
     await admit(runtime, message("unbound-stop", route("unbound"), "/stop"));
     expect(main.abortCount).toBe(1);
-    await admit(runtime, message("ordinary-after-stop", route("unbound")));
+    await admit(runtime, headMessage("ordinary-after-stop", route("unbound")));
     expect(main.prompts).toHaveLength(2);
     expect(store.input("ordinary-after-stop")?.state).toBe("submitted");
     await admit(runtime, message("bare-bound-stop", lane.route, "/stop"));
@@ -3747,7 +3931,7 @@ exit ${code}
     expect(store.input("restart-stopped-active")?.state).toBe("cancelled");
     expect(store.input("restart-stopped-queued")?.state).toBe("cancelled");
     expect(store.input("restart-stop")?.state).toBe("uncertain");
-    await admit(runtime, message("restart-after-stop"));
+    await admit(runtime, headMessage("restart-after-stop"));
     await admit(runtime, message("restart-stop", route(), "/stop head"));
     expect(store.input("restart-after-stop")?.state).toBe("pending");
     expect(main.abortCount).toBe(0);
@@ -3755,14 +3939,20 @@ exit ${code}
   });
 
   test("priority command lookalikes and quoted tokens remain ordinary user data", async () => {
-    const { runtime, main } = fixture();
+    const { runtime, main, store, config, hosts } = fixture();
+    const lane = savedLane(store, config, "priority-lookalikes", route());
     await runtime.start();
     for (const [index, text] of ["/stopper", "/compactness", "/statuses", "/helpful", "/usageful", "/contextual", '"/stop head"'].entries()) {
-      await admit(runtime, message(`priority-lookalike-${index}`, route(), text));
-      main.complete("Ordinary data response");
+      const id = `priority-lookalike-${index}`;
+      await admit(runtime, message(id, lane.route, text));
+      expect(store.input(id)).toMatchObject({ target: null, state: "done" });
+      const worker = hosts.get(lane.socketPath);
+      if (!worker) throw new Error("Expected ordinary lookalike work in the lane");
+      expect(worker.prompts[index]?.command.message).toContain(text);
+      worker.complete("");
       await runtime.kick();
     }
-    expect(main.prompts).toHaveLength(7);
+    expect(main.prompts).toEqual([]);
     expect(main.abortCount).toBe(0);
     expect(main.commands.some(command => command.type === "compact")).toBe(false);
   });
@@ -3776,7 +3966,7 @@ exit ${code}
     await runtime.receive(message("overlap-stop-1", route(), "/stop head"));
     await entered.promise;
     await runtime.receive(message("overlap-stop-2", route(), "/stop head"));
-    await runtime.receive(message("after-overlap"));
+    await runtime.receive(headMessage("after-overlap"));
     expect(main.abortCount).toBe(1);
     expect(main.prompts).toEqual([]);
     release.resolve();
@@ -3785,7 +3975,7 @@ exit ${code}
     expect(store.input("after-overlap")?.state).toBe("submitted");
     main.abortFails = true;
     await admit(runtime, message("failed-stop", route(), "/stop head"));
-    await admit(runtime, message("after-failed-stop"));
+    await admit(runtime, headMessage("after-failed-stop"));
     expect(store.input("failed-stop")?.state).toBe("uncertain");
     expect(store.input("after-failed-stop")?.state).toBe("pending");
   });
@@ -3838,7 +4028,7 @@ exit ${code}
     await admit(runtime, message("compact-pending", route(), "/compact"));
     await entered.promise;
     for (const [index, text] of ["/status", "/help", "/context", "/usage", "/model fixture/efficient"].entries()) await admit(runtime, message(`during-compact-${index}`, route(), text));
-    await runtime.receive(message("compact-ordinary"));
+    await runtime.receive(headMessage("compact-ordinary"));
     expect(store.input("during-compact-0")?.state).toBe("done");
     expect(store.input("during-compact-4")?.state).toBe("cancelled");
     expect(main.prompts).toEqual([]);
@@ -3847,7 +4037,7 @@ exit ${code}
     expect(store.input("compact-ordinary")?.state).toBe("cancelled");
     expect(store.input("stop-compact")?.state).toBe("cancelled");
     expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("compaction completed");
-    await admit(runtime, message("after-compact-stop"));
+    await admit(runtime, headMessage("after-compact-stop"));
     expect(main.prompts).toHaveLength(1);
   });
 
@@ -3861,7 +4051,7 @@ exit ${code}
       await messenger.whenSent(1);
       await admit(runtime, original);
       expect(store.input(original.id)?.state).toBe(result === "rejected" ? "cancelled" : "uncertain");
-      await admit(runtime, message(`compact-after-${result}`));
+      await admit(runtime, headMessage(`compact-after-${result}`));
       expect(main.prompts).toHaveLength(result === "rejected" ? 1 : 0);
       expect(main.commands.filter(command => command.type === "compact")).toHaveLength(1);
       expect(messenger.sent[0]?.text).not.toContain("secret");
@@ -3985,7 +4175,7 @@ exit ${code}
       const originalRoute = store.input(original.id)!.route;
       await admit(runtime, message("3103", destination, "/main"));
       await admit(runtime, original);
-      await admit(runtime, message(`global-preset-held-${failure}`, route("72")));
+      await admit(runtime, headMessage(`global-preset-held-${failure}`, route("72")));
       await admit(runtime, message(`global-preset-query-${failure}`, route(), "/model"));
       expect(store.input(original.id)).toMatchObject({ state: "uncertain", route: originalRoute });
       expect(originalRoute.topicId).toBeTruthy();
@@ -4017,7 +4207,7 @@ exit ${code}
   test("global preset query/list, duplicate and unknown flags reject deterministically even while HEAD is busy", async () => {
     const { runtime, main, store, messenger, persistedPresets } = fixture();
     await runtime.start();
-    await admit(runtime, message("global-syntax-busy"));
+    await admit(runtime, headMessage("global-syntax-busy"));
     for (const [index, text] of [
       "/model preset --global", "/model preset list --global", "/model preset --global list",
       "/model preset low --global --global", "/model preset --global low --global",
@@ -4055,7 +4245,7 @@ exit ${code}
       const original = message(`preset-ambiguous-${result}`, route(), `/model preset low${global ? " --global" : ""}`);
       await admit(runtime, original);
       await admit(runtime, original);
-      await admit(runtime, message(`preset-later-${result}`));
+      await admit(runtime, headMessage(`preset-later-${result}`));
       expect(store.input(original.id)?.state).toBe("uncertain");
       expect(store.input(`preset-later-${result}`)?.state).toBe("pending");
       expect(store.getMeta("head:model-settings:session-main")).toBeNull();
@@ -4071,9 +4261,10 @@ describe("trusted workflow activation", () => {
     const { runtime, store, main, hosts, directory } = fixture();
     main.workflowAvailable = false;
     await runtime.start();
-    const original = message("jevify-source", route("jevify-thread"), "jevify classify these independent diffs");
+    const task = "jevify classify these independent diffs";
+    const original = headMessage("jevify-source", route("jevify-thread"), task);
     await admit(runtime, original);
-    expect(main.prompts[0]!.command.message).toStartWith(`${original.text}\n\n`);
+    expect(main.prompts[0]!.command.message).toStartWith(`${task}\n\n`);
     expect(main.commands.some(command => command.type === "get_available_commands")).toBe(false);
     expect(store.input(original.id)?.workflow).toMatchObject({ name: "jevify", sourceId: original.id, provenance: "user" });
     const workflow = { name: "jevify" as const, reason: "Independent diff classification reduces context load" };
@@ -4098,13 +4289,14 @@ describe("trusted workflow activation", () => {
   test("head-selected jevify follow-up waits for the active lane and cannot gain authority from a report", async () => {
     const { runtime, store, main, hosts, directory } = fixture();
     await runtime.start();
-    await admit(runtime, message("jevify-initial", route("jevify-followup"), "Inspect this repository"));
+    await admit(runtime, headMessage("jevify-initial", route("jevify-followup"), "Inspect this repository"));
     const lane = await runtime.startLane({ ...selection, sourceId: "jevify-initial", title: "Inspect", cwd: directory,
       kickoff: "I will inspect the repository." });
     await runtime.kick();
     const host = hosts.get(lane.socketPath)!;
     host.workflowAvailable = false;
-    const source = message("jevify-followup", lane.route, "Classify the independent findings");
+    const task = "Classify the independent findings";
+    const source = headMessage("jevify-followup", lane.route, task);
     await admit(runtime, source);
     const workflow = { name: "jevify" as const, reason: "The findings form a homogeneous classification set" };
     await runtime.messageLane(lane.id, "Classify the findings with native bulk judgment", source.id, workflow);
@@ -4115,7 +4307,7 @@ describe("trusted workflow activation", () => {
     await runtime.kick();
     expect(host.prompts).toHaveLength(2);
     expect(host.prompts[1]!.command.streamingBehavior).toBeUndefined();
-    expect(String(host.prompts[1]!.command.message)).toStartWith(`jevify\n\n${source.text}\n\n`);
+    expect(String(host.prompts[1]!.command.message)).toStartWith(`jevify\n\n${task}\n\n`);
     expect(store.input(handoffId)?.workflow).toEqual({ ...workflow, sourceId: source.id, provenance: "head" });
     await runtime.messageLane(lane.id, "Classify the findings with native bulk judgment", source.id, workflow);
     expect(host.prompts).toHaveLength(2);
@@ -4132,7 +4324,9 @@ describe("trusted workflow activation", () => {
   test("preserves real user leading invocation, original route/request, and deduplicates redelivery", async () => {
     const { runtime, store, main } = fixture();
     await runtime.start();
-    const original = { ...message("workflow-user", route(null, { guildId: null }), "/new ulw-plan inspect this repository"), messageId: "1750000000000000001" };
+    const dm = route(null, { guildId: null });
+    await admit(runtime, message("1750000000000000000", dm, "/new"));
+    const original = { ...headMessage("workflow-user", dm, "ulw-plan inspect this repository"), messageId: "1750000000000000001" };
     await admit(runtime, original);
     const stored = store.input(original.id)!;
     const prompt = String(main.prompts[0]!.command.message);
@@ -4140,9 +4334,11 @@ describe("trusted workflow activation", () => {
     expect(prompt).toContain(`\nRequest ID: ${original.id}\n`);
     expect(prompt).toContain(`Original source ID: ${original.id}`);
     expect(prompt).toContain(`Original authorized conversation: ${routeKey(stored.route)}`);
-    expect(prompt).not.toContain("/new ulw-plan");
+    expect(prompt).not.toContain("/head ulw-plan");
     expect(stored).toMatchObject({ text: original.text, target: "main", workflow: { name: "ulw-plan", provenance: "user", sourceId: original.id } });
-    expect(stored.route.topicId).toBeTruthy();
+    const topic = store.input("1750000000000000000");
+    if (!topic) throw new Error("Expected the original /new boundary");
+    expect(stored.route).toEqual(topic.route);
     await admit(runtime, original);
     expect(main.prompts).toHaveLength(1);
     expect(store.input(original.id)?.route).toEqual(stored.route);
@@ -4152,7 +4348,7 @@ describe("trusted workflow activation", () => {
   test("plain ULW is an arming request rather than automatic native goal creation", async () => {
     const { runtime, store, main } = fixture();
     await runtime.start();
-    await admit(runtime, message("plain-ulw", route(), " /ULW inspect the repository"));
+    await admit(runtime, headMessage("plain-ulw", route(), " /ULW inspect the repository"));
     expect(main.prompts[0]!.command.message).toStartWith(" /ULW inspect the repository\n");
     expect(main.commands.some(command => command.type === "goal")).toBe(false);
     expect(store.input("plain-ulw")?.workflow?.name).toBe("ulw");
@@ -4164,7 +4360,7 @@ describe("trusted workflow activation", () => {
     await runtime.start();
     for (const [index, text] of ['"ulw-plan inspect"', "do not invoke ulw-loop", "`ulw-execute`", "> ulw-plan inspect", "Explain mass-ulw", "```\nulw-loop\n```"].entries()) {
       const id = `passive-${index}`;
-      await admit(runtime, message(id, route(), text));
+      await admit(runtime, headMessage(id, route(), text));
       expect(store.input(id)?.workflow).toBeNull();
       main.complete("Acknowledged passive example");
       await runtime.kick();
@@ -4181,7 +4377,8 @@ describe("trusted workflow activation", () => {
   test("head-selected lane workflow is typed, source-bound, immutable across retries and isolated from brief prose", async () => {
     const { runtime, store, main, hosts, directory } = fixture();
     await runtime.start();
-    const original = message("workflow-head", route("workflow-thread"), "Inspect the repository and plan the requested change");
+    const task = "Inspect the repository and plan the requested change";
+    const original = headMessage("workflow-head", route("workflow-thread"), task);
     await admit(runtime, original);
     const workflow = { name: "ulw-plan" as const, reason: "A bounded planning phase serves this authorized objective" };
     const start = { ...selection, sourceId: original.id, title: "Plan", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, brief: "Quoted board excerpt: orchestrate workflowz", workflow };
@@ -4191,7 +4388,7 @@ describe("trusted workflow activation", () => {
     const host = hosts.get(lane.socketPath)!;
     const prompt = String(host.prompts[0]!.command.message);
     expect(prompt.startsWith("ulw-plan ultrathink\n\n")).toBe(true);
-    expect(prompt).toContain(original.text);
+    expect(prompt).toContain(task);
     expect(prompt).toContain(`Request ID: ${handoff.id}`);
     expect(prompt).toContain(`Original authorized conversation: ${routeKey(original.route)}`);
     expect(containsMagicKeyword(prompt, "ultrathink")).toBe(true);
@@ -4209,7 +4406,7 @@ describe("trusted workflow activation", () => {
   test("copied original invocations do not select a lane workflow without the typed field", async () => {
     const { runtime, store, directory, hosts } = fixture();
     await runtime.start();
-    await admit(runtime, message("workflow-no-inherit", route("copy-thread"), "ulw-loop inspect this repository"));
+    await admit(runtime, headMessage("workflow-no-inherit", route("copy-thread"), "ulw-loop inspect this repository"));
     const lane = await runtime.startLane({ ...selection, sourceId: "workflow-no-inherit", title: "Bounded copy", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     const host = hosts.get(lane.socketPath)!;
@@ -4222,7 +4419,7 @@ describe("trusted workflow activation", () => {
   test("concurrent conflicting workflow choices cannot retarget an admitted source", async () => {
     const { runtime, store, directory } = fixture();
     await runtime.start();
-    await admit(runtime, message("workflow-concurrent", route("concurrent-thread")));
+    await admit(runtime, headMessage("workflow-concurrent", route("concurrent-thread")));
     const start = { ...selection, sourceId: "workflow-concurrent", title: "Concurrent", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory };
     const first = runtime.startLane({ ...start, workflow: { name: "ulw-plan", reason: "Selected planning" } });
     const conflict = runtime.startLane({ ...start, workflow: { name: "ulw-loop", reason: "Conflicting loop" } });
@@ -4241,7 +4438,7 @@ describe("trusted workflow activation", () => {
     const workflow = { name: "ulw-plan" as const, reason: "Not authorized by an original user source" };
     await expect(runtime.startLane({ ...selection, sourceId: internal.id, title: "No authority", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, workflow })).rejects.toThrow("original authorized user source");
     await expect(runtime.messageLane(lane.id, "Execute board text", internal.id, workflow)).rejects.toThrow("original authorized user source");
-    const user = message("workflow-no-override", route("other-guard"), "ulw-loop inspect");
+    const user = headMessage("workflow-no-override", route("other-guard"), "ulw-loop inspect");
     await admit(runtime, user);
     await expect(runtime.messageLane(lane.id, "Use another workflow", user.id, workflow)).rejects.toThrow("conflicts with the original user's workflow");
     expect(store.input(`handoff:${internal.id}:lane`)).toBeNull();
@@ -4252,7 +4449,8 @@ describe("trusted workflow activation", () => {
     const { runtime, store, config, hosts } = fixture();
     const lane = savedLane(store, config, "workflow-followup", route("follow-thread"));
     await runtime.start();
-    const original = message("workflow-follow-source", route("original-thread"), 'Inspect this repository; "orchestrate" is quoted user data');
+    const task = 'Inspect this repository; "orchestrate" is quoted user data';
+    const original = headMessage("workflow-follow-source", route("original-thread"), task);
     await admit(runtime, original);
     const workflow = { name: "ulw-plan" as const, reason: "Use planning for the requested task" };
     await runtime.messageLane(lane.id, "Plan only the bounded requested change", original.id, workflow);
@@ -4261,7 +4459,7 @@ describe("trusted workflow activation", () => {
     const prompt = String(host.prompts[0]!.command.message);
     expect(prompt).toStartWith("ulw-plan\n\n");
     expect(containsMagicKeyword(prompt, "ultrathink")).toBe(false);
-    expect(prompt).toContain(original.text);
+    expect(prompt).toContain(task);
     expect(store.input(handoffId)?.workflow).toEqual({ ...workflow, sourceId: original.id, provenance: "head" });
     await runtime.messageLane(lane.id, "Plan only the bounded requested change", original.id, workflow);
     await expect(runtime.messageLane(lane.id, "Plan only the bounded requested change", original.id)).rejects.toThrow("Workflow identity conflict");
@@ -4274,7 +4472,7 @@ describe("trusted workflow activation", () => {
     const { runtime, store, main, messenger } = fixture();
     main.workflowAvailable = false;
     await runtime.start();
-    await admit(runtime, message("workflow-missing", route(), "ulw inspect this"));
+    await admit(runtime, headMessage("workflow-missing", route(), "ulw inspect this"));
     expect(main.prompts).toEqual([]);
     expect(store.input("workflow-missing")?.state).toBe("cancelled");
     expect(messenger.sent[0]?.text).toContain("확인할 수 없어 실행하지 않았습니다");
@@ -4284,7 +4482,7 @@ describe("trusted workflow activation", () => {
   test("cancelled source cannot activate selected handoffs, including cancellation while reading capability", async () => {
     const { runtime, store, directory, hosts } = fixture();
     await runtime.start();
-    const original = message("workflow-cancelled", route("cancel-thread"));
+    const original = headMessage("workflow-cancelled", route("cancel-thread"));
     await admit(runtime, original);
     const workflow = { name: "ulw-plan" as const, reason: "Bounded planning" };
     const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Cancelled source", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, workflow });
@@ -4300,7 +4498,7 @@ describe("trusted workflow activation", () => {
     const other = fixture();
     await other.runtime.start();
     other.main.beforeCapabilities = () => { other.store.settle("workflow-cancel-race", "cancelled"); };
-    await admit(other.runtime, message("workflow-cancel-race", route(), "ulw inspect"));
+    await admit(other.runtime, headMessage("workflow-cancel-race", route(), "ulw inspect"));
     expect(other.main.prompts).toEqual([]);
     expect(other.store.input("workflow-cancel-race")?.state).toBe("cancelled");
   });
@@ -4621,8 +4819,8 @@ describe("authoritative per-lane model selection", () => {
     const { runtime, store, directory, launched, hosts, config } = fixture();
     config.model = "global/never-use-for-lanes";
     await runtime.start();
-    await admit(runtime, message("2001", route("21")));
-    await admit(runtime, message("2002", route("22")));
+    await admit(runtime, headMessage("2001", route("21")));
+    await admit(runtime, headMessage("2002", route("22")));
     const one = await runtime.startLane({ ...selection, sourceId: "2001", title: "Complex", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     const reason = "Native judge selected the efficient model for a bounded documentation task.";
     const two = await runtime.startLane({ sourceId: "2002", title: "Bounded", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, model: otherModel, modelReason: reason });
@@ -4658,7 +4856,7 @@ describe("authoritative per-lane model selection", () => {
   test("same-source model changes reject even during concurrent lane creation", async () => {
     const { runtime, directory, store } = fixture();
     await runtime.start();
-    await admit(runtime, message("2020", route("23")));
+    await admit(runtime, headMessage("2020", route("23")));
     const first = runtime.startLane({ ...selection, sourceId: "2020", title: "Original", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     const conflict = runtime.startLane({ ...selection, sourceId: "2020", title: "Conflicting", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, model: otherModel });
     const lane = await first;
@@ -4671,7 +4869,7 @@ describe("authoritative per-lane model selection", () => {
   test("resolved preset identities are snapshotted before asynchronous lane selection", async () => {
     const { runtime, store, main, directory } = fixture();
     await runtime.start();
-    await admit(runtime, message("2025", route("38")));
+    await admit(runtime, headMessage("2025", route("38")));
     const catalogStarted = Promise.withResolvers<void>();
     const releaseCatalog = Promise.withResolvers<void>();
     main.beforeCatalog = async () => {
@@ -4908,7 +5106,7 @@ describe("frozen native preset lane choices", () => {
     launchBehavior.pid = 2147483647;
     const saved = structuredClone(nativePresets.get("high")!);
     await runtime.start();
-    await admit(runtime, message("2200", route("60")));
+    await admit(runtime, headMessage("2200", route("60")));
     const lane = await runtime.startLane({ sourceId: "2200", title: "Frozen native preset", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, preset: "high", modelReason: "Native judge recommends the saved high preset." });
     await runtime.kick();
     expect(store.lane(lane.id)).toMatchObject({ model: saved.model, modelPreset: "high", modelPresetSnapshot: saved.snapshot });
@@ -5049,7 +5247,7 @@ describe("frozen native preset lane choices", () => {
     messenger.send = async output => { entered.resolve(); await release.promise; return send(output); };
     const flushing = runtime.kick();
     await entered.promise;
-    await runtime.receive(message("2221", lane.route));
+    await runtime.receive(headMessage("2221", lane.route));
     const draining = runtime.kick();
     release.resolve();
     await Promise.all([flushing, draining]);
@@ -5062,7 +5260,7 @@ describe("frozen native preset lane choices", () => {
     const { runtime, store, nativePresets, directory, messenger } = fixture();
     nativePresets.set("my-team-coding", { ...structuredClone(nativePresets.get("high")!), preset: "my-team-coding" });
     await runtime.start();
-    await admit(runtime, message("2230", route("65")));
+    await admit(runtime, headMessage("2230", route("65")));
     expect(await runtime.startLane({ sourceId: "2230", title: "Custom native preset", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory, preset: "my-team-coding", modelReason: "Use an existing operator native preset." })).toMatchObject({ modelPreset: "my-team-coding", model: executionModel });
     store.receive(message("2231", route(null)), "main");
     store.submit("2231", "already-head-owned", 0);
@@ -5206,11 +5404,11 @@ describe("real Store runtime coordination", () => {
     expect(head.prompts).toEqual([]);
     const request = slackCommand("null-request", dm, "/new inspect this repository");
     await admit(restarted, request);
-    expect(reopened.input(request.id)).toMatchObject({ state: "submitted", messageId: null });
-    expect(reopened.input(request.id)!.route.topicId).toMatch(/^topic-/);
-    expect(head.prompts).toHaveLength(1);
-    expect(head.prompts[0]!.command.message).toContain("inspect this repository");
-    expect(head.prompts[0]!.command.message).not.toContain("/new inspect");
+    expect(reopened.input(request.id)).toMatchObject({ target: null, state: "pending", messageId: null, invocationId: request.invocationId, text: request.text });
+    const pendingRoute = reopened.input(request.id)!.route;
+    expect(pendingRoute.topicId).toMatch(/^topic-/);
+    expect(reopened.output(`${request.id}:workspace`)).toMatchObject({ state: "sent", route: pendingRoute, sourceId: request.id });
+    expect(head.prompts).toEqual([]);
     expect(transport.activities).toEqual([]);
     expect(transport.fetched).toEqual([]);
     expect(reopened.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBeNull();
@@ -5291,21 +5489,25 @@ describe("real Store runtime coordination", () => {
       ...message(`slack:${suffix}`, dm, text), messageId: `1750000000.${suffix}`, receivedAt,
     });
     await runtime.start();
-    const firstRequest = event("000002", "/new first task", 500);
+    const firstRequest = event("000002", `/new cwd: ${directory}\nfirst task`, 500);
     await admit(runtime, firstRequest);
-    const first = await runtime.startLane({ ...selection, sourceId: firstRequest.id, title: "Slack first", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
+    const [first] = store.lanes();
+    if (!first) throw new Error("Expected the first Slack topic lane");
     await admit(runtime, event("000004", "/main", 1));
     await admit(runtime, event("000003", "Late first topic followup", 900));
-    expect(store.input("slack:000003")).toMatchObject({ target: "main", route: first.route });
+    expect(store.input("slack:000003")).toMatchObject({ target: null, state: "done", route: first.route });
     await admit(runtime, { ...event("000003", "Edited first topic followup"), id: "slack:000003:edited" });
-    expect(store.input("slack:000003:edited")).toMatchObject({ target: "main", route: first.route });
-    await admit(runtime, event("000001", "Historical main request", 999));
+    expect(store.input("slack:000003:edited")).toMatchObject({ target: null, state: "done", route: first.route });
+    for (const id of ["slack:000003", "slack:000003:edited"]) {
+      expect(store.input(`handoff:${id}:${first.id}`)?.target).toBe(first.id);
+    }
+    await admit(runtime, event("000001", "/head Historical main request", 999));
     expect(store.input("slack:000001")?.target).toBe("main");
-    await admit(runtime, event("000005", "Current main request", 0));
+    await admit(runtime, event("000005", "/head Current main request", 0));
     expect(store.input("slack:000005")?.route).toEqual(dm);
     await admit(runtime, firstRequest);
     expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
-    expect(store.input(firstRequest.id)?.target).toBe("main");
+    expect(store.input(firstRequest.id)).toMatchObject({ target: null, state: "done", text: firstRequest.text });
     expect(store.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBe("1750000000.000005");
     await admit(runtime, event("000006", "/new later task"));
     const currentTopic = store.input("slack:000006")!.route.topicId!;
@@ -5318,7 +5520,7 @@ describe("real Store runtime coordination", () => {
     await admit(runtime, { ...event("000004", "/new"), id: "slack:main-control-edit" });
     expect(store.input("slack:main-control-edit")).toMatchObject({ state: "done", route: dm });
     expect(store.lanes()).toHaveLength(1);
-    expect(store.input(firstRequest.id)?.target).toBe("main");
+    expect(store.input(firstRequest.id)).toMatchObject({ target: null, state: "done", text: firstRequest.text });
     expect(store.input("slack:000004")?.route).toEqual(dm);
     expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe(currentTopic);
     expect(store.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBe("1750000000.000006");
@@ -5345,22 +5547,27 @@ describe("real Store runtime coordination", () => {
   });
 
   test("Slack submitted DM handoff preserves original ownership and actual DM threads stay physical", async () => {
-    const { runtime, config, store, directory, messenger } = fixture();
+    const { runtime, config, store, directory, messenger, main } = fixture();
     config.slack = { botTokenEnv: "TEST_SLACK_BOT_TOKEN", appTokenEnv: "TEST_SLACK_APP_TOKEN", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: [] };
     const dm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DPRIVATE" });
     await runtime.start();
-    await admit(runtime, { ...message("slack:head", dm), messageId: "1750000000.000001" });
+    await admit(runtime, { ...headMessage("slack:head", dm), messageId: "1750000000.000001" });
     const delegated = await runtime.startLane({ ...selection, sourceId: "slack:head", title: "Handoff", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     expect(store.input("slack:head")).toMatchObject({ target: "main", state: "submitted", route: dm });
     expect(store.input("handoff:slack:head:lane")?.target).toBe(delegated.id);
     expect(delegated.route.threadId).toBeNull();
     expect(delegated.route.topicId).toBeTruthy();
     const threaded = { ...dm, threadId: "1750000000.000100" };
-    await admit(runtime, { ...message("slack:thread", threaded, "Independent native DM thread"), messageId: "1750000000.000101" });
-    expect(store.input("slack:thread")).toMatchObject({ target: "main", route: threaded });
+    await admit(runtime, { ...message("slack:thread", threaded, `cwd: ${directory}\nIndependent native DM thread`), messageId: "1750000000.000101" });
+    const physicalLane = store.laneForRoute(threaded);
+    if (!physicalLane) throw new Error("Expected a distinct physical Slack DM thread lane");
+    expect(physicalLane.id).not.toBe(delegated.id);
+    expect(store.input("handoff:slack:thread:lane")?.target).toBe(physicalLane.id);
+    expect(store.input("slack:thread")).toMatchObject({ target: null, state: "done", route: threaded });
     expect(store.input("slack:thread")?.route.topicId).toBeUndefined();
     expect(physicalRouteKey(threaded)).not.toBe(physicalRouteKey(dm));
     expect(messenger.threads).toEqual([]);
+    expect(main.prompts).toHaveLength(1);
   });
 
   test("Telegram negative group chats and real forum topic IDs keep independent native lanes", async () => {
@@ -5370,8 +5577,8 @@ describe("real Store runtime coordination", () => {
     const firstRoute = route("42", { platform: "telegram", guildId: "-1001234567890", channelId: "-1001234567890" });
     const secondRoute = { ...firstRoute, threadId: "43" };
     await runtime.start();
-    await admit(runtime, message("901", firstRoute));
-    await admit(runtime, message("902", secondRoute));
+    await admit(runtime, headMessage("901", firstRoute));
+    await admit(runtime, headMessage("902", secondRoute));
     const first = await runtime.startLane({ ...selection, sourceId: "901", title: "Forum one", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     const second = await runtime.startLane({ ...selection, sourceId: "902", title: "Forum two", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
@@ -5475,7 +5682,7 @@ describe("real Store runtime coordination", () => {
   test("secret native dialogs fail closed without presenting or persisting messenger cards", async () => {
     const { runtime, main, messenger, store } = fixture();
     await runtime.start();
-    await admit(runtime, message("secret-source", route(null, { guildId: null })));
+    await admit(runtime, headMessage("secret-source", route(null, { guildId: null })));
     const frame = { type: "extension_ui_request", method: "input", id: "secret-dialog", title: "Credential", secret: true };
     main.state.pendingUiRequests = [frame];
     main.emit(frame);
@@ -5485,34 +5692,46 @@ describe("real Store runtime coordination", () => {
     expect(store.approvals()).toEqual([]);
   });
 
-  test("unknown topics steer same-topic followups and lane selection never rebinds admitted inputs", async () => {
-    const { runtime, store, main, messenger, directory } = fixture();
+  test("ordinary first requests start isolated topic sessions and same-topic followups steer only their own run", async () => {
+    const { runtime, store, main, messenger, directory, hosts } = fixture();
+    const task = "Inspect the first topic in its selected workspace";
+    const original = message("100", route(), `cwd: ${directory}\n${task}`);
     await runtime.start();
-    await admit(runtime, message("100"));
-    expect(store.input("100")).toMatchObject({ target: "main", state: "submitted" });
-    expect(store.input("route:100")).toBeNull();
-    expect(main.prompts[0]!.command.message).toContain("sourceId: 100");
-    await admit(runtime, message("100-followup"));
-    expect(main.prompts).toHaveLength(2);
-    expect(main.prompts[1]!.command).toMatchObject({ streamingBehavior: "steer" });
-    expect(main.prompts[1]!.command.message).toContain("sourceId: 100-followup");
-    expect(store.input("100-followup")).toMatchObject({ target: "main", state: "submitted" });
-    await admit(runtime, message("100-other-topic", route("11")));
-    expect(main.prompts).toHaveLength(2);
-    expect(store.input("100-other-topic")).toMatchObject({ target: "main", state: "pending" });
-    expect(messenger.sent).toEqual([]);
-    const lane = await runtime.startLane({ ...selection, sourceId: "100", title: "Topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
-    await runtime.kick();
-    expect(store.input("100")?.target).toBe("main");
-    expect(store.input("100-followup")).toMatchObject({ target: "main", state: "submitted" });
-    expect(store.input("100-other-topic")).toMatchObject({ target: "main", state: "pending" });
-    expect(main.prompts).toHaveLength(2);
-    expect(store.input(`handoff:100-followup:${lane.id}`)).toBeNull();
-    expect(store.input(`handoff:100-other-topic:${lane.id}`)).toBeNull();
-    expect(store.input("handoff:100:lane")?.target).toBe(lane.id);
+    await admit(runtime, original);
+    const first = store.laneForRoute(original.route);
+    if (!first) throw new Error("Expected the first topic's own lane");
+    const worker = hosts.get(first.socketPath);
+    if (!worker) throw new Error("Expected the first topic's own Host");
+    expect(first.cwd).toBe(directory);
+    expect(store.input(original.id)).toMatchObject({ target: null, state: "done", route: original.route, text: original.text });
+    expect(store.input(`handoff:${original.id}:lane`)).toMatchObject({ target: first.id, state: "submitted" });
+    const prompt = worker.prompts[0]?.command.message;
+    expect(prompt).toContain(task);
+    expect(prompt).toContain(`Original source ID: ${original.id}`);
+    expect(prompt).not.toContain(`cwd: ${directory}\n${task}`);
+
+    const followup = message("100-followup", original.route, "Check the latest status too");
+    await admit(runtime, followup);
+    const followupId = `handoff:${followup.id}:${first.id}`;
+    expect(store.input(followup.id)).toMatchObject({ target: null, state: "done" });
+    expect(store.input(followupId)).toMatchObject({ target: first.id, state: "submitted" });
+    expect(worker.prompts[1]?.command).toMatchObject({ streamingBehavior: "steer", message: expect.stringContaining(`Original source ID: ${followup.id}`) });
+
+    const other = message("100-other-topic", route("11"), `cwd: ${directory}\nInspect the second topic separately`);
+    await admit(runtime, other);
+    const second = store.laneForRoute(other.route);
+    if (!second) throw new Error("Expected a second isolated lane");
+    expect(second.id).not.toBe(first.id);
+    expect(store.input(`handoff:${other.id}:lane`)).toMatchObject({ target: second.id, state: "submitted" });
+    expect(hosts.get(second.socketPath)?.prompts.map(entry => entry.command.streamingBehavior)).toEqual([undefined]);
+
+    await admit(runtime, original);
+    await admit(runtime, followup);
+    expect(store.lanes()).toHaveLength(2);
+    expect(worker.prompts).toHaveLength(2);
+    expect(main.prompts).toEqual([]);
     expect(messenger.threads).toEqual([]);
-    expect(lane.cwd).toBe(directory);
-    expect(await runtime.startLane({ ...selection, sourceId: "100", title: "Replay", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory })).toMatchObject({ id: lane.id, title: "Topic" });
+    expect(messenger.sent.map(output => output.id)).toEqual([`${original.id}:kickoff`, `${other.id}:kickoff`]);
   });
 
   test("only head synthesis delivers lane reports on their immutable original conversations", async () => {
@@ -5553,7 +5772,7 @@ describe("real Store runtime coordination", () => {
     const { runtime, store, config, hosts, main, messenger } = fixture();
     config.discord!.allowedChannelIds.push("5");
     const lane = savedLane(store, config, "cross-channel", route("75"));
-    const original = message("cross-channel-source", route(null, { channelId: "5" }), "Ask the existing lane for its result here");
+    const original = headMessage("cross-channel-source", route(null, { channelId: "5" }), "Ask the existing lane for its result here");
     await runtime.start();
     await admit(runtime, original);
     await runtime.messageLane(lane.id, "Report the requested result to head", original.id);
@@ -5577,14 +5796,14 @@ describe("real Store runtime coordination", () => {
     expect(messenger.sent.some(output => routeKey(output.route) === routeKey(lane.route))).toBe(false);
   });
 
-  test("bound followups enter head with compact lane context and direct answers never wake lanes", async () => {
+  test("explicit /head on bound topics includes compact context and never wakes paused lanes", async () => {
     const { runtime, store, config, main, messenger, launched } = fixture();
     const one = savedLane(store, config, "head-context-one", route("71"));
     const two = savedLane(store, config, "head-context-two", route("72"));
     store.updateLane(one.id, 0, { workState: "paused", result: "Private full lane transcript must not enter the head prompt" });
     await runtime.start();
-    await admit(runtime, message("head-first-one", one.route, "Answer this question here"));
-    await admit(runtime, message("head-first-two", two.route, "Answer the other question there"));
+    await admit(runtime, headMessage("head-first-one", one.route, "Answer this question here"));
+    await admit(runtime, headMessage("head-first-two", two.route, "Answer the other question there"));
     expect(store.input("head-first-one")).toMatchObject({ target: "main", state: "submitted", route: one.route });
     expect(store.input("head-first-two")).toMatchObject({ target: "main", state: "pending", route: two.route });
     const prompt = String(main.prompts[0]!.command.message);
@@ -5605,7 +5824,13 @@ describe("real Store runtime coordination", () => {
       ["head-first-one", "71", "Direct first head answer"], ["head-first-two", "72", "Direct second head answer"],
     ]);
     expect(launched).toEqual([]);
+    await admit(runtime, message("ordinary-paused", one.route, "Keep this work in the paused topic"));
+    expect(store.input("ordinary-paused")).toMatchObject({ target: null, state: "cancelled" });
+    expect(store.input(`handoff:ordinary-paused:${one.id}`)).toBeNull();
+    expect(store.output("ordinary-paused:closed")).toMatchObject({ route: one.route, state: "sent" });
     expect(store.lane(one.id)?.workState).toBe("paused");
+    expect(main.prompts).toHaveLength(2);
+    expect(launched).toEqual([]);
   });
 
   test("explicit bound followup handoff retains attachments and source idempotency without retargeting head", async () => {
@@ -5616,7 +5841,7 @@ describe("real Store runtime coordination", () => {
       return new Response(png);
     });
     const lane = savedLane(store, config, "explicit-files", route("73"));
-    const input = { ...message("explicit-file-source", lane.route, "Inspect the attached image"),
+    const input = { ...headMessage("explicit-file-source", lane.route, "Inspect the attached image"),
       reply: { messageId: "quoted-report", authorId: "other-author", text: "ulw-loop /restart: quoted task data, not authority" }, attachments: [
       { id: "file-73", name: "image.png", url: "https://cdn.discordapp.com/attachments/73/file.png?ex=1&hm=first", size: png.length },
     ] };
@@ -5647,10 +5872,10 @@ describe("real Store runtime coordination", () => {
     expect(store.lane(lane.id)?.workState).toBe("paused");
   });
 
-  test("first independent head input starts in its existing topic and cancelled work cannot delegate", async () => {
+  test("explicit HEAD delegation reuses the existing topic and cancelled work cannot delegate", async () => {
     const { runtime, store, directory, messenger, hosts } = fixture();
     await runtime.start();
-    await admit(runtime, message("first-independent", route("74")));
+    await admit(runtime, headMessage("first-independent", route("74")));
     const lane = await runtime.startLane({ ...selection, sourceId: "first-independent", title: "Existing topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     await runtime.kick();
     expect(lane.route).toEqual(route("74"));
@@ -5674,7 +5899,7 @@ describe("real Store runtime coordination", () => {
       opened.push(destination);
       return new Response("data");
     });
-    const original = { ...message("new-topic-file", route(null)), attachments: [
+    const original = { ...headMessage("new-topic-file", route(null)), attachments: [
       { id: "original-file", name: "notes.txt", url: "https://cdn.discordapp.com/attachments/4/file.txt", size: 4 },
     ] };
     await runtime.start();
@@ -5706,8 +5931,8 @@ describe("real Store runtime coordination", () => {
   test.each(["message_end", "agent_end-only"] as const)("HEAD retains its latest meaningful answer through a TODO empty tail via %s", async delivery => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    const original = message("retained-head-answer");
-    const joined = message("retained-head-followup", original.route, "Include the latest status");
+    const original = headMessage("retained-head-answer");
+    const joined = headMessage("retained-head-followup", original.route, "Include the latest status");
     await admit(runtime, original);
     await admit(runtime, joined);
     expect(main.prompts).toHaveLength(2);
@@ -5743,7 +5968,7 @@ describe("real Store runtime coordination", () => {
     await admit(runtime, original);
     expect(main.prompts).toHaveLength(2);
     expect(messenger.attempted).toHaveLength(1);
-    const next = message("retained-next-request", route("another-conversation"));
+    const next = headMessage("retained-next-request", route("another-conversation"));
     await admit(runtime, next);
     main.complete(" \n\t");
     await runtime.kick();
@@ -5755,7 +5980,7 @@ describe("real Store runtime coordination", () => {
   test.each(["replacement", "error", "aborted"] as const)("terminal-only HEAD continuation applies %s text without replaying an earlier run", async scenario => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    const original = message("retained-head-continuation");
+    const original = headMessage("retained-head-continuation");
     await admit(runtime, original);
     main.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Earlier run answer" }] } });
     main.emit({ type: "prompt_result", id: main.prompts[0]!.id, status: "completed", agentInvoked: true, sessionSettled: false });
@@ -5784,7 +6009,7 @@ describe("real Store runtime coordination", () => {
   test.each(["message_end", "agent_end-only"] as const)(`HEAD ${stopReason} clears retained text via %s`, async delivery => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    const original = message("retained-head-failure");
+    const original = headMessage("retained-head-failure");
     await admit(runtime, original);
     const earlier = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Earlier successful yield" }] };
     main.emit({ type: "message_end", message: earlier });
@@ -5809,7 +6034,7 @@ describe("real Store runtime coordination", () => {
   test.each(["message_end", "agent_end-only"] as const)("HEAD retry success retains its answer through an empty terminal tail via %s", async delivery => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    const original = message("retained-head-retry");
+    const original = headMessage("retained-head-retry");
     await admit(runtime, original);
     main.emit({ type: "message_end", message: { role: "assistant", stopReason: "error", content: [] } });
     main.emit({ type: "prompt_result", id: main.prompts[0]!.id, status: "error", agentInvoked: true, sessionSettled: false });
@@ -5835,7 +6060,7 @@ describe("real Store runtime coordination", () => {
   test.each(["error", "aborted"] as const)("a cumulative empty success cannot revive HEAD text cleared by %s", async stopReason => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    const original = message("retained-head-cleared");
+    const original = headMessage("retained-head-cleared");
     await admit(runtime, original);
     const earlier = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Cleared earlier answer" }] };
     main.emit({ type: "message_end", message: earlier });
@@ -5856,12 +6081,12 @@ describe("real Store runtime coordination", () => {
   test("local main commands cannot send a previous assistant answer", async () => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    await admit(runtime, message("local-prior-answer"));
+    await admit(runtime, headMessage("local-prior-answer"));
     main.complete("Previous request answer");
     await runtime.kick();
     main.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "old unrelated secret" }] } });
     main.local = true;
-    await admit(runtime, message("120", route(null, { guildId: null }), "/local-command"));
+    await admit(runtime, headMessage("120", route(null, { guildId: null }), "/local-command"));
     expect(store.input("120")?.state).toBe("done");
     expect(store.output("120:answer")).toBeNull();
     expect(messenger.sent).toMatchObject([{ sourceId: "local-prior-answer", text: "Previous request answer" }]);
@@ -5905,6 +6130,118 @@ describe("real Store runtime coordination", () => {
     expect(messenger.sent).toHaveLength(1);
   });
 
+  test.each(["queued", "pending-native", "submitted-native", "stale-generation", "missing-generation", "missing-owner"] as const)(
+    "startup keeps a durable %s /resume out of HEAD and issues only a proven first native resume", async scenario => {
+      const { runtime, store, config, hosts, main, messenger } = fixture();
+      const lane = savedLane(store, config, "recover-resume", route("11"), process.pid);
+      const other = savedLane(store, config, "other-resume", route("12"));
+      const nativeStarted = scenario === "pending-native" || scenario === "submitted-native";
+      // The live handler opens the lane before writing its native resume receipt.
+      store.updateLane(lane.id, lane.generation, { workState: nativeStarted ? "open" : "paused" });
+      store.updateLane(other.id, other.generation, { workState: "paused" });
+      const worker = new HostTransport(lane.sessionFile, "session-recover-resume");
+      worker.state.goal = { enabled: false, mode: "active", goal: { status: "paused" } };
+      hosts.set(lane.socketPath, worker);
+      const source = message("queued-resume", lane.route, "/resume");
+      // Simulate a crash after durable intake but before the live control handler.
+      store.receive(source, "main", {
+        [`user-source:${source.id}`]: "true",
+        ...(scenario === "missing-owner" ? {} : { [`topic-owner:${source.id}`]: lane.id }),
+        ...(scenario === "missing-generation" ? {} : {
+          [`topic-resume-generation:${source.id}`]: String(scenario === "stale-generation" ? lane.generation + 1 : lane.generation),
+        }),
+      });
+      const receiptId = `resume:${source.id}:${lane.id}`;
+      if (nativeStarted) {
+        store.receive({ ...source, id: receiptId, text: "Resume the original objective." }, lane.id,
+          { [`handoff-source:${receiptId}`]: source.id });
+        if (scenario === "submitted-native") expect(store.submit(receiptId, "native-resume-original", lane.generation)).toBe(true);
+      }
+
+      await runtime.start();
+      await messenger.whenSent(scenario === "submitted-native" ? 2 : 1);
+      await runtime.kick();
+      const firstNativeResume = scenario === "queued";
+      expect(worker.commands.filter(command => command.type === "goal" && command.op === "resume"))
+        .toHaveLength(firstNativeResume ? 1 : 0);
+      expect(worker.state.goal?.goal?.status).toBe(firstNativeResume ? "active" : "paused");
+      expect(store.lane(lane.id)?.workState).toBe(firstNativeResume || nativeStarted ? "open" : "paused");
+      expect(store.lane(other.id)?.workState).toBe("paused");
+      expect(store.input(source.id)?.state).toBe(scenario === "stale-generation" || scenario === "missing-generation" ? "cancelled"
+        : nativeStarted ? "uncertain" : "done");
+      expect(store.output(`${source.id}:control`)).toMatchObject({ sourceId: source.id, route: source.route, state: "sent" });
+      if (scenario === "submitted-native") {
+        expect(store.input(receiptId)).toMatchObject({ state: "uncertain", requestId: "native-resume-original", generation: lane.generation });
+      }
+      if (scenario === "pending-native") expect(store.input(receiptId)).toMatchObject({ state: "uncertain", requestId: null });
+      await admit(runtime, source);
+      expect(worker.commands.filter(command => command.type === "goal" && command.op === "resume"))
+        .toHaveLength(firstNativeResume ? 1 : 0);
+      expect(main.prompts).toEqual([]);
+      expect(worker.prompts).toEqual([]);
+      expect(messenger.sent.filter(output => output.id === `${source.id}:control`)).toHaveLength(1);
+    });
+
+  test("a recovered lane stop supersedes only earlier resume controls for its own lane", async () => {
+    const { runtime, store, config, main, hosts, messenger } = fixture();
+    const first = savedLane(store, config, "resume-stopped", route("11"), process.pid);
+    const second = savedLane(store, config, "resume-unrelated", route("12"));
+    store.updateLane(first.id, first.generation, { workState: "paused" });
+    store.updateLane(second.id, second.generation, { workState: "paused" });
+    const worker = new HostTransport(first.sessionFile, "session-resume-stopped");
+    worker.state.goal = { enabled: false, mode: "active", goal: { status: "paused" } };
+    hosts.set(first.socketPath, worker);
+    const queueResume = (id: string, lane: Lane) => store.receive(message(id, lane.route, "/resume"), "main", {
+      [`user-source:${id}`]: "true", [`topic-owner:${id}`]: lane.id, [`topic-resume-generation:${id}`]: String(lane.generation),
+    });
+    queueResume("resume-older", first);
+    queueResume("resume-elsewhere", second);
+    store.receive(message("stop-boundary-resume", first.route, "/stop"), "main", {
+      "user-source:stop-boundary-resume": "true", "head:stop-target:stop-boundary-resume": JSON.stringify(first.id),
+    });
+    queueResume("resume-newer", first);
+
+    await runtime.start();
+    await messenger.whenSent(3);
+    expect(store.input("resume-older")?.state).toBe("cancelled");
+    expect(store.input("resume-elsewhere")?.state).toBe("done");
+    expect(store.input("resume-newer")?.state).toBe("done");
+    expect(store.input(`resume:resume-older:${first.id}`)).toBeNull();
+    expect(store.input(`resume:resume-newer:${first.id}`)?.state).toBe("submitted");
+    expect(worker.commands.filter(command => command.type === "goal" && command.op === "resume")).toHaveLength(1);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("a resume admitted while the recovered stop awaits native cleanup cannot enter the fresh HEAD dispatch snapshot", async () => {
+    const { runtime, store, config, main, hosts, messenger } = fixture();
+    const lane = savedLane(store, config, "resume-during-stop", route("11"), process.pid);
+    const worker = new HostTransport(lane.sessionFile, "session-resume-during-stop");
+    worker.state.goal = { enabled: false, mode: "active", goal: { status: "paused" } };
+    const stopping = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    worker.beforeAbort = async () => { stopping.resolve(); await release.promise; };
+    hosts.set(lane.socketPath, worker);
+    const stop = message("recovered-stop", lane.route, "/stop");
+    store.receive(stop, "main", { [`user-source:${stop.id}`]: "true", [`head:stop-target:${stop.id}`]: JSON.stringify(lane.id) });
+
+    const startup = runtime.start();
+    await stopping.promise;
+    const resume = message("resume-during-cleanup", lane.route, "/resume");
+    try {
+      await runtime.receive(resume);
+      expect(store.input(resume.id)?.state).toBe("pending");
+    } finally { release.resolve(); }
+
+    await startup;
+    await messenger.whenSent(2);
+    await runtime.kick();
+    expect(store.input(resume.id)?.state).toBe("done");
+    expect(store.input(`resume:${resume.id}:${lane.id}`)?.state).toBe("submitted");
+    expect(worker.commands.filter(command => command.type === "goal" && command.op === "resume")).toHaveLength(1);
+    expect(main.prompts).toEqual([]);
+    expect(worker.prompts).toEqual([]);
+  });
+
   test("explicit resume owns a paused native goal's result without replaying the cancelled prompt", async () => {
     const { runtime, store, config, hosts, main, messenger } = fixture();
     const lane = savedLane(store, config, "goal-resume", route("11"));
@@ -5925,11 +6262,16 @@ describe("real Store runtime coordination", () => {
     host.state.isSettled = true;
     host.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Resumed native objective verified" }], stopReason: "stop" } });
     host.emit({ type: "session_settled" });
-    await main.whenPrompts(1);
-    expect(store.input(`resume:${source.id}:${lane.id}`)?.state).toBe("done");
-    expect(store.input(`report:resume:${source.id}:${lane.id}`)?.text).toContain("Resumed native objective verified");
+    await messenger.whenSent(2);
+    await runtime.kick();
+    const resumeId = `resume:${source.id}:${lane.id}`;
+    expect(store.input(resumeId)?.state).toBe("done");
+    expect(store.input(`report:${resumeId}`)).toBeNull();
+    expect(main.prompts).toEqual([]);
+    expect(store.output(`${resumeId}:answer`)).toMatchObject({
+      sourceId: source.id, route: source.route, text: "Resumed native objective verified", state: "sent",
+    });
     expect(store.input(`report:handoff:goal-original:${lane.id}`)).toBeNull();
-    await messenger.whenSent(1);
     expect(messenger.sent.filter(output => output.id === `${source.id}:control`)).toHaveLength(1);
   });
 
@@ -6146,7 +6488,7 @@ describe("real Store runtime coordination", () => {
   async function ownerDecision() {
     const f = fixture();
     await f.runtime.start();
-    await admit(f.runtime, message("decision-source"));
+    await admit(f.runtime, headMessage("decision-source"));
     const id = decisionId(f.main.state.sessionId, "decision-call");
     const frame = { type: "extension_ui_request", method: "ask", id: "decision-native",
       questions: [{ id: `${id}:0`, question: "Which database?", options: [{ label: "SQLite" }, { label: "Redis" }], recommended: 0 }] };
@@ -6162,10 +6504,11 @@ describe("real Store runtime coordination", () => {
     const f = fixture();
     const destination = route("42");
     const lane = savedLane(f.store, f.config, "choice-lane", destination);
-    const source = message("lane-choice-owner", destination, "Implement the fixture; choose a reversible local cache layout.");
+    const task = "Implement the fixture; choose a reversible local cache layout.";
+    const source = headMessage("lane-choice-owner", destination, task);
     await f.runtime.start();
     await admit(f.runtime, source);
-    await f.runtime.messageLane(lane.id, source.text, source.id);
+    await f.runtime.messageLane(lane.id, task, source.id);
     await f.runtime.kick();
     const host = f.hosts.get(lane.socketPath);
     if (!host) throw new Error("Lane native Host was not launched");
@@ -6194,7 +6537,7 @@ describe("real Store runtime coordination", () => {
     ] } });
     const selected = await f.runtime.reviewLaneDecision({ id: f.decision, reason: "Local and reversible", answers: f.answers });
     f.main.complete("Internal review result");
-    await admit(f.runtime, message("after-choice", f.source.route));
+    await admit(f.runtime, headMessage("after-choice", f.source.route));
     await f.main.whenPrompts(3);
     await f.runtime.kick();
     expect(selected).toMatchObject({ state: "answered", headSelection: { reason: "Local and reversible" }, response: { answers: f.answers } });
@@ -6542,7 +6885,7 @@ describe("real Store runtime coordination", () => {
   test("connection loss gets one identity-checked reconnect, quarantines old request, and never replays it", async () => {
     const { runtime, store, main, hosts, config, messenger, launched } = fixture();
     await runtime.start();
-    await admit(runtime, message("138", route(null, { guildId: null })));
+    await admit(runtime, headMessage("138", route(null, { guildId: null })));
     const replacement = new HostTransport(main.state.sessionFile!, main.state.sessionId);
     replacement.state.isSettled = false;
     replacement.state.isStreaming = true;
@@ -6905,7 +7248,7 @@ describe("real Store runtime coordination", () => {
     store.settle(original.id, "done");
     store.setMeta("discord:routes", JSON.stringify([destination]));
     store.setMeta(`cursor:${routeKey(destination)}`, "160");
-    messenger.backlog.set(routeKey(destination), [original, message("161", destination)]);
+    messenger.backlog.set(routeKey(destination), [original, headMessage("161", destination)]);
     await runtime.start();
     expect(messenger.fetched).toEqual([{ route: destination, cursor: "160" }]);
     expect(JSON.parse(store.getMeta("messenger:routes")!)).toEqual([destination]);
@@ -6937,7 +7280,7 @@ describe("real Store runtime coordination", () => {
     const event = (suffix: string, text: string): Inbound => ({ ...message(`history:${suffix}`, dm, text), messageId: `1750000000.${suffix}` });
     store.setMeta("messenger:routes", JSON.stringify([dm]));
     store.setMeta(`cursor:${physicalRouteKey(dm)}`, "1750000000.000001");
-    messenger.backlog.set(routeKey(dm), [event("000005", "main followup"), event("000003", "topic followup"), event("000004", "/main"), event("000002", "/new")]);
+    messenger.backlog.set(routeKey(dm), [event("000005", "/head main followup"), event("000003", "topic followup"), event("000004", "/main"), event("000002", "/new")]);
     await runtime.start();
     const topicId = store.input("history:000002")!.route.topicId!;
     expect(store.input("history:000003")?.route.topicId).toBe(topicId);
@@ -6978,7 +7321,7 @@ describe("real Store runtime coordination", () => {
   test("direct main guild delegation creates one independent thread and preserves submitted ownership", async () => {
     const { runtime, store, directory, messenger } = fixture();
     await runtime.start();
-    const original = message("170", route(null));
+    const original = headMessage("170", route(null));
     await admit(runtime, original);
     const [one, two] = await Promise.all([
       runtime.startLane({ ...selection, sourceId: original.id, title: "Delegation", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory }),
@@ -6996,7 +7339,7 @@ describe("real Store runtime coordination", () => {
     const { runtime, directory, messenger, store } = fixture();
     await runtime.start();
     const dm = route(null, { guildId: null });
-    await admit(runtime, message("180", dm));
+    await admit(runtime, headMessage("180", dm));
     const delegated = await runtime.startLane({ ...selection, sourceId: "180", title: "DM task", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
     expect(delegated.route.threadId).toBeNull();
     expect(delegated.route.topicId).toMatch(/^topic-/);
@@ -7005,7 +7348,8 @@ describe("real Store runtime coordination", () => {
     expect(store.input("handoff:180:lane")?.route.topicId).toBe(delegated.route.topicId);
     expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe(delegated.route.topicId!);
     await admit(runtime, message("182", dm, "Follow this delegated topic"));
-    expect(store.input("182")).toMatchObject({ target: "main", route: delegated.route });
+    expect(store.input("182")).toMatchObject({ target: null, state: "done", route: delegated.route });
+    expect(store.input(`handoff:182:${delegated.id}`)?.target).toBe(delegated.id);
     store.receive(message("181", route(null)), "main");
     store.submit("181", "native-main-next", 0);
     messenger.threadFails = true;
@@ -7046,9 +7390,10 @@ describe("real Store runtime coordination", () => {
     expect(reopened.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe(topicId);
     expect(head.prompts).toEqual([]);
     await admit(restarted, message("501", dm, "Inspect the requested repository"));
-    expect(reopened.input("501")).toMatchObject({ target: "main", state: "submitted", route: { ...dm, topicId } });
-    expect(reopened.input("route:501")).toBeNull();
-    expect(head.prompts[0]!.command.message).toContain("sourceId: 501");
+    expect(reopened.input("501")).toMatchObject({ target: null, state: "pending", route: { ...dm, topicId } });
+    expect(reopened.output("501:workspace")).toMatchObject({ sourceId: "501", route: { ...dm, topicId }, state: "sent" });
+    expect(reopened.lanes()).toEqual([]);
+    expect(head.prompts).toEqual([]);
     await admit(restarted, boundary);
     expect(reopened.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe(topicId);
     expect(transport.fetched.every(entry => entry.route.topicId === undefined)).toBe(true);
@@ -7058,32 +7403,40 @@ describe("real Store runtime coordination", () => {
     const { runtime, store, directory, messenger, main } = fixture();
     const dm = route(null, { guildId: null });
     await runtime.start();
-    const firstRequest = message("600", dm, "/new first repository task");
+    const firstRequest = message("600", dm, `/new cwd: ${directory}\nfirst repository task`);
     await admit(runtime, firstRequest);
-    expect(main.prompts[0]!.command.message).not.toContain("/new first repository task");
-    const first = await runtime.startLane({ ...selection, sourceId: "600", title: "First", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
+    const firstId = store.input("handoff:600:lane")?.target;
+    const first = firstId ? store.lane(firstId) : null;
+    if (!first) throw new Error("Expected the first logical DM lane");
     await admit(runtime, message("601", dm, "First followup"));
-    expect(store.input("601")).toMatchObject({ target: "main", route: first.route });
-    await admit(runtime, message("610", dm, "/new second repository task"));
-    const second = await runtime.startLane({ ...selection, sourceId: "610", title: "Second", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
+    expect(store.input("601")).toMatchObject({ target: null, state: "done", route: first.route });
+    await admit(runtime, message("610", dm, `/new cwd: ${directory}\nsecond repository task`));
+    const secondId = store.input("handoff:610:lane")?.target;
+    const second = secondId ? store.lane(secondId) : null;
+    if (!second) throw new Error("Expected the second logical DM lane");
     await admit(runtime, message("611", dm, "Second followup"));
-    expect(store.input("611")).toMatchObject({ target: "main", route: second.route });
+    expect(store.input("611")).toMatchObject({ target: null, state: "done", route: second.route });
     expect(first.route.threadId).toBeNull();
     expect(second.route.threadId).toBeNull();
     expect(first.route.topicId).not.toBe(second.route.topicId);
     expect(physicalRouteKey(first.route)).toBe(physicalRouteKey(second.route));
     expect(store.laneForRoute(dm)).toBeNull();
     await admit(runtime, message("620", dm, "/main"));
-    await admit(runtime, message("621", dm, "A direct head question"));
+    await admit(runtime, headMessage("621", dm, "A direct head question"));
     expect(store.input("621")?.target).toBe("main");
     expect(store.input("621")?.route.topicId).toBeUndefined();
     expect(store.lanes()).toHaveLength(2);
     await admit(runtime, firstRequest);
     expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe("");
-    expect(store.input("600")?.target).toBe("main");
+    expect(store.input("600")).toMatchObject({ target: null, state: "done", text: firstRequest.text });
     // Historical catchup is assigned by the command timeline, not today's /main.
     await admit(runtime, message("605", dm, "Late catchup belonging to first topic"));
-    expect(store.input("605")).toMatchObject({ target: "main", route: first.route });
+    expect(store.input("605")).toMatchObject({ target: null, state: "done", route: first.route });
+    for (const [id, lane] of [["601", first], ["611", second], ["605", first]] as const) {
+      expect(store.input(`handoff:${id}:${lane.id}`)?.target).toBe(lane.id);
+    }
+    expect(main.prompts).toHaveLength(1);
+    expect(main.prompts[0]?.command.message).toContain("A direct head question");
     expect(messenger.threads).toEqual([]);
   });
 
@@ -7095,12 +7448,14 @@ describe("real Store runtime coordination", () => {
     const dm = route(null, { platform, accountId: platform === "slack" ? "TTEAM:UBOT" : "2", guildId: null, channelId: platform === "telegram" ? "1" : platform === "slack" ? "DPRIVATE" : "4" });
     const command = (id: string, text: string): Inbound => ({ ...message(id, dm, text), messageId: platform === "slack" ? `1750000000.${id.padStart(6, "0")}` : id });
     await runtime.start();
-    await admit(runtime, command("700", "/new first task"));
-    const first = await runtime.startLane({ ...selection, sourceId: "700", title: "First", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
-    await runtime.kick();
-    await admit(runtime, command("710", "/new second task"));
-    const second = await runtime.startLane({ ...selection, sourceId: "710", title: "Second", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory });
-    await runtime.kick();
+    await admit(runtime, command("700", `/new cwd: ${directory}\nfirst task`));
+    const firstId = store.input("handoff:700:lane")?.target;
+    const first = firstId ? store.lane(firstId) : null;
+    if (!first) throw new Error("Expected the first topic for its approval card");
+    await admit(runtime, command("710", `/new cwd: ${directory}\nsecond task`));
+    const secondId = store.input("handoff:710:lane")?.target;
+    const second = secondId ? store.lane(secondId) : null;
+    if (!second) throw new Error("Expected the second topic for a distinct approval card");
     const firstHost = hosts.get(first.socketPath)!;
     const secondHost = hosts.get(second.socketPath)!;
     const frame = { type: "extension_ui_request", method: "confirm", id: "same-native-dialog-id", title: "Allow?" };
@@ -7138,7 +7493,7 @@ describe("real Store runtime coordination", () => {
     const { runtime, main, directory } = fixture(3, fetcher);
     await runtime.start();
     await admit(runtime, {
-      ...message("190", route(null, { guildId: null })),
+      ...headMessage("190", route(null, { guildId: null })),
       attachments: [{ id: "77", name: "../../image.png", url: "https://cdn.discordapp.com/attachments/4/77/image.png?secret=signed", size: png.length, contentType: "image/png" }],
     });
     const prompt = main.prompts[0]!.command;
@@ -7164,7 +7519,7 @@ describe("real Store runtime coordination", () => {
       const dm = route(null, { platform, accountId: platform === "slack" ? "TTEAM:UBOT" : "2", guildId: null, channelId: platform === "slack" ? "DPRIVATE" : "1" });
       const reference = platform === "telegram" ? "telegram-file:opaque_file_id" : "slack-file:FOPAQUE";
       await runtime.start();
-      const input = { ...message(`${platform}:attachment`, dm), messageId: platform === "slack" ? "1750000000.000001" : "100", attachments: [{ id: "opaque", name: "../../not-an-image.txt", url: reference, size: unknownSize ? null : png.length, contentType: "text/plain" }] };
+      const input = { ...headMessage(`${platform}:attachment`, dm), messageId: platform === "slack" ? "1750000000.000001" : "100", attachments: [{ id: "opaque", name: "../../not-an-image.txt", url: reference, size: unknownSize ? null : png.length, contentType: "text/plain" }] };
       await admit(runtime, input);
       expect(opened).toEqual([{ route: dm, reference }]);
       expect(main.prompts[0]!.command.images).toEqual([{ type: "image", data: png.toString("base64"), mimeType: "image/png" }]);
@@ -7185,7 +7540,7 @@ describe("real Store runtime coordination", () => {
     config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [] };
     const dm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
     await runtime.start();
-    await admit(runtime, { ...message("unknown-voice", dm), attachments: [
+    await admit(runtime, { ...headMessage("unknown-voice", dm), attachments: [
       { id: "voice", name: "voice.ogg", url: "telegram-file:voice", size: null, voice: true, durationSeconds: 1.5 },
     ] });
     expect(main.prompts[0]!.command.message).toContain("4 bytes; voice message; duration 1.5 seconds");
@@ -7209,7 +7564,7 @@ describe("real Store runtime coordination", () => {
     delete config.discord;
     config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [] };
     const dm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
-    const input: Inbound = { ...message(`unknown-limit-${mode}`, dm),
+    const input: Inbound = { ...headMessage(`unknown-limit-${mode}`, dm),
       attachments: Array.from({ length: mode === "request" ? 3 : 1 }, (_, index) => ({
         id: `file-${index}`, name: "file", url: `telegram-file:file-${index}`, size: null,
       })) };
@@ -7235,7 +7590,7 @@ describe("real Store runtime coordination", () => {
     ];
     for (const [index, attachments] of payloads.entries()) {
       const id = String(300 + index);
-      await admit(runtime, { ...message(id, route(null, { guildId: null })), attachments });
+      await admit(runtime, { ...headMessage(id, route(null, { guildId: null })), attachments });
       expect(store.input(id)?.state).toBe("cancelled");
     }
     expect(opened).toBe(0);
@@ -7248,7 +7603,7 @@ describe("real Store runtime coordination", () => {
         ? new Response("denied", { status: 403 })
         : new Response(new Uint8Array([1]), { headers: mode === "header" ? { "content-length": "3" } : {} }));
       await runtime.start();
-      const input = { ...message("310", route(null, { guildId: null })), attachments: [{ id: "opaque", name: "file", url: "adapter-file:opaque", size: 2 }] };
+      const input = { ...headMessage("310", route(null, { guildId: null })), attachments: [{ id: "opaque", name: "file", url: "adapter-file:opaque", size: 2 }] };
       await admit(runtime, input);
       expect(store.input(input.id)?.state).toBe("cancelled");
       expect(main.prompts).toEqual([]);
@@ -7266,11 +7621,11 @@ describe("real Store runtime coordination", () => {
     };
     const { runtime, main, store, messenger } = fixture(3, fetcher);
     await runtime.start();
-    await admit(runtime, { ...message("200", route(null, { guildId: null })), attachments: [
+    await admit(runtime, { ...headMessage("200", route(null, { guildId: null })), attachments: [
       { id: "77", name: "private", url: "https://127.0.0.1/private", size: 1 },
     ] });
     expect(fetches).toBe(1);
-    await admit(runtime, { ...message("201", route(null, { guildId: null })), attachments: [
+    await admit(runtime, { ...headMessage("201", route(null, { guildId: null })), attachments: [
       { id: "78", name: "large", url: "https://cdn.discordapp.com/attachments/4/78/file", size: 1 },
     ] });
     expect(fetches).toBe(2);
@@ -7286,12 +7641,12 @@ describe("real Store runtime coordination", () => {
     const fetcher: Messenger["openAttachment"] = async () => { requested.resolve(); return response.promise; };
     const { runtime, store } = fixture(3, fetcher);
     await runtime.start();
-    await runtime.receive({ ...message("205", route(null, { guildId: null })), attachments: [
+    await runtime.receive({ ...headMessage("205", route(null, { guildId: null })), attachments: [
       { id: "78", name: "file", url: "https://cdn.discordapp.com/attachments/4/78/file", size: 1 },
     ] });
     await requested.promise;
     try {
-      await runtime.receive(message("206", route("88")));
+      await runtime.receive(headMessage("206", route("88")));
       expect(store.input("206")).toMatchObject({ state: "pending", target: "main" });
       expect(store.input("205")?.state).toBe("pending");
     } finally { response.resolve(new Response(new Uint8Array([1]))); }
@@ -7424,5 +7779,435 @@ describe("real Store runtime coordination", () => {
     expect(delegated(store, "210")?.state).toBe("pending");
     expect(store.lane(lane.id)?.sessionId).toBe("session-one");
     expect(errors).toHaveLength(1);
+  });
+});
+
+test("workspace replies cannot place another thread's pending request or revive a stopped one", async () => {
+  const { runtime, store, main, hosts, directory } = fixture();
+  await runtime.start();
+  const a = route("41"), b = route("42");
+  const send = async (input: Inbound) => { await runtime.receive(input); await runtime.kick(); };
+  await send({ ...message("410", a), text: "Repair project A" });
+  await send({ ...message("420", b), text: "Repair project B" });
+  const askA = store.output("410:workspace"), askB = store.output("420:workspace");
+  expect(askA?.state).toBe("sent");
+  expect(askB?.state).toBe("sent");
+  await send({ ...message("411", a), text: `cwd: ${directory}`,
+    reply: { messageId: askB!.remoteId!, authorId: null, text: "workspace" } });
+  expect(store.lanes()).toHaveLength(0);
+  await send({ ...message("421", b), text: "/stop" });
+  expect(store.input("420")?.state).toBe("cancelled");
+  await send({ ...message("422", b), text: `cwd: ${directory}` });
+  expect(store.lanes()).toHaveLength(0);
+  await send({ ...message("412", a), text: directory, reply: {
+    messageId: askA!.remoteId!, authorId: null, text: "workspace",
+  } });
+  const lane = store.laneForRoute(a);
+  expect(lane?.cwd).toBe(directory);
+  expect(hosts.get(lane!.socketPath)?.prompts.map(item => item.command.message)).toEqual([expect.stringContaining("Repair project A")]);
+  expect(store.laneForRoute(b)).toBeNull();
+  expect(main.prompts).toEqual([]);
+});
+
+test("a historical request in an already bound channel waits for a specific prior session, even when both used the same repo", async () => {
+  const searches: string[] = [];
+  let available = true;
+  const { runtime, config, store, hosts, main, errors } = fixture(3, undefined, { topicMemory: {
+    status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: true }),
+    search: async query => {
+      searches.push(query);
+      if (!available) throw new Error("private-provider-diagnostic");
+      return { backend: "mnemopi", query, items: [], count: 0 };
+    },
+  } });
+  config.discord!.allowedChannelIds.push("5");
+  const destination = route("53", { channelId: "5" });
+  const unrelated = savedLane(store, config, "current", destination);
+  const lastWeek = "2026-11-11T12:00:00.000Z", now = Date.parse("2026-11-18T12:00:00.000Z");
+  for (const [id, detail] of [["one", "callback-state"], ["two", "device-cookie"], ["foreign", "private-detail"]] as const) {
+    const lane = savedLane(store, config, id, id === "foreign" ? route("51", { accountId: "99" }) : route(id === "one" ? "51" : "52"));
+    const sessionId = `session-${id}`, task = `로그인 버그 조사: ${detail} 문제를 확인해줘`;
+    store.updateLane(id, lane.generation, { sessionId });
+    mkdirSync(dirname(lane.sessionFile), { recursive: true });
+    const content = `\`\`\`superagent-runtime-context\nRequest ID: opener-${id}\n\nOriginal source ID: opener-${id}\n\nOriginal authorized conversation: ${routeKey(lane.route)}\n\nReply only to this request.\n\nIndependent lane ${id}; cwd: ${lane.cwd}\nDelivery mode: topic reply.\n\`\`\`\n\n${task}`;
+    writeFileSync(lane.sessionFile, [
+      { type: "session", version: 3, id: sessionId, timestamp: lastWeek, cwd: lane.cwd },
+      { type: "message", id: "turn", parentId: null, timestamp: lastWeek, message: { role: "user", content } },
+    ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+  }
+  await runtime.start();
+  const input = { ...message("610", destination, "지난주 로그인 버그 보던 데서 계속해줘"), receivedAt: now };
+  await admit(runtime, input);
+  const question = store.output("610:workspace");
+  if (!question?.remoteId) throw new Error("Expected a scoped choice between prior sessions");
+  expect(question.text).not.toMatch(/callback-state|device-cookie/);
+  expect(store.lanes()).toHaveLength(4);
+  const choices = JSON.parse(store.getMeta("topic-history:610")!) as Array<{ laneId: string }>;
+  expect(choices.map(ref => ref.laneId).sort()).toEqual(["one", "two"]);
+  const number = choices.findIndex(ref => ref.laneId === "two") + 1;
+  expect(number).toBeGreaterThan(0);
+  const reply = { messageId: question.remoteId, authorId: null, text: "not authoritative" };
+  await admit(runtime, { ...message("611", destination, String(number)), receivedAt: now + 1, reply });
+  const target = store.input("handoff:610:lane")?.target;
+  const continuation = target && store.lane(target);
+  if (!continuation) throw new Error("Historical choice never reached a continuation session");
+  const prompt = hosts.get(continuation.socketPath)?.prompts[0]?.command.message;
+  expect(prompt).toContain("device-cookie");
+  expect(prompt).not.toContain("callback-state");
+  expect(continuation.id).not.toBe("two");
+  expect(continuation.route.channelId).toBe(destination.channelId);
+  expect(store.laneForRoute(destination)?.id).toBe(unrelated.id);
+  expect(main.prompts).toHaveLength(0);
+  await admit(runtime, input);
+  await admit(runtime, { ...message("612", destination, String(number)), receivedAt: now + 2, reply });
+  expect(store.lanes()).toHaveLength(5);
+  expect(hosts.get(continuation.socketPath)?.prompts).toHaveLength(1);
+  expect(searches).toEqual([input.text]); // no second recall on choice, dispatch or redelivery
+  const held = { ...message("613", destination, "지난주 로그인 버그 보던 데서 계속해줘"), receivedAt: now + 3 };
+  await admit(runtime, held);
+  const second = store.output("613:workspace");
+  if (!second?.remoteId) throw new Error("Expected a new, source-bound choice");
+  const old = store.lane("two")!;
+  store.updateLane(old.id, old.generation, { workState: "paused" });
+  await admit(runtime, { ...message("614", destination, String(number)), receivedAt: now + 4,
+    reply: { ...reply, messageId: second.remoteId } });
+  expect(store.input("613")?.state).toBe("cancelled");
+  expect(store.input("handoff:613:lane")).toBeNull();
+  expect(store.lane("two")?.workState).toBe("paused");
+  available = false;
+  await admit(runtime, { ...message("615", destination, input.text), receivedAt: now + 5 });
+  expect(store.output("615:workspace")?.text).toContain("조회하지 못해");
+  expect(store.input("handoff:615:lane")).toBeNull();
+  expect(errors.map(String).join("\n")).not.toContain("private-provider-diagnostic");
+  expect(searches).toHaveLength(3);
+});
+
+test("ambiguous repository names wait for the owner's choice; a quote or another channel cannot supply it", async () => {
+  const { runtime, store, main, hosts, config, directory } = fixture();
+  for (const [id, name, destination] of [
+    ["a", "client-ui", route("51")], ["b", "client-api", route("52")],
+    ["c", "foreign-repo", route("53", { channelId: "99" })],
+  ] as const) {
+    const cwd = join(directory, name);
+    mkdirSync(cwd);
+    savedLane(store, { ...config, headCwd: cwd }, id, destination);
+  }
+  await runtime.start();
+  const thread = route("54");
+  const task = "client-ui랑 client-api의 변경을 비교해줘";
+  await admit(runtime, message("540", thread, task));
+  const question = store.output("540:workspace");
+  if (!question?.remoteId) throw new Error("An ambiguous repository request was not held for clarification");
+  const reply = { messageId: question.remoteId, text: "client-ui", authorId: null };
+  await admit(runtime, { ...message("541", thread, "foreign-repo"), reply });
+  expect(store.laneForRoute(thread)).toBeNull();
+  expect(store.input("541")?.state).toBe("cancelled");
+  await admit(runtime, { ...message("542", thread, "client-api"), reply });
+  const lane = store.laneForRoute(thread);
+  expect(lane?.cwd).toBe(join(directory, "client-api"));
+  await admit(runtime, { ...message("543", thread, "client-ui"), reply });
+  await admit(runtime, { ...message("542", thread, "client-ui"), id: "542:edit", reply });
+  expect(store.input("543")?.state).toBe("cancelled");
+  expect(hosts.get(lane!.socketPath)?.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(task)]);
+  await admit(runtime, message("544", route("56"), "Do not use client-api; start a new project"));
+  expect(store.output("544:workspace")?.state).toBe("sent");
+  expect(main.prompts).toEqual([]);
+});
+
+test("a reply in a Slack workspace question's thread selects the repository for the parent request only", async () => {
+  const { runtime, config, directory, store, messenger, hosts } = fixture();
+  config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+  const parent: Route = { platform: "slack", authorityId: "UOWNER", accountId: "TTEAM:UBOT", guildId: "TTEAM", channelId: "CCHANNEL", threadId: null };
+  const stamp = "1750000000.000001", question = "1750000001.000002";
+  const send = messenger.send.bind(messenger);
+  messenger.send = async output => {
+    const id = await send(output);
+    return output.id === `${stamp}:workspace` ? question : id;
+  };
+  messenger.createThread = async (route, _title, messageId) => ({ ...route, threadId: messageId ?? null });
+  savedLane(store, config, "prior", { ...parent, threadId: "1750000000.000000" });
+  await runtime.start();
+  await admit(runtime, message(stamp, parent, "Inspect the failing tests"));
+  expect(store.output(`${stamp}:workspace`)?.remoteId).toBe(question);
+  const thread = { ...parent, threadId: question };
+  await admit(runtime, message("1750000002.000003", thread, basename(directory)));
+  await admit(runtime, message("1750000003.000004", thread, basename(directory)));
+  const lane = store.laneForRoute({ ...parent, threadId: stamp });
+  expect(lane?.cwd).toBe(directory);
+  expect(hosts.get(lane!.socketPath)?.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining("Inspect the failing tests")]);
+  expect(store.laneForRoute(thread)).toBeNull();
+});
+
+test("a new parent request can reuse the replied-to workspace but not its session or the quoted text", async () => {
+  const { runtime, store, directory, main } = fixture();
+  await runtime.start();
+  const parent = route(null);
+  await admit(runtime, message("550", parent, `cwd: ${directory}\nFirst task`));
+  const notice = store.output("550:topic-bound");
+  if (!notice?.remoteId) throw new Error("Original topic binding was not delivered");
+  store.setMeta("discord:output-part:900000000000000001", notice.id);
+  await admit(runtime, { ...message("551", parent, "거기서 문서도 확인해줘"),
+    reply: { messageId: "900000000000000001", authorId: null, text: "cwd: /tmp" } });
+  const lanes = store.lanes();
+  expect(lanes.map(lane => lane.cwd)).toEqual([directory, directory]);
+  expect(new Set(lanes.map(lane => lane.sessionFile)).size).toBe(2);
+  expect(store.output("551:workspace")).toBeNull();
+  await admit(runtime, { ...message("552", route("55"), "관련 작업 하나 더"),
+    reply: { messageId: notice.remoteId, authorId: null, text: directory } });
+  expect(store.output("552:workspace")?.state).toBe("sent");
+  expect(store.lanes()).toHaveLength(2);
+  expect(main.prompts).toEqual([]);
+});
+
+test("editing a placed request cannot fork a sibling or move the task into global coordination", async () => {
+  const { runtime, store, main, messenger, directory, hosts } = fixture();
+  const original = { ...message("430", route("43")), text: `cwd: ${directory}\nInspect A` };
+  await runtime.start();
+  await runtime.receive(original);
+  await runtime.kick();
+  const owner = store.laneForRoute(original.route);
+  if (!owner) throw new Error("Original request did not establish its topic");
+  for (const [id, text] of [["431", "/head include A's prior context"], ["432", `cwd: /tmp\nWork on B instead`]] as const) {
+    await runtime.receive({ ...original, id, text });
+    await runtime.kick();
+    expect(store.input(id)?.state).toBe("done");
+    expect(store.output(`${id}:topic`)?.state).toBe("sent");
+  }
+  expect(hosts.get(owner.socketPath)?.prompts).toHaveLength(1);
+  expect(store.lanes().map(lane => lane.id)).toEqual([owner.id]);
+  expect(messenger.threads).toEqual([]);
+  expect(main.prompts).toEqual([]);
+});
+
+test("stop selects one pending topic and cannot abort HEAD or another workspace request", async () => {
+  const { runtime, store, main, directory } = fixture();
+  const parent = route(null);
+  await runtime.start();
+  await admit(runtime, headMessage("440", route("44"), "Coordinate other work"));
+  await admit(runtime, message("441", parent, "First project"));
+  await admit(runtime, message("442", parent, "Second project"));
+  await admit(runtime, message("443", parent, "/stop"));
+  expect([store.input("441")?.state, store.input("442")?.state]).toEqual(["pending", "pending"]);
+  const question = store.output("442:workspace");
+  if (!question?.remoteId) throw new Error("Missing second workspace question");
+  await admit(runtime, { ...message("444", parent, "/stop"),
+    reply: { messageId: question.remoteId, authorId: null, text: "" } });
+  expect([store.input("441")?.state, store.input("442")?.state]).toEqual(["pending", "cancelled"]);
+
+  const lookup = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  main.beforeCatalog = async () => { lookup.resolve(); await release.promise; };
+  const topic = route("45");
+  await runtime.receive(message("445", topic, `cwd: ${directory}\nRun task`));
+  await lookup.promise;
+  try {
+    await runtime.receive(message("446", topic, "/stop"));
+    expect(store.input("445")?.state).toBe("cancelled");
+  } finally { release.resolve(); }
+  await runtime.kick();
+  expect(store.laneForRoute(topic)).toBeNull();
+  expect(store.input("440")?.state).toBe("submitted");
+  expect(main.abortCount).toBe(0);
+});
+
+test("a fresh DM reserves one topic before placement, and an edited boundary cannot stop it", async () => {
+  const { runtime, store, main, messenger, directory, hosts } = fixture();
+  const dm = route(null, { guildId: null });
+  messenger.canCreateThread = async () => false;
+  await runtime.start();
+  await admit(runtime, message("451", dm, "Work on A"));
+  await admit(runtime, message("452", dm, "Check a second detail"));
+  const topic = store.input("451")?.route;
+  expect(topic?.topicId).toBeTruthy();
+  expect(store.input("452")?.route).toEqual(topic);
+  await admit(runtime, message("453", dm, `cwd: ${directory}`));
+  const lane = store.lanes()[0];
+  if (!lane) throw new Error("DM work did not start");
+  expect(hosts.get(lane.socketPath)?.prompts).toHaveLength(2);
+  await expect(runtime.messageLane(lane.id, "duplicate manager handoff", "handoff:451:lane")).rejects.toThrow("Topic-owned");
+  expect(main.prompts).toEqual([]);
+  const boundary = message("460", dm, "/new");
+  await admit(runtime, boundary);
+  await admit(runtime, message("461", dm, "Work on B"));
+  await admit(runtime, { ...boundary, id: "460:edit", text: "/stop" });
+  expect(store.input("461")?.state).toBe("pending");
+  expect(store.output("460:edit:topic")?.state).toBe("sent");
+});
+
+test("uncertain creation of a sibling cannot stall followup work in the already bound topic", async () => {
+  const { runtime, store, main, messenger, directory, hosts } = fixture();
+  const thread = route("47");
+  await runtime.start();
+  await admit(runtime, message("471", thread, `cwd: ${directory}\nInspect project A`));
+  const a = store.laneForRoute(thread);
+  if (!a) throw new Error("Missing original lane");
+  messenger.threadFails = true;
+  await admit(runtime, message("472", thread, `/new cwd: ${directory}\nSeparate investigation`));
+  expect(store.input("472")?.state).toBe("uncertain");
+  await admit(runtime, message("473", thread, "Continue the original inspection"));
+  expect(hosts.get(a.socketPath)?.prompts[1]?.command.message).toContain("Continue the original inspection");
+  expect(store.input(`handoff:473:${a.id}`)?.state).toBe("submitted");
+  expect(store.lanes()).toHaveLength(1);
+  expect(main.prompts).toEqual([]);
+});
+
+describe("ordinary placement in owner parents without native threads", () => {
+  test.each(["telegram", "discord"] as const)("%s places independent requests without moving their source or result", async platform => {
+    const { runtime, config, directory, store, messenger, main, hosts } = fixture();
+    const chat = "-1001234567890";
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [chat] };
+    const parent = route(null, platform === "telegram" ? { platform, guildId: chat, channelId: chat } : {});
+    const nextDirectory = join(directory, "independent-project");
+    mkdirSync(nextDirectory);
+    messenger.canCreateThread = async () => false;
+    await runtime.start();
+
+    const first = message("9101", parent, `cwd: ${directory}\nInspect the parser`);
+    await admit(runtime, first);
+    const [lane] = store.lanes();
+    const worker = lane && hosts.get(lane.socketPath);
+    if (!lane || !worker) throw new Error("The plain parent did not establish a topic worker");
+    expect(lane.route.topicId).toBeTruthy();
+    expect(physicalRouteKey(lane.route)).toBe(physicalRouteKey(parent));
+    expect(store.input(first.id)).toMatchObject({ state: "done", target: null, route: parent });
+    expect(store.output(`${first.id}:kickoff`)).toMatchObject({ state: "sent", route: lane.route });
+    expect(worker.prompts[0]?.command.message).toContain("Inspect the parser");
+    worker.complete("Parser inspected.");
+    await messenger.whenSent(2);
+    await runtime.kick();
+    expect(store.output(`handoff:${first.id}:lane:answer`)).toMatchObject({
+      state: "sent", sourceId: first.id, route: parent, text: "Parser inspected.",
+    });
+
+    await admit(runtime, message("9102", parent, `cwd: ${nextDirectory}\nReview the updater`));
+    const secondLane = store.lanes().find(item => item.cwd === nextDirectory);
+    expect(secondLane?.sessionFile).not.toBe(lane.sessionFile);
+    expect(secondLane?.route.topicId).toBeTruthy();
+    expect(secondLane?.route.topicId).not.toBe(lane.route.topicId);
+    expect(main.prompts).toEqual([]);
+    expect(messenger.threadSources).toEqual([]);
+  });
+
+  test("a parent reply uses the exact topic receipt unless the owner selects a different workspace", async () => {
+    const { runtime, config, directory, store, messenger, main, hosts } = fixture();
+    const parent = route(null, { platform: "telegram", guildId: "-1001234567890", channelId: "-1001234567890" });
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [parent.channelId] };
+    const nextDirectory = join(directory, "other-project");
+    mkdirSync(nextDirectory);
+    messenger.canCreateThread = async () => false;
+    await runtime.start();
+
+    const original = message("9111", parent, `cwd: ${directory}\nInspect the parser`);
+    await admit(runtime, original);
+    const [lane] = store.lanes();
+    const worker = lane && hosts.get(lane.socketPath);
+    if (!lane || !worker) throw new Error("Missing parent placement worker");
+    worker.complete("Parser inspected.");
+    await messenger.whenSent(2);
+    await runtime.kick();
+    const result = store.output("handoff:9111:lane:answer");
+    if (!result?.remoteId) throw new Error("Missing parent result receipt");
+    const reply = { messageId: result.remoteId, authorId: parent.accountId, text: result.text };
+    const followup = { ...message("9112", parent, "Check the enum branch too"), reply };
+    await admit(runtime, followup);
+    const followupId = `handoff:${followup.id}:${lane.id}`;
+    expect(store.input(followup.id)?.route).toEqual(lane.route);
+    expect(store.input(followupId)).toMatchObject({ target: lane.id, route: lane.route, state: "submitted" });
+    expect(worker.prompts[1]?.command.message).toContain("Check the enum branch too");
+
+    const newWork = { ...message("9113", parent, `cwd: ${nextDirectory}\nInspect the unrelated updater`), reply };
+    await admit(runtime, newWork);
+    const next = store.lanes().find(item => item.cwd === nextDirectory);
+    if (!next) throw new Error("Missing switched workspace placement");
+    expect(store.input(newWork.id)?.route).toEqual(parent);
+    expect(store.input(`handoff:${newWork.id}:lane`)).toMatchObject({ target: next.id, route: next.route });
+    expect(worker.prompts).toHaveLength(2);
+
+    await admit(runtime, { ...followup, id: "9112:edit", text: "Check the parser enum",
+      reply: { messageId: newWork.messageId, authorId: original.route.authorityId, text: "" } });
+    expect(store.input("9112:edit")?.route).toEqual(lane.route);
+    expect(store.getMeta("topic-owner:9112:edit")).toBe(lane.id);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("a reply to the original request stops and resumes only its logical topic", async () => {
+    const { runtime, config, directory, store, messenger, main } = fixture();
+    const parent = route(null, { platform: "telegram", guildId: "-1001234567890", channelId: "-1001234567890" });
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [parent.channelId] };
+    messenger.canCreateThread = async () => false;
+    await runtime.start();
+
+    const original = message("9121", parent, `cwd: ${directory}\nInspect the parser`);
+    await admit(runtime, original);
+    const [lane] = store.lanes();
+    if (!lane) throw new Error("Missing logical parent lane");
+    const reply = { messageId: original.messageId, authorId: parent.authorityId, text: original.text };
+    await admit(runtime, { ...message("9122", parent, "/stop"), reply });
+    await messenger.whenSent(2);
+    expect(store.lane(lane.id)?.workState).toBe("paused");
+    expect(main.abortCount).toBe(0);
+
+    await admit(runtime, { ...message("9123", parent, "/resume"), reply });
+    await messenger.whenSent(3);
+    expect(store.input("9123")).toMatchObject({ state: "done", route: lane.route });
+    expect(store.lane(lane.id)?.workState).toBe("open");
+    expect(main.prompts).toEqual([]);
+  });
+
+  test.each(["probe-failed", "mutation-uncertain"] as const)("never makes a logical topic after %s", async failure => {
+    const { runtime, config, directory, store, messenger, main } = fixture();
+    const parent = route(null, { platform: "telegram", guildId: "-1001234567890", channelId: "-1001234567890" });
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [parent.channelId] };
+    messenger.canCreateThread = async () => {
+      if (failure === "probe-failed") throw new DeliveryError("Capability check failed", "uncertain");
+      return true;
+    };
+    messenger.threadFails = true;
+    await runtime.start();
+    const original = message("9131", parent, `cwd: ${directory}\nInspect the parser`);
+    await admit(runtime, original);
+    messenger.canCreateThread = async () => false;
+    await admit(runtime, original);
+
+    expect(store.input(original.id)).toMatchObject({ state: "uncertain", route: parent });
+    expect(store.lanes()).toEqual([]);
+    expect(store.output(`${original.id}:kickoff`)).toBeNull();
+    expect(store.getMeta(`handoff-route:${original.id}`)).toBe(failure === "mutation-uncertain" ? "uncertain" : null);
+    expect(messenger.threadSources).toEqual(failure === "mutation-uncertain" ? [original.messageId] : []);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("a manual request for a native sibling does not become a parent logical topic", async () => {
+    const { runtime, directory, store, messenger } = fixture();
+    const parent = route(null);
+    messenger.canCreateThread = async () => false;
+    await runtime.start();
+    const original = headMessage("9141", route("42"));
+    await admit(runtime, original);
+
+    const start = { ...selection, sourceId: original.id, title: "Native sibling",
+      kickoff: "Inspect the repository.", cwd: directory };
+    await expect(runtime.startLane({ ...start, destination: { ...parent, topicId: "not-an-owner-topic" } }))
+      .rejects.toThrow("ordinary owner intake");
+    await expect(runtime.startLane({ ...start, destination: parent })).rejects.toThrow("independent native thread");
+    expect(store.lanes()).toEqual([]);
+    expect(store.input(original.id)?.route).toEqual(original.route);
+    expect(store.output(`${original.id}:kickoff`)).toBeNull();
+  });
+
+  test("logical routing does not authorize unlisted, foreign, or threaded Telegram destinations", async () => {
+    const { runtime, config, store } = fixture();
+    const parent = route(null, { platform: "telegram", guildId: "-1001234567890", channelId: "-1001234567890" });
+    const restricted = "-1009876543210";
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [parent.channelId] };
+    const logical = { ...parent, topicId: "some-work" };
+    for (const destination of [
+      { ...logical, guildId: restricted, channelId: restricted },
+      { ...logical, guildId: "-1001001001001", channelId: "-1001001001001" },
+      { ...logical, authorityId: "99" },
+      { ...logical, threadId: "7" },
+    ]) {
+      await expect(runtime.receive(message("9151", destination))).rejects.toThrow(/not authorized|Unauthorized/);
+    }
+    expect(store.input("9151")).toBeNull();
   });
 });

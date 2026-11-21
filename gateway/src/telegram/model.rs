@@ -207,20 +207,14 @@ impl Policy {
 
     pub fn authorize(&self, me: &Identity, route: &Route) -> Result<(), EffectError> {
         let chat = match &route.guild_id {
-            None => {
-                route.channel_id == self.owner
-                    && (route.topic_id.is_none() || route.thread_id.is_none())
-            }
-            Some(guild) => {
-                guild == &route.channel_id
-                    && route.topic_id.is_none()
-                    && self.chats.contains(&route.channel_id)
-            }
+            None => route.channel_id == self.owner,
+            Some(guild) => guild == &route.channel_id && self.chats.contains(&route.channel_id),
         };
         if route.platform != "telegram"
             || route.account_id != me.id.to_string()
             || route.authority_id != self.owner
             || !chat
+            || (route.topic_id.is_some() && route.thread_id.is_some())
             || route
                 .thread_id
                 .as_deref()

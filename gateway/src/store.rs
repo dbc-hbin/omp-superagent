@@ -14,11 +14,13 @@ use uuid::Uuid;
 
 mod ingress;
 mod restart;
+mod rotation;
 #[cfg(test)]
 mod tests;
 
 pub use ingress::{GatewayReceipt, QueuedEvent, answer_digest};
 pub(crate) use restart::{AuthorityError, js_trim};
+pub(crate) use rotation::{HEAD_ROTATION, HEAD_SESSION_FILE};
 
 pub struct Store {
     db: Mutex<Connection>,
@@ -88,6 +90,30 @@ impl Store {
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let db = self.db()?;
         set_meta(&db, key, value)
+    }
+
+    pub(crate) fn insert_meta_if_absent(
+        &self,
+        keys: impl IntoIterator<Item = String>,
+        value: &str,
+    ) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+            )?;
+            for key in keys {
+                if insert.execute(params![key, value])? == 0 {
+                    anyhow::ensure!(
+                        get_meta(&tx, &key)?.as_deref() == Some(value),
+                        "Conflicting immutable metadata receipt"
+                    );
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn begin_effect(&self, id: &str, operation: &str, args: &[Value]) -> Result<EffectStart> {
