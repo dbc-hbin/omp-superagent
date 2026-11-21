@@ -36,7 +36,7 @@ pub async fn serve(
         service.clone(),
         adapters.clone(),
     ));
-    let server = Server::listen(&state_dir.join("run/gateway.sock"), hub).await?;
+    let server = Server::listen(&state_dir.join("run/gateway.sock"), hub.clone()).await?;
     if let Err(e) = adapters.start().await {
         server.close().await?;
         return Err(e);
@@ -68,7 +68,7 @@ pub async fn serve(
                 biased;
                 _ = service.shutdown_requested() => break,
                 _ = tick.tick() => {
-                    if service.monitor().await.is_err() { eprintln!("Gateway HEAD ownership requires reconciliation"); }
+                    if service.monitor(hub.head_ready()).await.is_err() { eprintln!("Gateway HEAD ownership requires reconciliation"); }
                 }
             }
         }

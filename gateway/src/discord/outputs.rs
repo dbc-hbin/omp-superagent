@@ -226,7 +226,7 @@ impl State {
             )?],
             None => Payload::split(&output.text, &first_nonce, MESSAGE_PARTS)?,
         };
-        let mut first = None;
+        let mut sent_ids = Vec::with_capacity(payloads.len());
         for (part, mut payload) in payloads.into_iter().enumerate() {
             payload.create(&nonce(&output.id, &output.route, part));
             if part == 0
@@ -240,14 +240,20 @@ impl State {
                     .request(Method::POST, &format!("channels/{}/messages", channel.id)),
             );
             if Instant::now() >= deadline {
-                return Err(if first.is_some() {
+                return Err(if !sent_ids.is_empty() {
                     broken("Discord output deadline expired after partial delivery")
                 } else {
                     not_started()
                 });
             }
             let sent = match Rest::response_before::<RemoteMessage>(request, deadline).await {
-                Ok(sent) if sent.belongs(&output.route) && snowflake(&sent.id) => sent,
+                Ok(sent)
+                    if sent.belongs(&output.route)
+                        && snowflake(&sent.id)
+                        && !sent_ids.contains(&sent.id) =>
+                {
+                    sent
+                }
                 Ok(_) => {
                     return Err(broken(
                         "Discord message receipt identity could not be verified",
@@ -255,7 +261,7 @@ impl State {
                 }
                 // Earlier parts are already visible: never report a definite
                 // rejection that would invite sending the whole output again.
-                Err(_) if first.is_some() => {
+                Err(_) if !sent_ids.is_empty() => {
                     return Err(broken("Discord delivered only part of a split message"));
                 }
                 Err(error) => return Err(error),
@@ -271,11 +277,21 @@ impl State {
                     return Err(broken("Discord picker send did not confirm these controls"));
                 }
             }
-            first.get_or_insert(sent.id);
+            sent_ids.push(sent.id);
         }
-        let first = first.ok_or_else(|| broken("Discord message was not sent"))?;
+        let mut sent_ids = sent_ids.into_iter();
+        let first = sent_ids
+            .next()
+            .ok_or_else(|| broken("Discord message was not sent"))?;
         if let Some(card) = opening {
             self.ctx.pickers.posted(card, first.clone())?;
+        }
+        // Later receipts only identify an output after the entire split is verified.
+        if !sent_ids.as_slice().is_empty() {
+            let keys = sent_ids.map(|id| format!("discord:output-part:{id}"));
+            self.ctx
+                .insert_meta_if_absent(keys, &output.id)
+                .map_err(|_| broken("Discord output part receipts could not be saved"))?;
         }
         Ok(first)
     }

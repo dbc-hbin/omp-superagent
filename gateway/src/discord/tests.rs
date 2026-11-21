@@ -521,11 +521,14 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
             .join("\n\n")
     };
     let reply = json!({"route":route,"messageId":"205"});
+    store
+        .set_meta("discord:output-part:803", "split")
+        .unwrap();
     let split = hub
         .effect(
             "send",
             &[json!({"id":"split","route":route,"replyTo":reply,
-                "text":paragraphs(&["segment 1", "segment 2", "segment 3"])})],
+                "text":paragraphs(&["segment 1", "segment 2", "segment 3", "segment 4"])})],
         )
         .await
         .unwrap();
@@ -533,9 +536,24 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
         split, "801",
         "the first message is the stored remote receipt"
     );
+    for (id, expected) in [
+        ("801", None),
+        ("802", Some("split")),
+        ("803", Some("split")),
+        ("804", Some("split")),
+    ] {
+        assert_eq!(
+            store
+                .get_meta(&format!("discord:output-part:{id}"))
+                .unwrap()
+                .as_deref(),
+            expected,
+            "unexpected part mapping for Discord message {id}"
+        );
+    }
     let physical: model::Route = serde_json::from_value(route.clone()).unwrap();
     let mut nonces = HashSet::new();
-    for part in 0..3 {
+    for part in 0..4 {
         let body = received(&mut observed, "/channels/99/messages").await;
         let content = body["content"].as_str().unwrap();
         assert!(content.starts_with(&format!("segment {}", part + 1)));
@@ -556,11 +574,29 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     }
     assert!(observed.try_recv().is_err());
 
+    let conflict = hub
+        .effect(
+            "send",
+            &[json!({"id":"conflict","route":route,
+                "text":paragraphs(&["segment 5", "segment 6", "segment 2"])})],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.certainty, "uncertain");
+    for _ in 0..3 {
+        received(&mut observed, "/channels/99/messages").await;
+    }
+    assert_eq!(
+        store.get_meta("discord:output-part:802").unwrap().as_deref(),
+        Some("split")
+    );
+    assert_eq!(store.get_meta("discord:output-part:806").unwrap(), None);
+
     let partial = hub
         .effect(
             "send",
             &[json!({"id":"partial","route":route,
-                "text":paragraphs(&["segment 1", "reject", "segment 3"])})],
+                "text":paragraphs(&["segment 5", "segment 6", "reject", "segment 7"])})],
         )
         .await
         .unwrap_err();
@@ -570,9 +606,32 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     );
     received(&mut observed, "/channels/99/messages").await;
     received(&mut observed, "/channels/99/messages").await;
+    received(&mut observed, "/channels/99/messages").await;
+    assert_eq!(
+        store.get_meta("discord:output-part:806").unwrap(),
+        None,
+        "a verified later part does not identify an incomplete output"
+    );
     assert!(
         observed.try_recv().is_err(),
         "later parts are not sent and nothing is retried after a partial failure"
+    );
+    let duplicate = hub
+        .effect(
+            "send",
+            &[json!({"id":"duplicate","route":route,
+                "text":paragraphs(&["segment 7", "segment 8", "segment 8"])})],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.certainty, "uncertain");
+    for _ in 0..3 {
+        received(&mut observed, "/channels/99/messages").await;
+    }
+    assert_eq!(
+        store.get_meta("discord:output-part:808").unwrap(),
+        None,
+        "a duplicate snowflake cannot confirm delivery of a distinct part"
     );
     let rejected = hub
         .effect(

@@ -5,7 +5,7 @@ import { DISCORD_COMMANDS, parseDiscordCommand } from "../src/discord-commands.t
 describe("Discord command catalog", () => {
   test("registers only supported Superagent commands for guild installs and owner bot DMs", () => {
     expect(DISCORD_COMMANDS.map(command => command.name)).toEqual([
-      "help", "status", "restart", "context", "usage", "cron", "resume", "resolve", "main", "model", "effort", "compact", "stop", "new",
+      "help", "head", "status", "restart", "context", "usage", "cron", "resume", "resolve", "main", "model", "effort", "compact", "stop", "new",
     ]);
     for (const command of DISCORD_COMMANDS) {
       expect(command.type).toBe(ApplicationCommandType.ChatInput);
@@ -14,7 +14,7 @@ describe("Discord command catalog", () => {
       expect(command.contexts).toEqual([InteractionContextType.Guild, InteractionContextType.BotDM]);
       expect(command.integration_types).toEqual([ApplicationIntegrationType.GuildInstall]);
       expect(parseDiscordCommand(command.name, [])).toBe(`/${command.name}`);
-      if (["model", "effort", "compact", "stop", "new", "resolve", "cron"].includes(command.name)) {
+      if (["head", "model", "effort", "compact", "stop", "new", "resolve", "cron"].includes(command.name)) {
         expect(command.options).toEqual([{
           name: "text", type: ApplicationCommandOptionType.String, description: expect.any(String), required: false,
         }]);
@@ -23,7 +23,7 @@ describe("Discord command catalog", () => {
     }
   });
 
-  test.each(["model", "effort", "compact", "stop", "new", "resolve", "cron"])("/%s preserves free text and multiline instructions", name => {
+  test.each(["head", "model", "effort", "compact", "stop", "new", "resolve", "cron"])("/%s preserves free text and multiline instructions", name => {
     expect(parseDiscordCommand(name, [{ name: "text", type: ApplicationCommandOptionType.String, value: "  first line\nsecond line  " }])).toBe(`/${name} first line\nsecond line`);
   });
 

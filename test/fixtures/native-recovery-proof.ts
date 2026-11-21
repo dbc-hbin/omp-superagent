@@ -33,9 +33,10 @@ export async function runNativeRecoveryProof(options: {
   assert.equal(original.model?.provider, "gateway-native");
   assert.equal(original.goal, null);
   const route: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: "3", channelId: "4", threadId: "80" };
-  const input = (id: string, text = `Native recovery request ${id}`): Inbound => ({
+  const input = (id: string, text: string): Inbound => ({
     id, messageId: id, route, text, receivedAt: Date.now(), attachments: [],
   });
+  const headInput = (id: string) => input(id, `/head Native recovery request ${id}`);
   const state = (id: string) => (db.query("SELECT state FROM inputs WHERE id=?").get(id) as { state: string } | null)?.state;
   const events = async (): Promise<Event[]> => {
     const text = await fs.readFile(path.join(root, "recovery-events.jsonl"), "utf8").catch(error => {
@@ -55,10 +56,10 @@ export async function runNativeRecoveryProof(options: {
     await until(() => state(id) === "done" && messenger.sent.some(output => output.sourceId === id), `status control ${id}`);
   };
 
-  await messenger.deliver(input("801"));
+  await messenger.deliver(headInput("801"));
   await until(async () => (await recoveryCalls("801")).length === 1, "same HEAD model receives original durable completion evidence");
   assert.equal(state("801"), "uncertain");
-  await messenger.deliver(input("802"));
+  await messenger.deliver(headInput("802"));
   await until(() => state("802") === "pending", "later ordinary input is durably held throughout recovery");
   assert.equal(await fs.readFile(path.join(root, "original-effect-801"), "utf8"), "Original native effect 801\n");
   const during = await head.client.getState();
@@ -85,16 +86,16 @@ export async function runNativeRecoveryProof(options: {
   assert(messenger.sent.some(output => output.sourceId === "801"), "Reconciliation is reported on the original request");
   assert(messenger.sent.every(output => JSON.stringify(output.route) === JSON.stringify(route)));
   const originalOutputs = messenger.sent.filter(output => output.sourceId === "801").map(output => output.id);
-  await messenger.deliver(input("801"));
+  await messenger.deliver(headInput("801"));
   await status("810");
   await waitSettled("duplicate delivery and status leave recovery settled");
   assert.equal((await recoveryCalls("801")).length, 1);
   assert.deepEqual(messenger.sent.filter(output => output.sourceId === "801").map(output => output.id), originalOutputs,
     "Duplicate ingress and lifecycle reads cannot resend a reconciliation notification");
 
-  await messenger.deliver(input("803"));
+  await messenger.deliver(headInput("803"));
   await until(() => state("803") === "uncertain", "lost admission remains uncertain without a native receipt");
-  await messenger.deliver(input("804"));
+  await messenger.deliver(headInput("804"));
   await until(() => state("804") === "pending", "missing original receipt fences ordinary work");
   await waitSettled("missing receipt does not create speculative native execution");
   await status("811");
@@ -106,10 +107,10 @@ export async function runNativeRecoveryProof(options: {
   await messenger.deliver(input("812", "/resolve 803"));
   await until(() => state("803") === "cancelled" && state("804") === "done", "owner escape hatch remains usable after automatic hold");
 
-  await messenger.deliver(input("805"));
+  await messenger.deliver(headInput("805"));
   await until(async () => (await recoveryCalls("805")).length === 1, "restricted recovery reaches adversarial tool call");
   await waitSettled("blocked recovery tool ends its isolated native turn");
-  await messenger.deliver(input("806"));
+  await messenger.deliver(headInput("806"));
   await status("813");
   assert.equal(state("805"), "uncertain");
   assert.equal(state("806"), "pending");

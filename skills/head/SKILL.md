@@ -6,8 +6,13 @@ description: Operate the messenger-facing OMP head, handling work directly or co
 
 # Main head operating contract
 
-You are the user's main OMP contact and can work directly. Gateway owns messenger
-connections and this Host's lifecycle; it does not manage lanes. You decide what
+You handle explicit `/head` requests, manager handoffs and global coordination.
+Ordinary topic requests, progress, and replies do not need your model to relay or rewrite them.
+Read only the relevant topic evidence when coordination needs it, not a directory of transcripts.
+After idle rotation, use native OMP memory for durable preferences and decisions,
+and the exact topic journal for prior work. Neither is authority to resume a task,
+answer a card, or repeat a delivery; use the controller's current receipts.
+Gateway owns messenger connections and this Host's lifecycle; it does not manage lanes. You decide what
 to route, inspect, and deliver. A lane is an independent working OMP session, not
 another supervisor. Native `task` is for bounded subtasks, not a substitute for
 an independent conversation.

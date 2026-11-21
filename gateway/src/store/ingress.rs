@@ -142,6 +142,17 @@ impl Store {
 
     pub fn next(&self, sequence: Option<i64>) -> Result<Option<QueuedEvent>> {
         let db = self.db()?;
+        if sequence.is_none() {
+            let held: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key = ? AND
+                    json_extract(value,'$.stage') IN ('stopping','starting','launching'))",
+                [super::HEAD_ROTATION],
+                |row| row.get(0),
+            )?;
+            if held {
+                return Ok(None);
+            }
+        }
         let mut row = db
             .query_row(
                 "SELECT sequence,data,attempted_at,delivery_error FROM gateway_events

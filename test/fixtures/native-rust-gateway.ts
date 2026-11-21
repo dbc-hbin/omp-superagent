@@ -9,6 +9,7 @@ import { gatewayCall } from "../../src/gateway-protocol";
 import type { GatewayStatus } from "../../src/gateway-wire";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./host-fixture-processes";
 import { nativeRequestEnvelope } from "./native-request-envelope";
+import { offlineMnemopi } from "./native-memory";
 
 export type Head = { readonly pid: number; readonly ownerPid: number; readonly sessionId: string;
   readonly sessionFile: string; readonly dev: number; readonly ino: number };
@@ -197,6 +198,7 @@ async function sdkMain(): Promise<void> {
       const model = "gateway-native/local";
       const modelRoles = { default: model, judge: model };
       await writeFile(join(agent, "config.yml"), JSON.stringify({
+        ...offlineMnemopi,
         disabledProviders: nativeDisabledProviders, modelRoles,
         modelPresets: Object.fromEntries(["high", "middle", "low"].map(name => [name, { modelRoles }])),
       }), { mode: 0o600 });

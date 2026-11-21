@@ -8,6 +8,7 @@ mod maintenance;
 mod process;
 mod restart_record;
 mod restart_service;
+mod rotation;
 mod rpc_wire;
 mod stock_ops;
 mod supervision;
@@ -26,6 +27,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
+use tokio::time::Instant;
 
 use crate::{adapter::EffectError, server::Service, store::Store};
 
@@ -60,6 +62,7 @@ enum Phase {
     Running,
     Accepting,
     Accepted,
+    Rotating,
     OperatorStopping,
     Held,
 }
@@ -74,6 +77,7 @@ struct State {
     shutdown_result: Option<supervision::ShutdownOutcome>,
     restarting: bool,
     head_error: Option<&'static str>,
+    next_rotation_probe: Option<Instant>,
 }
 
 impl Lifecycle {
@@ -95,6 +99,7 @@ impl Lifecycle {
             shutdown_result: None,
             restarting: false,
             head_error: None,
+            next_rotation_probe: None,
         };
         Ok(Self(Arc::new(Owner {
             config,
@@ -173,6 +178,16 @@ impl Lifecycle {
     }
 
     pub async fn activate(&self, request: Option<&str>) -> Result<()> {
+        if request.is_none() && self.rotation()?.is_some_and(|plan| matches!(plan.stage,
+            rotation::Stage::Stopping | rotation::Stage::Starting | rotation::Stage::Launching))
+        {
+            // An interrupted rotation must not stop the independent
+            // Gateway while exact native recovery is still being proved.
+            if self.reconcile_head(false).await.is_err() {
+                eprintln!("Gateway HEAD rotation requires reconciliation");
+            }
+            return Ok(());
+        }
         self.ensure_head().await?;
         if let Some(id) = request {
             let store = &self.0.store;
@@ -201,9 +216,17 @@ impl Lifecycle {
         Ok(())
     }
 
-    pub async fn monitor(&self) -> Result<()> {
+    pub async fn monitor(&self, controller_ready: bool) -> Result<()> {
         self.schedule_maintenance()?;
-        if let Err(error) = self.ensure_head().await {
+        self.reconcile_head(controller_ready).await
+    }
+
+    async fn reconcile_head(&self, controller_ready: bool) -> Result<()> {
+        let result = async {
+            self.monitor_rotation(controller_ready).await?;
+            self.ensure_head().await
+        }.await;
+        if let Err(error) = result {
             self.state()?.head_error = Some("Head ownership/startup requires reconciliation");
             return Err(error);
         }
@@ -217,6 +240,7 @@ impl Lifecycle {
         admission_ready: bool,
     ) -> Result<Value> {
         let state = self.state()?;
+        let rotation = self.rotation()?;
         let closed = *self.0.closing.borrow();
         let live = match &state.head {
             Some(head) => alive(head.pid)?,
@@ -231,8 +255,16 @@ impl Lifecycle {
             let initialization = saved.filter(|saved| saved["sessionId"].as_str() == Some(head.session_id.as_str()))
                 .unwrap_or_else(|| json!({"sessionId": head.session_id, "state": "checking",
                     "detail": "Waiting for authoritative native HEAD attachment, approval reconciliation and preset inspection."}));
-            native["ready"] = json!(live && head_ready && initialization["state"] == "complete");
+            native["ready"] = json!(live && head_ready && initialization["state"] == "complete"
+                && !rotation.as_ref().is_some_and(|plan| plan.stage == rotation::Stage::Stopping));
             native["initialization"] = initialization;
+        }
+        if let Some(rotation) = rotation {
+            native["rotation"] = json!({
+                "id": rotation.id, "stage": rotation.stage,
+                "previousSessionId": rotation.original.session_id,
+                "replacementSessionId": rotation.replacement_session_id,
+            });
         }
         let mut status = json!({
             "gateway": {"pid": os_process::id(), "ready": state.transport_ready && !closed,

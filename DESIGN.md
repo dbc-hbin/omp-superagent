@@ -3,9 +3,11 @@
 Superagent connects one OMP head to Discord, Telegram, and Slack. The head can
 work directly or delegate to independent native OMP sessions called **lanes**.
 The Gateway keeps the messenger connection and durable intake alive without
-running a model. All configured messenger owners are the **same trusted operator**:
-they share head context, not platform identities or conversation bindings. This is
-not a multitenant service or an OS sandbox.
+running a model. All configured messenger owners are the **same trusted operator**.
+Ordinary owner work stays in the native session bound to its topic. Separately,
+[restricted group rooms](docs/design/messaging.md#restricted-group-rooms) opt
+specific members into explicit group actions without access to the owner head
+or lanes. This is not a multitenant service or an OS sandbox.
 
 - [Messaging and authority](docs/design/messaging.md): ingress, routing, controls,
   approvals, recovery, delivery, and Discord voice.
@@ -28,7 +30,7 @@ not a multitenant service or an OS sandbox.
 | --- | --- | --- |
 | CLI and setup | Configuration, credentials, doctor, start/status/stop and one-shot macOS registration. | [CLI](src/cli.ts), [config](src/config.ts), [setup](src/setup.ts), [credentials](src/credentials.ts), [autostart](src/autostart.ts) |
 | Gateway | One Rust process authenticates the configured adapters, admits intake durably, proxies scoped messenger effects and supervises exactly one head. It never connects to lane RPC or decides work. | [Gateway](gateway/src/main.rs), [server](gateway/src/server.rs), [ingress ledger](gateway/src/store.rs), [client](src/gateway-client.ts), [adapter hub](gateway/src/adapter.rs) |
-| Head | Interprets every ordinary message and follow-up, runs direct work or explicitly dispatches lanes, owns approvals and reporting, and decides what is sent back. | [Head extension](src/extension.ts), [runtime](src/runtime.ts), [coordination store](src/store.ts) |
+| Head | Its controller owns intake, placement, approvals and delivery. The shared model handles explicit `/head` work and manager coordination, not ordinary topic prompts or their answers. | [Head extension](src/extension.ts), [runtime](src/runtime.ts), [coordination store](src/store.ts) |
 | Lane | Runs its assigned work in its own native session with its own cwd, model and context; reports to the head, not directly to a messenger. | [Lane extension](src/lane-extension.ts), [lane reporting](src/lane-report.ts), [role instructions](skills/lane/SKILL.md) |
 | Host | One installed OMP process owns each managed root session. A detached Rust process owns its stdin/stdout and private reconnectable socket; it does not run inference, tools, or supervision policy. | [Host client](src/host.ts), [stdio owner](host-owner/src/main.rs), [SDK helper](src/host-sdk-helper.ts), [native lifecycle extension](src/host-extension.ts) |
 | Board | An informational log in `coordination.sqlite` shared by registered head/lane sessions in the same instance. Not a command, approval, or delivery bus. | [Board](src/board.ts), [board extension](src/board-extension.ts) |
@@ -82,6 +84,33 @@ part of the native build.
    registers a per-instance one-shot next-login invocation of the same `start`;
    no `KeepAlive`, immediate activation, or second supervisor. `uninstall` removes
    only future startup. There is no Linux service installer or Windows support.
+
+### Idle head rotation
+
+The Gateway may replace only the designated head after the runtime attests at
+least 30 continuous minutes of native head idle and known native context usage
+of at least 50%. Pending Gateway ingress, head-dependent work, native approvals,
+goals, children, unresolved deliveries and scheduled or placement activity
+can make a head ineligible. The stock Host and runtime both recheck their
+guards immediately before graceful shutdown. Rotation does not abort work,
+cancel approvals, or force-kill a process.
+
+An atomic intake fence leaves new events durably queued in their original
+order. The Gateway waits for the exact old native exit and persistence receipt
+and the stdio owner's exit before reserving a new head generation. The new
+native journal has a different session ID and path; it has no copied transcript
+or replayed prompt. The replacement preserves the selected model and configured
+effort (including automatic effort) and verifies native readback. Resident
+lanes retain their Host, topic binding and generation; the replacement
+reconciles already-admitted independent work by its original lane identity
+and native journal, not by submitting it again.
+
+Inspect `head.rotation.stage` in `omp-sa status` for the latest rotation.
+An ambiguous shutdown never authorizes another shutdown request or early
+replacement; a verified exit can continue the existing transition. Explicit
+operator stop supersedes an in-flight rotation. `/restart` remains a separate
+control and restores the exact current native session, including one created
+by rotation.
 
 ### Explicit restart
 

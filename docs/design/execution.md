@@ -32,10 +32,11 @@ references](../../skills/head/SKILL.md) for operating policy.
 | `thread_inspect`, `lane_thread_update` and the `decision_*` tools | Use the [messaging and authority contract](messaging.md) for scope, original thread/approval identities and readback. |
 
 Send only the original task, relevant evidence, constraints and acceptance
-criteria to a lane; never copy the full head transcript. Head-to-lane
-instructions and lane-to-head reports are in English; head replies use the
-operator's language. Source-bound progress and outcomes go to the head through
-durable reports, not messenger SDKs. Distinguish dispatch acceptance, actual
+criteria to a lane; never copy the full head transcript. A new topic starts
+with the exact observed head model, not its conversation; subsequent work uses
+the topic's own saved model and session. A topic lane replies in the operator's
+language through the controller outbox. Explicit manager handoffs and their
+internal reports use English. No lane gains messenger credentials. Distinguish dispatch acceptance, actual
 execution, native settlement, verified acceptance criteria, and user delivery.
 
 The [`lane_report` tool](../../src/lane-extension.ts) records evidence in the

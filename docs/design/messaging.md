@@ -135,11 +135,46 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
 
 ## Topic routing and controls
 
-- An ordinary question or coordination request can be answered directly. For
-  independent work, the head selects the actual repository, scope and model
-  and calls `lane_start`; for a later instruction it calls `lane_message` with
-  the original durable source. A binding is context, never authority. Inbound
-  follow-ups still go to the head, and creation does not move pending work.
+- The head **controller** receives ordinary input; its **model** does not. Each
+  authenticated original records its intended topic owner at admission. The
+  controller creates a source-bound handoff to that session. A new topic may reuse a
+  workspace, never another topic's transcript. The controller matches repository or
+  directory names in owner text against placed lanes of the same authenticated channel
+  or DM. A reply to a placed original or a sent message on its physical route supplies
+  that task's workspace; the quote body is not evidence. `/new` in a bound thread can
+  reuse that thread's workspace. An explicit `cwd: /absolute/path` takes precedence.
+  With no unique existing directory, ask on the original route; a known name or absolute
+  path selects just one pending original. Neither an edited confirmation nor a stale
+  answer to the workspace question becomes another task. A Slack reply uses the sent question's root timestamp.
+  A retrospective request with a task description can search previous managed native
+  sessions across the configured owner's currently allowed channels. Search the
+  operator's text, not reply bodies or attachments. Restricted group rooms, HEAD,
+  other bot accounts and unrelated local OMP sessions are not candidates. Natural
+  language dates refer to the original request timestamp, using UTC calendar boundaries.
+  The controller first calls the live head extension's public `ctx.memory.search`:
+  with Mnemopi this runs the same scoped lookup (`recallResultsScoped`) as OMP's
+  `recall` tool. The head does not run a model turn or save a memory. A memory
+  hit is a search hint, never a routing decision. Combine corroborated memory
+  hits with direct matches on active branches of eligible journals. A successful
+  empty recall still permits a direct match; an unavailable lookup does not.
+  Neither the outbox nor the destination prompt receives raw memory results.
+  If the journal read budget would leave the search incomplete, ask rather than
+  select a partial winner. Do not default to the latest lane.
+  Freeze matched lane/session/workspace identities at admission. Multiple plausible
+  tasks require a source-scoped choice, even in the same workspace or journal. Cross-channel
+  continuation starts a destination-owned session, not another writer on the old
+  journal. Recheck the prior identity, work state, entry and pinned evidence
+  digest before native submission, without searching mutable memory again;
+  historical text cannot start workflows or approve effects.
+  A new request with a different explicit workspace,
+  or `/new` with a request in a thread, starts a separate topic instead of
+  changing a lane's cwd. A closed lane or an uncertain receipt is not reopened
+  by ordinary input.
+- `/head <request>` explicitly addresses the shared coordination model (Slack:
+  `!head` or `/superagent-head`). Its manager handoffs keep the original review
+  path. Ordinary topic commentary and final answers instead pass through the
+  controller's source-bound outbox without a synthesis turn. Approval cards
+  also stay with their original native session and authorized route.
 - Thread-first work sends a short kickoff to the selected topic. The durable
   `sent` receipt gates new lane dispatch and steering for that input. A missing
   or uncertain delivery is not a successful kickoff.
@@ -202,8 +237,9 @@ profile with `usage --json --redact --no-extensions` and projects provider quota
 and reset data, without sending account identifiers or raw responses. Unknown
 quota is not zero or an estimate of this session's usage. `/compact` uses native
 compaction and requires an idle eligible head; status and priority stop remain
-available while it runs. `/stop` pauses the bound lane, or stops head work when
-unbound; use `/stop head` or a lane ID to name a target. Once admitted to the
+available while it runs. `/stop` pauses the bound lane. In an unbound topic it
+cancels work awaiting workspace clarification, or stops head work when there
+is no such request. Use `/stop head` or a lane ID to name a target. Once admitted to the
 head, priority controls and approval answers do not wait for an ordinary model
 turn to finish. [Restart](../../DESIGN.md#explicit-restart)
 is distinct from stopping a task or resuming a topic. `/cron` controls
@@ -236,8 +272,10 @@ it does not forward the HTML, submit defaults or wait for a connected head.
 [`decision_ask`](../../src/decision-tool.ts) uses the separate native `askDialog`; it is not a
 parallel approval engine. [Decision records](../../src/decisions.ts) link the
 native tool call, original source and original question/card. `answering` is an
-attempt, not the `answered` state confirmed by native settlement. A lane's
-source-bound question goes to head review first. For a routine reversible
+attempt, not the `answered` state confirmed by native settlement. A topic-owned
+question goes to the authorized topic directly; it does not wake the coordination
+model. An unowned native dialog after reconnect is held if its original topic
+cannot be verified. A manager-delegated lane's question goes to head review first. For a routine reversible
 choice within the assignment, the head returns an original option to the lane
 and records the reason internally, without a separate messenger message. When
 the owner must decide, the original card shows why their decision is needed
@@ -280,7 +318,9 @@ approval.
   first splits an over-limit reply at paragraph, line, then space boundaries
   into at most five ordered messages, closing and reopening a code fence that
   crosses a boundary; only the first replies to the original message, each part
-  has its own nonce, and the first message ID is the receipt. The Gateway has
+  has its own nonce, and the first message ID is the delivery receipt. For newly
+  completed multipart sends the Gateway also records later message IDs for scoped
+  reply lookup; partial or uncertain sends are not workspace evidence. The Gateway has
   25 seconds for the whole Discord output, including destination lookup,
   leaving time to return the result before the head's 30-second IPC timeout.
   No new parts are posted after that deadline. An in-flight POST at expiry or

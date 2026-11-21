@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use std::process;
 use uuid::Uuid;
 
-use crate::adapter::EffectError;
+use crate::{adapter::EffectError, store::HEAD_ROTATION};
 
 use super::{
     Lifecycle, Phase,
@@ -10,23 +10,37 @@ use super::{
     host_launch::PreparedHost,
     host_rpc::{Head, PROBE_TIMEOUT, Probe, ShutdownRefused, confirmed_exit},
     restart_record::{self, ACTIVE, FENCE, Fence, HEAD, Record, STOP, Stage},
+    rotation::{self, Stage as RotationStage},
 };
 
 impl Lifecycle {
     pub(super) async fn probe(&self) -> Result<Probe> {
         let config = &self.0.config;
-        Probe::open(&config.head_socket, &config.head_session, PROBE_TIMEOUT).await
+        let session_file = rotation::session_file(config, &self.0.store)?;
+        Probe::open(&config.head_socket, &session_file, PROBE_TIMEOUT).await
     }
 
     pub(super) async fn authorize(&self, pid: u32) -> Result<()> {
+        // The fresh runtime must start after the replacement's exact stock
+        // selection and identity have been published, never during launch.
+        let _rotating = if self.rotation()?.is_some_and(|plan| plan.stage == RotationStage::Launching) {
+            Some(self.0.supervision.lock().await)
+        } else {
+            None
+        };
         let actual = self.probe().await?.head;
         let state = self.state()?;
+        let rotation = self.rotation()?;
+        let rotating = rotation.as_ref().is_some_and(|plan| plan.stage == RotationStage::Launching);
         let owns = match &state.head {
             Some(known) => actual.same(known),
-            None => state.launching_owner == Some(actual.owner_pid),
+            None => !rotating && state.launching_owner == Some(actual.owner_pid),
         };
         ensure!(
-            actual.pid == pid && owns,
+            actual.pid == pid && owns && !rotation.as_ref().is_some_and(|plan|
+                state.phase == Phase::OperatorStopping
+                    && plan.replacement_session_id.as_deref() == Some(actual.session_id.as_str())
+                    && plan.replacement_owner_pid == Some(actual.owner_pid)),
             EffectError::rejected("Gateway client is not the supervised native head")
         );
         Ok(())
@@ -34,6 +48,14 @@ impl Lifecycle {
 
     pub(super) async fn ensure_head(&self) -> Result<()> {
         let _supervising = self.0.supervision.lock().await;
+        let mut rotation = self.rotation()?;
+        if rotation.as_ref().is_some_and(|plan| plan.stage == RotationStage::Stopping) {
+            return Ok(());
+        }
+        if let Some(plan) = rotation.as_ref().filter(|plan| matches!(plan.stage, RotationStage::Starting | RotationStage::Launching)) {
+            ensure!(self.0.config.config_hash()? == plan.config_hash,
+                "Gateway configuration changed before replacement HEAD startup");
+        }
         let head = {
             let state = self.state()?;
             if state.phase != Phase::Running || *self.0.closing.borrow() {
@@ -41,6 +63,14 @@ impl Lifecycle {
             }
             state.head.clone()
         };
+        if let Some(plan) = rotation.as_mut().filter(|plan| plan.stage == RotationStage::Launching) {
+            let probe = self.probe().await.context("Replacement HEAD launch ownership remains held")?;
+            let mut state = self.state()?;
+            self.publish_rotation(plan, &probe.head, &probe.state)?;
+            state.head = Some(probe.head);
+            state.head_error = None;
+            return Ok(());
+        }
         if let Some(known) = &head
             && alive(known.pid)?
         {
@@ -78,34 +108,54 @@ impl Lifecycle {
             .ulw
             .get()
             .context("Gateway lifecycle has not been prepared")?;
-        let prepared = PreparedHost::prepare(config, &self.0.store, ulw).await?;
+        let replacement = rotation.as_mut().filter(|plan| plan.stage == RotationStage::Starting);
+        let prepared = PreparedHost::prepare(config, &self.0.store, ulw, replacement.as_deref()).await?;
+        let session_file = rotation::session_file(config, &self.0.store)?;
+        let mut replacement = replacement;
         let mut owner = {
             let mut state = self.state()?;
             if state.phase != Phase::Running || *self.0.closing.borrow() {
                 return Ok(());
             }
+            if let Some(plan) = &mut replacement {
+                plan.stage = RotationStage::Launching;
+                plan.replacement_session_id = Some(prepared.expected_session_id().context("Fresh HEAD session ID missing")?.to_owned());
+                self.0.store.set_meta(HEAD_ROTATION, &serde_json::to_string(plan)?)?;
+            }
             let owner = prepared.spawn(config)?;
             state.launching_owner = Some(owner.pid);
             owner
         };
-        let result = owner.identify(config).await;
+        if let Some(plan) = &mut replacement {
+            plan.replacement_owner_pid = Some(owner.pid);
+            if let Err(error) = self.0.store.set_meta(HEAD_ROTATION, &serde_json::to_string(plan)?) {
+                owner.reap(); // Rotation never signals a process, including a failed launch.
+                return Err(error);
+            }
+        }
+        let result = owner.identify(config, &session_file).await;
         match result {
-            Ok(identity) => {
+            Ok(probe) => {
                 // Start the pipe-owner wait before the store commit so even a
                 // failed write retains its manifest until that exact process exits.
                 owner.reap();
                 let mut state = self.state()?;
                 state.launching_owner = None;
-                state.head = Some(identity);
-                self.0
-                    .store
-                    .set_meta(HEAD, &serde_json::to_string(&state.head)?)?;
+                if let Some(plan) = replacement {
+                    self.publish_rotation(plan, &probe.head, &probe.state)?;
+                    state.head = Some(probe.head);
+                } else {
+                    state.head = Some(probe.head);
+                    self.0.store.set_meta(HEAD, &serde_json::to_string(&state.head)?)?;
+                }
                 state.head_error = None;
                 Ok(())
             }
             Err(error) => {
                 self.state()?.launching_owner = None;
-                if owner.abandon().await.is_err() {
+                if replacement.is_some() {
+                    owner.reap();
+                } else if owner.abandon().await.is_err() {
                     eprintln!("Failed HEAD startup owner could not be disposed");
                 }
                 Err(error)
@@ -186,6 +236,48 @@ impl Lifecycle {
             }
             state.head.clone()
         };
+        if restart.is_none() && let Some(mut rotation) = self.rotation()? {
+            match rotation.stage {
+                RotationStage::Stopping => {
+                    // Do not send another shutdown after an ambiguous
+                    // automatic request, even on an operator stop.
+                    confirmed_exit(&self.0.config.head_socket, &rotation.original).await?;
+                    remove_dead_socket(
+                        &self.0.config.head_socket,
+                        Some(rotation.original.endpoint()),
+                        Some(rotation.original.owner_pid),
+                    ).await?;
+                    self.refuse_rotation(&mut rotation)?;
+                    return self.clear_head();
+                }
+                RotationStage::Launching if head.is_none() => {
+                    let actual = self.probe().await.context("Replacement HEAD ownership is unresolved; no stop was sent")?;
+                    // Authorize stopping the exact launch even if the
+                    // selection readback failed. Explicit stop does not
+                    // promote the replacement to a ready HEAD.
+                    ensure!(rotation.replacement_owner_pid == Some(actual.head.owner_pid)
+                        && rotation.replacement_session_id.as_deref() == Some(actual.head.session_id.as_str()),
+                        "Replacement HEAD ownership is unresolved; no stop was sent");
+                    let mut probe = actual;
+                    if let Err(error) = probe.shutdown().await {
+                        if let Some(refusal) = error.downcast_ref::<ShutdownRefused>() {
+                            return Err(EffectError::rejected(&refusal.0).into());
+                        }
+                        return Err(error);
+                    }
+                    let identity = probe.head;
+                    confirmed_exit(&self.0.config.head_socket, &identity).await?;
+                    remove_dead_socket(&self.0.config.head_socket, Some(identity.endpoint()), Some(identity.owner_pid)).await?;
+                    // The unpublished replacement never received ingress.
+                    // Only a subsequent explicit start can relaunch it.
+                    rotation.stage = RotationStage::Starting;
+                    rotation.replacement_owner_pid = None;
+                    self.0.store.set_meta(HEAD_ROTATION, &serde_json::to_string(&rotation)?)?;
+                    return self.clear_head();
+                }
+                RotationStage::Starting | RotationStage::Launching | RotationStage::Complete | RotationStage::Refused => {}
+            }
+        }
         if let Some((expected, record)) = restart {
             if !self.restart_still_authorized(expected, record)? {
                 return Ok(());

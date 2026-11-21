@@ -6,6 +6,7 @@ import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { HostConnection, startHost } from "../src/host";
 import { nativeDisabledProviders } from "./fixtures/native-extension";
 import { nativeTestCommand } from "./fixtures/native-command";
+import { offlineMnemopi } from "./fixtures/native-memory";
 
 const nativeTest = process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 
@@ -26,7 +27,7 @@ nativeTest("stock OMP resumes a managed session by ID, respects a live native wr
     ...(process.env.OMP_TEST_NATIVES_DIR ? { PI_NATIVES_DIR: process.env.OMP_TEST_NATIVES_DIR } : {}),
   };
   const nativeConfig = path.join(agent, "config.yml");
-  await fs.writeFile(nativeConfig, JSON.stringify({ disabledProviders: nativeDisabledProviders,
+  await fs.writeFile(nativeConfig, JSON.stringify({ ...offlineMnemopi, disabledProviders: nativeDisabledProviders,
     eval: { js: false, py: false } }));
   const options = {
     command, cwd, env, socketPath: path.join(root, "lane.sock"), sessionFile: path.join(root, "session.jsonl"),

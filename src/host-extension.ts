@@ -17,6 +17,8 @@ import type { RpcAbortAndRestoreQueueResult, RpcSessionState } from "@oh-my-pi/p
 import { calculateTokensPerSecond } from "@oh-my-pi/pi-coding-agent/utils/token-rate";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import type { LanePresetSnapshot } from "./contracts";
+import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent,
+  type RotationNative, type RotationProbeEvent } from "./head-rotation";
 
 const terminalService = (state: ServiceUnit["state"]) => state === "exited" || state === "failed";
 const serviceGeneration = ({ owner, id, generation, startedAt, restartCount }: ServiceUnit) =>
@@ -343,7 +345,32 @@ export default function hostExtension(pi: ExtensionAPI): void {
       && !session.yieldQueue.has()
       && !session.getGoalModeState()?.enabled;
   };
+  const rotationState = (): RotationNative | null => {
+    if (process.env.OMP_SUPERAGENT_ROLE !== "head" || !localIdle()) return null;
+    const { id, file, session } = exact();
+    const usage = session.getContextUsage();
+    const model = session.model;
+    if (!file || !usage || typeof usage.tokens !== "number" || !Number.isFinite(usage.tokens)
+      || typeof usage.percent !== "number" || !Number.isFinite(usage.percent) || usage.percent < 50
+      || !Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0
+      || !model || typeof model.reasoning !== "boolean" || typeof session.configuredThinkingLevel !== "function") return null;
+    const { modelRoles, defaultThinkingLevel } = snapshot();
+    const roles = Object.fromEntries(Object.entries(modelRoles).filter((entry): entry is [string, string] =>
+      typeof entry[1] === "string"));
+    return { hostPid: process.pid, sessionId: id, sessionFile: file, nativeRun: runOrdinal,
+      contextPercent: usage.percent,
+      selection: { provider: model.provider, modelId: model.id, reasoning: model.reasoning,
+        thinkingLevel: session.thinkingLevel ?? null, configuredThinkingLevel: session.configuredThinkingLevel() ?? null,
+        modelSettings: { modelRoles: roles, ...(defaultThinkingLevel !== undefined ? { defaultThinkingLevel } : {}) } } };
+  };
   const handle = async (command: Frame): Promise<unknown> => {
+    if (command.type === "get_head_rotation") {
+      const state = rotationState();
+      if (!state) return null;
+      let attestation: Parameters<RotationProbeEvent["respond"]>[0] | undefined;
+      pi.events.emit(HEAD_ROTATION_PROBE, { state, respond: value => { attestation = value; } } satisfies RotationProbeEvent);
+      return attestation ?? null;
+    }
     if (command.type === "get_session_stats") return exact().session.getSessionStats();
     if (command.type === "get_state") {
       const { session } = exact();
@@ -426,7 +453,9 @@ export default function hostExtension(pi: ExtensionAPI): void {
         journalCursorControlVersion: 1,
         hasOwnedRunningWork: ownership.unknown ? undefined : ownership.busy, mutationHeld, observationHeld,
         admitted: ownership.identity.session.hasAdmittedSubmission,
-        postPromptWork: ownership.identity.session.hasPostPromptWork };
+        postPromptWork: ownership.identity.session.hasPostPromptWork,
+        ...(typeof ownership.identity.session.configuredThinkingLevel === "function"
+          ? { configuredThinkingLevel: ownership.identity.session.configuredThinkingLevel() ?? null } : {}) };
     }
     if (command.type === "set_model_preset") {
       if (!localIdle()) throw new Error("Native session is busy or has an unresolved mutation");
@@ -480,6 +509,14 @@ export default function hostExtension(pi: ExtensionAPI): void {
       const finalOwnership = await owned(true);
       if (exact().ref !== ownership.identity.ref || !localIdle() || ownership.unknown || finalOwnership.unknown
         || ownership.busy || finalOwnership.busy) throw new Error("session_busy");
+      if (typeof command.headRotation === "string") {
+        const state = rotationState();
+        if (!state) throw new Error("session_busy");
+        let allowed = false;
+        pi.events.emit(HEAD_ROTATION_GUARD, { id: command.headRotation, state,
+          respond: value => { allowed = value; } } satisfies RotationGuardEvent);
+        if (!allowed) throw new Error("session_busy");
+      }
       // The owner has fenced its inputs and revalidated stock state/UI. Nothing
       // awaits between this final native guard, disposal fence and shutdown.
       ownership.identity.session.sessionManager.flushSync();

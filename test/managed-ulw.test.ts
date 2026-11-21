@@ -6,6 +6,7 @@ import { connect, startHost, type HostOptions } from "../src/host";
 import { getExtensionNameFromPath } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { stopHostFixtures } from "./fixtures/host-fixture-processes";
 import { writeStockHostExecutable } from "./fixtures/stock-host";
+import { offlineMnemopi } from "./fixtures/native-memory";
 
 const cleanups: Array<() => Promise<void>> = [];
 // Production revisions are deliberately not pruned. Tests own their entire temp
@@ -93,6 +94,7 @@ async function launchFixture(packageName = "omp-superkit", alternateName = "omp-
   const unrelated = join(f.root, "operator-package");
   const oldUlw = join(f.root, "old-ulw");
   await mkdir(join(agentDir, "extensions"), { recursive: true });
+  await writeFile(join(agentDir, "config.yml"), JSON.stringify(offlineMnemopi), { mode: 0o600 });
   await mkdir(join(unrelated, "skills/operator-skill"), { recursive: true });
   await mkdir(oldUlw);
   await writeFile(join(agentDir, "extensions/ambient.ts"), "throw new Error('discovery must not import ambient modules');\n");
@@ -255,6 +257,7 @@ test("stock launch bootstraps the explicit profile before its .env and native di
   const profileAgent = join(f.home, ".omp/profiles/work/agent");
   const profileConfig = join(f.root, "profile.json");
   await mkdir(join(profileAgent, "extensions"), { recursive: true });
+  await writeFile(join(profileAgent, "config.yml"), JSON.stringify(offlineMnemopi), { mode: 0o600 });
   await writeFile(join(profileAgent, "extensions/profile.ts"), "throw new Error('profile discovery must not execute factories');\n");
   await writeFile(profileConfig, JSON.stringify({ extensions: [f.unrelated, f.oldUlw] }));
   await writeFile(join(profileAgent, ".env"), `PI_CONFIG_FILES=${profileConfig}\n`);
@@ -465,6 +468,7 @@ if(!sessionId)throw new Error('Fixture requires the actual persisted session ide
 await stockHostFixture({sessionId,sessionFile,state:()=>({sessionName:fs.readFileSync(packagePath+'/index.ts','utf8')})});`);
   const home = join(f.root, "host-home");
   await mkdir(join(home, "agent"), { recursive: true });
+  await writeFile(join(home, "agent/config.yml"), JSON.stringify(offlineMnemopi), { mode: 0o600 });
   const launch = async (name: string, env: Record<string, string>, managedUlwRoot?: string) => {
     const options: HostOptions = { command: [launcher], socketPath: join(f.root, `${name}.sock`),
       sessionFile: join(f.root, `${name}.jsonl`), cwd: f.root, extensionPath: launcher,

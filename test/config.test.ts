@@ -8,6 +8,8 @@ import { loadCredentials } from "../src/credentials";
 import { discoverInstalledOmp, inspectInstalledOmp } from "../src/installed-omp";
 import type { Route } from "../src/contracts";
 import { dependencies } from "../package.json";
+import { requireGateway } from "../src/gateway-native";
+import { offlineMnemopi } from "./fixtures/native-memory";
 
 const testedVersion = dependencies["@oh-my-pi/pi-coding-agent"];
 const dirs: string[] = [];
@@ -234,6 +236,8 @@ else process.exit(8);
     const installedVersion = "18.22.2";
     const f = await executable(installedVersion, undefined, "--global SERVICE");
     const path = await config({ command: [f.command] });
+    mkdirSync(join(f.directory, "agent"), { mode: 0o700 });
+    await Bun.write(join(f.directory, "agent/config.yml"), JSON.stringify(offlineMnemopi));
     const child = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../src/cli.ts"), "doctor", "--config", path], {
       env: { PATH: process.env.PATH, HOME: f.directory, PI_CODING_AGENT_DIR: join(f.directory, "agent") },
       stdin: "ignore", stdout: "pipe", stderr: "pipe",
@@ -245,6 +249,7 @@ else process.exit(8);
     expect(JSON.parse(stdout)).toMatchObject({
       omp: { executable: f.command, version: installedVersion, processBackend: "broker", stdioRpc: true },
       nativeTuiAttach: false, messengersActivated: false,
+      memory: { status: "enabled", source: "global", backend: "mnemopi" },
       credentials: { DISCORD_BOT_TOKEN: false },
     });
     expect(await Bun.file(join(dirname(path), "state/coordination.sqlite")).exists()).toBe(false);
@@ -252,4 +257,59 @@ else process.exit(8);
     const rows = (await Bun.file(f.audit).text()).trim().split("\n").map(line => JSON.parse(line));
     expect(rows.map(row => row.args)).toEqual([["--version"], ["--help"], ["ps", "--help"]]);
   });
+
+  test("doctor checks the launch-selected native profile, including its dotenv and CLI overlays", async () => {
+    const f = await executable(testedVersion);
+    const profile = join(f.directory, ".omp/profiles/isolated/agent");
+    mkdirSync(profile, { recursive: true, mode: 0o700 });
+    const profileOverlay = join(f.directory, "profile.yml");
+    const launchOverlay = join(f.directory, "launch.yml");
+    await Bun.write(join(profile, ".env"), `PI_CONFIG_FILES=${profileOverlay}\n`);
+    await Bun.write(profileOverlay, JSON.stringify(offlineMnemopi));
+    await Bun.write(launchOverlay, '{"memory":{"backend":"off"}}\n');
+    for (const overrides of [[], ["--config", launchOverlay]]) {
+      const path = await config({ command: [f.command, "--profile=isolated", ...overrides] });
+      const child = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../src/cli.ts"), "doctor", "--config", path], {
+        env: { PATH: process.env.PATH, HOME: f.directory, PI_CODING_AGENT_DIR: join(f.directory, "unused-default") },
+        stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+      ]);
+      const shadowed = overrides.length > 0;
+      expect({ code, stderr }).toEqual({ code: shadowed ? 1 : 0, stderr: "" });
+      expect(JSON.parse(stdout)).toMatchObject({
+        memory: { status: shadowed ? "missing" : "enabled", source: "overlay",
+          backend: shadowed ? "off" : "mnemopi", agentDir: profile },
+        messengersActivated: false,
+      });
+    }
+    expect(await Bun.file(join(profile, "agent.db")).exists()).toBe(false);
+    expect(await Bun.file(join(profile, "config.yml")).exists()).toBe(false);
+  }, 30_000);
+
+  test.each(["launch", "serve"])("direct native Gateway %s refuses ineffective memory before creating state", async mode => {
+    const f = await executable(testedVersion);
+    const denied = join(f.directory, "deny.yml");
+    const bytes = '{"memory":{"backend":"off"}}\n';
+    const agent = join(f.directory, "agent");
+    mkdirSync(agent, { mode: 0o700 });
+    await Bun.write(join(agent, "config.yml"), JSON.stringify(offlineMnemopi));
+    await Bun.write(denied, bytes);
+    const file = await config({ command: [f.command, "--config", denied] });
+    const child = Bun.spawn([await requireGateway(), mode, "--config", file], {
+      env: { PATH: process.env.PATH, HOME: f.directory, PI_CODING_AGENT_DIR: agent,
+        OMP_SUPERAGENT_ROOT: realpathSync(join(import.meta.dir, "..")), OMP_SUPERAGENT_BUN: process.execPath },
+      stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 30_000, killSignal: "SIGKILL",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    expect(code).toBe(1);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("Managed sessions require effective native OMP Mnemopi");
+    expect(await Bun.file(join(dirname(file), "state/coordination.sqlite")).exists()).toBe(false);
+    expect(await Bun.file(join(agent, "agent.db")).exists()).toBe(false);
+    expect(await Bun.file(denied).text()).toBe(bytes);
+  }, 40_000);
 });

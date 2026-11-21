@@ -12,8 +12,8 @@
   Connect Discord, Telegram, and Slack to <a href="https://github.com/can1357/oh-my-pi">oh-my-pi</a>.
   The head can investigate, write code, and answer directly—or assign work to independent
   OMP sessions called <strong>lanes</strong>, each with its own repository, context, and model.
-  Every request and follow-up goes through the head, which coordinates the work and brings
-  the results back to your conversation.
+  Ordinary requests and replies stay in their work topic. Address the global head
+  with <code>/head</code> when you want coordination across topics.
 </p>
 
 <p align="center">
@@ -57,8 +57,8 @@
     </td>
     <td width="50%" valign="top">
       <h4>Models chosen per lane</h4>
-      The head consults OMP's judge and chooses a native model or preset. Lane model
-      changes stay local to that session, without rewriting global settings.
+      A topic starts with the current head model and retains its own selection.
+      For explicit delegation, the head can choose a different native model or preset.
     </td>
   </tr>
   <tr>
@@ -91,8 +91,8 @@
 </picture>
 
 The **Gateway** owns messenger connections and the head's lifecycle. The **head** owns
-lane control and decides whether to work directly or delegate. **Lanes** report to the
-head; the head replies to the original conversation.
+lane control, approvals and delivery. A topic's **lane** handles its own follow-ups;
+the controller returns its replies without a global model turn.
 
 [Mermaid source](assets/architecture.mmd)
 
@@ -104,8 +104,8 @@ service or an OS sandbox; see [Design](DESIGN.md).
 | Step | What it changes |
 | --- | --- |
 | [Install](#1-install) | Prepares dependencies and the managed ULW integration. Does not start a bot or replace OMP. |
-| [`setup`](#2-configure) | Writes `config.local.json` and the owner-only, plaintext `config.local.json.env` (`0600`). Bot avatars change only on the confirmed final save. Enabling Mnemopi needs a separate `yes` and changes OMP's global memory backend. Starts no bot or model session. |
-| [`doctor`](#3-start) | Checks local configuration without logging into the messengers. |
+| [`setup`](#2-configure) | Writes `config.local.json` and the owner-only, plaintext `config.local.json.env` (`0600`). Bot avatars change only on the confirmed final save. Changing OMP's global memory backend needs a separate `yes`. Starts no bot or model session. |
+| [`doctor`](#3-start) | Checks local configuration and effective Mnemopi without logging into the messengers. |
 | [`start`](#3-start) | Starts the detached Gateway and head and connects all configured messengers. |
 | [Discord voice](docs/discord-voice.md) | Off by default. A rejected subscription call never switches to API billing. |
 | [`/stop`](#working-from-chat) | Pauses the bound lane. Approvals, cancellations, tool exclusions, and uncertain-effect holds remain binding. |
@@ -218,10 +218,12 @@ credentials take precedence. Configure model authentication through OMP.
 </td></tr></table>
 
 Setup does not start a bot or model session. Its final save confirmation includes
-replacing configured Discord/Telegram bot avatars with the mascot. Enabling the
-recommended Mnemopi memory backend requires a separate explicit `yes` and final save;
-it changes OMP's global memory backend. Setup recommends configuring a missing native
-judge role but does not choose or call a model.
+replacing configured Discord/Telegram bot avatars with the mascot. Head and lane
+workspaces require effective native Mnemopi (`memory.backend: mnemopi`), even for
+existing configurations. Setup asks for a separate explicit `yes` before changing
+OMP's global memory backend. It does not override project or launch settings. If
+Mnemopi is still unavailable, setup keeps the saved files but reports incomplete.
+Setup recommends configuring a missing native judge role but does not choose or call a model.
 
 See [configuration and setup effects](docs/OPERATIONS.md#3-설정) for permissions,
 memory behavior, alternative config paths, and manual configuration.
@@ -234,7 +236,9 @@ Check local configuration without logging into the messengers:
 omp-sa doctor --config ./config.local.json
 ```
 
-Start the detached Gateway and head, connecting **all configured messengers**:
+Startup refuses if the head's native profile and workspace do not resolve to Mnemopi.
+Each lane launch also checks its own workspace. Start the detached Gateway and head,
+connecting **all configured messengers**:
 
 ```sh
 omp-sa start --config ./config.local.json
@@ -264,18 +268,26 @@ crash supervisor; Linux service installation is not provided.
 
 ## Working from chat
 
-- Ask normally. Questions get direct answers; work instructions open a topic with a
-  brief approach, followed by meaningful progress and results.
-- Follow up in the same topic to steer active work through the head. Repositories and
+- Start with the request itself. For example, “check login in client-ui” selects a uniquely named
+  workspace previously used in this conversation. Reply to a placed task or its delivered
+  message to reuse its workspace in a new topic without copying its history.
+- From any allowed owner channel, describe the earlier work, e.g. “continue the login bug
+  investigation from last week.” The controller uses OMP's Mnemopi recall and verifies
+  candidates against this instance's eligible session journals.
+  A cross-channel continuation uses the matched workspace and relevant task evidence, not
+  the original channel binding, transcript or approvals. Choose by number if multiple tasks match.
+- If the workspace is unclear, reply to the question with a known repository name or absolute
+  directory. An explicit `cwd: /absolute/workspace` on the first line still overrides inference.
+- Use `/head <request>` for coordination or direct global work. Repositories and
   topics keep independent lane context; voice metadata does not imply transcription.
 - Use `/help` and `/status` for controls and state. `/model` and `/effort` manage the
   idle head session, not existing lanes or global defaults. You can also ask the head
-  in a normal message to switch its own model after that turn. Global preset changes
+  with `/head` to switch its own model after that turn. Global preset changes
   require explicit `--global`. Slack's message commands use `!`.
 - `/usage` shows provider account quotas and reset times reported by stock OMP, without a model turn.
-- Ask HEAD to summarize CI every two hours, or use `/cron add "every 2h" Summarize CI`, and
 - To receive a generated file, start an owner request with `attach: path/to/result.pdf` (relative to the work directory).
 - For a shared server or room, [configure restricted group access](docs/OPERATIONS.md#단체방서버-권한-분리) for request intake, tool-free chat or scoped worktree edits. These rooms cannot operate the owner session.
+- Ask `/head` to summarize CI every two hours, or use `/cron add "every 2h" Summarize CI`, and
   manage it from the same chat with [`/cron`](docs/OPERATIONS.md#예약-작업-cron).
 - `/stop` pauses the bound lane; `/resume` authorizes continuation. Approvals,
   cancellations, tool exclusions, and uncertain-effect holds remain binding.

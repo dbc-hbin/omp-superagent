@@ -1,5 +1,6 @@
 [
   { "name": "help", "description": "Show Superagent commands and their scope." },
+  { "name": "head", "description": "Send a request to the global Superagent coordination session.", "text": "Request for the global head, for example to compare two work topics." },
   { "name": "status", "description": "Inspect Superagent HEAD and this conversation's lane, including while busy." },
   { "name": "restart", "description": "Restart Superagent Gateway and HEAD together when idle, preserving the session." },
   { "name": "context", "description": "Inspect Superagent HEAD context without starting a model turn." },
@@ -12,5 +13,5 @@
   { "name": "effort", "description": "Choose the Superagent HEAD thinking effort.", "text": "Omit for the menu, or enter an exact advertised effort level." },
   { "name": "compact", "description": "Compact Superagent HEAD context when idle.", "text": "Optional compaction instructions, including multiple lines." },
   { "name": "stop", "description": "Stop Superagent HEAD work or pause a bound or explicitly named lane.", "text": "head or an actual lane ID; omit to use this conversation's lane, otherwise HEAD." },
-  { "name": "new", "description": "Start a new Superagent topic in this owner DM, optionally with a request.", "text": "An optional first request for the new topic." }
+  { "name": "new", "description": "Start a Superagent work topic; use a sibling for a new request in an existing thread.", "text": "An optional first request for the new topic." }
 ]

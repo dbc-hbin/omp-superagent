@@ -9,6 +9,7 @@ import { buildHostArgs, connect, HostConnection, HostStartError, startHost, type
 import { HostChannel, HostRequestTimeout, serviceCompletionRecorded } from "../src/host-protocol";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
 import { writeStockHostExecutable } from "./fixtures/stock-host";
+import { offlineMnemopi } from "./fixtures/native-memory";
 
 test("adapter correlation times out without replay and still observes a late original response", async () => {
   const input = new PassThrough();
@@ -77,6 +78,10 @@ async function directory(launchesHost = false): Promise<string> {
   });
   await fs.chmod(result, 0o700);
   await fs.writeFile(path.join(result, "extension.ts"), "export default function () {}\n");
+  if (launchesHost) {
+    await fs.mkdir(path.join(result, "agent"), { mode: 0o700 });
+    await fs.writeFile(path.join(result, "agent/config.yml"), JSON.stringify(offlineMnemopi), { mode: 0o600 });
+  }
   return result;
 }
 
@@ -467,6 +472,25 @@ test("startHost preserves stale sockets for explicit operator cleanup", async ()
   await expect(startHost({ ...options(host.root), socketPath: stale })).rejects.toThrow();
   expect((await fs.lstat(stale)).ino).toBe(before.ino);
 });
+
+test("a lane's native project denial blocks startup before publishing a session", async () => {
+  const root = await directory();
+  const launch = { ...options(root), cwd: path.join(root, "lane-checkout") };
+  await fs.mkdir(path.join(root, "agent"), { mode: 0o700 });
+  await fs.writeFile(path.join(root, "agent/config.yml"), JSON.stringify(offlineMnemopi));
+  await fs.mkdir(path.join(launch.cwd, ".omp"), { recursive: true });
+  const project = path.join(launch.cwd, ".omp/config.yml");
+  const bytes = '{"memory":{"backend":"off"}}\n';
+  await fs.writeFile(project, bytes);
+  const launched = path.join(root, "native-launched");
+  await writeStockHostExecutable(launch.command[0]!, `await Bun.write(${JSON.stringify(launched)}, "launched");`);
+
+  await expect(startFixtureHost(launch)).rejects.toThrow("Effective backend is off (project settings)");
+
+  expect(await Bun.file(launched).exists()).toBe(false);
+  expect(await Bun.file(launch.sessionFile).exists()).toBe(false);
+  expect(await fs.readFile(project, "utf8")).toBe(bytes);
+}, 40_000);
 
 test("startup failures are named and never include host log contents", async () => {
   const root = await directory();

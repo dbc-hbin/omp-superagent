@@ -8,6 +8,7 @@ import { serviceCompletionRecorded } from "../src/host-protocol";
 import { decisionId } from "../src/decisions";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
 import { nativeTestCommand } from "./fixtures/native-command";
+import { offlineMnemopi } from "./fixtures/native-memory";
 
 const nativeTest = process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 const RECORD_TYPE = "omp-superagent-native-test";
@@ -116,7 +117,7 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
   const cwd = path.join(root, "workspace");
   for (const directory of [home, agentDirectory, cwd]) await fs.mkdir(directory, { mode: 0o700 });
   const configPath = path.join(agentDirectory, "config.yml");
-  await fs.writeFile(configPath, JSON.stringify({ task: { maxConcurrency: 1 }, disabledProviders: nativeDisabledProviders,
+  await fs.writeFile(configPath, JSON.stringify({ ...offlineMnemopi, task: { maxConcurrency: 1 }, disabledProviders: nativeDisabledProviders,
     bash: { patterns: [{ match: "printf 'superagent-service-completed\\n'", approval: "prompt" }] },
     eval: { js: false, py: false } }), { mode: 0o600 });
   const options: HostOptions = {

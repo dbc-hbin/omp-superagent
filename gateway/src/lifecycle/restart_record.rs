@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::store::Store;
 
@@ -134,8 +134,9 @@ pub(super) async fn validate_plan(
     config: &LifecycleConfig,
     record: &Record,
     plan: &Plan,
+    session_file: &Path,
 ) -> Result<()> {
-    validate_identity(config, record, plan)?;
+    validate_identity(config, record, plan, session_file)?;
     ensure!(
         session_id(config, &record.session_file).await?.as_deref()
             == Some(record.session_id.as_str()),
@@ -148,6 +149,7 @@ pub(super) fn validate_identity(
     config: &LifecycleConfig,
     record: &Record,
     plan: &Plan,
+    session_file: &Path,
 ) -> Result<()> {
     ensure!(
         same_path(&plan.config_path, &config.path)
@@ -160,7 +162,7 @@ pub(super) fn validate_identity(
             && record.session_id == plan.head.session_id
             && !record.session_id.is_empty()
             && same_path(&record.session_file, &plan.head.session_file)
-            && same_path(&record.session_file, &config.head_session),
+            && same_path(&record.session_file, session_file),
         "Restart durable ownership does not match the original configuration and session"
     );
     ensure!(

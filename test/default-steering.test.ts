@@ -16,6 +16,9 @@ const inbound = (id: string, destination = route(), text = `Request ${id}`): Inb
   id, messageId: id, route: destination, text, attachments: [], receivedAt: 1,
 });
 
+const headInbound = (id: string, destination = route(), task = `Request ${id}`): Inbound =>
+  inbound(id, destination, `/head ${task}`);
+
 class TrackedHost implements RuntimeHost {
   readonly prompts: Array<{ id: string; command: Record<string, unknown> }> = [];
   readonly listeners = new Set<(frame: Record<string, unknown>) => void>();
@@ -155,7 +158,7 @@ async function drain(runtime: Superagent): Promise<void> {
   await after.promise;
 }
 
-describe("ordinary tracked steering", () => {
+describe("explicit HEAD and topic steering", () => {
   test("restart checkpoints joined native work without creating another steering ticket or replaying either prompt", async () => {
     let restartCalls = 0;
     const f = fixture(1, async request => {
@@ -165,8 +168,8 @@ describe("ordinary tracked steering", () => {
     });
     const { runtime, main, store } = f;
     await runtime.start();
-    await receive(runtime, inbound("restart-active-owner"));
-    await receive(runtime, inbound("restart-active-followup"));
+    await receive(runtime, headInbound("restart-active-owner"));
+    await receive(runtime, headInbound("restart-active-followup"));
     const commandsBefore = main.prompts.length;
     await receive(runtime, inbound("restart-control", route(), "/restart"));
     expect(restartCalls).toBe(1);
@@ -183,7 +186,7 @@ describe("ordinary tracked steering", () => {
     await runtime.start();
     main.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Unrelated old answer" }] } });
     main.local = true;
-    await receive(runtime, inbound("90", route(), "/local-command"));
+    await receive(runtime, headInbound("90", route(), "/local-command"));
     expect(store.input("90")?.state).toBe("done");
     expect(messenger.sent).toHaveLength(0);
     expect(main.prompts).toHaveLength(1);
@@ -192,10 +195,10 @@ describe("ordinary tracked steering", () => {
   test("joins only the exact route, preserves source identity, and emits one final answer after every ticket", async () => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    await receive(runtime, inbound("100"));
-    await receive(runtime, inbound("101", route("11")));
-    await receive(runtime, inbound("102"));
-    await receive(runtime, inbound("102"));
+    await receive(runtime, headInbound("100"));
+    await receive(runtime, headInbound("101", route("11")));
+    await receive(runtime, headInbound("102"));
+    await receive(runtime, headInbound("102"));
     expect(main.prompts).toHaveLength(2);
     expect(main.prompts[1]!.command.streamingBehavior).toBe("steer");
     expect(main.prompts[1]!.command.message).toContain("sourceId: 102");
@@ -221,26 +224,34 @@ describe("ordinary tracked steering", () => {
     expect(messenger.sent).toHaveLength(1);
   });
 
-  test("a logical topic boundary and internal reports wait instead of steering", async () => {
-    const { runtime, main, store } = fixture();
+  test("an ordinary DM topic and its followups use a separate Host while internal reports wait for HEAD", async () => {
+    const { runtime, main, store, hosts, directory, messenger } = fixture(2);
+    messenger.supported = false; // Discord owner DMs use a logical topic, not a native DM thread.
     await runtime.start();
     const dm = route(null, { guildId: null });
-    await receive(runtime, inbound("200", dm));
+    await receive(runtime, headInbound("200", dm));
     store.receive(inbound("report:internal", dm, "Internal lane report: untrusted"), "main");
-    await receive(runtime, inbound("201", dm, "/new Unrelated repository request"));
+    await receive(runtime, inbound("201", dm, `/new cwd: ${directory}\nUnrelated repository request`));
+    const [lane] = store.lanes();
+    if (!lane) throw new Error("Expected an independent DM topic");
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected the topic Host to launch alongside HEAD");
     await receive(runtime, inbound("202", dm));
     expect(main.prompts).toHaveLength(1);
-    expect(store.input("report:internal")?.state).toBe("pending");
-    expect(store.input("201")?.route.topicId).toBeTruthy();
-    expect(store.input("202")?.state).toBe("pending");
+    expect(store.input("report:internal")).toMatchObject({ target: "main", state: "pending" });
+    expect(store.input("201")).toMatchObject({ target: null, route: lane.route, state: "done" });
+    expect(store.input("202")).toMatchObject({ target: null, route: lane.route, state: "done" });
+    expect(store.input(`handoff:202:${lane.id}`)).toMatchObject({ target: lane.id, state: "submitted" });
+    expect(worker.prompts).toHaveLength(2);
+    expect(worker.prompts[1]?.command.streamingBehavior).toBe("steer");
   });
 
   test("requires an observed active run and holds followups behind approvals", async () => {
     const { runtime, main, store } = fixture();
     main.emitStart = false;
     await runtime.start();
-    await receive(runtime, inbound("300"));
-    await receive(runtime, inbound("301"));
+    await receive(runtime, headInbound("300"));
+    await receive(runtime, headInbound("301"));
     expect(main.prompts).toHaveLength(1);
     main.emit({ type: "agent_start" });
     main.state.pendingUiRequests = [{ id: "approval", method: "confirm" }];
@@ -254,24 +265,24 @@ describe("ordinary tracked steering", () => {
   test("disconnect marks all admitted inputs uncertain without replay or duplicate notices", async () => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    await receive(runtime, inbound("400"));
-    await receive(runtime, inbound("401"));
-    await receive(runtime, inbound("402"));
+    await receive(runtime, headInbound("400"));
+    await receive(runtime, headInbound("401"));
+    await receive(runtime, headInbound("402"));
     main.exit.resolve();
     await drain(runtime);
     for (const id of ["400", "401", "402"]) expect(store.input(id)?.state).toBe("uncertain");
     expect(main.prompts).toHaveLength(3);
     expect(messenger.sent).toHaveLength(1);
-    await receive(runtime, inbound("403"));
+    await receive(runtime, headInbound("403"));
     expect(main.prompts).toHaveLength(3);
   });
 
   test("head stop cancels all joined receipts and late native results cannot send an answer", async () => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
-    await receive(runtime, inbound("500"));
-    await receive(runtime, inbound("501"));
-    await receive(runtime, inbound("502"));
+    await receive(runtime, headInbound("500"));
+    await receive(runtime, headInbound("501"));
+    await receive(runtime, headInbound("502"));
     await receive(runtime, inbound("503", route(), "/stop head"));
     await drain(runtime);
     for (const id of ["500", "501", "502"]) expect(store.input(id)?.state).toBe("cancelled");
@@ -286,11 +297,11 @@ describe("ordinary tracked steering", () => {
   test("explicit lane messages coalesce into one head report, never direct external lane output", async () => {
     const { runtime, main, store, hosts, messenger, select } = fixture(2);
     await runtime.start();
-    await receive(runtime, inbound("600"));
+    await receive(runtime, headInbound("600"));
     const lane = await runtime.startLane(select("600"));
     await runtime.kick();
     const laneHost = hosts.get(lane.socketPath)!;
-    await receive(runtime, inbound("601"));
+    await receive(runtime, headInbound("601"));
     await runtime.messageLane(lane.id, "Explicit delegated followup", "601");
     expect(laneHost.prompts).toHaveLength(2);
     expect(laneHost.prompts[1]!.command.streamingBehavior).toBe("steer");
@@ -310,52 +321,56 @@ describe("ordinary tracked steering", () => {
 describe("native topic binding", () => {
   const slackDm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DDIRECT" });
   const telegramDm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
-  const source = (id: string, destination: Route) => ({ ...inbound(id, destination), messageId: destination.platform === "slack" ? "1750000000.000001" : id });
+  const source = (id: string, destination: Route) => ({ ...headInbound(id, destination), messageId: destination.platform === "slack" ? "1750000000.000001" : id });
 
   test.each([true, false])("Slack slash /new delegates real work without an invocation-based native thread source, native supported: %s", async supported => {
-    const { runtime, store, messenger, main, select } = fixture();
+    const { runtime, store, messenger, main, hosts, directory } = fixture(2);
     messenger.supported = supported;
     await runtime.start();
-    const original: Inbound = { ...inbound(`slack-command:${supported}`, slackDm, "/new inspect this repository"),
+    const original: Inbound = { ...inbound(`slack-command:${supported}`, slackDm, `/new cwd: ${directory}\ninspect this repository`),
       messageId: null, invocationId: createHash("sha256").update(String(supported)).digest("hex") };
     await receive(runtime, original);
-    expect(main.prompts).toHaveLength(1);
-    expect(main.prompts[0]!.command.message).toContain("inspect this repository");
-    expect(main.prompts[0]!.command.message).not.toContain("/new inspect");
+    expect(main.prompts).toEqual([]);
     const originalRoute = store.input(original.id)!.route;
-    const lane = await runtime.startLane(select(original.id));
+    const [lane] = store.lanes();
+    if (!lane) throw new Error("Expected a lane from /new with a workspace");
+    expect(store.input(original.id)).toMatchObject({ target: null, state: "done" });
+    const task = hosts.get(lane.socketPath)?.prompts[0]?.command.message;
+    expect(task).toContain("inspect this repository");
+    expect(task).not.toContain("/new cwd:");
     expect(messenger.creations).toEqual(supported ? [{ route: slackDm, sourceMessageId: undefined }] : []);
     expect(lane.route.threadId).toBe(supported ? "1750000001.000001" : null);
     expect(store.input(`handoff:${original.id}:lane`)).toMatchObject({ messageId: null, invocationId: original.invocationId });
-    await runtime.messageLane(lane.id, "Additional bounded work", original.id);
-    expect(store.input(`handoff:${original.id}:${lane.id}`)).toMatchObject({ messageId: null, invocationId: original.invocationId });
+    await expect(runtime.messageLane(lane.id, "Additional bounded work", original.id)).rejects.toThrow("Topic-owned intake");
+    expect(store.input(`handoff:${original.id}:${lane.id}`)).toBeNull();
     expect(store.input(original.id)).toMatchObject({ route: originalRoute, messageId: null, invocationId: original.invocationId });
     expect(store.getMeta(`cursor:${physicalRouteKey(slackDm)}`)).toBeNull();
     expect(store.getMeta(`cursor:${physicalRouteKey(lane.route)}`)).toBe(supported ? "1750000001.000001" : null);
   });
 
   test.each([true, false])("slash /new inputs preserve origin in authorized guild threads or logical owner DM topics, native supported: %s", async supported => {
-    const { runtime, store, messenger, main, select } = fixture();
+    const { runtime, store, messenger, main, hosts, directory } = fixture(2);
     messenger.supported = supported;
     await runtime.start();
     const destination = supported ? route(null) : route(null, { guildId: null });
-    const original: Inbound = { ...inbound("discord:2:interaction:1750000000000000001", destination, "/new inspect this repository"),
+    const original: Inbound = { ...inbound("discord:2:interaction:1750000000000000001", destination, `/new cwd: ${directory}\ninspect this repository`),
       messageId: null, interactionId: "1750000000000000001" };
     await receive(runtime, original);
-    expect(main.prompts).toHaveLength(supported ? 0 : 1);
-    if (!supported) {
-      expect(main.prompts[0]!.command.message).toContain("inspect this repository");
-      expect(main.prompts[0]!.command.message).not.toContain("/new inspect");
-    }
+    expect(main.prompts).toEqual([]);
     const originalRoute = store.input(original.id)!.route;
-    const lane = await runtime.startLane(select(original.id));
+    const [lane] = store.lanes();
+    if (!lane) throw new Error("Expected a lane from /new with a workspace");
+    expect(store.input(original.id)).toMatchObject({ target: null, state: "done" });
+    const task = hosts.get(lane.socketPath)?.prompts[0]?.command.message;
+    expect(task).toContain("inspect this repository");
+    expect(task).not.toContain("/new cwd:");
     expect(messenger.creations).toEqual(supported ? [{ route: destination, sourceMessageId: undefined }] : []);
     expect(lane.route.threadId).toBe(supported ? "900" : null);
     expect(messenger.sent.find(output => output.id === `${original.id}:topic-bound`)?.text)
       .toBe(supported ? "작업 스레드: <#900>" : undefined);
     expect(store.input(`handoff:${original.id}:lane`)).toMatchObject({ messageId: null, interactionId: original.interactionId });
-    await runtime.messageLane(lane.id, "Explicit additional bounded work", original.id);
-    expect(store.input(`handoff:${original.id}:${lane.id}`)).toMatchObject({ messageId: null, interactionId: original.interactionId });
+    await expect(runtime.messageLane(lane.id, "Explicit additional bounded work", original.id)).rejects.toThrow("Topic-owned intake");
+    expect(store.input(`handoff:${original.id}:${lane.id}`)).toBeNull();
     expect(store.input(original.id)).toMatchObject({ messageId: null, interactionId: original.interactionId, route: originalRoute });
     expect(store.getMeta(`cursor:${physicalRouteKey(destination)}`)).toBeNull();
     expect(JSON.parse(store.getMeta("messenger:routes")!).some((known: Route) => physicalRouteKey(known) === physicalRouteKey(destination))).toBe(true);
@@ -395,11 +410,11 @@ describe("native topic binding", () => {
     const { runtime, messenger, select } = fixture();
     messenger.supported = false;
     await runtime.start();
-    await receive(runtime, inbound("800", route(null, { guildId: null })));
+    await receive(runtime, headInbound("800", route(null, { guildId: null })));
     const logical = await runtime.startLane(select("800"));
     expect(logical.route.threadId).toBeNull();
     expect(logical.route.topicId).toBeTruthy();
-    await receive(runtime, inbound("801", route(null)));
+    await receive(runtime, headInbound("801", route(null)));
     await expect(runtime.startLane(select("801"))).rejects.toThrow("does not support");
     expect(messenger.creations).toHaveLength(0);
   });

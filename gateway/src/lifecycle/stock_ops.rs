@@ -18,6 +18,38 @@ use super::LifecycleConfig;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
+impl LifecycleConfig {
+    /// Verify the head's native profile before the native entry point can activate adapters.
+    pub async fn require_mnemopi(&self) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Status {
+            status: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Report {
+            memory: Status,
+        }
+        let (_, args) = self
+            .command
+            .split_first()
+            .context("No OMP executable provided")?;
+        let mut check = bun(self, &self.head_environment());
+        check
+            .arg(self.root.join("src/managed-memory-helper.ts"))
+            .arg("inspect")
+            .args(args);
+        let report: Report = tagged_output(
+            &capture(check, None, OPERATION_TIMEOUT).await?,
+            "MANAGED_MEMORY ",
+        )?;
+        ensure!(
+            report.memory.status == "enabled",
+            "Effective Mnemopi is not configured"
+        );
+        Ok(())
+    }
+}
+
 pub(super) async fn inspect_omp(
     config: &LifecycleConfig,
     environment: &BTreeMap<OsString, OsString>,

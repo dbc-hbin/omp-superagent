@@ -448,7 +448,7 @@ Bun.spawn = function (...args) {
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
-async function doctor(context: Fixture, explicit: Record<string, string> = {}) {
+async function doctor(context: Fixture, explicit: Record<string, string> = {}, expectedExit = 0) {
   const env = { ...context.env, ...explicit };
   const auditStart = (await context.audit()).length;
   const child = Bun.spawn([process.execPath, "--no-env-file", cli, "doctor", "--config", context.config], {
@@ -459,7 +459,7 @@ async function doctor(context: Fixture, explicit: Record<string, string> = {}) {
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
     ]), "Explicit real doctor command did not exit");
     expect(stderr).toBe("");
-    expect(code).toBe(0);
+    expect(code).toBe(expectedExit);
     const result = JSON.parse(stdout);
     expect(result.config).toBe(context.config);
     expect(result.messengersActivated).toBe(false);
@@ -474,12 +474,15 @@ async function doctor(context: Fixture, explicit: Record<string, string> = {}) {
     expect(observed).toBeDefined();
     // The compiled CLI need not execute Bun preloads. Audit the actual child
     // environment and permit only metadata commands on the selected executable.
-    const probes = audit.filter(row => row.phase === "probe");
+    const probes = audit.filter(row => row.phase === "probe" && row.argv[0] === context.nativeCommand[0]);
     expect(probes.map(row => row.argv)).toEqual(
       [["--version"], ["--help"], ["ps", "--help"]].map(argv => [context.nativeCommand[0], ...argv]));
     for (const probe of probes) {
       for (const name of Object.keys(result.credentials)) expect(probe.hashes[name]).toBeNull();
     }
+    const memoryChecks = audit.filter(row => row.phase === "probe" && row.argv.some(arg => arg.endsWith("/managed-memory-helper.ts")));
+    expect(memoryChecks).toHaveLength(1);
+    for (const name of Object.keys(result.credentials)) expect(memoryChecks[0]!.hashes[name]).toBeNull();
     return { stdout, result, observed };
   } finally {
     if (child.exitCode === null) child.kill("SIGKILL");
@@ -487,9 +490,9 @@ async function doctor(context: Fixture, explicit: Record<string, string> = {}) {
   }
 }
 
-async function existingConfig(context: Fixture) {
+async function existingConfig(context: Fixture, nativeArgs: readonly string[] = []) {
   const value = {
-    command: context.nativeCommand, stateDir: context.state, headCwd: context.root,
+    command: [...context.nativeCommand, ...nativeArgs], stateDir: context.state, headCwd: context.root,
     maxHosts: 4, maxSubagents: 8, idleMs: 300000,
     telegram: { tokenEnv: customName, ownerId: "246813579", allowedChatIds: ["-97531"] },
   };
@@ -592,6 +595,7 @@ ptyTest("actual traced setup wrapper prepares all messengers privately; explicit
     expect((await fs.stat(`${context.config}.env`)).mode & 0o777).toBe(0o600);
     const explicit = "pty-explicit-environment-wins";
     const proof = await doctor(context, { DISCORD_BOT_TOKEN: explicit });
+    expect(proof.result.memory).toMatchObject({ status: "enabled", source: "global", backend: "mnemopi" });
     expect(proof.result.platforms).toEqual(["discord", "telegram", "slack"]);
     expect(proof.result.credentials).toEqual(Object.fromEntries(defaultNames.map(name => [name, true])));
     expect(await fs.readFile(context.config, "utf8")).toBe(bytes);
@@ -609,7 +613,7 @@ ptyTest("actual traced setup wrapper prepares all messengers privately; explicit
   } finally { await context.cleanup(); }
 }, 120_000);
 
-ptyTest("new setup decline, Enter and non-yes answers save credentials without touching native memory", async () => {
+ptyTest("new setup declining Mnemopi saves credentials but does not complete setup", async () => {
   for (const answer of ["n", "", "yeah"]) {
     const context = await fixture({ memory: { backend: "off" } });
     try {
@@ -618,8 +622,10 @@ ptyTest("new setup decline, Enter and non-yes answers save credentials without t
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-declined-memory-secret", false);
       await terminal.answer(memoryPrompt, answer);
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(true);
+      await terminal.finished(false);
       expect(terminal.transcript()).toContain("Native memory settings will not be changed.");
+      expect(terminal.transcript()).toContain("Setup saved but is incomplete");
+      expect(terminal.transcript()).not.toContain("Start explicitly:");
       expect(terminal.transcript()).toContain(judgeRecommendation);
       expect(terminal.transcript().indexOf(judgeRecommendation)).toBeGreaterThan(terminal.transcript().indexOf("Saved configuration:"));
       expect(terminal.transcript()).toContain("/models, choose Roles -> Judge");
@@ -631,6 +637,11 @@ ptyTest("new setup decline, Enter and non-yes answers save credentials without t
       expect(await exists(context.config)).toBe(true);
       expect(parseEnv(await fs.readFile(`${context.config}.env`, "utf8"))).toEqual({ TELEGRAM_BOT_TOKEN: "pty-declined-memory-secret" });
       expect(await exists(context.nativeDb)).toBe(false);
+      if (answer === "n") {
+        const proof = await doctor(context, {}, 1);
+        expect(proof.result.memory).toMatchObject({ status: "missing", backend: "off", source: "global" });
+        expect(proof.result.memoryBlock).toContain("require effective native OMP Mnemopi");
+      }
       await context.inert();
     } finally { await context.cleanup(); }
   }
@@ -677,12 +688,14 @@ ptyTest("fresh installs recommend a judge, unresolved legacy state is unknown, a
       const terminal = context.terminal();
       await newTelegram(context, terminal);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-native-presence-judge-secret", false);
-      await terminal.answer(memoryPrompt, "n");
+      if (mode !== "legacy") await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(true);
+      await terminal.finished(false);
       const transcript = terminal.transcript();
       expect(transcript).toContain("Saved configuration:");
       if (mode === "legacy") {
+        expect(transcript).toContain("Unmigrated native settings could not be verified");
+        expect(transcript).not.toContain(memoryPrompt);
         expect(transcript).toContain(judgeUnknown);
         expect(transcript).toContain("unknown, not confirmed missing");
         expect(transcript).not.toContain(judgeRecommendation);
@@ -722,9 +735,8 @@ ptyTest("project null leaves a legacy judge unknown while overlay null explicitl
       const terminal = context.terminal();
       await newTelegram(context, terminal);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-legacy-precedence-judge-secret", false);
-      await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(true);
+      await terminal.finished(false);
       const transcript = terminal.transcript();
       expect(transcript).toContain("Saved configuration:");
       if (layer === "project") {
@@ -780,9 +792,9 @@ ptyTest("effective global, project and overlay judge selectors suppress advice w
       const terminal = context.terminal();
       await newTelegram(context, terminal, headCwd);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-configured-judge-secret", false);
-      await terminal.answer(memoryPrompt, "n");
+      if (layer === "global") await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(true);
+      await terminal.finished(false);
       expect(terminal.transcript()).toContain("Saved configuration:");
       expect(terminal.transcript()).not.toContain(judgeRecommendation);
       expect(terminal.transcript()).not.toContain(judgeUnknown);
@@ -814,7 +826,7 @@ ptyTest("empty or null overlay judge roles recommend effective configuration wit
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-shadowed-judge-secret", false);
       await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(true);
+      await terminal.finished(false);
       expect(terminal.transcript()).toContain(judgeRecommendation);
       expect(terminal.transcript()).toContain("empty or unset in overlay settings");
       expect(terminal.transcript()).toContain("a hidden lower-layer assignment does not make it effective");
@@ -843,7 +855,7 @@ ptyTest("delimiter-only global and project judge settings recommend configuratio
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-delimiter-only-judge-secret", false);
       await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(true);
+      await terminal.finished(false);
       expect(terminal.transcript()).toContain(judgeRecommendation);
       expect(terminal.transcript()).toContain(`empty or unset in ${layer} settings`);
       expect(terminal.transcript()).not.toContain(judgeUnknown);
@@ -865,9 +877,8 @@ ptyTest("a malformed native overlay reports an unknown judge without repair or s
     const terminal = context.terminal();
     await newTelegram(context, terminal);
     await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-unknown-judge-secret", false);
-    await terminal.answer(memoryPrompt, "n");
     await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-    await terminal.finished(true);
+    await terminal.finished(false);
     expect(terminal.transcript()).toContain("Saved configuration:");
     expect(terminal.transcript()).toContain(judgeUnknown);
     expect(terminal.transcript()).toContain("unknown, not confirmed missing");
@@ -885,13 +896,19 @@ ptyTest("a malformed native overlay reports an unknown judge without repair or s
   } finally { await context.cleanup(); }
 }, 90_000);
 
-ptyTest("existing-config credential replacement does not inspect or recommend a missing judge", async () => {
+ptyTest("existing setup saves only the explicitly consented native profile's backend", async () => {
   const context = await fixture({});
   try {
-    const original = await existingConfig(context);
+    const profile = path.join(context.env.HOME!, ".omp/profiles/setup-memory/agent");
+    const profileConfig = path.join(profile, "config.yml");
+    await fs.mkdir(profile, { recursive: true });
+    await fs.writeFile(profileConfig, '{"memory":{"backend":"off"},"mnemopi":{"bank":"preserve-bank"}}\n');
+    const original = await existingConfig(context, ["--profile=setup-memory"]);
     const terminal = context.terminal();
     await terminal.secret(customName, "pty-refreshed-without-judge-inspection", true);
     await terminal.answer("Replace existing credential values? [y/N]: ", "yes");
+    await terminal.prompt(`This would change OMP's global memory.backend preference for ${profile}`);
+    await terminal.answer(memoryPrompt, "yes");
     await terminal.answer("Write configuration/credentials? [y/N]: ", "yes");
     await terminal.finished(true);
     expect(terminal.transcript()).toContain("Saved configuration:");
@@ -899,6 +916,10 @@ ptyTest("existing-config credential replacement does not inspect or recommend a 
     expect(terminal.transcript()).not.toContain(judgeUnknown);
     expect(terminal.transcript()).not.toContain("pty-refreshed-without-judge-inspection");
     expect(await context.nativeSetupImports()).toBe(0);
+    expect(YAML.parse(await fs.readFile(profileConfig, "utf8"))).toEqual({
+      memory: { backend: "mnemopi" }, mnemopi: { bank: "preserve-bank" },
+    });
+    expect(await exists(path.join(profile, "agent.db"))).toBe(false);
     expect(await fs.readFile(context.config, "utf8")).toBe(original.config);
     expect(parseEnv(await fs.readFile(`${context.config}.env`, "utf8"))).toEqual({
       [customName]: "pty-refreshed-without-judge-inspection", [unrelatedName]: "pty-unrelated-must-not-load",
@@ -963,7 +984,7 @@ ptyTest("new setup rejects a missing credential before ambient dotenv or native 
   } finally { await context.cleanup(); }
 }, 90_000);
 
-ptyTest("published setup reports project-shadowed memory without overwriting the project preference", async () => {
+ptyTest("setup blocked by project memory does not offer or write an ineffectual global override", async () => {
   const context = await fixture();
   const project = '{"memory":{"backend":"off"},"mnemopi":{"bank":"project-kept"}}\n';
   try {
@@ -972,20 +993,17 @@ ptyTest("published setup reports project-shadowed memory without overwriting the
     const terminal = context.terminal();
     await newTelegram(context, terminal);
     await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-shadowed-memory-secret", false);
-    await terminal.answer(memoryPrompt, "Y");
     await terminal.answer("Write configuration/credentials? [y/N]: ", "yes");
-    await terminal.finished(true);
+    await terminal.finished(false);
     expect(terminal.transcript()).toContain("Saved configuration:");
-    expect(terminal.transcript()).toContain("Saved native memory.backend=mnemopi");
-    expect(terminal.transcript()).toContain("Mnemopi is not effective for the head workspace (project settings take precedence)");
+    expect(terminal.transcript()).not.toContain(memoryPrompt);
+    expect(terminal.transcript()).not.toContain("Saved native memory.backend=mnemopi");
+    expect(terminal.transcript()).toContain("Effective backend is off (project settings)");
     expect(terminal.transcript()).not.toContain("Mnemopi is configured for the head workspace");
     expect(await fs.readFile(context.nativeProjectConfig, "utf8")).toBe(project);
-    expect(YAML.parse(await fs.readFile(context.nativeConfig, "utf8"))).toEqual({
-      ...(YAML.parse(context.nativeOriginal) as Record<string, unknown>), memory: { backend: "mnemopi" },
-    });
     expect(await exists(context.config)).toBe(true);
     expect(await exists(`${context.config}.env`)).toBe(true);
-    await context.inert(false, true);
+    await context.inert();
   } finally { await context.cleanup(); }
 }, 90_000);
 
@@ -998,11 +1016,10 @@ ptyTest("native configuration failure leaves setup saved and reports no unverifi
     const terminal = context.terminal();
     await newTelegram(context, terminal);
     await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-saved-before-native-failure", false);
-    await terminal.answer(memoryPrompt, "yes");
     await terminal.answer("Write configuration/credentials? [y/N]: ", "yes");
-    await terminal.finished(true);
+    await terminal.finished(false);
     expect(terminal.transcript()).toContain("Saved configuration:");
-    expect(terminal.transcript()).toContain("Setup saved, but native Mnemopi could not be saved or verified");
+    expect(terminal.transcript()).toContain("Native memory settings could not be verified");
     expect(terminal.transcript()).toContain(judgeUnknown);
     expect(terminal.transcript()).toContain("unknown, not confirmed missing");
     expect(terminal.transcript()).not.toContain(judgeRecommendation);
@@ -1018,7 +1035,7 @@ ptyTest("native configuration failure leaves setup saved and reports no unverifi
 }, 90_000);
 
 ptyTest("existing config and blank retention ignore ambient dotenv; only named credentials load", async () => {
-  const context = await fixture({ memory: { backend: "off" } });
+  const context = await fixture({ memory: { backend: "mnemopi" } });
   try {
     const original = await existingConfig(context);
     context.ambientEnv = `${customName}=pty-ambient-phantom\n${unrelatedName}=pty-ambient-unrelated\n`;
@@ -1097,7 +1114,7 @@ ptyTest("start rejects missing named credentials before ambient dotenv can activ
 }, 60_000);
 
 ptyTest("profile setup uses start's shell precedence and preserves saved files on ambiguous upload failure", async () => {
-  const context = await fixture();
+  const context = await fixture({ memory: { backend: "mnemopi" } });
   try {
     const original = await existingConfig(context);
     const explicit = "pty-profile-explicit-shell-token";
@@ -1125,7 +1142,7 @@ ptyTest("profile setup uses start's shell precedence and preserves saved files o
 }, 90_000);
 
 ptyTest("Slack-only setup gives the mascot app-icon step without any profile API calls", async () => {
-  const context = await fixture();
+  const context = await fixture({ memory: { backend: "mnemopi" } });
   try {
     const original = JSON.parse((await existingConfig(context)).config);
     delete original.telegram;
@@ -1175,7 +1192,10 @@ ptyTest("terminal and parent-only signals, EOF and declined confirmations preser
       } else {
         await terminal.secret(customName, replacement, true);
         await terminal.answer("Replace existing credential values? [y/N]: ", action === "decline-replacement" ? "n" : "y");
-        if (action === "decline-final") await terminal.answer("Write configuration/credentials? [y/N]: ", "n");
+        if (action === "decline-final") {
+          await terminal.answer(memoryPrompt, "n");
+          await terminal.answer("Write configuration/credentials? [y/N]: ", "n");
+        }
       }
       await terminal.finished(false);
       expect(terminal.transcript()).not.toContain(replacement);

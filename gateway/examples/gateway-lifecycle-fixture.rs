@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const SHUTDOWN: &str = "stop-test-gateways";
+const HISTORY_CHANNEL: &str = "5";
+const HISTORY_STARTER: &str = "90312";
 
 struct OfflineMessenger {
     root: PathBuf,
@@ -30,10 +32,17 @@ struct OfflineMessenger {
 }
 
 fn authorized(route: &Value) -> bool {
-    route
-        == &json!({
+    let thread = &route["threadId"];
+    let channel = &route["channelId"];
+    let allowed = match channel.as_str() {
+        Some("4") => thread.is_null() || matches!(thread.as_str(), Some("50" | "51" | "52")),
+        Some(HISTORY_CHANNEL) => thread.is_null() || thread.as_str() == Some(HISTORY_STARTER),
+        _ => false,
+    };
+    allowed
+        && route == &json!({
             "platform": "discord", "accountId": "2", "authorityId": "1",
-            "guildId": "3", "channelId": "4", "threadId": null
+            "guildId": "3", "channelId": channel, "threadId": thread
         })
 }
 
@@ -89,7 +98,9 @@ impl Adapter for OfflineMessenger {
             .first()
             .ok_or_else(|| EffectError::rejected("Missing fixture messenger argument"))?;
         let route = match operation {
-            "assertRoute" | "fetchAfter" => argument,
+            "assertRoute" | "fetchAfter" | "inspectThread" | "canCreateThread" | "createThread" => {
+                argument
+            }
             "send" | "setActivity" => &argument["route"],
             _ => {
                 return Err(EffectError::rejected(
@@ -102,10 +113,35 @@ impl Adapter for OfflineMessenger {
                 "Fixture messenger route did not match",
             ));
         }
-        match operation {
-            "assertRoute" | "setActivity" => Ok(Value::Null),
-            "fetchAfter" => Ok(json!([])),
-            "send" => {
+        let history_parent = route["channelId"].as_str() == Some(HISTORY_CHANNEL)
+            && route["threadId"].is_null();
+        match (operation, args) {
+            ("assertRoute" | "setActivity", _) => Ok(Value::Null),
+            ("fetchAfter", _) => Ok(json!([])),
+            ("canCreateThread", [_]) => Ok(Value::Bool(history_parent)),
+            ("createThread", [_, title, source])
+                if history_parent
+                    && title
+                        .as_str()
+                        .is_some_and(|name| (1..=100).contains(&name.chars().count()))
+                    && source.as_str() == Some(HISTORY_STARTER) =>
+            {
+                // A Discord thread opened from a message uses that message's snowflake.
+                let mut thread = route.clone();
+                thread["threadId"] = source.clone();
+                Ok(thread)
+            }
+            ("inspectThread", _) => {
+                let id = route["threadId"]
+                    .as_str()
+                    .ok_or_else(|| EffectError::rejected("Fixture route is not a thread"))?;
+                // Fixture work threads already have an open-state title.
+                Ok(json!({
+                    "route": route, "title": format!("⏳ Fixture topic {id}"),
+                    "archived": false, "requiresTag": false, "availableTags": [], "appliedTags": []
+                }))
+            }
+            ("send", _) => {
                 let id = argument["id"]
                     .as_str()
                     .ok_or_else(|| EffectError::rejected("Missing fixture output ID"))?;

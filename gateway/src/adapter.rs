@@ -137,6 +137,13 @@ impl Context {
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.store.set_meta(key, value)
     }
+    pub(crate) fn insert_meta_if_absent(
+        &self,
+        keys: impl IntoIterator<Item = String>,
+        value: &str,
+    ) -> Result<()> {
+        self.store.insert_meta_if_absent(keys, value)
+    }
     pub fn has_pending_answer(&self, id: &str, route: &Value) -> Result<bool> {
         self.rooms.owner_route(route)?;
         self.store.has_pending_answer(id, route)
