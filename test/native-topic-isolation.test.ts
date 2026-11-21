@@ -105,7 +105,7 @@ async function verifyJournal(fixture: Fixture, owner: JournalIdentity, expected:
   return journal;
 }
 
-nativeTest("stock topics stay isolated across HEAD rotation and recall-assisted cross-channel continuation", async () => {
+nativeTest("stock topics stay isolated across HEAD rotation and recall-assisted continuation in new and bound threads", async () => {
   const root = await mkdtemp(join(await realpath("/tmp"), "osti-"));
   const fixture = gatewayFixture(root);
   let succeeded = false;
@@ -336,6 +336,28 @@ nativeTest("stock topics stay isolated across HEAD rotation and recall-assisted 
     assert.deepEqual({ parent, messageId, result: JSON.parse(effect.result) }, {
       parent: continuationParent, messageId: continuation.messageId, result: { ok: true, value: destination },
     });
+
+    const bound = { input: inbound("313", topicB, paraphrase),
+      answer: `topic-proof:lane:${workB}:b1,b2,b3,auth-continuation\nauth-trace:${digest}:bounded` };
+    await sendTurn(fixture, bound);
+    await fixture.deliver(bound.input); // The same ingress cannot import evidence or run twice.
+    const boundLane = lane(fixture, topicB);
+    assert.deepEqual([boundLane.id, boundLane.sessionId, boundLane.sessionFile, boundLane.cwd],
+      [intact.id, intact.sessionId, intact.sessionFile, workB]);
+    const boundJournal = await verifyJournal(fixture, boundLane, { cwd: workB, turns: [b1, b2, b3, bound] });
+    assert.deepEqual(boundJournal.prompts.at(-1)?.previous, evidence);
+    assert.equal((await nativeRead(fixture, "recall-witness", witnessPath)).recallCount, 2);
+    for (const { sessionFile, before } of journals) {
+      if (sessionFile === boundLane.sessionFile) continue;
+      const expected = sessionFile === newHead.sessionFile ? headAfterSeed : before;
+      assert(expected.equals(await readFile(sessionFile)), `Bound continuation modified another journal: ${sessionFile}`);
+    }
+    assert(destinationJournal.equals(await readFile(fresh.sessionFile)), "Bound continuation wrote to the unrelated new thread");
+    assert.deepEqual(ledger(fixture, db => db.query<{ id: string }, []>("SELECT id FROM lanes ORDER BY id").all()).map(row => row.id),
+      [resumed.id, intact.id, c.id, fresh.id].sort(), "Bound continuation must not create an extra lane");
+    assert.deepEqual(ledger(fixture, db => db.query(
+      "SELECT arguments,state,result FROM gateway_effects WHERE operation='createThread'",
+    ).all()), effects, "Bound continuation must not create another thread");
 
     await fixture.cli("stop");
     await fixture.initialExit();

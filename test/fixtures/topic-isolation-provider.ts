@@ -60,7 +60,7 @@ export default function topicIsolationProvider(pi: ExtensionAPI): void {
           : message.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n");
         const request = nativeRequestEnvelope(text);
         if (!request) return [];
-        if (request.sourceId === "312") return ["auth-continuation"];
+        if (request.sourceId === "312" || request.sourceId === "313") return ["auth-continuation"];
         // A lane's brief repeats its opening task inside the envelope, but
         // only the user text outside it identifies this particular turn.
         const task = text.replace(request.envelope, "");

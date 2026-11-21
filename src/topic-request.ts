@@ -2,12 +2,35 @@ import { realpathSync, statSync } from "node:fs";
 import { basename, isAbsolute } from "node:path";
 import type { Lane } from "./contracts";
 
+export const TOPIC_CHOICE_WAIT_MS = 5 * 60_000;
+
 /** Only owner text, never a quote, attachment path, or channel description. */
 export function topicRequest(text: string) {
   const request = text.replace(/^\s*\/new(?:\s+|$)/, "");
   const header = /^cwd:[ \t]*([^\n]*)(?:\n|$)/i.exec(request.trimStart());
   if (!header) return { text: request, cwd: null };
   return { text: request.trimStart().slice(header[0].length), cwd: header[1].trim() };
+}
+
+/** Parse only the original Discord owner request body. An empty result asks for a task. */
+export function discordThreadSplit(text: string): string | null {
+  const line = text.trim();
+  if (/[\r\n\u2028\u2029]/u.test(line)) return null;
+  const directive = /^(?:이건\s+따로\s+빼\s*줘|(?:please\s+)?split\s+this\s+into\s+a\s+new\s+thread)(?:[.!]|\s*:\s*(.*))?$/iu.exec(line);
+  if (directive) return directive[1]?.trim() ?? "";
+
+  // Without a colon, accept a plain task label, not an embedded sentence or quotation.
+  const korean = /^([\p{L}\p{M}\p{N}_ -]+?)(?:은|는|을|를)\s+새\s+스레드에서\s+해\s*줘[.!]?$/u.exec(line);
+  const english = /^(?:please\s+)?do\s+([\p{L}\p{M}\p{N}_ -]+?)\s+in\s+a\s+new\s+thread[.!]?$/iu.exec(line);
+  const task = (korean?.[1] ?? english?.[1])?.trim();
+  // Keep hyphenated task words, but not punctuation standing in for a word or clause boundary.
+  if (!task || /(?:^| )-|-(?: |$)|--|(?:^| )_+(?: |$)/u.test(task)) return null;
+  // The closing thread phrase can be an excluded alternative, not a destination.
+  if (/\b(?:no|not|never|instead|(?:rather|other)[ -]+than|as[ -]+opposed[ -]+to|but|or|nor|except|unless|without|versus|vs)\b|말고|대신|아니라|아닌/iu.test(task)) return null;
+  if (/\b(?:for +example|the +phrase|the +words)\b|예를\s*들어|예시로|라고\s/iu.test(task)) return null;
+  // “Do we ...” and similar questions need not end in a question mark.
+  if (english && /^(?:i|you|we|they)\b/iu.test(task)) return null;
+  return /^(?:this(?: task)?|it|이거|이것)$/iu.test(task) ? "" : task;
 }
 
 /** An edit can revise the task, not create a new placement or confirm a different one. */

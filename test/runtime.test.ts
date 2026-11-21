@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { createHash } from "node:crypto";
@@ -1782,12 +1782,16 @@ describe("topic-owned lane delivery", () => {
     expect(store.inputs("main")).toEqual([]);
   });
 
-  test("repeated topic revisions retain the delivery selected in a sibling thread", async () => {
+  test("repeated Slack topic revisions retain the delivery selected in a sibling thread", async () => {
     const { runtime, config, directory, store, hosts, main, messenger } = fixture();
-    const originalLane = savedLane(store, config, "revision-origin", route("44"));
+    config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+    const thread: Route = { platform: "slack", authorityId: "UOWNER", accountId: "TTEAM:UBOT",
+      guildId: "TTEAM", channelId: "CCHANNEL", threadId: "1750000000.000001" };
+    const originalLane = savedLane(store, config, "revision-origin", thread);
     const cwd = join(directory, "sibling-workspace");
     mkdirSync(cwd);
-    const original = message("revision-original", originalLane.route, `cwd: ${cwd}\nInvestigate the invoice.`);
+    const original = { ...message("revision-original", originalLane.route, `cwd: ${cwd}\nInvestigate the invoice.`),
+      messageId: "1750000000.000002" };
     await runtime.start();
     await admit(runtime, original);
     const siblingRoute = messenger.threads[0];
@@ -1818,6 +1822,87 @@ describe("topic-owned lane delivery", () => {
       route: siblingRoute, sourceId: revision.id, replyTo: undefined, text: revision.answer,
     })));
     expect(messenger.threads).toEqual([siblingRoute]);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("a different cwd in a bound Discord thread requires an explicit /new", async () => {
+    const { runtime, directory, store, hosts, main, messenger, launched } = fixture();
+    const originalRoute = route("44");
+    const nextCwd = join(directory, "other-workspace");
+    mkdirSync(nextCwd);
+    await runtime.start();
+    const opening = message("1741", originalRoute, `cwd: ${directory}\nInspect the invoice parser.`);
+    await admit(runtime, opening);
+    const current = store.laneForRoute(originalRoute);
+    if (!current) throw new Error("Missing current thread binding");
+    const worker = hosts.get(current.socketPath);
+    if (!worker) throw new Error("Missing current thread Host");
+    worker.complete("Parser inspected.");
+    await messenger.whenSent(2); // Opening kickoff and answer.
+
+    const task = "Check the importer in the other workspace.";
+    const change = message("1742", originalRoute, `cwd: ${nextCwd}\n${task}`);
+    await admit(runtime, change);
+    await admit(runtime, change);
+    const question = store.output(`${change.id}:workspace`);
+    expect(question).toMatchObject({ state: "sent", route: originalRoute, sourceId: change.id });
+    expect(question?.text).toMatch(/\/new\b/);
+    expect(messenger.attempted.filter(output => output.sourceId === change.id)).toHaveLength(1);
+    expect(store.lanes().map(lane => lane.id)).toEqual([current.id]);
+    expect(messenger.threadSources).toEqual([]);
+    expect(launched.map(host => host.cwd)).toEqual([directory]);
+    expect(worker.prompts).toHaveLength(1);
+
+    const split = message("1743", originalRoute, `/new cwd: ${nextCwd}\n${task}`);
+    await admit(runtime, split);
+    await admit(runtime, split);
+    await admit(runtime, { ...split, id: `${split.id}:edit`, text: `cwd: ${directory}\nReplace the split request.` });
+    const [siblingRoute] = messenger.threads;
+    if (!siblingRoute) throw new Error("Explicit /new did not establish a sibling");
+    expect(siblingRoute).not.toEqual(originalRoute);
+    const sibling = store.laneForRoute(siblingRoute);
+    if (!sibling) throw new Error("Missing sibling lane binding");
+    const other = hosts.get(sibling.socketPath);
+    if (!other) throw new Error("Missing sibling Host");
+    expect(sibling).toMatchObject({ cwd: nextCwd, route: siblingRoute });
+    expect(sibling.sessionId).not.toBe(current.sessionId);
+    expect(sibling.sessionFile).not.toBe(current.sessionFile);
+    expect(other.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(task)]);
+    expect(store.laneForRoute(originalRoute)).toMatchObject({
+      id: current.id, sessionId: current.sessionId, sessionFile: current.sessionFile, cwd: directory,
+    });
+    expect(store.lanes().map(lane => lane.id).sort()).toEqual([current.id, sibling.id].sort());
+    expect(messenger.threadSources).toHaveLength(1);
+    expect(launched.map(host => host.cwd)).toEqual([directory, nextCwd]);
+    expect(worker.prompts).toHaveLength(1);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("an explicit natural-language split starts one sibling and leaves the bound Discord thread intact", async () => {
+    const { runtime, config, store, main, messenger, hosts, launched } = fixture();
+    const current = savedLane(store, config, "split-origin", route("44"), process.pid);
+    const worker = new HostTransport(current.sessionFile, "session-split-origin");
+    hosts.set(current.socketPath, worker);
+    await runtime.start();
+    const task = "Check report formatting.";
+    const split = message("1745", current.route, `이건 따로 빼줘: ${task}`);
+
+    await admit(runtime, split);
+    await admit(runtime, split);
+
+    const [destination] = messenger.threads;
+    if (!destination) throw new Error("Missing explicitly requested sibling");
+    const sibling = store.laneForRoute(destination);
+    if (!sibling) throw new Error("The sibling has no native lane");
+    const prompt = hosts.get(sibling.socketPath)?.prompts[0]?.command.message;
+    expect(prompt).toContain(task);
+    expect(prompt).not.toContain("이건 따로 빼줘");
+    expect(sibling.cwd).toBe(current.cwd);
+    expect(sibling.sessionFile).not.toBe(current.sessionFile);
+    expect(store.laneForRoute(current.route)).toMatchObject({ id: current.id, sessionId: current.sessionId, cwd: current.cwd });
+    expect(messenger.threadSources).toHaveLength(1);
+    expect(launched).toHaveLength(1);
+    expect(worker.prompts).toEqual([]);
     expect(main.prompts).toEqual([]);
   });
 
@@ -6147,6 +6232,21 @@ describe("real Store runtime coordination", () => {
     expect(launched).toEqual([]);
   });
 
+  test("manager lane_message leaves a split-shaped delegated instruction verbatim in the native request", async () => {
+    const { runtime, store, config, hosts, messenger } = fixture();
+    const lane = savedLane(store, config, "verbatim-manager", route("73"));
+    const original = headMessage("manager-verbatim-source", lane.route, "Delegate the login check");
+    const delegatedText = "Do the login check in a new thread";
+    await runtime.start();
+    await admit(runtime, original);
+
+    await runtime.messageLane(lane.id, delegatedText, original.id);
+
+    expect(hosts.get(lane.socketPath)?.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(delegatedText)]);
+    expect(messenger.threadSources).toEqual([]);
+    expect(store.laneForRoute(lane.route)?.id).toBe(lane.id);
+  });
+
   test("explicit bound followup handoff retains attachments and source idempotency without retargeting head", async () => {
     const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
     const opened: Route[] = [];
@@ -8123,77 +8223,508 @@ test("workspace replies cannot place another thread's pending request or revive 
   expect(main.prompts).toEqual([]);
 });
 
-test("a historical request in an already bound channel waits for a specific prior session, even when both used the same repo", async () => {
+const historicalNow = Date.parse("2026-11-18T12:00:00.000Z");
+const historicalRequest = "지난주 로그인 버그 보던 데서 계속해줘";
+const historicalTask = (detail: string) => `로그인 버그 조사: ${detail} 문제를 확인해줘`;
+
+function historyFixture(recall: "available" | "unavailable" = "available") {
   const searches: string[] = [];
-  let available = true;
-  const { runtime, config, store, hosts, main, errors } = fixture(3, undefined, { topicMemory: {
+  const f = fixture(3, undefined, { topicMemory: {
     status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: true }),
     search: async query => {
       searches.push(query);
-      if (!available) throw new Error("private-provider-diagnostic");
+      if (recall === "unavailable") throw new Error("private-provider-diagnostic");
       return { backend: "mnemopi", query, items: [], count: 0 };
     },
   } });
-  config.discord!.allowedChannelIds.push("5");
+  if (!f.config.discord) throw new Error("Missing Discord fixture config");
+  f.config.discord.allowedChannelIds.push("5");
   const destination = route("53", { channelId: "5" });
-  const unrelated = savedLane(store, config, "current", destination);
-  const lastWeek = "2026-11-11T12:00:00.000Z", now = Date.parse("2026-11-18T12:00:00.000Z");
-  for (const [id, detail] of [["one", "callback-state"], ["two", "device-cookie"], ["foreign", "private-detail"]] as const) {
-    const lane = savedLane(store, config, id, id === "foreign" ? route("51", { accountId: "99" }) : route(id === "one" ? "51" : "52"));
-    const sessionId = `session-${id}`, task = `로그인 버그 조사: ${detail} 문제를 확인해줘`;
-    store.updateLane(id, lane.generation, { sessionId });
-    mkdirSync(dirname(lane.sessionFile), { recursive: true });
-    const content = `\`\`\`superagent-runtime-context\nRequest ID: opener-${id}\n\nOriginal source ID: opener-${id}\n\nOriginal authorized conversation: ${routeKey(lane.route)}\n\nReply only to this request.\n\nIndependent lane ${id}; cwd: ${lane.cwd}\nDelivery mode: topic reply.\n\`\`\`\n\n${task}`;
-    writeFileSync(lane.sessionFile, [
-      { type: "session", version: 3, id: sessionId, timestamp: lastWeek, cwd: lane.cwd },
-      { type: "message", id: "turn", parentId: null, timestamp: lastWeek, message: { role: "user", content } },
-    ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
-  }
-  await runtime.start();
-  const input = { ...message("610", destination, "지난주 로그인 버그 보던 데서 계속해줘"), receivedAt: now };
-  await admit(runtime, input);
-  const question = store.output("610:workspace");
-  if (!question?.remoteId) throw new Error("Expected a scoped choice between prior sessions");
-  expect(question.text).not.toMatch(/callback-state|device-cookie/);
-  expect(store.lanes()).toHaveLength(4);
-  const choices = JSON.parse(store.getMeta("topic-history:610")!) as Array<{ laneId: string }>;
-  expect(choices.map(ref => ref.laneId).sort()).toEqual(["one", "two"]);
-  const number = choices.findIndex(ref => ref.laneId === "two") + 1;
-  expect(number).toBeGreaterThan(0);
-  const reply = { messageId: question.remoteId, authorId: null, text: "not authoritative" };
-  await admit(runtime, { ...message("611", destination, String(number)), receivedAt: now + 1, reply });
-  const target = store.input("handoff:610:lane")?.target;
-  const continuation = target && store.lane(target);
-  if (!continuation) throw new Error("Historical choice never reached a continuation session");
-  const prompt = hosts.get(continuation.socketPath)?.prompts[0]?.command.message;
-  expect(prompt).toContain("device-cookie");
-  expect(prompt).not.toContain("callback-state");
-  expect(continuation.id).not.toBe("two");
-  expect(continuation.route.channelId).toBe(destination.channelId);
-  expect(store.laneForRoute(destination)?.id).toBe(unrelated.id);
-  expect(main.prompts).toHaveLength(0);
-  await admit(runtime, input);
-  await admit(runtime, { ...message("612", destination, String(number)), receivedAt: now + 2, reply });
-  expect(store.lanes()).toHaveLength(5);
-  expect(hosts.get(continuation.socketPath)?.prompts).toHaveLength(1);
-  expect(searches).toEqual([input.text]); // no second recall on choice, dispatch or redelivery
-  const held = { ...message("613", destination, "지난주 로그인 버그 보던 데서 계속해줘"), receivedAt: now + 3 };
-  await admit(runtime, held);
-  const second = store.output("613:workspace");
-  if (!second?.remoteId) throw new Error("Expected a new, source-bound choice");
-  const old = store.lane("two")!;
-  store.updateLane(old.id, old.generation, { workState: "paused" });
-  await admit(runtime, { ...message("614", destination, String(number)), receivedAt: now + 4,
-    reply: { ...reply, messageId: second.remoteId } });
-  expect(store.input("613")?.state).toBe("cancelled");
-  expect(store.input("handoff:613:lane")).toBeNull();
-  expect(store.lane("two")?.workState).toBe("paused");
-  available = false;
-  await admit(runtime, { ...message("615", destination, input.text), receivedAt: now + 5 });
-  expect(store.output("615:workspace")?.text).toContain("조회하지 못해");
-  expect(store.input("handoff:615:lane")).toBeNull();
-  expect(errors.map(String).join("\n")).not.toContain("private-provider-diagnostic");
-  expect(searches).toHaveLength(3);
+  const current = savedLane(f.store, f.config, "current", destination, process.pid);
+  const worker = new HostTransport(current.sessionFile, "session-current");
+  f.hosts.set(current.socketPath, worker);
+  return { ...f, current, destination, worker, searches };
+}
+
+function writeHistoricalTurn(lane: Lane, detail: string, at = "2026-11-11T12:00:00.000Z"): void {
+  const id = lane.id;
+  const content = `\`\`\`superagent-runtime-context\nRequest ID: opener-${id}\n\nOriginal source ID: opener-${id}\n\nOriginal authorized conversation: ${routeKey(lane.route)}\n\nReply only to this request.\n\nIndependent lane ${id}; cwd: ${lane.cwd}\nDelivery mode: topic reply.\n\`\`\`\n\n${historicalTask(detail)}`;
+  mkdirSync(dirname(lane.sessionFile), { recursive: true });
+  writeFileSync(lane.sessionFile, [
+    { type: "session", version: 3, id: lane.sessionId, timestamp: at, cwd: lane.cwd },
+    { type: "message", id: `turn-${id}`, parentId: null, timestamp: at, message: { role: "user", content } },
+  ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+}
+
+function historicalLane(store: Store, config: Config, options: {
+  readonly id: string; readonly route: Route; readonly detail: string; readonly at?: string;
+}): Lane {
+  const lane = savedLane(store, config, options.id, options.route);
+  const sessionId = `session-${lane.id}`;
+  store.updateLane(lane.id, lane.generation, { sessionId });
+  const prior = { ...lane, sessionId };
+  writeHistoricalTurn(prior, options.detail, options.at);
+  return prior;
+}
+
+function historicalAnswer(question: OutputRecord | null, lane: Lane): { number: string; reply: NonNullable<Inbound["reply"]> } {
+  if (!question?.remoteId) throw new Error("Expected a delivered historical question");
+  const number = question.text.split("\n").find(line => line.endsWith(` · turn-${lane.id}`))?.match(/^\d+/)?.[0];
+  if (!number) throw new Error(`Missing offered entry for ${lane.id}`);
+  return { number, reply: { messageId: question.remoteId, authorId: null, text: "quoted text is not authoritative" } };
+}
+
+describe("historical continuation in an existing Discord work thread", () => {
+  test.each(["unique match", "lookup miss", "lookup outage"] as const)("%s dispatches only in the current session", async outcome => {
+    const { runtime, config, store, directory, destination, current, worker, messenger, main, launched, errors, searches } =
+      historyFixture(outcome === "lookup outage" ? "unavailable" : "available");
+    const cwd = join(directory, "prior-workspace");
+    mkdirSync(cwd);
+    const prior = historicalLane(store, { ...config, headCwd: cwd }, { id: "prior", route: route("51"), detail: "device-cookie" });
+    const text = outcome === "lookup miss" ? "Resume the message queue deadlock from last week." : historicalRequest;
+    const input = { ...message("610", destination, text), receivedAt: historicalNow };
+    await runtime.start();
+
+    await admit(runtime, input);
+    await admit(runtime, input);
+
+    const handoff = `handoff:${input.id}:${current.id}`;
+    expect(store.input(handoff)).toMatchObject({ target: current.id, state: "submitted" });
+    expect(worker.prompts).toHaveLength(1);
+    const prompt = worker.prompts[0]?.command.message;
+    expect(prompt).toContain(text);
+    if (outcome === "unique match") {
+      expect(prompt).toMatch(/"sessionId":"session-prior","evidence":"[^"\n]*turn-prior[^"\n]*device-cookie/);
+    } else {
+      expect(prompt).not.toMatch(/session-prior|turn-prior|device-cookie|private-provider-diagnostic/);
+    }
+    worker.complete("The current thread owns this answer.");
+    await messenger.whenSent(1);
+    await runtime.kick();
+
+    expect(messenger.sent).toMatchObject([{ id: `${handoff}:answer`, sourceId: input.id, route: destination,
+      replyTo: { route: destination, messageId: input.messageId }, text: "The current thread owns this answer." }]);
+    expect(store.laneForRoute(destination)).toMatchObject({
+      id: current.id, sessionId: current.sessionId, sessionFile: current.sessionFile, cwd: directory,
+    });
+    expect(store.lanes().map(lane => lane.id).sort()).toEqual([current.id, prior.id].sort());
+    expect(store.lane(prior.id)).toMatchObject({ sessionId: prior.sessionId, cwd, runtimeState: "unloaded" });
+    expect(messenger.threadSources).toEqual([]);
+    expect(launched).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(searches).toEqual([text]);
+    expect(errors.map(String).join("\n")).not.toContain("private-provider-diagnostic");
+  });
+
+  test("an ambiguous same-workspace match waits for a scoped choice and imports only the selected evidence once", async () => {
+    const { runtime, config, store, destination, current, worker, main, messenger, launched, searches } = historyFixture();
+    const one = historicalLane(store, config, { id: "one", route: route("51"), detail: "callback-state" });
+    const two = historicalLane(store, config, { id: "two", route: route("52"), detail: "device-cookie" });
+    historicalLane(store, config, { id: "foreign", route: route("51", { accountId: "99" }), detail: "private-detail" });
+    const input = { ...message("620", destination, historicalRequest), receivedAt: historicalNow };
+    await runtime.start();
+
+    await admit(runtime, input);
+    await admit(runtime, input);
+    const question = store.output(`${input.id}:workspace`);
+    expect(question).toMatchObject({ state: "sent", route: destination, sourceId: input.id });
+    expect(question?.text).not.toMatch(/callback-state|device-cookie|turn-foreign|private-detail/);
+    historicalAnswer(question, one);
+    const { number, reply } = historicalAnswer(question, two);
+    await admit(runtime, { ...message("621", { ...destination, threadId: "54" }, number), receivedAt: historicalNow + 1, reply });
+    expect(store.input(input.id)?.state).toBe("pending");
+    expect(worker.prompts).toEqual([]);
+    expect(messenger.sent.filter(output => output.sourceId === input.id)).toHaveLength(1);
+    expect(messenger.threadSources).toEqual([]);
+
+    const answer = { ...message("622", destination, number), receivedAt: historicalNow + 2, reply };
+    await admit(runtime, answer);
+    await admit(runtime, answer);
+    await admit(runtime, { ...answer, id: "622:edit", text: historicalAnswer(question, one).number });
+    await admit(runtime, { ...message("623", destination, number), receivedAt: historicalNow + 3, reply });
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(input.text)]);
+    const prompt = worker.prompts[0]?.command.message;
+    expect(prompt).toMatch(/"sessionId":"session-two","evidence":"[^"\n]*turn-two[^"\n]*device-cookie/);
+    expect(prompt).not.toMatch(/session-one|turn-one|callback-state|private-detail/);
+    const handoff = `handoff:${input.id}:${current.id}`;
+    const settled = messenger.whenSent(messenger.sent.length + 1);
+    worker.complete("Device-cookie investigation continued.");
+    await settled;
+    await runtime.kick();
+
+    expect(store.output(`${handoff}:answer`)).toMatchObject({ state: "sent", sourceId: input.id, route: destination,
+      replyTo: { route: destination, messageId: input.messageId }, text: "Device-cookie investigation continued." });
+    expect(store.laneForRoute(destination)).toMatchObject({ id: current.id, sessionId: current.sessionId, cwd: current.cwd });
+    expect(store.lanes().map(lane => lane.id).sort()).toEqual([current.id, one.id, two.id, "foreign"].sort());
+    expect(messenger.threadSources).toEqual([]);
+    expect(launched).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(searches).toEqual([input.text]);
+  });
+
+  test("choosing between two earlier turns of this session identifies the chosen turn in the new prompt", async () => {
+    const { runtime, destination, current, store, worker } = historyFixture();
+    writeHistoricalTurn(current, "refresh-token");
+    writeFileSync(current.sessionFile, JSON.stringify({
+      type: "message", id: "other-login", parentId: `turn-${current.id}`, timestamp: "2026-11-12T12:00:00Z",
+      message: { role: "user", content: historicalTask("other-cookie") },
+    }) + "\n", { flag: "a" });
+    await runtime.start();
+    await admit(runtime, { ...message("6380", destination, historicalRequest), receivedAt: historicalNow });
+    const choice = historicalAnswer(store.output("6380:workspace"), current);
+    expect(worker.prompts).toEqual([]);
+    await admit(runtime, { ...message("6381", destination, choice.number), reply: choice.reply });
+    expect(worker.prompts).toHaveLength(1);
+    expect(worker.prompts[0]?.command.message).toContain("refresh-token");
+    expect(worker.prompts[0]?.command.message).not.toContain("other-cookie");
+  });
+
+  test.each(["paused", "changed journal"] as const)("a selected prior task with a %s does not reach the current Host", async failure => {
+    const { runtime, config, store, destination, current, worker, main, messenger, launched } = historyFixture();
+    historicalLane(store, config, { id: "one", route: route("51"), detail: "callback-state" });
+    const selected = historicalLane(store, config, { id: "two", route: route("52"), detail: "device-cookie" });
+    const input = { ...message("630", destination, historicalRequest), receivedAt: historicalNow };
+    await runtime.start();
+    await admit(runtime, input);
+    const question = store.output(`${input.id}:workspace`);
+    const { number, reply } = historicalAnswer(question, selected);
+    if (failure === "paused") store.updateLane(selected.id, selected.generation, { workState: "paused" });
+    else writeHistoricalTurn(selected, "changed-device-cookie");
+
+    await admit(runtime, { ...message("631", destination, number), receivedAt: historicalNow + 1, reply });
+
+    const handoff = `handoff:${input.id}:${current.id}`;
+    expect([store.input(input.id)?.state, store.input(handoff)?.state]).toContain("cancelled");
+    const held = messenger.sent.filter(output => output.id !== question?.id);
+    expect(held).toMatchObject([{ route: destination }]);
+    expect(held[0]?.text).not.toMatch(/device-cookie|callback-state/);
+    expect(store.lane(selected.id)?.workState).toBe(failure === "paused" ? "paused" : "open");
+    expect(worker.prompts).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(messenger.threadSources).toEqual([]);
+    expect(launched).toEqual([]);
+  });
+
+  test.each(["paused", "completed"] as const)("a historical match does not reopen or bypass a %s bound Discord lane", async workState => {
+    const { runtime, config, store, destination, current, worker, main, messenger, launched } = historyFixture();
+    const prior = historicalLane(store, config, { id: "prior", route: route("51"), detail: "device-cookie" });
+    const input = { ...message("632", destination, historicalRequest), receivedAt: historicalNow };
+    await runtime.start();
+    store.updateLane(current.id, current.generation, { workState });
+
+    await admit(runtime, input);
+
+    expect(store.input(input.id)?.state).toBe("cancelled");
+    expect(store.laneForRoute(destination)).toMatchObject({ id: current.id, sessionId: current.sessionId, workState });
+    expect(messenger.sent).toMatchObject([{ id: `${input.id}:closed`, route: destination, sourceId: input.id }]);
+    expect(store.lanes().map(lane => lane.id).sort()).toEqual([current.id, prior.id].sort());
+    expect(worker.prompts).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(messenger.threadSources).toEqual([]);
+    expect(launched).toEqual([]);
+  });
+
+  test("a stop during timeout evidence verification cancels placement without an uncertain handoff", async () => {
+    const { runtime, config, store, destination, current, worker, messenger } = historyFixture();
+    config.idleMs = 60 * 60_000;
+    config.telegram = { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: ["3"] };
+    historicalLane(store, config, { id: "recent", route: route("51", { platform: "telegram", channelId: "3" }), detail: "device-cookie" });
+    historicalLane(store, config, { id: "older", route: route("52"), detail: "callback-state", at: "2026-11-10T12:00:00Z" });
+    messenger.assertRoute = async () => {};
+    const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
+    const checking = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    try {
+      await runtime.start();
+      await admit(runtime, { ...message("6385", destination, historicalRequest), receivedAt: historicalNow });
+      expect(store.output("6385:workspace")?.state).toBe("sent");
+      messenger.assertRoute = async () => { checking.resolve(); await release.promise; };
+      clock.mockReturnValue(historicalNow + 5 * 60_000);
+      const placement = runtime.kick();
+      await checking.promise;
+      await runtime.receive(message("6386", destination, "/stop"));
+      release.resolve();
+      await placement;
+      await runtime.kick();
+      expect(store.lane(current.id)?.workState).toBe("paused");
+      expect(store.input("6385")?.state).toBe("cancelled");
+      expect(store.input(`handoff:6385:${current.id}`)).toBeNull();
+      expect(worker.prompts).toEqual([]);
+    } finally { release.resolve(); clock.mockRestore(); }
+  });
+
+  test.each(["owner choice", "queued owner choice", "same workspace", "next verified candidate", "current session", "stale current session", "no verified candidate"] as const)(
+    "a delivered Discord historical choice honors %s and dispatches once across the five-minute deadline", async outcome => {
+      const { runtime, config, store, directory, destination, current, worker, main, messenger, launched, searches } = historyFixture();
+      config.idleMs = 60 * 60_000; // The simulated clarification window must not evict the current Host.
+      const otherCwd = join(directory, "other-history-workspace");
+      mkdirSync(otherCwd);
+      const inWorkspace = historicalLane(store, config, { id: "in-workspace", route: route("51"), detail: "same-workspace-detail" });
+      const newer = historicalLane(store, { ...config, headCwd: otherCwd }, {
+        id: "newer", route: route("52"), detail: "other-workspace-detail", at: "2026-11-12T12:00:00.000Z",
+      });
+      const older = historicalLane(store, config, {
+        id: "older", route: route("57"), detail: "older-workspace-detail", at: "2026-11-10T12:00:00.000Z",
+      });
+      if (outcome === "current session" || outcome === "stale current session") writeHistoricalTurn(current, "current-context-detail");
+      const gateway = outcome === "queued owner choice" ? new GatewayStore(config.stateDir) : null;
+      const original = { ...message("635", destination, historicalRequest), receivedAt: historicalNow };
+      const deliveredAt = historicalNow + 7 * 60_000;
+      const deadline = deliveredAt + 5 * 60_000;
+      const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
+      try {
+        await runtime.start();
+        messenger.beforeSend = async output => {
+          if (output.id === `${original.id}:workspace`) clock.mockReturnValue(deliveredAt);
+        };
+        await admit(runtime, original);
+        const question = store.output(`${original.id}:workspace`);
+        const { number, reply } = historicalAnswer(question, newer);
+        expect(question).toMatchObject({ state: "sent", route: destination });
+        expect(worker.prompts).toEqual([]);
+
+        if (outcome === "next verified candidate" || outcome === "no verified candidate") {
+          writeHistoricalTurn(inWorkspace, "changed-workspace-detail");
+          if (outcome === "no verified candidate") store.updateLane(older.id, older.generation, { workState: "paused" });
+        }
+        if (outcome === "stale current session") writeHistoricalTurn(current, "changed-current-context");
+        clock.mockReturnValue(deadline - 1);
+        await runtime.kick();
+        expect(worker.prompts).toEqual([]);
+        const answer = { ...message("636", destination, number), receivedAt: deadline - 1, reply };
+        if (outcome === "owner choice") {
+          await admit(runtime, answer);
+          expect(worker.prompts).toHaveLength(1);
+        }
+        if (gateway) gateway.admit({ kind: "message", input: answer });
+        clock.mockReturnValue(deadline);
+        await runtime.kick();
+        if (gateway) {
+          expect(worker.prompts).toEqual([]);
+          await admit(runtime, answer);
+        }
+        expect(worker.prompts).toHaveLength(1);
+        clock.mockReturnValue(deadline + 1);
+        await admit(runtime, original);
+        const late = historicalAnswer(question, inWorkspace);
+        const lateAnswer = { ...message("637", destination, late.number), receivedAt: deadline + 1, reply: late.reply };
+        await admit(runtime, lateAnswer);
+        await admit(runtime, lateAnswer);
+        if (outcome === "owner choice") await admit(runtime, answer);
+
+        expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(original.text)]);
+        const prompt = worker.prompts[0]?.command.message;
+        if (outcome === "same workspace" || outcome === "stale current session") {
+          expect(prompt).toMatch(/"sessionId":"session-in-workspace","evidence":"[^"\n]*same-workspace-detail/);
+          expect(prompt).not.toMatch(/other-workspace-detail|older-workspace-detail|changed-current-context/);
+        } else if (outcome === "current session") {
+          expect(prompt).toMatch(/"sessionId":"session-current","evidence":"[^"\n]*turn-current[^"\n]*current-context-detail/);
+        } else if (outcome === "owner choice" || outcome === "queued owner choice") {
+          expect(prompt).toMatch(/"sessionId":"session-newer","evidence":"[^"\n]*other-workspace-detail/);
+          expect(prompt).not.toMatch(/same-workspace-detail|older-workspace-detail/);
+        } else if (outcome === "next verified candidate") {
+          expect(prompt).toMatch(/"sessionId":"session-older","evidence":"[^"\n]*older-workspace-detail/);
+          expect(prompt).not.toMatch(/changed-workspace-detail|other-workspace-detail/);
+        } else {
+          expect(prompt).not.toMatch(/same-workspace-detail|changed-workspace-detail|other-workspace-detail|older-workspace-detail/);
+        }
+        expect(store.input(`handoff:${original.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
+        expect(messenger.sent.filter(output => output.sourceId === original.id)).toHaveLength(1);
+        expect(store.lanes().map(lane => lane.id).sort()).toEqual([current.id, inWorkspace.id, newer.id, older.id].sort());
+        expect(messenger.threadSources).toEqual([]);
+        expect(launched).toEqual([]);
+        expect(main.prompts).toEqual([]);
+        expect(searches).toEqual([original.text]);
+      } finally { gateway?.close(); clock.mockRestore(); }
+    },
+  );
+
+  test.each(["manual choice", "timed fallback", "queued handoff", "already finished"] as const)(
+    "/stop on a historical question targets only that handoff after %s", async stage => {
+      const { runtime, config, store, destination, current, worker, main, messenger } = historyFixture();
+      config.idleMs = 60 * 60_000;
+      const one = historicalLane(store, config, { id: "one", route: route("51"), detail: "callback-state" });
+      historicalLane(store, config, { id: "two", route: route("52"), detail: "device-cookie" });
+      const input = { ...message("641", destination, historicalRequest), receivedAt: historicalNow };
+      const next = message("643", destination, "Check the release checklist.");
+      const handoff = `handoff:${input.id}:${current.id}`;
+      const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
+      const preparing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+      try {
+        await runtime.start();
+        await admit(runtime, input);
+        const { number, reply } = historicalAnswer(store.output(`${input.id}:workspace`), one);
+        const time = historicalNow + 5 * 60_000;
+        if (stage === "timed fallback") {
+          clock.mockReturnValue(time);
+          await runtime.kick();
+        } else if (stage === "queued handoff") {
+          worker.beforeCursor = () => { preparing.resolve(); return release.promise; };
+          await runtime.receive({ ...message("642", destination, number), receivedAt: historicalNow + 1, reply });
+          await preparing.promise;
+        } else {
+          await admit(runtime, { ...message("642", destination, number), receivedAt: historicalNow + 1, reply });
+        }
+        expect(store.input(handoff)?.state).toBe(stage === "queued handoff" ? "pending" : "submitted");
+        if (stage === "already finished") {
+          worker.complete("Historical task is finished.");
+          await messenger.whenSent(2);
+          await admit(runtime, next);
+          expect(store.input(`handoff:${next.id}:${current.id}`)?.state).toBe("submitted");
+        }
+
+        const sent = messenger.whenSent(messenger.sent.length + 1);
+        await runtime.receive({ ...message("644", destination, "/stop"), receivedAt: time + 1, reply });
+        release.resolve();
+        await runtime.kick();
+        await sent;
+
+        expect(store.lane(current.id)?.workState).toBe(stage === "already finished" ? "open" : "paused");
+        expect(store.input(handoff)?.state).toBe(stage === "already finished" ? "done" : stage === "queued handoff" ? "pending" : "cancelled");
+        if (stage === "queued handoff") expect(worker.prompts).toEqual([]);
+        expect(worker.abortCount).toBe(stage === "already finished" ? 0 : 1);
+        if (stage === "already finished") expect(store.input(`handoff:${next.id}:${current.id}`)?.state).toBe("submitted");
+        expect(main.abortCount).toBe(0);
+        expect(main.prompts).toEqual([]);
+      } finally { release.resolve(); clock.mockRestore(); }
+    },
+  );
+
+  test("late numeric replies to the historical original and its question cannot become new lane work", async () => {
+    const { runtime, config, store, destination, current, worker, messenger } = historyFixture();
+    const one = historicalLane(store, config, { id: "one", route: route("51"), detail: "callback-state" });
+    historicalLane(store, config, { id: "two", route: route("52"), detail: "device-cookie" });
+    const input = { ...message("645", destination, historicalRequest), receivedAt: historicalNow };
+    const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
+    try {
+      await runtime.start();
+      await admit(runtime, input);
+      const { number, reply } = historicalAnswer(store.output(`${input.id}:workspace`), one);
+      await admit(runtime, { ...message("646", destination, number), receivedAt: historicalNow + 1, reply });
+      worker.complete("Historical task is finished.");
+      await messenger.whenSent(2);
+
+      const originalReply = { messageId: input.messageId, authorId: null, text: "" };
+      for (const [index, [text, reference]] of ([[number, reply], [number, originalReply], ["0", originalReply]] as const).entries()) {
+        const answer = { ...message(String(647 + index), destination, text), receivedAt: historicalNow + 2, reply: reference };
+        await admit(runtime, answer);
+        expect(store.input(answer.id)?.state).toBe("cancelled");
+        expect(store.input(`handoff:${answer.id}:${current.id}`)).toBeNull();
+      }
+      expect(worker.prompts).toHaveLength(1);
+    } finally { clock.mockRestore(); }
+  });
+
+  test("an unreferenced number must follow confirmed delivery and identify exactly one open historical question", async () => {
+    const { runtime, config, store, destination, current, worker, messenger } = historyFixture();
+    const one = historicalLane(store, config, { id: "one", route: route("51"), detail: "callback-state" });
+    historicalLane(store, config, { id: "two", route: route("52"), detail: "device-cookie" });
+    const first = { ...message("650", destination, historicalRequest), receivedAt: historicalNow };
+    const second = { ...message("652", destination, historicalRequest), receivedAt: historicalNow + 2_000 };
+    const delivered = historicalNow + 1_000;
+    const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
+    try {
+      await runtime.start();
+      messenger.beforeSend = async output => {
+        if (output.id === `${first.id}:workspace`) clock.mockReturnValue(delivered);
+      };
+      await admit(runtime, first);
+      const { number, reply } = historicalAnswer(store.output(`${first.id}:workspace`), one);
+      await admit(runtime, { ...message("651", destination, number), receivedAt: delivered - 1 });
+      expect(store.input("651")?.state).toBe("cancelled");
+      expect(worker.prompts).toEqual([]);
+
+      clock.mockReturnValue(second.receivedAt);
+      await admit(runtime, second);
+      await admit(runtime, { ...message("653", destination, number), receivedAt: second.receivedAt + 1 });
+      expect(store.input("653")?.state).toBe("cancelled");
+      expect(worker.prompts).toEqual([]);
+
+      await admit(runtime, { ...message("654", destination, number), receivedAt: second.receivedAt + 2, reply });
+      expect(store.input(`handoff:${first.id}:${current.id}`)?.state).toBe("submitted");
+      const noneReferenced = historicalAnswer(store.output(`${second.id}:workspace`), one).number;
+      await admit(runtime, { ...message("655", destination, noneReferenced), receivedAt: second.receivedAt + 3 });
+      expect(store.input(`handoff:${second.id}:${current.id}`)?.state).toBe("submitted");
+      expect(worker.prompts).toHaveLength(2);
+    } finally { clock.mockRestore(); }
+  });
+
+  test("first-seen Discord edits cannot answer a historical choice with a cwd header, bare path or repo name", async () => {
+    const { runtime, config, store, directory, destination, worker } = historyFixture();
+    const cwd = join(directory, "edited-history-candidate");
+    mkdirSync(cwd);
+    historicalLane(store, { ...config, headCwd: cwd }, { id: "one", route: route("51"), detail: "callback-state" });
+    historicalLane(store, config, { id: "two", route: route("52"), detail: "device-cookie" });
+    const original = { ...message("656", destination, historicalRequest), receivedAt: historicalNow };
+    const reply = { messageId: original.messageId, authorId: null, text: "" };
+    const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
+    try {
+      await runtime.start();
+      await admit(runtime, original);
+      expect(store.output(`${original.id}:workspace`)?.state).toBe("sent");
+
+      for (const [index, text] of [`cwd: ${cwd}`, cwd, basename(cwd)].entries()) {
+        const edit = message(String(657 + index), destination, text);
+        await admit(runtime, { ...edit, id: `discord:${destination.accountId}:${edit.messageId}:edit:${historicalNow + index}`,
+          receivedAt: historicalNow + index, ...(index === 0 ? {} : { reply }) });
+        expect(store.input(original.id)?.state).toBe("pending");
+        expect(worker.prompts).toEqual([]);
+      }
+    } finally { clock.mockRestore(); }
+  });
+
+  test("an unconfirmed historical clarification never starts the five-minute fallback", async () => {
+    const { runtime, config, store, destination, worker, main, messenger, launched } = historyFixture();
+    config.idleMs = 60 * 60_000;
+    historicalLane(store, config, { id: "one", route: route("51"), detail: "callback-state" });
+    historicalLane(store, config, { id: "two", route: route("52"), detail: "device-cookie" });
+    const input = { ...message("639", destination, historicalRequest), receivedAt: historicalNow };
+    const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
+    try {
+      await runtime.start();
+      messenger.sendError = new DeliveryError("Discord receipt unavailable", "uncertain");
+      await admit(runtime, input);
+
+      clock.mockReturnValue(historicalNow + 10 * 60_000);
+      await runtime.kick();
+
+      expect(store.output(`${input.id}:workspace`)).toMatchObject({ state: "uncertain", route: destination });
+      expect(store.input(input.id)?.state).toBe("pending");
+      expect(messenger.attempted.map(output => output.id)).toEqual([`${input.id}:workspace`]);
+      expect(messenger.threadSources).toEqual([]);
+      expect(worker.prompts).toEqual([]);
+      expect(main.prompts).toEqual([]);
+      expect(launched).toEqual([]);
+    } finally { clock.mockRestore(); }
+  });
+
+  test.each(["an unbound Discord parent", "a bound Slack thread"] as const)("%s still asks when historical lookup is unavailable", async scope => {
+    const { runtime, config, store, worker, main, messenger, launched, errors, searches } = historyFixture("unavailable");
+    const slack = scope === "a bound Slack thread";
+    const destination: Route = slack
+      ? { platform: "slack", authorityId: "UOWNER", accountId: "TTEAM:UBOT", guildId: "TTEAM", channelId: "CCHANNEL",
+        threadId: "1750000000.000001" }
+      : route(null, { channelId: "5" });
+    if (slack) {
+      config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+      savedLane(store, config, "slack-current", destination);
+    }
+    const input = { ...message("640", destination, historicalRequest),
+      messageId: slack ? "1750000000.000002" : "640", receivedAt: historicalNow };
+    await runtime.start();
+
+    await admit(runtime, input);
+
+    const question = store.output(`${input.id}:workspace`);
+    expect(question).toMatchObject({ state: "sent", route: destination, sourceId: input.id });
+    expect(store.input(input.id)?.state).toBe("pending");
+    expect(store.getMeta(`topic-history-unavailable:${input.id}`)).toBe("true");
+    expect(worker.prompts).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(messenger.threadSources).toEqual([]);
+    expect(launched).toEqual([]);
+    expect(searches).toEqual([input.text]);
+    expect(`${question?.text}\n${errors.map(String).join("\n")}`).not.toContain("private-provider-diagnostic");
+  });
 });
 
 test("ambiguous repository names wait for the owner's choice; a quote or another channel cannot supply it", async () => {

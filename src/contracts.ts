@@ -288,6 +288,10 @@ export interface StorePort {
   topicDelivery(id: string): { readonly source: InputRecord; readonly route: Route; readonly outputSourceId: string } | null;
   /** Whether an unowned dialog could belong to a durable topic admission on this native generation. */
   hasTopicAdmission(target: string, generation: number): boolean;
+  /** A timely owner choice or stop on the original route is durably admitted by Gateway and still awaiting its head receipt. */
+  hasPendingTopicChoice(input: InputRecord, deadline: number): boolean;
+  /** At expiry, save the automatic pin (empty means current context) only if the same pending question still has no owner choice or Gateway fence. */
+  tryAutoTopicChoice(input: InputRecord, deadline: number, pin: string): boolean;
   inputs(target?: string, state?: ActiveInputState): InputRecord[];
   hasInput(target: string, state: ActiveInputState): boolean;
   /** An uncertain HEAD input with a nonempty original native-owner record. */

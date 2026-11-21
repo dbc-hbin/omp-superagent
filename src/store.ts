@@ -34,6 +34,7 @@ import { isLaneModel, laneModelArgument, sameLaneModel } from "./lane-models";
 import { readLaneRows, toLane } from "./lane-rows";
 import { workflowChoice } from "./workflow";
 import { laneWaitKey, type LaneReport } from "./lane-report";
+import { existingWorkspace, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
 import type { CronUpdate } from "./cron-jobs";
 
 const ACTIVE_INPUTS = "state IN ('pending','submitted','uncertain')";
@@ -311,6 +312,74 @@ export class Store implements StorePort {
     ).iterate(target, generation);
     for (const row of rows) if (this.topicOwner(toInput(row))) return true;
     return false;
+  }
+
+  hasPendingTopicChoice(input: InputRecord, deadline: number): boolean {
+    const { platform, accountId, authorityId, guildId, channelId, threadId } = input.route;
+    if (platform !== "discord" || guildId === null || threadId === null) return false;
+    // Gateway creates the shared ingress ledger; standalone Store use has none.
+    if (!this.db.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_events'").get()) return false;
+    const questionId = `${input.id}:workspace`;
+    const choices: readonly { readonly cwd: string }[] = JSON.parse(this.getMeta(`topic-history:${input.id}`) ?? "[]");
+    // The Gateway pending index skips delivered history, including terminal rejections.
+    // Unresolved rows stay pending. The durable insert, not its wall-clock timestamp,
+    // fences a timely-authored choice even when transport-delayed.
+    const rows = this.db.query<{
+      readonly id: string; readonly text: string; readonly messageId: string | null;
+      readonly replyId: string | null; readonly authoredAt: number;
+    }, [number, number, string, string, string, string, string, string, string]>(`
+      SELECT json_extract(data, '$.input.id') AS id,
+             json_extract(data, '$.input.text') AS text,
+             json_extract(data, '$.input.messageId') AS messageId,
+             json_extract(data, '$.input.reply.messageId') AS replyId,
+             json_extract(data, '$.input.receivedAt') AS authoredAt
+      FROM gateway_events INDEXED BY gateway_events_pending WHERE delivered_at IS NULL
+        AND json_extract(data, '$.kind') = 'message'
+        AND json_type(data, '$.input.pickerSelection') IS NULL
+        AND (json_type(data, '$.input.messageId') = 'text'
+          OR json_type(data, '$.input.interactionId') = 'text')
+        AND json_type(data, '$.input.receivedAt') = 'integer'
+        AND json_extract(data, '$.input.receivedAt') BETWEEN ? AND ?
+        AND json_extract(data, '$.input.id') <> ?
+        AND json_extract(data, '$.input.route.platform') = ?
+        AND json_extract(data, '$.input.route.accountId') = ?
+        AND json_extract(data, '$.input.route.authorityId') = ?
+        AND json_extract(data, '$.input.route.guildId') = ?
+        AND json_extract(data, '$.input.route.channelId') = ?
+        AND json_extract(data, '$.input.route.threadId') = ?
+    `).iterate(input.receivedAt, deadline, input.id, platform, accountId, authorityId, guildId, channelId, threadId);
+    for (const row of rows) {
+      if (row.messageId !== null && row.id.startsWith(`discord:${accountId}:${row.messageId}:edit:`)) continue;
+      const questionReply = row.replyId !== null && this.sentOutputForMessage(input.route, row.replyId)?.id === questionId;
+      const scopedReply = questionReply || row.replyId !== null && row.replyId === input.messageId;
+      if (!questionReply && row.authoredAt < deadline - TOPIC_CHOICE_WAIT_MS) continue;
+      const text = row.text.trim();
+      if (text === "/stop") return true;
+      if (row.messageId === null || row.replyId !== null && !scopedReply || /^\/new(?:\s|$)/.test(text)) continue;
+      if (/^[1-9]\d*$/.test(text)) return true;
+      const request = topicRequest(text);
+      if (request.cwd === null ? !scopedReply : request.text.trim()) continue;
+      const cwd = existingWorkspace(request.cwd ?? text);
+      if (choices.some(ref => cwd !== null ? ref.cwd === cwd
+        : request.cwd === null && basename(ref.cwd).toLowerCase() === text.toLowerCase())) return true;
+    }
+    return false;
+  }
+
+  tryAutoTopicChoice(input: InputRecord, deadline: number, pin: string): boolean {
+    return this.db.transaction(() => {
+      const current = this.input(input.id);
+      const automatic = `topic-choice-auto:${input.id}`;
+      // Gateway admission also acquires a write lock on this database. No timely
+      // answer can commit between our last ledger read and saving the fallback.
+      if (!Number.isSafeInteger(deadline) || Date.now() < deadline
+        || current?.state !== "pending" || current.target !== null || routeKey(current.route) !== routeKey(input.route)
+        || this.getMeta(`topic-choice-deadline:${input.id}`) !== String(deadline)
+        || this.getMeta(`topic-previous:${input.id}`) !== null || this.getMeta(automatic) !== null
+        || this.hasPendingTopicChoice(current, deadline)) return false;
+      this.setMeta(automatic, pin);
+      return true;
+    }).immediate();
   }
 
   inputs(target?: string, state?: ActiveInputState): InputRecord[] {
@@ -832,6 +901,12 @@ export class Store implements StorePort {
       }
       this.db.query("UPDATE outputs SET state = ?, remote_id = ?, error = ? WHERE id = ?")
         .run(state, state === "pending" ? null : remoteId ?? output.remoteId, error ?? null, id);
+      // Start the owner's response window with the durable question receipt,
+      // never with input admission or an unconfirmed send attempt.
+      if (state === "sent" && id === `${output.sourceId}:workspace`
+        && this.getMeta(`topic-history:${output.sourceId}`) !== null && !this.getMeta(`topic-creator:${output.sourceId}`)) {
+        this.setMeta(`topic-choice-deadline:${output.sourceId}`, String(Date.now() + TOPIC_CHOICE_WAIT_MS));
+      }
     }).immediate();
   }
 

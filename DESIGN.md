@@ -4,7 +4,10 @@ Superagent connects one OMP head to Discord, Telegram, and Slack. The head can
 work directly or delegate to independent native OMP sessions called **lanes**.
 The Gateway keeps the messenger connection and durable intake alive without
 running a model. All configured messenger owners are the **same trusted operator**.
-Ordinary owner work stays in the native session bound to its topic. Separately,
+Ordinary owner work stays in the native session bound to its topic. In a
+[bound Discord work thread](docs/design/messaging.md#topic-routing-and-controls),
+historical continuation and its replies stay there unless the operator explicitly
+asks to split. Separately,
 [restricted group rooms](docs/design/messaging.md#restricted-group-rooms) opt
 specific members into explicit group actions without access to the owner head
 or lanes. This is not a multitenant service or an OS sandbox.

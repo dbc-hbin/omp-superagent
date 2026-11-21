@@ -166,10 +166,29 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   journal. Recheck the prior identity, work state, entry and pinned evidence
   digest before native submission, without searching mutable memory again;
   historical text cannot start workflows or approve effects.
-  A new request with a different explicit workspace,
-  or `/new` with a request in a thread, starts a separate topic instead of
-  changing a lane's cwd. A closed lane or an uncertain receipt is not reopened
-  by ordinary input.
+  Outside a bound Discord work thread, a new request with a different explicit
+  workspace can start a separate topic. `/new` with a request in a thread starts
+  a separate topic instead of changing a lane's cwd. A closed lane or an
+  uncertain receipt is not reopened by ordinary input.
+- In an already-bound physical Discord work thread, work and replies stay in the
+  current thread. A historical match contributes only verified, pinned evidence
+  to the current lane, not a handoff to a different session or workspace. Ask
+  about ambiguous matches in that same thread and honor a timely choice. For
+  this history-choice question only, after five minutes from confirmed delivery
+  the controller continues in that thread: prefer a verified eligible candidate
+  from the current session, then a verified candidate in the same cwd by recency.
+  If none remains eligible, continue with the current lane context. This timeout
+  does not approve effects or authorize cross-workspace execution.
+- A different `cwd:` in a bound Discord work thread does not change its lane or
+  open a sibling automatically. To separate work, send `/new <request>` or a
+  direct, one-line split request, e.g. `이건 따로 빼줘: 로그인 점검`,
+  `로그인 점검은 새 스레드에서 해줘`, `Split this into a new thread: Check login`,
+  or `Do the login check in a new thread`. If the operator sends only
+  `이건 따로 빼줘` or `Split this into a new thread`, the controller asks them to
+  name the task with `/new` instead of creating a topic. Natural split
+  directives apply only to original owner messages in physical Discord work
+  threads, not edits, quoted text or attachments. DM and other adapters retain
+  their existing topic behavior.
 - `/head <request>` explicitly addresses the shared coordination model (Slack:
   `!head` or `/superagent-head`). Its manager handoffs keep the original review
   path. Ordinary topic commentary and final answers instead pass through the

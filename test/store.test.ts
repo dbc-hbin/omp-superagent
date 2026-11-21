@@ -1,13 +1,15 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Client, Collection, type ClientUser, type Message } from "discord.js";
 import { physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
+import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { Store } from "../src/store.ts";
+import { TOPIC_CHOICE_WAIT_MS } from "../src/topic-request";
 import type { LaneReport } from "../src/lane-report";
 import type { HeadRecoveryAttempt } from "../src/contracts";
 import { acknowledgeDecision, decisionId, decisionViews } from "../src/decisions";
@@ -633,6 +635,99 @@ describe("durable coordination store", () => {
     expect(reopened.input("boundary")?.route.topicId).toBe("first");
     expect(reopened.getMeta("dm:active")).toBe("first");
   });
+
+  function confirmedChoice(store: Store, directory: string) {
+    const original = inbound("history-choice");
+    const confirmedAt = original.receivedAt + 100;
+    const questionId = `${original.id}:workspace`;
+    store.receive(original, null, {
+      [`user-source:${original.id}`]: "true",
+      [`topic-history:${original.id}`]: JSON.stringify([{ cwd: realpathSync(directory) }, { cwd: "/other-workspace" }]),
+    });
+    store.queueOutput({ id: questionId, sourceId: original.id, route: original.route, text: "Which prior task?" });
+    store.claimOutput(questionId);
+    const clock = spyOn(Date, "now").mockReturnValue(confirmedAt);
+    try { store.finishOutput(questionId, "sent", "question"); }
+    finally { clock.mockRestore(); }
+    const input = store.input(original.id);
+    if (!input) throw new Error("Original choice source not admitted");
+    return { input, confirmedAt, deadline: confirmedAt + TOPIC_CHOICE_WAIT_MS };
+  }
+
+  const gatewayChoiceCases: readonly {
+    readonly name: string;
+    readonly holds: boolean;
+    readonly event: (fixture: ReturnType<typeof confirmedChoice>, cwd: string) => Partial<Inbound>;
+  }[] = [
+    { name: "a naked number authored at expiry", holds: true, event: f => ({ text: "2", receivedAt: f.deadline }) },
+    { name: "a cwd header without a reply", holds: true, event: (_, cwd) => ({ text: `cwd: ${cwd}` }) },
+    { name: "a bare repository in a reply to the original", holds: true,
+      event: (f, cwd) => ({ text: basename(cwd), reply: { messageId: f.input.messageId ?? "", authorId: null, text: null } }) },
+    { name: "a bare path in a reply to the confirmed question", holds: true,
+      event: (_, cwd) => ({ text: cwd, reply: { messageId: "question", authorId: null, text: null } }) },
+    { name: "a direct reply posted before the head recorded the question receipt", holds: true,
+      event: f => ({ receivedAt: f.confirmedAt - 1, reply: { messageId: "question", authorId: null, text: null } }) },
+    { name: "an exact slash-command stop", holds: true, event: () => ({ text: "/stop", messageId: null, interactionId: "901" }) },
+    { name: "an unreferenced repo name", holds: false, event: (_, cwd) => ({ text: basename(cwd) }) },
+    { name: "an older bare number", holds: false, event: f => ({ receivedAt: f.confirmedAt - 1 }) },
+    { name: "an answer authored after expiry", holds: false, event: f => ({ receivedAt: f.deadline + 1 }) },
+    { name: "a reply to somebody else's question", holds: false,
+      event: () => ({ reply: { messageId: "unrelated-question", authorId: null, text: null } }) },
+    { name: "an edited Discord answer", holds: false, event: () => ({ id: "discord:account:902:edit:201:sha" }) },
+    { name: "a new work directive", holds: false, event: (_, cwd) => ({ text: `/new cwd: ${cwd}\nStart another task` }) },
+    ...(["accountId", "authorityId", "guildId", "channelId", "threadId"] as const).map(field => ({
+      name: `another ${field}`, holds: false, event: () => ({ route: route({ [field]: "unrelated" }) }),
+    })),
+  ];
+
+  for (const { name, holds, event } of gatewayChoiceCases) {
+    test(`automatic history choice ${holds ? "waits for" : "ignores"} ${name} in the Gateway ledger`, () => {
+      const { store, directory } = fixture();
+      const choice = confirmedChoice(store, directory);
+      const { input, deadline } = choice;
+      const pinKey = `topic-choice-auto:${input.id}`;
+      expect(store.hasPendingTopicChoice(input, deadline)).toBe(false); // No Gateway table in standalone Store.
+      const gateway = new GatewayStore(directory);
+      const clock = spyOn(Date, "now").mockReturnValue(deadline + 10);
+      try {
+        gateway.admit({ kind: "message", input: {
+          ...inbound("discord:account:902:original"), messageId: "902", text: "1", receivedAt: choice.confirmedAt,
+          ...event(choice, directory),
+        } });
+        expect(store.hasPendingTopicChoice(input, deadline)).toBe(holds);
+        // An admission after the preliminary check cannot slip through the atomic recheck.
+        expect(store.tryAutoTopicChoice(input, deadline, "")).toBe(!holds);
+        expect(store.getMeta(pinKey)).toBe(holds ? null : "");
+        if (holds) {
+          const queued = gateway.next();
+          if (!queued) throw new Error("Expected the persisted Gateway message");
+          gateway.receipt(queued.sequence, "unresolved");
+          expect(store.hasPendingTopicChoice(input, deadline)).toBe(true);
+          gateway.receipt(queued.sequence, "rejected");
+          expect(store.hasPendingTopicChoice(input, deadline)).toBe(false);
+          expect(store.tryAutoTopicChoice(input, deadline, "")).toBe(true);
+        }
+      } finally {
+        clock.mockRestore();
+        gateway.close();
+      }
+    });
+  }
+
+  test.each(["not expired", "stale deadline", "manual choice", "already automatic", "cancelled"] as const)(
+    "the local-only Store refuses an automatic history pin when %s", scenario => {
+      const { store, directory } = fixture();
+      const { input, deadline } = confirmedChoice(store, directory);
+      const pinKey = `topic-choice-auto:${input.id}`;
+      const clock = spyOn(Date, "now").mockReturnValue(scenario === "not expired" ? deadline - 1 : deadline);
+      try {
+        if (scenario === "manual choice") store.setMeta(`topic-previous:${input.id}`, "owner-pin");
+        if (scenario === "already automatic") expect(store.tryAutoTopicChoice(input, deadline, "")).toBe(true);
+        if (scenario === "cancelled") store.settle(input.id, "cancelled");
+        expect(store.tryAutoTopicChoice(input, scenario === "stale deadline" ? deadline - 1 : deadline, "new-pin")).toBe(false);
+        expect(store.getMeta(pinKey)).toBe(scenario === "already automatic" ? "" : null);
+      } finally { clock.mockRestore(); }
+    });
 
   test("concurrent admission persists one immutable request and preserves ordering", async () => {
     const { store, path } = fixture();
