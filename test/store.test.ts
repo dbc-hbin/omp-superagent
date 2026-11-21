@@ -1312,15 +1312,14 @@ describe("durable coordination store", () => {
     expect(store.claimOutput("answer")).toBe(true);
   });
 
-  test("a second writer including a symlink alias is rejected until close", () => {
+  test.each(["original path", "symlink alias"] as const)("a second writer using the %s is rejected until close", kind => {
     const { store, path, directory } = fixture();
-    expect(() => open(path)).toThrow();
-    const alias = join(directory, "alias.sqlite");
-    symlinkSync(path, alias);
-    expect(() => open(alias)).toThrow();
+    const secondPath = kind === "symlink alias" ? join(directory, "alias.sqlite") : path;
+    if (kind === "symlink alias") symlinkSync(path, secondPath);
+    expect(() => open(secondPath)).toThrow();
     store.close();
     store.close();
-    const next = open(alias);
+    const next = open(secondPath);
     expect(next.receive(inbound("after-close"), null)).toBe(true);
   });
 
