@@ -210,7 +210,7 @@ describe("dedicated key SSH material", () => {
     const block = sshConfigBlock("builder", { ...host, hostname: "100.64.0.9", port: 2222 }, "/home/op/.ssh/omp-sa-builder_ed25519");
     expect(block).toBe([
       "# omp-superagent worker builder (managed by omp-sa worker add)", "Host omp-sa-builder", "  HostName 100.64.0.9", "  User alice",
-      "  Port 2222", "  IdentityFile /home/op/.ssh/omp-sa-builder_ed25519", "  IdentitiesOnly yes", "",
+      "  Port 2222", "  IdentityFile /home/op/.ssh/omp-sa-builder_ed25519", "  IdentitiesOnly yes", "  StrictHostKeyChecking yes", "  BatchMode yes", "",
     ].join("\n"));
     expect(knownHostsName("100.64.0.9", 2222)).toBe("[100.64.0.9]:2222");
     expect(knownHostsName("worker.example", 22)).toBe("worker.example");

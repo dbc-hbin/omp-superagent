@@ -474,7 +474,8 @@ export function sshConfigBlock(name: string, host: ResolvedHost, identityFile: s
   return [
     managedComment(name), `Host omp-sa-${name}`, `  HostName ${host.hostname}`, `  User ${host.user}`, `  Port ${host.port}`,
     ...host.proxyJump ? [`  ProxyJump ${host.proxyJump}`] : [],
-    `  IdentityFile ${identityFile}`, "  IdentitiesOnly yes", "",
+    // The worker client passes these too; the alias states them so manual use is just as strict.
+    `  IdentityFile ${identityFile}`, "  IdentitiesOnly yes", "  StrictHostKeyChecking yes", "  BatchMode yes", "",
   ].join("\n");
 }
 
@@ -503,6 +504,8 @@ export function blockMismatches(block: HostBlock, host: ResolvedHost, identityFi
     ["HostName", block.settings.get("hostname"), host.hostname], ["User", block.settings.get("user"), host.user],
     ["Port", block.settings.get("port") ?? "22", String(host.port)], ["IdentityFile", identity, identityFile],
     ["IdentitiesOnly", block.settings.get("identitiesonly")?.toLowerCase(), "yes"],
+    ["StrictHostKeyChecking", block.settings.get("stricthostkeychecking")?.toLowerCase(), "yes"],
+    ["BatchMode", block.settings.get("batchmode")?.toLowerCase(), "yes"],
     ["ProxyJump", block.settings.get("proxyjump") ?? "", host.proxyJump ?? ""],
   ];
   return want.filter(([, actual, expected]) => actual !== expected).map(([key, actual, expected]) => `${key} is ${actual ?? "unset"}, expected ${expected}`);
