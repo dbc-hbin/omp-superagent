@@ -6,7 +6,6 @@ import type { WorkerPlacement } from "../src/contracts";
 import { activeManagedUlwRevision } from "../src/managed-ulw";
 import { MINIMUM_WORKER_OMP, prepareWorkerLaunch, requireCompatibleWorker, requireWorkerModel } from "../src/remote-lanes";
 import { workerPackage, type WorkerCapability } from "../src/remote-worker-wire";
-import { requireUserManager } from "../src/remote-worker-provision";
 import { Store } from "../src/store";
 
 const placement: WorkerPlacement = { worker: "builder", destination: "build-alias", workerId: "dbaf439b-f2f3-47b4-abf0-73beee9d7833" };
@@ -38,9 +37,9 @@ test("a worker must run HEAD's exact package, a supported OMP and a synchronized
   expect(() => requireCompatibleWorker(capability({ clock: Date.now() - 5 * 60_000 }))).toThrow("clock differs");
 });
 
-test.skipIf(process.platform === "linux")("the worker endpoint refuses non-Linux platforms before any launch", () => {
-  expect(process.env.OMP_SUPERAGENT_TEST_WORKER_CONTEXT).toBeUndefined();
-  expect(() => requireUserManager()).toThrow(`${process.platform} workers are not supported`);
+test("a worker must be a Linux or macOS machine", () => {
+  for (const platform of ["linux", "darwin"]) expect(() => requireCompatibleWorker(capability({ platform }))).not.toThrow();
+  expect(() => requireCompatibleWorker(capability({ platform: "win32" }))).toThrow("Worker platform win32 is not supported");
 });
 
 test("lane models are checked against the worker's own catalog, not HEAD's", () => {

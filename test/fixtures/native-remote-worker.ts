@@ -11,6 +11,8 @@ import { decodeHeader, encodeHeader, parse, replySchema, REQUEST_TIMEOUT, reques
 import { nativeTestArgv, nativeTestCommand } from "./native-command";
 import { nativeDisabledProviders } from "./native-extension";
 import { offlineMnemopi } from "./native-memory";
+import { installWorkerLauncher, launcherPath, supportDirectory } from "../../src/worker-macos";
+import { assertLaunchdOwner, awaitNoWorkerJobs } from "./worker-launchd";
 import { recoveryGate, remoteWorkerModel, waitForProofFile, workspaceProbe } from "./native-remote-worker-provider";
 
 const repo = resolve(import.meta.dir, "../..");
@@ -129,7 +131,8 @@ export async function loopbackWorkerExec(fixture: ExecFixture): Promise<void> {
   }
 }
 
-export async function nativeRemoteWorkerFixture(root: string) {
+/** `launchd`: the worker's Host runs in the real gui-domain LaunchAgent (macOS), not directly from the endpoint. */
+export async function nativeRemoteWorkerFixture(root: string, launchd = false) {
   const bun = await realpath(process.execPath);
   const localPath = [dirname(bun), "/usr/bin", "/bin"].join(delimiter);
   const headHome = join(root, "head-home");
@@ -158,11 +161,13 @@ export async function nativeRemoteWorkerFixture(root: string) {
     OMP_TEST_NATIVES_DIR: headEnv.PI_NATIVES_DIR });
   assert.equal(command.length, 1, "Worker provisioning requires one installed stock OMP executable, without CLI overrides");
   await stageWorker(installation);
+  const support = supportDirectory(workerHome);
+  if (launchd) installWorkerLauncher(support);
   const workerCustody = join(installation, custody);
   const worker: typeof import("./host-fixture-processes") = await import(workerCustody);
   const loopback: ExecFixture = { transport: "loopback", destination, virtualCwd, workerAlias, startAttempts, lostStartReceipt,
     argv: [bun, "--no-env-file", join(installation, "bin/omp-sa-worker")],
-    env: { ...workerEnv, SA_PROOF_CUSTODY: workerCustody, SA_PROOF_ROOT: stateDir, OMP_SUPERAGENT_TEST_WORKER_CONTEXT: "direct" },
+    env: { ...workerEnv, SA_PROOF_CUSTODY: workerCustody, SA_PROOF_ROOT: stateDir, OMP_SUPERAGENT_TEST_WORKER_CONTEXT: launchd ? "forward-env" : "direct" },
   };
   await Promise.all([
     writeFile(join(provisionDir, "worker.json"), JSON.stringify({ workerId, instance, stateDir, workspaceRoots: [cwd], command }),
@@ -180,7 +185,10 @@ await loopbackWorkerExec(${JSON.stringify(loopback)});
     startAttempts, lostStartReceipt,
     transportPath: [sshBin, localPath].join(delimiter),
     headEnv: { ...headEnv, SA_PROOF_ROOT: headState, SA_PROOF_CUSTODY: join(repo, custody), OMP_SUPERAGENT_ROLE: "head" },
-    assertWorkerOwner: (root, identity) => worker.assertResidentFixtureOwner(root, identity),
+    async assertWorkerOwner(root, identity) {
+      await worker.assertResidentFixtureOwner(root, identity);
+      if (launchd) assertLaunchdOwner(identity.ownerPid, launcherPath(support));
+    },
     waitForGate: () => waitForProofFile(gate.entered),
     releaseGate: () => writeFile(gate.release, "", { mode: 0o600, flag: "wx" }),
     readWorkerFile: path => readFile(path, "utf8"),
@@ -191,7 +199,7 @@ await loopbackWorkerExec(${JSON.stringify(loopback)});
         if (dir.isDirectory() && /^[a-f0-9]{24}$/.test(dir.name)) await worker.stopHostFixtures(join(stateDir, dir.name));
       }
     },
-    async cleanup(): Promise<void> {},
+    async cleanup(): Promise<void> { if (launchd) await awaitNoWorkerJobs(); },
   } satisfies RemoteWorkerProof;
 }
 

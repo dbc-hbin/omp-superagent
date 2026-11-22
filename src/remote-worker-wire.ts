@@ -72,6 +72,22 @@ export const capabilitySchema = Type.Object({
   superkit: Type.Union([revisionHash, Type.Null()]),
   roots: Type.Array(absolutePath, { minItems: 1, maxItems: 64 }),
   models: Type.Array(text(1024), { maxItems: 4096 }),
+  /** macOS only: the readiness of the fixed launcher, reported (not enforced) here so doctor can name each missing piece; starting a Host enforces it. */
+  macos: Type.Optional(Type.Object({
+    launcher: Type.Union([Type.Object({ path: absolutePath, cdhash: text(64) }, { additionalProperties: false }), Type.Null()]),
+    /** The launcher on disk is not the binary the recorded grants belong to. */
+    launcherChanged: Type.Boolean(),
+    /** Whether the launcher's payload pointer names this running release. */
+    pointer: Type.Union([Type.Literal("current"), Type.Literal("stale"), Type.Literal("absent")]),
+    /** Protected paths of the worker scope no recorded grant covers. */
+    missing: Type.Array(Type.Object({ path: absolutePath, category: text(64) }, { additionalProperties: false }), { maxItems: 65 }),
+    /** The one-time setup script of this release, run at the Mac. */
+    setup: absolutePath,
+    /** Present only when the worker account runs its own sshd (worker add --user-sshd): its launchd state and the addresses it listens on. */
+    userSshd: Type.Optional(Type.Object({
+      state: text(64), listening: Type.Array(text(128), { maxItems: 16 }),
+    }, { additionalProperties: false })),
+  }, { additionalProperties: false })),
 }, { additionalProperties: false });
 /** What a launched Host actually loaded, pinned in the worker reservation. */
 export const launchedSchema = Type.Object({

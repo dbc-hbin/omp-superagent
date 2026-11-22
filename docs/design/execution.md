@@ -55,9 +55,10 @@ it and `worker list` shows what was last measured. The logic lives in
   roots and existing install state as nonce-framed `key value` lines; the
   planner turns them into refusals, warnings and per-step decisions, so
   `--dry-run` and a real run share the same path and differ only in whether the
-  apply scripts run. Platform requirements live in one table (`PLATFORMS`), so a
-  second platform adds an entry and its Host launch path instead of branching
-  through the steps.
+  apply scripts run. Platform requirements, one-time worker-side preparation and
+  doctor rows live in one table (`PLATFORMS`: Linux and macOS), so another
+  platform adds an entry and its Host launch path instead of branching through
+  the steps.
 - Every apply script re-checks the worker's state itself, copies a file it
   replaces to `<file>.bak-<time>`, and writes through a rename, so a lost
   connection or a second run leaves nothing half-done. Nothing runs as root;
@@ -91,13 +92,13 @@ HEAD has only `HOME`, `PATH` and credentials).
 
 | # | Surface | Decision | Test | Pri | Status |
 |---|---|---|---|---|---|
-| 1 | Worker platform | Linux with a systemd user manager only. macOS (needs a `gui/<uid>` LaunchAgent for login-keychain access) and Windows are refused with a clear error; no automatic placement. | `requireUserManager`; real Linux worker E2E | P0 | done |
-| 2 | Process context | The SSH endpoint never parents a Host. Each generation's launcher is the main process of a transient `systemd-run --user` unit (`Type=oneshot`, `KillMode=process`; the unit's exit status is the launcher's). Linger is required. Host env = the account's login-shell environment (`$SHELL -l -i -c`, NUL-framed after a nonce, stdin `/dev/null`, 20 s bound, refuse on failure) minus transport/service-manager variables, plus lane role/ID. | real Linux worker: owner cgroup under `user@<uid>.service/app.slice/omp-sa-…service`; PATH resolves like a fresh login shell; `SSH_CONNECTION` absent; Host survives every SSH exit in the scenario | P0 | done |
+| 1 | Worker platform | Linux with a systemd user manager (linger) or macOS with a logged-in GUI session (`gui/<uid>` launchd domain, for login-keychain access); the capability reports `platform` and HEAD accepts `linux` and `darwin`. Windows is refused with a clear error; no automatic placement. A macOS account with no GUI session is refused with the instruction to log in at the desktop once and keep the session. | `requireUserContext` / `requireCompatibleWorker` units; real Linux worker E2E; real launchd loopback proofs on macOS | P0 | done |
+| 2 | Process context | The SSH endpoint never parents a Host. `runInUserContext` runs each generation's launcher in the account's own user context. Linux: the main process of a transient `systemd-run --user` unit (`Type=oneshot`, `KillMode=process`; the unit's exit status is the launcher's); linger required. macOS: a one-shot LaunchAgent (`RunAtLoad`, no `KeepAlive`, `AbandonProcessGroup`) bootstrapped into `gui/<uid>` whose program is always the one fixed, ad-hoc signed `omp-sa-worker-launcher`; the Host owner is `setsid`-detached and survives removal of the job. Host env = the account's login-shell environment (`$SHELL -l -i -c`, NUL-framed after a nonce, stdin `/dev/null`, 20 s bound, refuse on failure; measured in the same user context) minus transport/service-manager variables, plus lane role/ID. | real Linux worker: owner cgroup under `user@<uid>.service/app.slice/omp-sa-…service`; PATH resolves like a fresh login shell; `SSH_CONNECTION` absent; Host survives every SSH exit in the scenario. macOS (real launchd loopback proofs): owner's parent is launchd, its responsible process is the fixed launcher; detached child survives job removal; login environment has no `SSH_CONNECTION`/`SSH_CLIENT`/`SSH_TTY` | P0 | done |
 | 3 | Native home | Worker account's own OMP home, auth, settings, skills, AGENTS.md and memory, unchanged; memory is per machine. | real Linux worker smoke: account's own Anthropic auth answered through a worker Host | P0 | done |
 | 4 | Launch options | Same option object as a local lane (model/preset snapshot, `subagentConcurrency`, lane extension set); worker adds only its paths, login env and pinned superkit. | parity test (model/preset readback, tools) | P0 | done |
 | 5 | omp-superkit | A launcher that exits before claiming its reservation restores the record it replaced (no Host can exist). Per-worker `superkit`: `managed` (default) pins HEAD's active immutable revision; HEAD ships its validated package (digest-checked archive) over the worker channel; the worker probes and atomically activates it; `start` carries the revision and the Host loads exactly that package (`managedUlwRevision`), never the moving pointer. Mismatch/failed probe refuses. Worker installs use `--ignore-scripts` and never fetch from GitHub. `none` is an explicit non-parity mode: no superkit, workflow-selecting requests refused. | `remote-lanes.test.ts`, `remote-worker.test.ts` (match, mismatch, missing, idempotent provisioning, bad digest), runtime none-mode refusal, native loopback and real Linux worker provisioning | P0 | done |
 | 6 | Capability handshake | Protocol `omp-sa-worker-2`. Before every launch `capability` reports platform, package version and source digest, OMP version, superkit revision, boot ID, clock, approved roots and models (the worker itself refuses a non-Linux platform); HEAD refuses a package mismatch, OMP below the SDK-matched minimum and clock skew over 2 min. `start` and `attach` return the launch facts pinned in the worker reservation (package, OMP, superkit, boot ID), recorded on the lane (`workerLaunch`) and shown in `status`/`lane_inspect`. | `remote-lanes.test.ts`; native assertion on `workerLaunch` | P0 | done |
-| 7 | Worker code provisioning | `omp-sa worker add` installs HEAD's own release on the worker over the operator's ordinary SSH login: a deterministic archive of exactly the files `workerPackage()` digests plus `bun.lock`, `skills/`, `upstream/ulw.json` and the one native Host owner for the worker's architecture, `bun install --frozen-lockfile --ignore-scripts --production`, installed digest verified against HEAD's, atomic `releases/current` switch; old releases stay. The handshake still refuses any mismatch before a launch. | `worker-setup.test.ts` (archive, planning, idempotence decisions); `worker-onboarding.test.ts` (dry run, add, re-add, doctor over a loopback ssh); mismatch refusal | P1 | done |
+| 7 | Worker code provisioning | `omp-sa worker add` installs HEAD's own release on the worker over the operator's ordinary SSH login: a deterministic archive of exactly the files `workerPackage()` digests plus `bun.lock`, `skills/`, `upstream/ulw.json` and the one native Host owner for the worker's architecture, `bun install --frozen-lockfile --ignore-scripts --production`, installed digest verified against HEAD's, atomic `releases/current` switch; old releases stay. The handshake still refuses any mismatch before a launch. | `worker-setup.test.ts` (archive, planning, idempotence decisions, macOS preflight/PATH/doctor rows with fakes); `worker-onboarding.test.ts` (dry run, add, re-add, doctor over a loopback ssh); `worker-macos.test.ts` (prepare script on this Mac); mismatch refusal | P1 | done |
 | 8 | Model availability | Lane start/resume/model change check the worker's catalog (capability); a live worker lane is checked against its own Host's `get_available_models`; the worker's start preflight requires the exact lane model (HEAD's exact selection, also for presets) in `omp models --json` under the login env. Other preset roles can be aliases, patterns or fallback lists and are left to OMP's own resolution on the worker. A restore launch sends no model: the restored session keeps its own, which is then checked against the Host's catalog. | unit refusals; real Linux worker real-home model listing | P0 | done |
 | 9 | Attachments | Every attachment is stored once, SHA-256 verified, under the lane's private worker directory via the `input` op; the prompt names the worker path. Images are no longer sent only as RPC images. | runtime test; worker test | P0 | done |
 | 10 | Verifying lane evidence | Head tool `lane_evidence` reads bounded, read-only evidence from a lane's own workspace, identically for local lanes (here) and worker lanes (the worker's `evidence` op): a file inside the lane cwd after resolving symlinks (64 KiB per read, offset/limit), `git status`/`log`/`diff --stat` with no optional locks, hooks, pager, fsmonitor or external diff, and the lane Host's current log tail. The head reference forbids reading worker paths with local tools. | `lane-evidence.test.ts` (bounds, escapes, git, log), worker endpoint test, runtime routing test, native loopback and real Linux worker scenario | P0 | done |
@@ -108,12 +109,97 @@ HEAD has only `HOME`, `PATH` and credentials).
 | 15 | SSH hardening | Dedicated key with `from=<tailnet ranges>,restrict,command=…omp-sa-worker` (`worker add --dedicated-key` writes it and verifies enforcement; `doctor` re-checks and refuses a Tailscale-SSH-served alias with the fix); client options fixed in code. Only OpenSSH honors `authorized_keys` options: Tailscale SSH on a tailnet address's port 22 bypasses the forced command, so tailnet workers keep Tailscale SSH and add OpenSSH on the tailnet address at another port; the key line also carries `from=` tailnet ranges. | real-SSH proofs run over the tailnet through a dedicated forced-command key (`whoami` returns a worker frame; port forwarding refused; key refused from outside the tailnet) | P0 | done |
 | 16 | Parallel editing on a worker | Same routing policy as local; the owner (or a lane on the worker) prepares worker checkouts inside approved roots. | — | P1 | documented |
 | 17 | Stop, close, status | Native shutdown and exit verification over SSH; CLI refuses remote control; status shows placement, `workerLaunch`, reachability. | existing tests | P0 | done |
-| 18 | Clocks and PIDs | Skew bounded by #6. PIDs are pinned with the boot ID; after a reboot recorded PIDs are treated as dead, never as reused live owners. A Host lost in a reboot without an exit receipt needs operator reconciliation. | worker evaluate path | P0 (skew, boot ID) / P1 (reboot reconciliation) | done / documented |
+| 18 | Clocks and PIDs | Skew bounded by #6. PIDs are pinned with the boot ID (Linux `boot_id`, macOS `kern.bootsessionuuid`); after a reboot recorded PIDs are treated as dead, never as reused live owners. A Host lost in a reboot without an exit receipt needs operator reconciliation. | worker evaluate path | P0 (skew, boot ID) / P1 (reboot reconciliation) | done / documented |
 | 19 | Observations after reattach | Remote recovery does not restore the observation cursor; progress observations resume only after the current run. | — | P1 | documented |
 | 20 | Goal continuation across HEAD restart | Multi-run goal continuation spanning a restart/reconnect ends unconfirmed for remote lanes (no checkpointed `ownedRuns`). | — | P1 | documented |
 | 21 | Owner result uploads | The same owner directive and live tool-execution match as a local lane. For a worker lane HEAD never opens a same-named local path: the worker's `result` op stages the file with the local staging rules (literal non-hidden relative path, no links or hard links, 8 MiB, unchanged during read) against its own private paths (worker state, worker provisioning, OMP home, SSH directory, lane journal), streams the bytes with a SHA-256, and HEAD queues them only while that owner input is still the submitted run. | worker endpoint test (stage, hidden refusal, missing file) | P0 | done |
 | 22 | Dispatch authority | Remote dispatch requires the original authorized user source (stricter than local, deliberate). | runtime test | — | deliberate difference |
 | 23 | No difference | Cron delegation refusal, PR watch (HEAD only), native session publication on the worker, workflow advertisement via the lane Host, idle eviction, worker logs (`r<gen>.log`, `launcher.log`). | existing tests | — | same |
+
+#### macOS workers
+
+A macOS Host must run in the account's GUI login context, not under `sshd`, to
+reach the login keychain and to behave like stock OMP started from the desktop.
+`runInUserContext` (`src/worker-user-context.ts`) writes a private (0600) plist
+into the worker `stateDir`, `launchctl bootstrap`s it into `gui/<uid>`, polls
+`launchctl print` (or the launcher's status file) within a bound, reads the
+exit status and captured output, then `bootout`s the job and removes the plist.
+Without a `gui/<uid>` domain (nobody is logged in at the console) the worker is
+refused.
+
+**Fixed launcher.** macOS attributes privacy (TCC) access to a launchd job's
+*responsible process*, and a keychain "Always Allow" binds to the accessing
+binary's code identity. Both are owner-approved once, so every Host job runs
+the same `omp-sa-worker-launcher` (`worker-launcher/omp-sa-worker-launcher.c`,
+built with `cc`, ad-hoc signed once as `com.omp-superagent.worker-launcher`,
+installed at `~/Library/Application Support/omp-superagent-worker/bin/` and
+never replaced: a rebuild changes the cdhash). An upgrade changes only the
+private `payload` pointer next to it (bun plus the versioned release script,
+one entry per line, rewritten by the endpoint when it differs). The launcher
+refuses unless the support directory is 0700 and the pointer is a regular
+0600 file owned by the user. It runs the payload as a *child*, not by `exec`
+(after an exec the process would carry bun's identity), and it stays alive
+while any process still has it as responsible process (the detached Host owner
+and its tools; measured with `responsibility_get_pid_responsible_for_pid`), then
+removes its own job. Measured on macOS 27: a detached grandchild's responsible
+process is the launcher while the launcher lives and becomes the grandchild
+itself once the launcher exits, so exiting early would hand attribution back to
+bun/omp, whose paths and signatures change on upgrade.
+
+**Prompt inventory** (what a worker Host can trigger):
+
+| Prompt | Triggered by | Applies to a worker whose roots are outside protected folders? |
+|---|---|---|
+| Files and Folders (Desktop, Documents, Downloads, iCloud Drive, removable and network volumes) | first listing of such a folder by the responsible process | No. Roots and `stateDir` are classified by canonical path (`tccCategory`); a protected one needs a recorded grant or the lane is refused. |
+| Full Disk Access | protected data outside the folders above (Mail, Messages, Safari, TCC database) | No. Silent denial, no prompt; optional toggle. |
+| Automation (AppleEvents) | a tool controlling another app with `osascript` (stock OMP uses it only for TUI clipboard paste) | No. Raised once for the launcher if a tool does it. |
+| Local Network | a tool reaching LAN hosts | No. Provider traffic is internet or tailnet; once for the launcher if used. |
+| Login keychain | stock OMP keeps provider auth in `~/.omp/agent/agent.db`, not the keychain; keychain items are read only by child tools (`gh`, `git credential-osxkeychain`, `ssh-add`), whose ACLs bind to those tools' own stable Apple/vendor identities | No prompt while the keychain is unlocked (GUI login with the account password). Automatic login does not unlock it. |
+| Remote Login | enabling sshd | One-time owner toggle, not a Host prompt. |
+
+**No dialogs at launch.** `requireMacosWorkerReady` reads only the support
+files and the launcher's signature; it never lists a protected folder. It
+refuses a start naming the missing grant (the path and category) or a launcher
+whose cdhash differs from the one recorded. Grants live in a private
+`grants.json` written by the one-time setup (`setupMacosWorker`,
+`bun run setup:macos-worker`, run at the Mac or over SSH while the owner is at
+the screen). Setup installs the launcher if absent, then runs the launcher's own
+`--probe` on each protected root through a launchd job in the gui domain: the
+prompt (if any) is raised once, for the launcher, on the Mac's screen, and only
+a successful probe is recorded. Later lanes, reboots and omp-superagent, OMP and
+Bun upgrades neither prompt nor change that identity. Full Disk Access, the one
+grant with no prompt, is probed silently and recorded when enabled.
+
+**One-command macOS onboarding.** The `darwin` entry of `PLATFORMS` makes
+`worker add` the setup path for a Mac. Its preflight (over the ordinary setup
+connection) checks `uname -s`, the `gui/<uid>` domain
+(`launchctl print gui/$(id -u)`; refused with "log in at the desktop and stay
+logged in"), the Command Line Tools by directory (`xcode-select -p` plus
+`<dir>/usr/bin/cc`: running `cc` could raise the install dialog, so absence is
+refused with `xcode-select --install`) and the login shell: a non-interactive
+SSH zsh (the macOS default) reads `~/.zshenv`, so the guarded PATH block goes
+there, not into `~/.bashrc` (`PATH_FILES`). After the release is installed the
+install step runs the release's own `worker-macos-setup.ts --prepare` over
+plain `sh` (`prepareMacosWorker`): the launcher is built and signed only if
+absent, the payload pointer is set to this release, grants already recorded for
+the same launcher are kept (a different launcher starts with none), and the
+protected roots no grant covers are returned. It never lists a protected folder
+and never touches the GUI domain, so it raises no dialog; the report names the
+remaining owner-at-screen step (`bun --no-env-file <release>/src/worker-macos-setup.ts`
+at the Mac, or the Files & Folders / Full Disk Access toggle for the launcher
+path). The capability carries the worker's launcher readiness (`macos`: launcher
+and cdhash against the recorded one, pointer current/stale/absent, missing
+grants, setup script) instead of refusing, so `worker doctor` adds
+`macos session/launcher/payload/grants` rows through the forced command; any
+missing grant is FAIL with the toggle. Starting a Host still enforces it
+(`requireMacosWorkerReady`). A setup destination that refuses or times out gets
+the least invasive enablement (System Settings > General > Sharing > Remote
+Login, limited to the worker account); onboarding never changes system settings.
+
+Unverified here: the Files and Folders prompt itself (setup was exercised only
+against unprotected paths and a nonexistent volume so as not to raise dialogs
+on this machine) and persistence of a granted prompt across a Bun upgrade on a
+machine where it was granted.
 
 ### Management tools
 

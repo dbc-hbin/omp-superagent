@@ -13,10 +13,16 @@ import { activeManagedUlwRevision, MANAGED_ULW_FIXTURE_ROOT_ENV } from "./manage
 import { requireCompatibleWorker, MINIMUM_WORKER_OMP, placement, workerInstance } from "./remote-lanes";
 import { Store } from "./store";
 import { workerPackage, type WorkerCapability } from "./remote-worker-wire";
+import { grantInstruction, protectedPaths, type MacosWorkerScope } from "./worker-macos";
+import type { MacosSetupReport } from "./worker-macos-setup";
 import {
-  authorizedKeysScript, commandScript, installScript, memoryScript, newNonce, parseFacts, preflightScript,
-  REMOTE_RELEASES, REMOTE_STATE_DIR, REMOTE_WRAPPER, sq, workerJsonScript,
+  authorizedKeysScript, commandScript, installScript, macosPrepareScript, memoryScript, newNonce, parseFacts, PATH_FILES, preflightScript,
+  REMOTE_RELEASES, REMOTE_STATE_DIR, REMOTE_WRAPPER, sq, userSshdApplyScript, userSshdInspectScript, workerJsonScript,
 } from "./worker-setup-remote";
+import {
+  listenAddress, planUserSshd, userSshdConfig, userSshdDirectory, userSshdPlist, USER_SSHD_BINARY, USER_SSHD_DIRECTORY, USER_SSHD_LABEL, USER_SSHD_MIN_PORT,
+  type UserSshdDesired, type UserSshdPlan,
+} from "./worker-user-sshd";
 
 const SETUP_DESTINATION = /^[A-Za-z0-9][A-Za-z0-9_.@:%-]*$/;
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
@@ -27,7 +33,7 @@ const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 
 export const WORKER_USAGE = `Usage:
   omp-sa worker add NAME --ssh SETUP_DESTINATION --root ABS_PATH [--root ABS_PATH ...] --config FILE
-      [--dedicated-key [--from CIDR,...|any] [--hostname HOST] [--port PORT]]
+      [--dedicated-key [--from CIDR,...|any] [--hostname HOST] [--port PORT] [--user-sshd]]
       [--superkit managed|none] [--state-dir ABS_PATH] [--replace] [--dry-run]
   omp-sa worker doctor NAME --config FILE
   omp-sa worker list --config FILE`;
@@ -44,6 +50,8 @@ export interface AddOptions {
   ssh: string;
   roots: string[];
   dedicatedKey: boolean;
+  /** macOS: run the worker account's own sshd on `hostname`:`port` (see worker-user-sshd). */
+  userSshd: boolean;
   superkit: WorkerSuperkit;
   dryRun: boolean;
   replace: boolean;
@@ -67,7 +75,7 @@ export function parseWorkerArgs(args: readonly string[]): WorkerCommand {
   const booleans = new Set<string>();
   const valueFlags = kind === "add"
     ? ["--ssh", "--root", "--config", "--superkit", "--from", "--hostname", "--port", "--state-dir"] : ["--config"];
-  const booleanFlags = kind === "add" ? ["--dedicated-key", "--dry-run", "--replace"] : [];
+  const booleanFlags = kind === "add" ? ["--dedicated-key", "--user-sshd", "--dry-run", "--replace"] : [];
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
     if (!flag.startsWith("--")) { positional.push(flag); continue; }
@@ -100,6 +108,11 @@ export function parseWorkerArgs(args: readonly string[]): WorkerCommand {
   if (hostname !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(hostname)) throw new WorkerSetupError("--hostname must be a host name or address");
   const port = portValue === undefined ? undefined : Number(portValue);
   if (port !== undefined && !(Number.isInteger(port) && port >= 1 && port <= 65535)) throw new WorkerSetupError("--port must be 1-65535");
+  const userSshd = booleans.has("--user-sshd");
+  if (userSshd && (!dedicatedKey || hostname === undefined || port === undefined)) {
+    throw new WorkerSetupError("--user-sshd serves the dedicated alias and requires --dedicated-key, --hostname (the worker's tailnet address) and --port");
+  }
+  if (userSshd && port! < USER_SSHD_MIN_PORT) throw new WorkerSetupError(`--user-sshd runs without root and cannot listen below port ${USER_SSHD_MIN_PORT}`);
   const from = fromValue === undefined ? TAILNET_FROM : fromValue === "any" ? null : fromValue;
   if (from !== null && !from.split(",").every(item => /^!?[A-Za-z0-9.:*?\/_-]+$/.test(item))) {
     throw new WorkerSetupError("--from must be a comma-separated list of CIDRs/addresses/patterns, or any");
@@ -107,7 +120,7 @@ export function parseWorkerArgs(args: readonly string[]): WorkerCommand {
   const stateDir = values.get("--state-dir")?.[0];
   if (stateDir !== undefined && !/^\/[A-Za-z0-9_./-]+$/.test(stateDir)) throw new WorkerSetupError("--state-dir must be an absolute path of plain characters");
   return {
-    kind, name, ssh, roots: roots.map(normalizeRoot), dedicatedKey, superkit, from, hostname, port, stateDir,
+    kind, name, ssh, roots: roots.map(normalizeRoot), dedicatedKey, userSshd, superkit, from, hostname, port, stateDir,
     dryRun: booleans.has("--dry-run"), replace: booleans.has("--replace"), configPath,
   };
 }
@@ -123,18 +136,98 @@ function normalizeRoot(root: string): string {
 
 /**
  * Everything that depends on the worker's operating system. A new platform
- * adds an entry here (its launch manager, requirements and native Host owner)
- * and its Host launch path; the setup steps themselves do not branch on it.
+ * adds an entry here (its launch manager, requirements, one-time preparation,
+ * doctor rows and native Host owner) and its Host launch path; the setup steps
+ * themselves do not branch on it.
  */
 interface PlatformPolicy {
   readonly owner: string;
   readonly describe: string;
   readonly requirements: (info: PreflightInfo) => string[];
+  /** Worker-side one-time preparation after the release is installed; never raises a dialog. */
+  readonly prepare: ((context: PrepareContext) => Promise<PrepareOutcome>) | null;
+  /** Rows the worker's own capability adds to doctor. */
+  readonly doctor: ((capability: WorkerCapability) => DoctorRow[]) | null;
+}
+export interface PrepareContext {
+  readonly options: AddOptions;
+  readonly io: SetupIo;
+  readonly info: PreflightInfo;
+  readonly release: string;
+  readonly scope: MacosWorkerScope;
+}
+export interface PrepareOutcome { readonly status: "ok" | "would" | "attention"; readonly detail: string }
+
+const describeScope = (items: readonly { path: string; category: string }[]) => items.map(item => `${item.path} (${item.category})`).join(", ");
+
+type PrepareReport = MacosSetupReport & { pointerChanged: boolean };
+
+function parsePrepareReport(text: string): PrepareReport {
+  try {
+    const report = JSON.parse(text) as PrepareReport;
+    const strings = (value: unknown) => Array.isArray(value) && value.every(entry => typeof entry === "string");
+    if (typeof report.setup === "string" && typeof report.launcher?.path === "string" && typeof report.launcher.cdhash === "string"
+      && typeof report.launcher.installed === "boolean" && typeof report.pointerChanged === "boolean" && strings(report.granted)
+      && Array.isArray(report.pending) && report.pending.every(item => typeof item.path === "string" && typeof item.category === "string")) return report;
+  } catch { /* Reported below. */ }
+  throw new WorkerSetupError("macOS launcher setup on the worker returned an unreadable report");
+}
+
+/** The fixed launcher, its payload pointer and what the owner still has to grant at the Mac; nothing here raises a privacy prompt. */
+export async function macosPrepareStep({ options, io, info, release, scope }: PrepareContext): Promise<PrepareOutcome> {
+  if (options.dryRun) {
+    const owed = protectedPaths(scope, info.homeReal);
+    return {
+      status: "would",
+      detail: `macOS launcher: would build and ad-hoc sign omp-sa-worker-launcher once if absent, point its payload at release ${release} and keep any recorded grants\n`
+        + (owed.length ? `owner steps at the Mac would remain for: ${describeScope(owed)}` : "no root is privacy-protected: no owner step at the Mac"),
+    };
+  }
+  const nonce = newNonce();
+  const facts = await runScript(io.remote, options.ssh, macosPrepareScript({
+    nonce, bun: info.bun!.path, release, scope: JSON.stringify(scope),
+  }), nonce, 300_000, "macOS launcher setup");
+  const report = parsePrepareReport(facts.prepare ?? "");
+  const lines = [`macOS launcher ${report.launcher.path} (cdhash ${report.launcher.cdhash.slice(0, 12)}; ${report.launcher.installed ? "built and signed now" : "already installed, kept"}); `
+    + `payload pointer ${report.pointerChanged ? "updated" : "unchanged"} -> release ${release}; `
+    + `recorded grants: ${report.fullDiskAccess ? "Full Disk Access" : report.granted.join(", ") || "none"}`];
+  if (!report.pending.length) return { status: "ok", detail: lines.join("\n") };
+  lines.push(`owner steps remaining at the Mac (setup never triggers a dialog itself): ${describeScope(report.pending)}`,
+    grantInstruction(report.launcher.path, report.setup, report.pending));
+  return { status: "attention", detail: lines.join("\n") };
+}
+
+export function macosDoctorRows(capability: WorkerCapability): DoctorRow[] {
+  const macos = capability.macos;
+  if (!macos) return [];
+  const rows: DoctorRow[] = [{ check: "macos session", status: "ok", detail: "GUI login session available; Hosts run in its launchd domain with the login keychain" }];
+  // The account's own sshd (worker add --user-sshd), when its LaunchAgent exists: launchd state and sockets only, never a dialog.
+  const sshd = macos.userSshd;
+  const sshdRows: DoctorRow[] = !sshd ? [] : [sshd.state === "running" && sshd.listening.length
+    ? { check: "user sshd", status: "ok", detail: `${USER_SSHD_LABEL} running, listening on ${sshd.listening.join(", ")}` }
+    : { check: "user sshd", status: "warn", detail: `${USER_SSHD_LABEL} is ${sshd.state}${sshd.state === "running" ? " but listens on no socket" : ""}; run worker add again with --user-sshd to repair it (its log is ~/${USER_SSHD_DIRECTORY}/sshd.log on the worker)` }];
+  if (!macos.launcher) {
+    rows.push({ check: "macos launcher", status: "fail", detail: "the fixed worker launcher is not installed; run worker add again (it builds and signs it once; needs Xcode Command Line Tools on the Mac)" });
+    return [...rows, ...sshdRows];
+  }
+  const identity = `${macos.launcher.path} (cdhash ${macos.launcher.cdhash.slice(0, 12)})`;
+  rows.push(macos.launcherChanged
+    ? { check: "macos launcher", status: "fail", detail: `${identity} is not the binary the recorded grants belong to; at the Mac, run: bun --no-env-file ${macos.setup} to re-record them (macOS ties a grant to the binary's signature)` }
+    : { check: "macos launcher", status: "ok", detail: `${identity} matches the recorded grants` });
+  rows.push(macos.pointer === "current"
+    ? { check: "macos payload", status: "ok", detail: "the launcher's payload pointer names the installed release" }
+    : { check: "macos payload", status: "warn", detail: `the launcher's payload pointer is ${macos.pointer}; it is rewritten before the next launch, or run worker add again` });
+  rows.push(macos.missing.length
+    ? { check: "macos grants", status: "fail", detail: `the launcher cannot read ${describeScope(macos.missing)}; ${grantInstruction(macos.launcher.path, macos.setup, macos.missing)}` }
+    : { check: "macos grants", status: "ok", detail: "every privacy-protected root and the state directory is covered (or none is protected)" });
+  return [...rows, ...sshdRows];
 }
 const PLATFORMS: Readonly<Record<string, PlatformPolicy>> = {
   linux: {
     owner: "linux",
     describe: "Linux with a systemd user manager",
+    prepare: null,
+    doctor: null,
     requirements: info => {
       const problems: string[] = [];
       if (info.userManager !== "running" && info.userManager !== "degraded") {
@@ -147,14 +240,29 @@ const PLATFORMS: Readonly<Record<string, PlatformPolicy>> = {
       return problems;
     },
   },
+  darwin: {
+    owner: "darwin",
+    describe: "macOS with a logged-in GUI session",
+    prepare: macosPrepareStep,
+    doctor: macosDoctorRows,
+    requirements: info => {
+      const problems: string[] = [];
+      if (info.guiDomain !== "yes") {
+        problems.push(`the account ${info.user} has no GUI login session (launchctl print gui/${info.uid || "<uid>"} failed): log in at the Mac's desktop as that account and stay logged in `
+          + "(do not log out or fast-user-switch away; or enable automatic login), so Hosts run in its launchd domain with its login keychain");
+      }
+      if (!info.developerTools) {
+        problems.push("install Xcode Command Line Tools (xcode-select --install) once at the Mac: the fixed worker launcher is compiled there, and compiling must not raise the install dialog during setup");
+      }
+      return problems;
+    },
+  },
 };
 
 export function platformPolicy(info: Pick<PreflightInfo, "system" | "direct">): PlatformPolicy | null {
-  const known = PLATFORMS[info.system.toLowerCase()];
-  if (known) return known;
-  // Test fixtures only: a loopback "worker" on the CI machine's own platform.
-  if (info.direct) return { owner: info.system.toLowerCase(), describe: info.system, requirements: () => [] };
-  return null;
+  // Test fixtures only: a loopback "worker" on the CI machine's own platform, without its user manager or GUI session.
+  if (info.direct) return { owner: info.system.toLowerCase(), describe: info.system, requirements: () => [], prepare: null, doctor: null };
+  return PLATFORMS[info.system.toLowerCase()] ?? null;
 }
 
 const OWNER_ARCH: Readonly<Record<string, string>> = { x86_64: "x64", amd64: "x64", aarch64: "arm64", arm64: "arm64" };
@@ -172,12 +280,17 @@ export interface PreflightInfo {
   system: string;
   machine: string;
   user: string;
+  uid: string;
   home: string;
   homeReal: string;
   loginShell: string;
   direct: boolean;
   userManager: string;
   linger: string;
+  /** macOS: `yes`/`no` for the `gui/<uid>` launchd domain; empty elsewhere. */
+  guiDomain: string;
+  /** macOS: Command Line Tools are installed (found by directory, never by running cc). */
+  developerTools: boolean;
   omp: { path: string; version: string } | null;
   bun: { path: string; version: string } | null;
   git: string | null;
@@ -186,7 +299,8 @@ export interface PreflightInfo {
   /** null: absent; "invalid": present but not a usable provisioning file. */
   workerJson: WorkerJson | "invalid" | null;
   wrapper: string | null;
-  bashrcMarker: boolean;
+  /** Startup files (see PATH_FILES) that already carry the guarded PATH block. */
+  pathMarkers: string[];
   hostKey: string | null;
   authorizedKey: "absent" | "no-file" | { line: string };
   releasePresent: boolean;
@@ -222,8 +336,9 @@ export function parsePreflight(facts: Record<string, string>, roots: readonly st
     if (typeof parsed.version === "string" && typeof parsed.digest === "string") release = { version: parsed.version, digest: parsed.digest };
   } catch { /* Missing or unverifiable. */ }
   return {
-    system: text("uname_s"), machine: text("uname_m"), user: text("user"), home: text("home"), homeReal: text("home_real"),
+    system: text("uname_s"), machine: text("uname_m"), user: text("user"), uid: text("uid"), home: text("home"), homeReal: text("home_real"),
     loginShell: text("login_shell"), direct: text("direct") === "1", userManager: text("user_manager"), linger: text("linger"),
+    guiDomain: text("gui_domain"), developerTools: facts.developer_tools === "yes",
     omp: tool(text("omp_path"), text("omp_version").replace(/^omp\//, "")),
     bun: tool(text("bun_path"), text("bun_version")),
     git: text("git_version") || null,
@@ -236,7 +351,7 @@ export function parsePreflight(facts: Record<string, string>, roots: readonly st
     }),
     workerJson: workerJson === null ? null : parseWorkerJson(workerJson),
     wrapper: decode(facts.wrapper),
-    bashrcMarker: facts.bashrc_marker === "yes",
+    pathMarkers: Object.values(PATH_FILES).filter(file => facts[`path_marker${file}`] === "yes"),
     hostKey: facts.host_key || null,
     authorizedKey: facts.authorized_keys_file === "none" ? "no-file" : facts.authorized_keys ? { line: facts.authorized_keys } : "absent",
     releasePresent: facts.release_present === "yes",
@@ -258,7 +373,7 @@ export function planPreflight(info: PreflightInfo): PreflightPlan {
   const policy = platformPolicy(info);
   const arch = OWNER_ARCH[info.machine];
   if (!policy) {
-    refusals.push(`${info.system || "unknown"} workers are not supported; remote workers currently require ${PLATFORMS.linux!.describe}`);
+    refusals.push(`${info.system || "unknown"} workers are not supported; remote workers currently require ${Object.values(PLATFORMS).map(known => known.describe).join(" or ")}`);
   } else {
     refusals.push(...policy.requirements(info));
   }
@@ -645,6 +760,15 @@ export const sshRemote: RemoteRunner = async (destination, command, stdin, timeo
   return { code, stdout, stderr };
 };
 
+/** The destination never answered (as opposed to refusing the key or the command). */
+export const sshUnreachable = (stderr: string): boolean => /connection refused|timed out|no route to host|network is unreachable/i.test(stderr);
+
+/** If the setup destination is a Mac: the least invasive way to let ssh in. Onboarding never changes a system setting. */
+export function remoteLoginNote(destination: string): string {
+  return `If ${destination} is a Mac: enable System Settings > General > Sharing > Remote Login at the Mac, and limit "Allow access for" to the worker account only `
+    + "(not all users); no other sharing service or setting is needed. omp-sa never changes system settings; run worker add again afterwards.";
+}
+
 const tail = (text: string, limit = 400) => text.trim().split("\n").slice(-4).join(" | ").slice(-limit);
 
 async function runScript(remote: RemoteRunner, destination: string, script: string, nonce: string, timeoutMs: number, what: string) {
@@ -669,7 +793,7 @@ export interface SetupIo {
 }
 const defaultIo: SetupIo = { log: line => console.log(line), remote: sshRemote };
 
-const STEPS = ["validate", "preflight", "install", "command", "worker.json", "memory", "dedicated-key", "register", "doctor"] as const;
+const STEPS = ["validate", "preflight", "install", "command", "worker.json", "memory", "user-sshd", "dedicated-key", "register", "doctor"] as const;
 
 class Reporter {
   constructor(private readonly log: SetupIo["log"], private readonly dryRun: boolean) {}
@@ -720,13 +844,21 @@ export async function workerAdd(options: AddOptions, io: SetupIo = defaultIo): P
   const dedicated = options.dedicatedKey ? dedicatedKeyPaths(options.name) : null;
   const existingPublicKey = dedicated && existsSync(dedicated.publicPath) ? readFileSync(dedicated.publicPath, "utf8") : null;
   const nonce = newNonce();
-  const facts = await runScript(io.remote, options.ssh, preflightScript({
+  const preflight = await io.remote(options.ssh, "sh -s", preflightScript({
     nonce, roots: options.roots, releaseId: id, authorizedKey: existingPublicKey && keyIdentity(existingPublicKey),
-  }), nonce, 150_000, "Preflight");
+  }), 150_000);
+  if (preflight.code === 255 && sshUnreachable(preflight.stderr)) {
+    throw new WorkerSetupError(`Preflight failed (ssh exit 255): ${tail(preflight.stderr)}\n${remoteLoginNote(options.ssh)}`);
+  }
+  const facts = factsOrThrow(preflight, nonce, "Preflight");
   const info = parsePreflight(facts, options.roots);
   const plan = planPreflight(info);
   const ownerBinary = plan.ownerBinary;
   const reasons = [...plan.refusals];
+  if (options.userSshd && info.system === "Linux") {
+    reasons.push("--user-sshd is macOS only: an sshd that honors authorized_keys options on another port needs root on Linux. "
+      + "Have an administrator set it up with the drop-in recipe below, then run worker add without --user-sshd", ...openSshFix());
+  }
   if (ownerBinary && !existsSync(join(packageRoot, "host-owner/bin", ownerBinary))) {
     reasons.push(`HEAD's package has no native Host owner for this worker (host-owner/bin/${ownerBinary}); install the official npm package, `
       + "which carries every platform, or build it for this architecture");
@@ -745,11 +877,18 @@ export async function workerAdd(options: AddOptions, io: SetupIo = defaultIo): P
   // 3. Install HEAD's exact release.
   const verified = info.releasePresent && info.releasePackage?.version === pkg.version && info.releasePackage.digest === pkg.digest;
   const release = releaseFiles(packageRoot, ownerBinary!);
+  // The platform's own one-time preparation (macOS: the fixed launcher) runs once the release is in place.
+  const prepare = async (): Promise<PrepareOutcome | null> => platformPolicy(info)!.prepare?.({
+    options, io, info, release: id, scope: { stateDir: json.desired.stateDir, workspaceRoots: json.desired.workspaceRoots },
+  }) ?? null;
   if (verified) {
-    report.step(2, "skipped", `release ${id} is installed and verifies${info.releaseCurrent === id ? " (current)" : "; would switch current to it"}`);
+    const prepared = await prepare();
+    report.step(2, prepared?.status === "attention" ? "attention" : "skipped",
+      `release ${id} is installed and verifies${info.releaseCurrent === id ? " (current)" : "; would switch current to it"}${prepared ? `\n${prepared.detail}` : ""}`);
   } else if (options.dryRun) {
+    const prepared = await prepare();
     report.step(2, "would", `install release ${id} (${release.files.length} files${release.lockfile ? "" : "; HEAD package has no bun.lock, dependency ranges resolve"})`
-      + `${info.releasePresent ? "; the existing directory does not verify and would be moved aside" : ""}`);
+      + `${info.releasePresent ? "; the existing directory does not verify and would be moved aside" : ""}${prepared ? `\n${prepared.detail}` : ""}`);
   } else {
     const archive = ustarArchive(release.files);
     const installNonce = newNonce();
@@ -759,9 +898,10 @@ export async function workerAdd(options: AddOptions, io: SetupIo = defaultIo): P
     });
     const result = await io.remote(options.ssh, `sh -c ${sq(script)}`, archive, 900_000);
     const installed = factsOrThrow(result, installNonce, "Release install");
-    report.step(2, "installed", `release ${id} ${installed.installed === "new" ? "installed" : "already present"}; current -> ${installed.current}`
+    const prepared = await prepare();
+    report.step(2, prepared?.status === "attention" ? "attention" : "installed", `release ${id} ${installed.installed === "new" ? "installed" : "already present"}; current -> ${installed.current}`
       + `${release.lockfile ? "" : "\nHEAD package has no bun.lock: dependency ranges were resolved, not frozen"}`
-      + `${installed.moved_aside ? `\nan unverified directory was kept at ${installed.moved_aside}` : ""}`);
+      + `${installed.moved_aside ? `\nan unverified directory was kept at ${installed.moved_aside}` : ""}${prepared ? `\n${prepared.detail}` : ""}`);
   }
 
   // 4. Command and PATH.
@@ -770,20 +910,23 @@ export async function workerAdd(options: AddOptions, io: SetupIo = defaultIo): P
   const binDirectory = `${info.homeReal}/.local/bin`;
   const onPath = async () => (await io.remote(options.ssh, `sh -c 'printf %s "$PATH"'`, null, 30_000)).stdout.split(":").some(entry =>
     entry === binDirectory || entry === `${info.home}/.local/bin`);
-  const bashLogin = basename(info.loginShell) === "bash";
+  // The startup file a non-interactive SSH command of the login shell reads (zsh, the macOS default, reads ~/.zshenv, not ~/.bashrc).
+  const pathFile = PATH_FILES[basename(info.loginShell)] ?? null;
+  const marked = pathFile !== null && info.pathMarkers.includes(pathFile);
   const needsPath = !(await onPath());
   const pathAction = !needsPath ? "~/.local/bin is already on the non-interactive SSH PATH"
-    : info.bashrcMarker ? "~/.bashrc already has the PATH block (still not effective; check the worker's ~/.bashrc)"
-    : bashLogin ? "would add the guarded PATH block at the top of ~/.bashrc" : `login shell ${info.loginShell || "unknown"} is not bash: add ~/.local/bin to its non-interactive PATH yourself`;
+    : marked ? `~/${pathFile} already has the PATH block (still not effective; check the worker's ~/${pathFile})`
+    : pathFile ? `would add the guarded PATH block at the top of ~/${pathFile}`
+    : `login shell ${info.loginShell || "unknown"} is neither bash nor zsh: add ~/.local/bin to its non-interactive PATH yourself`;
   if (options.dryRun) {
     report.step(3, "would", `wrapper ${binDirectory}/omp-sa-worker: ${wrapperDecision}; ${pathAction}`);
   } else {
     const commandNonce = newNonce();
-    const done = await runScript(io.remote, options.ssh, commandScript({ nonce: commandNonce, wrapper, bashrc: needsPath && bashLogin && !info.bashrcMarker }),
+    const done = await runScript(io.remote, options.ssh, commandScript({ nonce: commandNonce, wrapper, pathFile: needsPath && !marked ? pathFile : null }),
       commandNonce, 60_000, "Command installation");
     const afterProbe = await io.remote(options.ssh, "sh -c 'command -v omp-sa-worker'", null, 30_000);
     const found = afterProbe.stdout.trim();
-    report.step(3, found ? "ok" : "attention", `wrapper ${done.wrapper}; ${done.bashrc ? `~/.bashrc ${done.bashrc}; ` : ""}`
+    report.step(3, found ? "ok" : "attention", `wrapper ${done.wrapper}; ${done.path ? `~/${pathFile} ${done.path}; ` : ""}`
       + (found ? `omp-sa-worker resolves over ordinary SSH (${found})`
         : `omp-sa-worker does not resolve over a non-interactive SSH login yet. Add ${binDirectory} to that PATH on the worker (${pathAction}); `
           + "a dedicated key's forced command does not need it"));
@@ -806,9 +949,12 @@ export async function workerAdd(options: AddOptions, io: SetupIo = defaultIo): P
   // 6. Native memory parity: the same default HEAD applies to its own profile.
   const memory = await memoryStep(options, io, info, id, verified, report);
 
+  // The worker's own sshd comes first: the dedicated key's forced-command probe connects to it.
+  const sshd = await userSshdStep(options, io, info, report);
+
   // Dedicated key, host key pin, ssh alias (also steps of the dedicated-key flow).
-  if (dedicated) await dedicatedKeyStep(options, io, info, dedicated, report);
-  else report.step(6, "skipped", `using the existing SSH alias ${runtimeDestination} as the runtime destination`);
+  if (dedicated) await dedicatedKeyStep(options, io, sshd.hostKey ? { ...info, hostKey: sshd.hostKey } : info, dedicated, report, sshd.hostKeyPlanned);
+  else report.step(7, "skipped", `using the existing SSH alias ${runtimeDestination} as the runtime destination`);
 
   // 7. Register in HEAD's config.
   const entry: WorkerConfig = { destination: runtimeDestination, workerId: json.desired.workerId, superkit: options.superkit };
@@ -817,21 +963,21 @@ export async function workerAdd(options: AddOptions, io: SetupIo = defaultIo): P
   parseConfig(JSON.parse(merged.text), config.path);
   const changedIdentity = merged.previous && (merged.previous.destination !== entry.destination || merged.previous.workerId !== entry.workerId);
   const identityWarning = changedIdentity ? "\nwarning: lanes already bound to the previous destination/workerId refuse to resume until closed" : "";
-  if (!merged.changed) report.step(7, "unchanged", `workers.${options.name} already registered in ${config.path}`);
-  else if (options.dryRun) report.step(7, "would", `${merged.previous ? "update" : "add"} workers.${options.name} = ${JSON.stringify(entry)} in ${config.path}${identityWarning}`);
+  if (!merged.changed) report.step(8, "unchanged", `workers.${options.name} already registered in ${config.path}`);
+  else if (options.dryRun) report.step(8, "would", `${merged.previous ? "update" : "add"} workers.${options.name} = ${JSON.stringify(entry)} in ${config.path}${identityWarning}`);
   else {
     const backup = replaceLocalFile(config.path, merged.text, 0o600);
-    report.step(7, "ok", `${merged.previous ? "updated" : "added"} workers.${options.name} in ${config.path}${backup ? ` (backup ${backup})` : ""}${identityWarning}`
+    report.step(8, "ok", `${merged.previous ? "updated" : "added"} workers.${options.name} in ${config.path}${backup ? ` (backup ${backup})` : ""}${identityWarning}`
       + "\na running Gateway does not reload its config; the next start uses it");
   }
 
   // 8. Doctor.
   let doctor: DoctorResult | null = null;
-  if (options.dryRun) report.step(8, "would", `run worker doctor ${options.name}`);
+  if (options.dryRun) report.step(9, "would", `run worker doctor ${options.name}`);
   else {
     const verifiedConfig = await loadConfig(options.configPath);
     doctor = await runDoctor(verifiedConfig, options.name, io, { memory });
-    report.step(8, doctor.ok ? "ok" : "FAILED", doctor.ok ? "worker doctor passed" : "worker doctor reported failures (below)");
+    report.step(9, doctor.ok ? "ok" : "FAILED", doctor.ok ? "worker doctor passed" : "worker doctor reported failures (below)");
     io.log(renderDoctor(doctor));
   }
   return { instance, workerId: json.desired.workerId, destination: runtimeDestination, release: id, dryRun: options.dryRun, doctor };
@@ -876,6 +1022,54 @@ async function memoryStep(options: AddOptions, io: SetupIo, info: PreflightInfo,
   return { backend: applied.memory.backend, updated: applied.updated };
 }
 
+const SSHD_FILE_TEXT = { create: "create", update: "rewrite (the previous file is kept as .bak-*)", unchanged: "unchanged" } as const;
+const SSHD_LAUNCHD_TEXT = {
+  none: "already running with this configuration, left alone", bootstrap: "load the LaunchAgent (launchctl bootstrap)",
+  kickstart: "restart it to read the configuration (launchctl kickstart -k)", reload: "reload it (launchctl bootout, then bootstrap)",
+} as const;
+
+function describeUserSshd(plan: UserSshdPlan, home: string, listen: readonly string[], verb: "would" | "did"): string {
+  const directory = userSshdDirectory(home);
+  const host = plan.hostKey === "create" ? `${verb === "would" ? "would create" : "created"} the ed25519 host key in ${directory}` : `host key in ${directory} kept`;
+  return [
+    `own sshd on ${listen.join(", ")} (AllowUsers this account only; no root, no Remote Login)`,
+    host,
+    `sshd_config ${SSHD_FILE_TEXT[plan.config]}`,
+    `LaunchAgent ${USER_SSHD_LABEL}.plist ${SSHD_FILE_TEXT[plan.plist]}`,
+    `launchd: ${SSHD_LAUNCHD_TEXT[plan.launchd]}`,
+  ].join("\n");
+}
+
+/**
+ * macOS `--user-sshd`: the worker account runs its own non-root sshd (see worker-user-sshd) over the setup connection, so the
+ * dedicated key's forced command is served by an OpenSSH that honors it. Returns the host key to pin (the one this sshd has).
+ */
+async function userSshdStep(options: AddOptions, io: SetupIo, info: PreflightInfo, report: Reporter): Promise<{ hostKey: string | null; hostKeyPlanned: boolean }> {
+  if (!options.userSshd) {
+    report.step(6, "skipped", "not requested (--user-sshd)");
+    return { hostKey: null, hostKeyPlanned: false };
+  }
+  const desired: UserSshdDesired = { home: info.homeReal, user: info.user, listen: [listenAddress(options.hostname!, options.port!)] };
+  const inspectNonce = newNonce();
+  const current = await runScript(io.remote, options.ssh, userSshdInspectScript({ nonce: inspectNonce, label: USER_SSHD_LABEL }), inspectNonce, 60_000, "User sshd inspection");
+  if (current.sshd_binary !== "yes") report.refuse(6, [`${USER_SSHD_BINARY} is not available on the worker`]);
+  const plan = planUserSshd({
+    config: decode(current.sshd_config), plist: decode(current.sshd_plist), hostKey: current.host_key || null,
+    launchd: !current.launchd || current.launchd === "absent" ? null : current.launchd,
+  }, desired);
+  if (options.dryRun) {
+    report.step(6, "would", describeUserSshd(plan, info.homeReal, desired.listen, "would"));
+    return { hostKey: current.host_key || null, hostKeyPlanned: plan.hostKey === "create" };
+  }
+  const nonce = newNonce();
+  const done = await runScript(io.remote, options.ssh, userSshdApplyScript({
+    nonce, label: USER_SSHD_LABEL, config: userSshdConfig(desired), plist: userSshdPlist(desired), port: options.port!, action: plan.launchd,
+  }), nonce, 120_000, "User sshd setup");
+  const unchanged = plan.config === "unchanged" && plan.plist === "unchanged" && plan.hostKey === "keep" && plan.launchd === "none";
+  report.step(6, unchanged ? "unchanged" : "ok", `${describeUserSshd(plan, info.homeReal, desired.listen, "did")}\nrunning and listening: ${done.listening!.trim()}`);
+  return { hostKey: done.host_key || null, hostKeyPlanned: false };
+}
+
 interface DedicatedKeyPaths { privatePath: string; publicPath: string; sshDirectory: string }
 
 function dedicatedKeyPaths(name: string): DedicatedKeyPaths {
@@ -884,7 +1078,8 @@ function dedicatedKeyPaths(name: string): DedicatedKeyPaths {
   return { privatePath, publicPath: `${privatePath}.pub`, sshDirectory };
 }
 
-async function dedicatedKeyStep(options: AddOptions, io: SetupIo, info: PreflightInfo, paths: DedicatedKeyPaths, report: Reporter): Promise<void> {
+async function dedicatedKeyStep(options: AddOptions, io: SetupIo, info: PreflightInfo, paths: DedicatedKeyPaths, report: Reporter,
+  hostKeyPlanned: boolean): Promise<void> {
   const alias = `omp-sa-${options.name}`;
   const notes: string[] = [];
   const dry = options.dryRun;
@@ -919,7 +1114,7 @@ async function dedicatedKeyStep(options: AddOptions, io: SetupIo, info: Prefligh
       const nonce = newNonce();
       const done = await runScript(io.remote, options.ssh, authorizedKeysScript({ nonce, line, key: keyIdentity(publicKey) }), nonce, 60_000, "authorized_keys update");
       if (done.authorized_keys === "different") {
-        report.refuse(6, [`the worker's authorized_keys already has this key with other options; edit that line to exactly:\n${line}`]);
+        report.refuse(7, [`the worker's authorized_keys already has this key with other options; edit that line to exactly:\n${line}`]);
       }
       notes.push(`worker authorized_keys ${done.authorized_keys}`);
     }
@@ -935,7 +1130,7 @@ async function dedicatedKeyStep(options: AddOptions, io: SetupIo, info: Prefligh
   const block = findHostBlock(existing, alias);
   const mismatches = block ? blockMismatches(block, host, paths.privatePath) : [];
   if (block && mismatches.length && !block.managed) {
-    report.refuse(6, [`~/.ssh/config already defines Host ${alias} differently (${mismatches.join("; ")}); edit it to:\n${sshConfigBlock(options.name, host, paths.privatePath)}`]);
+    report.refuse(7, [`~/.ssh/config already defines Host ${alias} differently (${mismatches.join("; ")}); edit it to:\n${sshConfigBlock(options.name, host, paths.privatePath)}`]);
   }
   if (!block) {
     if (dry) notes.push(`would append Host ${alias} to ~/.ssh/config (${host.hostname}:${host.port} as ${host.user}, IdentitiesOnly)`);
@@ -954,37 +1149,38 @@ async function dedicatedKeyStep(options: AddOptions, io: SetupIo, info: Prefligh
     }
   } else notes.push(`~/.ssh/config Host ${alias} matches`);
 
-  notes.push(await pinHostKey(host, info.hostKey, dry, report));
+  notes.push(await pinHostKey(host, info.hostKey, dry, report, hostKeyPlanned));
 
   if (dry) {
-    report.step(6, "would", notes.join("\n"));
+    report.step(7, "would", notes.join("\n"));
     return;
   }
   const { state: forced, stderr } = await probeForcedCommand(alias);
   if (forced === "bypassed") {
-    report.step(6, "REFUSED", `${notes.join("\n")}\n${tailscaleRemedy(alias)}`);
+    report.step(7, "REFUSED", `${notes.join("\n")}\n${tailscaleRemedy(alias)}`);
     throw new WorkerSetupError("The dedicated alias does not enforce its forced command");
   }
   if (forced === "unclear") {
-    report.step(6, "REFUSED", `${notes.join("\n")}\nssh ${alias} whoami returned no worker frame${stderr ? ` (${stderr})` : ""}; check that the alias reaches the worker's OpenSSH and trusts its host key`);
+    report.step(7, "REFUSED", `${notes.join("\n")}\nssh ${alias} whoami returned no worker frame${stderr ? ` (${stderr})` : ""}; check that the alias reaches the worker's OpenSSH and trusts its host key`);
     throw new WorkerSetupError("Could not verify forced-command enforcement");
   }
-  report.step(6, "ok", `${notes.join("\n")}\nforced command enforced: ssh ${alias} whoami returned a worker protocol frame`);
+  report.step(7, "ok", `${notes.join("\n")}\nforced command enforced: ssh ${alias} whoami returned a worker protocol frame`);
 }
 
 /** Add `[host]:port key` to known_hosts only if absent; a different recorded key is never replaced. */
-async function pinHostKey(host: ResolvedHost, hostKey: string | null, dry: boolean, report: Reporter): Promise<string> {
+async function pinHostKey(host: ResolvedHost, hostKey: string | null, dry: boolean, report: Reporter, hostKeyPlanned: boolean): Promise<string> {
   const name = knownHostsName(host.hostname, host.port);
   const file = join(headHome(), ".ssh", "known_hosts");
   const known = existsSync(file) ? await localCommand(["ssh-keygen", "-F", name, "-f", file]) : { code: 1, stdout: "", stderr: "" };
   if (known.code === 0) {
     if (hostKey && !known.stdout.includes(hostKey.split(" ")[1]!)) {
-      report.refuse(6, [`known_hosts already records a different host key for ${name}; verify the worker and remove the stale entry yourself`]);
+      report.refuse(7, [`known_hosts already records a different host key for ${name}; verify the worker and remove the stale entry yourself`]);
     }
     return `known_hosts already has ${name}`;
   }
+  if (!hostKey && dry && hostKeyPlanned) return `would pin the host key of the worker's own sshd for ${name} once it exists`;
   if (!hostKey) {
-    report.refuse(6, [`the worker's /etc/ssh/ssh_host_ed25519_key.pub is not readable over the setup connection and ${name} is not in known_hosts; add its host key yourself (verify the fingerprint out of band), then re-run`]);
+    report.refuse(7, [`the worker's /etc/ssh/ssh_host_ed25519_key.pub is not readable over the setup connection and ${name} is not in known_hosts; add its host key yourself (verify the fingerprint out of band), then re-run`]);
   }
   if (dry) return `would pin the worker's ed25519 host key for ${name}`;
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
@@ -1050,6 +1246,7 @@ export async function runDoctor(config: Config, name: string, io: SetupIo = defa
   } catch (error) {
     row("compatible", "fail", error instanceof Error ? error.message : String(error));
   }
+  rows.push(...platformPolicy({ system: capability.platform, direct: false })?.doctor?.(capability) ?? []);
   if (entry.superkit === "none") row("superkit", "ok", "none (explicit plain worker)");
   else {
     const revision = activeSuperkit();

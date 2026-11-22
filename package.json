@@ -18,6 +18,7 @@
     "scripts/",
     "skills/",
     "host-owner/bin/",
+    "worker-launcher/omp-sa-worker-launcher.c",
     "gateway/bin/",
     "upstream/ulw.json",
     "assets/",
@@ -33,6 +34,8 @@
   },
   "scripts": {
     "build:owner": "bun --no-env-file scripts/build-host-owner.ts --owner",
+    "build:worker-launcher": "bun --no-env-file scripts/build-worker-launcher.ts",
+    "setup:macos-worker": "bun --no-env-file src/worker-macos-setup.ts",
     "build:native": "bun --no-env-file scripts/build-host-owner.ts",
     "check": "tsc --noEmit",
     "test": "bun run build:native && bun test test",

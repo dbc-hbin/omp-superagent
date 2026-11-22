@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { USER_SSHD_BINARY, USER_SSHD_DIRECTORY } from "./worker-user-sshd";
 
 /**
  * Bounded POSIX shell scripts that `omp-sa worker add` runs on the worker over
@@ -12,7 +13,9 @@ export const REMOTE_RELEASES = ".local/share/omp-superagent-worker/releases";
 export const REMOTE_WRAPPER = ".local/bin/omp-sa-worker";
 export const REMOTE_WORKER_JSON = ".config/omp-superagent/worker.json";
 export const REMOTE_STATE_DIR = ".local/state/omp-superagent-worker";
-export const BASHRC_MARKER = "omp-superagent worker PATH";
+export const PATH_MARKER = "omp-superagent worker PATH";
+/** The startup file a non-interactive SSH command of each login shell reads, where the guarded PATH block goes. */
+export const PATH_FILES: Readonly<Record<string, string>> = { bash: ".bashrc", zsh: ".zshenv" };
 
 export const sq = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
@@ -98,9 +101,17 @@ emit user "$(id -un)"
 emit uid "$(id -u)"
 emit home "$HOME"
 emit home_real "$HOME_REAL"
-LOGIN_SHELL="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; [ -n "$LOGIN_SHELL" ] || LOGIN_SHELL="\${SHELL:-}"
+LOGIN_SHELL="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"
+[ -n "$LOGIN_SHELL" ] || LOGIN_SHELL="\${SHELL:-}"
+[ -n "$LOGIN_SHELL" ] || LOGIN_SHELL="$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{ print $2 }')"
 emit login_shell "$LOGIN_SHELL"
-if [ "$DIRECT" = 0 ]; then
+if [ "$DIRECT" = 0 ] && [ "$(uname -s)" = Darwin ]; then
+  # The GUI login session's launchd domain, and Command Line Tools by their directory (running cc could raise the install dialog).
+  emit gui_domain "$(/bin/launchctl print "gui/$(id -u)" >/dev/null 2>&1 && echo yes || echo no)"
+  # Command Line Tools keep cc in usr/bin; a selected Xcode keeps it in its default toolchain.
+  DEV="$(xcode-select -p 2>/dev/null)"
+  if [ -n "$DEV" ] && { [ -x "$DEV/usr/bin/cc" ] || [ -x "$DEV/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc" ]; }; then emit developer_tools yes; fi
+elif [ "$DIRECT" = 0 ]; then
   emit user_manager "$(systemctl --user is-system-running 2>/dev/null | head -n1)"
   emit linger "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null | head -n1)"
 fi
@@ -113,11 +124,15 @@ for root in ${rootsList}; do
 done
 [ -f "$HOME_REAL/${REMOTE_WORKER_JSON}" ] && emit worker_json "$(b64 "$HOME_REAL/${REMOTE_WORKER_JSON}")"
 [ -f "$HOME_REAL/${REMOTE_WRAPPER}" ] && emit wrapper "$(b64 "$HOME_REAL/${REMOTE_WRAPPER}")"
-[ -f "$HOME_REAL/.bashrc" ] && grep -q ${sq(BASHRC_MARKER)} "$HOME_REAL/.bashrc" && emit bashrc_marker yes
+for rc in ${Object.values(PATH_FILES).join(" ")}; do
+  [ -f "$HOME_REAL/$rc" ] && grep -q ${sq(PATH_MARKER)} "$HOME_REAL/$rc" && emit "path_marker$rc" yes
+done
 ${params.authorizedKey === null ? "" : `if [ -f "$HOME_REAL/.ssh/authorized_keys" ]; then
   emit authorized_keys "$(grep -F ${sq(params.authorizedKey)} "$HOME_REAL/.ssh/authorized_keys" | head -n1 | tr '\\t' ' ')"
 else emit authorized_keys_file none; fi`}
-HOST_KEY=/etc/ssh/ssh_host_ed25519_key.pub; [ "$DIRECT" = 1 ] && HOST_KEY="$HOME_REAL/.omp-sa-test-ssh_host_ed25519_key.pub"
+# A user-level worker sshd (macOS without admin rights) has its own host key; prefer it when present.
+HOST_KEY=/etc/ssh/ssh_host_ed25519_key.pub; [ -r "$HOME_REAL/.omp-sa-sshd/ssh_host_ed25519_key.pub" ] && HOST_KEY="$HOME_REAL/.omp-sa-sshd/ssh_host_ed25519_key.pub"
+[ "$DIRECT" = 1 ] && HOST_KEY="$HOME_REAL/.omp-sa-test-ssh_host_ed25519_key.pub"
 [ -r "$HOST_KEY" ] && emit host_key "$(head -n1 "$HOST_KEY" | cut -d' ' -f1,2)"
 CUR="$(readlink "${state}/current" 2>/dev/null)"; emit release_current "$(basename "$CUR" 2>/dev/null)"
 REL=${sq(params.releaseId)}
@@ -198,15 +213,15 @@ run_login "$TMPD/inner.sh" 900
 export interface CommandParams {
   nonce: string;
   wrapper: string;
-  /** Add the guarded non-interactive PATH block to ~/.bashrc. */
-  bashrc: boolean;
+  /** Add the guarded non-interactive PATH block at the top of this home-relative startup file (see PATH_FILES). */
+  pathFile: string | null;
 }
 
-/** `~/.local/bin/omp-sa-worker` and, when requested, the guarded PATH block at the top of ~/.bashrc. */
+/** `~/.local/bin/omp-sa-worker` and, when requested, the guarded PATH block at the top of the login shell's non-interactive startup file. */
 export function commandScript(params: CommandParams): string {
-  const block = `# >>> ${BASHRC_MARKER} (managed by omp-sa worker add)
+  const block = `# >>> ${PATH_MARKER} (managed by omp-sa worker add)
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH"; export PATH ;; esac
-# <<< ${BASHRC_MARKER}
+# <<< ${PATH_MARKER}
 `;
   return `${prelude(params.nonce)}
 BIN="$HOME_REAL/.local/bin"; mkdir -p "$BIN" || { emit error "cannot create $BIN"; exit 3; }
@@ -214,12 +229,12 @@ W="$BIN/omp-sa-worker"
 printf '%s' ${sq(params.wrapper)} > "$BIN/.omp-sa-worker.$$" && chmod 755 "$BIN/.omp-sa-worker.$$"
 if [ -f "$W" ] && cmp -s "$BIN/.omp-sa-worker.$$" "$W"; then rm -f "$BIN/.omp-sa-worker.$$"; emit wrapper unchanged
 else backup "$W"; replace_file "$BIN/.omp-sa-worker.$$" "$W" && emit wrapper written; fi
-${params.bashrc ? `RC="$HOME_REAL/.bashrc"
-if [ -f "$RC" ] && grep -q ${sq(BASHRC_MARKER)} "$RC"; then emit bashrc unchanged
+${params.pathFile ? `RC="$HOME_REAL"/${sq(params.pathFile)}
+if [ -f "$RC" ] && grep -q ${sq(PATH_MARKER)} "$RC"; then emit path unchanged
 else
   printf '%s' ${sq(block)} > "$RC.omp-sa.$$"
   if [ -f "$RC" ]; then backup "$RC"; cat "$RC" >> "$RC.omp-sa.$$"; fi
-  replace_file "$RC.omp-sa.$$" "$RC" && emit bashrc written
+  replace_file "$RC.omp-sa.$$" "$RC" && emit path written
 fi` : ""}
 `;
 }
@@ -281,6 +296,31 @@ run_login "$TMPD/inner.sh" 90
 `;
 }
 
+export interface MacosPrepareParams {
+  nonce: string;
+  /** The worker's own bun (an absolute path), the executable the launcher's payload pointer names. */
+  bun: string;
+  /** Release directory name under the worker's releases directory. */
+  release: string;
+  /** JSON `{ stateDir, workspaceRoots }`: the scope whose protected paths need the owner's grants. */
+  scope: string;
+}
+
+/**
+ * The launcher setup that needs no GUI session and raises no privacy prompt (see prepareMacosWorker), run by the
+ * installed release itself. Plain `sh` is enough: it only compiles, signs and writes files in the account's home.
+ */
+export function macosPrepareScript(params: MacosPrepareParams): string {
+  return `${prelude(params.nonce)}
+TMPD="$(mktemp -d "\${TMPDIR:-/tmp}/omp-sa-setup.XXXXXX")"; trap 'rm -rf "$TMPD"' EXIT
+cd "$HOME_REAL" || { emit error "cannot enter $HOME_REAL"; exit 3; }
+SETUP="$HOME_REAL/${REMOTE_RELEASES}/"${sq(params.release)}/src/worker-macos-setup.ts
+[ -f "$SETUP" ] || { emit error "release is not installed: $SETUP"; exit 3; }
+if OUT="$(${sq(params.bun)} --no-env-file "$SETUP" --prepare ${sq(params.scope)} </dev/null 2>"$TMPD/err")"; then emit prepare "$(printf '%s' "$OUT" | tail -n1)"
+else emit error "macOS launcher setup failed: $(tail -n 3 "$TMPD/err" | tr '\n' ' ')"; exit 3; fi
+`;
+}
+
 export interface AuthorizedKeyParams {
   nonce: string;
   line: string;
@@ -303,5 +343,104 @@ cp -p "$F" "$F.new.$$" 2>/dev/null || { : > "$F.new.$$"; chmod 600 "$F.new.$$"; 
 printf '%s\\n' ${sq(params.line)} >> "$F.new.$$"
 backup "$F"
 replace_file "$F.new.$$" "$F" && chmod 600 "$F" && emit authorized_keys appended
+`;
+}
+
+/** Paths and the agent's launchd state, shared by the user-sshd inspection and apply scripts. */
+const userSshdPaths = (label: string) => `LABEL=${sq(label)}
+D="$HOME_REAL/${USER_SSHD_DIRECTORY}"; K="$D/ssh_host_ed25519_key"
+PLIST="$HOME_REAL/Library/LaunchAgents/$LABEL.plist"; DOMAIN="gui/$(id -u)"
+launchd_state() {
+  /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || { echo absent; return; }
+  S="$(/bin/launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '$1 == "state" && $2 == "=" { print $3; exit }')"
+  echo "\${S:-loaded}"
+}
+`;
+
+export interface UserSshdInspectParams { nonce: string; label: string }
+
+/** Read-only: what the worker's own sshd (see worker-user-sshd) currently consists of. */
+export function userSshdInspectScript(params: UserSshdInspectParams): string {
+  return `${prelude(params.nonce)}
+${userSshdPaths(params.label)}
+[ -x ${USER_SSHD_BINARY} ] && emit sshd_binary yes
+[ -f "$D/sshd_config" ] && emit sshd_config "$(b64 "$D/sshd_config")"
+[ -f "$PLIST" ] && emit sshd_plist "$(b64 "$PLIST")"
+[ -f "$K" ] && [ -r "$K.pub" ] && emit host_key "$(head -n1 "$K.pub" | cut -d' ' -f1,2)"
+emit launchd "$(launchd_state)"
+exit 0
+`;
+}
+
+export interface UserSshdApplyParams {
+  nonce: string;
+  label: string;
+  /** Final sshd_config and LaunchAgent plist contents. */
+  config: string;
+  plist: string;
+  port: number;
+  /** The launchd action the plan chose (see planUserSshd). */
+  action: "none" | "bootstrap" | "kickstart" | "reload";
+}
+
+/**
+ * Creates the private directory, the host key (kept if present), the checked config and the plist (each replaced only when
+ * different, previous copy kept as `.bak-*`), then loads or restarts the agent and waits for it to run and log that it listens.
+ */
+export function userSshdApplyScript(params: UserSshdApplyParams): string {
+  return `${prelude(params.nonce)}
+${userSshdPaths(params.label)}
+PORT=${params.port}; ACTION=${params.action}
+fail() {
+  emit error "$1"
+  [ -f "$D/sshd.log" ] && tail -n 6 "$D/sshd.log" | while IFS= read -r l; do emit log "$l"; done
+  exit 3
+}
+[ -x ${USER_SSHD_BINARY} ] || fail "${USER_SSHD_BINARY} is not available"
+mkdir -p "$D" "$HOME_REAL/Library/LaunchAgents" && chmod 700 "$D" || fail "cannot create $D"
+if [ ! -f "$K" ]; then
+  rm -f "$K.pub"
+  ERR="$(ssh-keygen -q -t ed25519 -N "" -C "omp-sa worker sshd" -f "$K" 2>&1)" || fail "ssh-keygen failed: $ERR"
+  emit host_key_state created
+elif [ ! -r "$K.pub" ]; then
+  ssh-keygen -y -f "$K" > "$K.pub.$$" && mv -f "$K.pub.$$" "$K.pub" || fail "cannot derive the public host key"
+  emit host_key_state restored
+else emit host_key_state kept; fi
+emit host_key "$(head -n1 "$K.pub" | cut -d' ' -f1,2)"
+# The new config must pass sshd's own check before it replaces the working one.
+printf '%s' ${sq(params.config)} > "$D/.sshd_config.$$" && chmod 600 "$D/.sshd_config.$$"
+ERR="$(${USER_SSHD_BINARY} -t -f "$D/.sshd_config.$$" 2>&1)" || { rm -f "$D/.sshd_config.$$"; fail "sshd rejected the configuration: $(printf '%s' "$ERR" | tr '\\n' ' ')"; }
+if [ -f "$D/sshd_config" ] && cmp -s "$D/.sshd_config.$$" "$D/sshd_config"; then rm -f "$D/.sshd_config.$$"; emit sshd_config unchanged
+else backup "$D/sshd_config"; mv -f "$D/.sshd_config.$$" "$D/sshd_config" && chmod 600 "$D/sshd_config" && emit sshd_config written; fi
+printf '%s' ${sq(params.plist)} > "$PLIST.new.$$" && chmod 600 "$PLIST.new.$$"
+ERR="$(plutil -lint "$PLIST.new.$$" 2>&1)" || { rm -f "$PLIST.new.$$"; fail "the LaunchAgent plist is invalid: $ERR"; }
+if [ -f "$PLIST" ] && cmp -s "$PLIST.new.$$" "$PLIST"; then rm -f "$PLIST.new.$$"; emit sshd_plist unchanged
+else backup "$PLIST"; mv -f "$PLIST.new.$$" "$PLIST" && emit sshd_plist written; fi
+OFFSET=0; [ "$ACTION" != none ] && OFFSET="$(wc -c < "$D/sshd.log" 2>/dev/null | tr -d ' ')"
+bootstrap() {
+  n=0
+  until ERR="$(/bin/launchctl bootstrap "$DOMAIN" "$PLIST" 2>&1)"; do
+    n=$((n + 1)); [ $n -ge 5 ] && fail "launchctl bootstrap failed: $ERR"; sleep 1
+  done
+}
+case "$ACTION" in
+  bootstrap) bootstrap ;;
+  kickstart) ERR="$(/bin/launchctl kickstart -k "$DOMAIN/$LABEL" 2>&1)" || fail "launchctl kickstart failed: $ERR" ;;
+  reload) /bin/launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1; bootstrap ;;
+esac
+emit launchd_action "$ACTION"
+# The agent must be running and sshd must have logged that it listens on the port (since the restart above).
+i=0; LISTENING=""
+while [ $i -lt 40 ]; do
+  if [ "$(launchd_state)" = running ]; then
+    LISTENING="$(tail -c +$(( \${OFFSET:-0} + 1 )) "$D/sshd.log" 2>/dev/null | grep -E "Server listening on .* port $PORT(\\.|$)" | sed 's/^.*Server listening on //' | tr '\\n' ' ')"
+    [ -n "$LISTENING" ] && break
+  fi
+  i=$((i + 1)); sleep 1
+done
+[ -n "$LISTENING" ] || fail "the agent $LABEL is $(launchd_state) and its sshd has not logged that it listens on port $PORT"
+emit launchd running
+emit listening "$LISTENING"
+exit 0
 `;
 }

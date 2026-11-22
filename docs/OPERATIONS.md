@@ -15,16 +15,16 @@ Gateway가 메신저 연결과 헤드 수명을 맡고, 모든 요청·후속 �
 플랫폼·계정·대화·주제 신원은 분리한다. 멀티테넌트 구성이나 OS 보안 샌드박스가 아니다.
 관리 RPC Host의 동일 프로세스 native TUI/herdr attach는 지원하지 않는다.
 
-### 명시적으로 Linux 워커 선택하기
+### 명시적으로 워커(Linux·macOS) 선택하기
 
-**지원 범위.** 워커는 **Linux + systemd 사용자 매니저** 계정만 지원한다. macOS 워커는
-`gui/<uid>` LaunchAgent 경로가 실기기에서 검증되기 전까지 명확한 오류로 거부하고,
-Windows 워커와 자동 머신 선택(배치)은 없다. HEAD는 소유자나 근거가 지정한 워커에만 레인을 둔다.
-`workers`를 설정하지 않으면 기존 로컬 레인만 사용한다.
+**지원 범위.** 워커는 두 가지 계정만 지원한다. **Linux + systemd 사용자 매니저**(linger 필요)와
+**macOS + 로그인된 GUI 세션**(`gui/<uid>` launchd 도메인, Remote Login/OpenSSH로 접근 가능). 그 밖의 플랫폼
+(Windows)은 명확한 오류로 거부하고, 자동 머신 선택(배치)은 없다. HEAD는 소유자나 근거가 지정한 워커에만
+레인을 둔다. `workers`를 설정하지 않으면 기존 로컬 레인만 사용한다.
 
 **동등성 원칙.** 원격 레인은 그 워커 계정이 자기 PC에서 직접 실행한 stock OMP처럼 동작한다.
-워커 Host는 SSH 세션이 아니라 계정의 systemd 사용자 매니저 안 일시 유닛(`omp-sa-<레인>-g<세대>`)에서
-**로그인 셸 환경**(`$SHELL -l -i -c`로 측정)으로 실행된다. 계정 자신의 OMP 홈(설정·인증·스킬·
+워커 Host는 SSH 세션이 아니라 계정의 사용자 컨텍스트(Linux: systemd 사용자 매니저의 일시 유닛 `omp-sa-<레인>-g<세대>`,
+macOS: `gui/<uid>` 도메인의 일회성 LaunchAgent)에서 **로그인 셸 환경**(`$SHELL -l -i -c`로 측정)으로 실행된다. 계정 자신의 OMP 홈(설정·인증·스킬·
 AGENTS.md·메모리)을 그대로 쓰므로 메모리는 머신별이다. 레인 정책(lane 확장, 모델·프리셋 스냅샷,
 서브에이전트 동시성, 세션 설정 범위)은 로컬 레인과 같고, omp-superkit은 HEAD가 고정한 리비전이다.
 
@@ -44,16 +44,18 @@ omp-sa worker list --config config.json
   `--dedicated-key` 없이 쓰면 HEAD 설정의 `destination`도 같은 별칭이어야 한다(`user@host`는 별칭이 아니므로 거부).
   접속은 `ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes`(tty 없음, 에이전트·포트 포워딩 금지)로만 한다.
 - `--dry-run`은 각 단계와 그 결정을 출력하고 아무것도 바꾸지 않는다(원격은 읽기 전용 점검만 수행).
-- 단계 순서: ① HEAD 쪽 검증(설정, `coordination.sqlite`의 `worker:instance`, 패키지 신원, 워커 아키텍처용
-  `host-owner/bin/omp-host-owner-linux-<x64|arm64>`) ② 원격 사전 점검(Linux, systemd 사용자 매니저, linger,
+- 단계 순서: ① HEAD 쪽 검증(설정, `coordination.sqlite`의 `worker:instance`, 패키지 신원, 워커 플랫폼·아키텍처용
+  `host-owner/bin/omp-host-owner-<linux|darwin>-<x64|arm64>`) ② 원격 사전 점검(Linux: systemd 사용자 매니저, linger / macOS: `gui/<uid>` 도메인, Command Line Tools,
   로그인 셸의 OMP 버전·모델 인증, bun, git, `--root`) ③ HEAD와 같은 릴리스를
   `~/.local/share/omp-superagent-worker/releases/<버전>-<다이제스트12>/`에 설치하고 설치본의 `workerPackage()`
-  다이제스트를 검증한 뒤 `releases/current`를 원자적으로 전환(이미 검증된 디렉터리는 건너뜀, 이전 릴리스는 유지)
-  ④ `~/.local/bin/omp-sa-worker` 래퍼와 비대화형 SSH PATH(login shell이 bash이고 PATH에 없을 때만 `~/.bashrc` 맨 위에
-  보호된 한 줄 추가) ⑤ `worker.json`(0600, 디렉터리 0700, 조상 디렉터리 쓰기 권한 점검) ⑥ 워커 OMP 메모리 백엔드 ⑦ (선택)
-  `--dedicated-key` ⑧ `workers.<이름>`을 HEAD 설정에 원자적으로 기록 ⑨ `doctor`.
-- 원격 사전 점검은 정확한 사유로 거부한다: 비 Linux, 사용자 매니저 없음, linger 꺼짐(실행할 `loginctl enable-linger <user>`를
-  그대로 출력), OMP 없음 또는 최소 버전 미달, 모델 인증 없음, bun 없음, `--root` 없음. 이미 다른 HEAD의
+  다이제스트를 검증한 뒤 `releases/current`를 원자적으로 전환(이미 검증된 디렉터리는 건너뜀, 이전 릴리스는 유지).
+  macOS는 이어서 설치본이 **고정 런처 준비**를 일반 SSH 명령으로 실행한다(아래 "macOS 워커")
+  ④ `~/.local/bin/omp-sa-worker` 래퍼와 비대화형 SSH PATH(PATH에 없을 때만, login shell이 bash면 `~/.bashrc`,
+  zsh(macOS 기본)면 `~/.zshenv` 맨 위에 보호된 한 줄 추가; 비대화형 SSH의 zsh는 `.zshenv`만 읽는다) ⑤ `worker.json`(0600, 디렉터리 0700, 조상 디렉터리 쓰기 권한 점검) ⑥ 워커 OMP 메모리 백엔드 ⑦ (선택, macOS)
+  `--user-sshd` ⑧ (선택) `--dedicated-key` ⑨ `workers.<이름>`을 HEAD 설정에 원자적으로 기록 ⑩ `doctor`.
+- 원격 사전 점검은 정확한 사유로 거부한다: 지원하지 않는 OS, 사용자 매니저 없음, linger 꺼짐(실행할 `loginctl enable-linger <user>`를
+  그대로 출력), macOS의 GUI 로그인 세션 없음(Mac 데스크톱에 로그인해 유지하라는 안내)·Command Line Tools 없음
+  (`xcode-select --install`을 Mac에서 한 번 실행하라는 안내; `xcode-select -p`로 확인하며 `cc`를 실행해 설치 창을 띄우지 않는다), OMP 없음 또는 최소 버전 미달, 모델 인증 없음, bun 없음, `--root` 없음. 이미 다른 HEAD의
   `worker.json`이 있으면 `--replace` 없이는 거부하고, 이 계정이 HEAD에 다른 이름으로 등록돼 있으면 거부한다.
   `workerId`는 같은 HEAD 인스턴스의 기존 값을 유지한다. 기본 `stateDir`(`~/.local/state/omp-superagent-worker`)가 Unix
   소켓 경로 한도를 넘으면 더 짧은 `--state-dir`을 요구한다.
@@ -87,6 +89,8 @@ HostName·User·Port·ProxyJump 복사, `--hostname`/`--port`로 재정의)을 �
 그 밖의 경우: `/etc/ssh/sshd_config.d/omp-sa.conf`에 `ListenAddress 0.0.0.0:22`, `ListenAddress [::]:22`,
 `ListenAddress <tailnet-ip>:2222`를 두고 `sshd -t && systemctl reload ssh`. 이후
 `worker add ... --dedicated-key --hostname <tailnet-ip-또는-이름> --port 2222`로 다시 실행한다.
+macOS 워커는 관리자가 필요 없는 `--user-sshd`로 이를 대신한다(아래 "macOS 워커"). Linux에서는 `--user-sshd`가 root가 필요해
+거부되고 위 드롭인 절차가 그대로 출력된다.
 
 **지원 범위.** `add`는 Linux 워커만 처리한다. 플랫폼 요구사항은 코드의 한 곳(`worker-setup.ts`의 `PLATFORMS`)에
 모여 있어 다른 플랫폼을 추가할 수 있다. 루프백 테스트는 `OMP_SUPERAGENT_TEST_WORKER_CONTEXT=direct`로 Linux 전용 점검
@@ -109,21 +113,95 @@ HostName·User·Port·ProxyJump 복사, `--hostname`/`--port`로 재정의)을 �
 
 #### 2. 워커 계정 준비 (수동 참고: `worker add`가 대신 수행, 워커에서 해당 계정으로)
 
-1. 로그인 유지: `loginctl show-user $USER -p Linger`가 `yes`여야 한다(아니면 관리자가
-   `loginctl enable-linger <user>`). 없으면 실행을 거부한다.
+1. 로그인 유지. **Linux**: `loginctl show-user $USER -p Linger`가 `yes`여야 한다(아니면 관리자가
+   `loginctl enable-linger <user>`). **macOS**: 계정이 Mac의 데스크톱에 한 번 로그인해 그 세션을 유지해야 한다
+   (로그아웃·빠른 사용자 전환 금지). `launchctl print gui/$(id -u)`가 성공해야 하며, 아니면 실행을 거부한다.
+   그 밖의 macOS 사전 조건은 아래 "macOS 워커"를 따른다.
 2. stock OMP(HEAD가 요구하는 `@oh-my-pi/pi-coding-agent` 버전 이상)와 Bun을 설치하고, 계정에서 직접
    모델 인증을 마친다. HEAD의 토큰·프로필·환경 파일은 복사하지 않는다.
 3. **HEAD와 같은 omp-superagent 릴리스**를 설치한다. 소스 트리를 쓸 때는 `bun install --frozen-lockfile
    --ignore-scripts`로 설치해 워커가 GitHub에서 superkit을 따로 준비하지 않게 한다. Linux용
-   `host-owner/bin/omp-host-owner-linux-<arch>`가 있어야 한다(공식 npm 패키지에 포함). 패키지 버전이나
+   `host-owner/bin/omp-host-owner-<linux|darwin>-<arch>`가 있어야 한다(공식 npm 패키지에 포함). 패키지 버전이나
    소스 다이제스트가 다르면 HEAD가 실행을 거부한다.
 4. `omp-sa-worker`가 비대화형 SSH의 PATH에서 보이도록 `~/.local/bin/omp-sa-worker` 래퍼
    (`exec <bun> --no-env-file <설치경로>/bin/omp-sa-worker`)를 두고 PATH에 포함한다.
 5. `~/.config/omp-superagent/worker.json`(계정 소유 `0600`, 상위 디렉터리는 그룹·기타 쓰기 금지):
    `{"workerId":"<위 workerId>","instance":"<worker:instance>","stateDir":"/home/<user>/.osa","workspaceRoots":["/home/<user>/projects"],"command":["omp"]}`.
-   `stateDir`은 짧은 `0700` 디렉터리, `workspaceRoots`는 실제 정규 경로다.
+   `stateDir`은 짧은 `0700` 디렉터리, `workspaceRoots`는 실제 정규 경로다. macOS에서는 홈이 `/Users/<user>`이고, 두 경로를 보호 폴더 밖(예: `~/.osa`, `~/projects`)에 둔다.
 6. 점검: `ssh <별칭> omp-sa-worker </dev/null`이 프로토콜 오류 프레임을 출력하면 실행 경로가 맞다.
    설정 오류는 이 명령의 stderr에 이유가 나온다. 워커에서 `omp-sa start`를 실행하지 않는다.
+
+#### macOS 워커
+
+macOS 워커의 Host는 위 `omp-sa-worker`가 아니라 **하나의 고정 런처**
+(`~/Library/Application Support/omp-superagent-worker/bin/omp-sa-worker-launcher`)를 실행하는 LaunchAgent에서
+돈다. macOS는 개인정보(TCC) 접근을 launchd 작업의 *responsible process* 에, 키체인 "항상 허용"을 접근하는
+바이너리의 코드 신원에 묶는다. 런처는 한 번 설치·서명한 뒤 **업그레이드로 교체하지 않으므로** 한 번 허용한
+권한이 이후 레인·재부팅·omp-superagent/OMP/Bun 업그레이드에서 다시 묻지 않는다. 업그레이드는 런처 옆
+비공개 `payload` 포인터(bun과 릴리스 경로)만 바꾼다(엔드포인트가 자동으로 갱신).
+
+**`omp-sa worker add`로 한 번에.** macOS 워커도 `omp-sa worker add <이름> --ssh <목적지> --root ...` 한 번이면 된다.
+사전 점검이 `uname -s`, `gui/<uid>` 도메인(`launchctl print gui/$(id -u)`), Command Line Tools, 로그인 셸(기본
+zsh), `--root`의 보호 폴더 여부를 확인한다. 설치 단계는 릴리스를 설치한 뒤 설치본의 `worker-macos-setup.ts --prepare`를
+일반 SSH 명령(GUI 세션과 무관)으로 실행해 런처가 없을 때만 한 번 빌드·서명하고, `payload` 포인터를 새 릴리스로
+돌리고, 같은 런처의 기존 `grants.json`을 유지한다. 이 단계는 보호 폴더를 읽지 않으므로 **어떤 대화상자도 띄우지 않으며**,
+소유자가 Mac 앞에서 해야 할 남은 일(보호 폴더별로 런처에 허용할 항목)을 정확히 출력한다. `doctor`는 `macos session`,
+`macos launcher`(서명 cdhash가 기록과 일치), `macos payload`(포인터가 설치 릴리스를 가리킴), `macos grants`를 보여 주고
+허용이 빠진 보호 폴더는 켤 항목과 함께 FAIL로 표시한다. 대상이 연결되지 않으면(`Connection refused` 등) 가장 덜 침습적인
+방법(시스템 설정 > 일반 > 공유 > 원격 로그인, "다음 사용자의 접근 허용"을 워커 계정으로만 제한)을 안내하고 시스템 설정은
+절대 바꾸지 않는다.
+
+**`--user-sshd`: 관리자 없이 워커 계정이 직접 띄우는 sshd (macOS 권장).** macOS 원격 로그인은 관리자가 시스템 설정에서 켜야
+하고 모든 인터페이스에서 받으며, Homebrew `tailscaled`는 tailnet 주소의 22번 포트를 Tailscale SSH가 맡고
+`authorized_keys` 옵션(`command=`, `from=`, `restrict`)을 무시한다. 워커 계정이 **자기 권한으로** 돌리는 비-root sshd는 그 계정으로만
+로그인할 수 있고 관리자 작업도 GUI 단계도 필요 없다.
+
+```sh
+omp-sa worker add <이름> --ssh <목적지> --root /Users/<user>/projects --config config.json \
+  --dedicated-key --hostname <워커의-tailnet-IP> --port 2222 --user-sshd --dry-run   # 먼저 확인
+```
+
+`--user-sshd`는 `--dedicated-key`, `--hostname`(워커의 tailnet 주소 하나; IPv6 리터럴이면 대괄호는 자동으로 붙는다), `--port`(1024 이상)를 요구한다.
+설정 연결로 워커 계정이 다음을 하며(전용 키 단계보다 앞서 실행되므로 그 키의 forced command 점검이 이 sshd를 거친다), 모두 멱등이다.
+
+- `~/.omp-sa-sshd/`(0700)에 호스트 키 `ssh_host_ed25519_key`(없을 때만 생성)와 `sshd_config`(0600): `ListenAddress <주소>:<포트>`,
+  `HostKey`, `PidFile`, `AuthorizedKeysFile .ssh/authorized_keys`, 비밀번호·키보드 인증 끔, `UsePAM no`, `PermitRootLogin no`,
+  `AllowUsers <user>`, `UseDNS no`, `StrictModes yes`. 적용 전에 `/usr/sbin/sshd -t -f`로 검사하고, 통과하지 못하면 기존 파일을 건드리지 않는다.
+- `~/Library/LaunchAgents/com.omp-superagent.sshd.plist`: `/usr/sbin/sshd -D -f ~/.omp-sa-sshd/sshd_config -E ~/.omp-sa-sshd/sshd.log`,
+  `RunAtLoad`, `KeepAlive`, `ThrottleInterval 30`. `launchctl bootstrap gui/<uid> <plist>`로 올린 뒤 `launchctl print gui/<uid>/com.omp-superagent.sshd`가
+  `state = running`이고 로그에 `Server listening on <주소> port <포트>`가 찍힐 때까지 확인한다.
+- 이미 같은 설정이면 아무것도 바꾸지 않는다(실행 중이면 재시작도 없음). 설정이 다르면 `sshd_config.bak-<시각>`을 남기고 다시 쓴 뒤
+  `launchctl kickstart -k`로 재시작하고, plist가 다르면 `bootout` 후 `bootstrap`한다. `ThrottleInterval` 때문에 직전 시작에서 30초 안에
+  재시작하면 그만큼 기다린다. `--dry-run`은 위 결정만 출력한다(워커에서는 읽기 전용 점검만).
+- 전용 키 단계는 `known_hosts`에 이 sshd의 호스트 키(`~/.omp-sa-sshd/ssh_host_ed25519_key.pub`)를 고정한다. 응용 프로그램 방화벽은 Apple 서명
+  `/usr/sbin/sshd`의 수신을 대화상자 없이 허용했다.
+- `worker doctor`는 이 LaunchAgent가 있으면 `user sshd` 행으로 launchd 상태와 듣고 있는 소켓을 보여 준다(대화상자 없음).
+
+멈추려면 워커에서 `launchctl bootout gui/$(id -u)/com.omp-superagent.sshd`를 실행하고 plist와 `~/.omp-sa-sshd/`를 지운다.
+
+**수동으로 할 때 한 번만 필요한 준비 (Mac 앞에서, 한 번에):**
+
+1. (`--user-sshd`를 쓰지 않을 때만) 시스템 설정 > 일반 > 공유 > **원격 로그인** 켜기(대상 사용자 허용). 이것이 SSH(OpenSSH) 접근이다.
+2. 워커 계정으로 데스크톱에 로그인하고 로그아웃하지 않는다. 키체인을 쓰는 도구(`gh`, `git credential-osxkeychain`)가
+   있으면 계정 암호로 로그인해 로그인 키체인이 잠금 해제된 상태여야 한다(자동 로그인은 키체인을 풀지 않는다).
+3. Xcode Command Line Tools(`cc`, `codesign`)를 설치한다(런처를 소스에서 한 번 빌드·서명).
+4. `bun run setup:macos-worker`를 워커 계정으로 실행한다(Mac 앞에서, 또는 소유자가 화면을 보는 상태의 SSH).
+   런처를 설치하고, 보호 폴더 안의 `workspaceRoots`/`stateDir`가 있으면 런처가 직접 그 폴더를 읽어 보며 **폴더당
+   한 번** 뜨는 권한 창(파일 및 폴더)을 소유자가 허용한다. 읽기에 성공한 것만 `grants.json`에 기록하고, 실패하면
+   켤 항목(시스템 설정 > 개인정보 보호 및 보안 > 파일 및 폴더 또는 전체 디스크 접근 권한에서
+   `omp-sa-worker-launcher`)을 출력한다. 켠 뒤 다시 실행한다.
+
+`workspaceRoots`와 `stateDir`가 Desktop·Documents·Downloads·iCloud·클라우드 저장소·외장/네트워크 볼륨 **밖**이면
+권한 창이 뜰 일이 없고 4단계는 런처 설치만 한다(권장). HEAD가 레인을 시작할 때는 대화상자를 띄우지 않고
+미설치 런처·기록되지 않은 보호 폴더·바뀐 런처를 정확한 항목과 함께 거부한다. 다른 권한(자동화/AppleEvents, 로컬
+네트워크)은 기본 Host가 일으키지 않으며, 도구가 쓰면 런처에 대해 한 번만 묻는다. OMP는 제공자 인증을
+키체인이 아니라 `~/.omp/agent/agent.db`에 둔다.
+
+**Tailscale (macOS).** App Store/독립 실행형 Tailscale 앱은 Tailscale SSH 서버를 실행하지 않으므로 tailnet 주소의
+22번 포트는 보통 OpenSSH다(이 경우 `authorized_keys`의 고정 명령이 적용된다). 반드시 `ssh <별칭> whoami`가
+`whoami` 결과가 아니라 워커 프로토콜 응답을 내는지로 고정 명령 적용 여부를 확인한다. `whoami` 결과가 나오면
+Tailscale SSH가 가로챈 것이므로 OpenSSH를 별도 포트에서 받는다. macOS에서는 관리자가 필요 없는 위 `--user-sshd`를 쓴다
+(원격 로그인과 `sshd_config`의 `Port`/`ListenAddress`는 관리자가 켜야 하고 모든 인터페이스에서 받는다).
 
 #### 3. SSH 강화 (권장)
 

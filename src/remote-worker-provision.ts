@@ -4,6 +4,8 @@ import { homedir, hostname, userInfo } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { Type, type Static } from "@sinclair/typebox/type";
 import { absolutePath, parse, RemoteWorkerError, text, uuid, type WorkerScope } from "./remote-worker-wire";
+import { requireMacosWorkerReady, type MacosWorkerScope } from "./worker-macos";
+import { requireUserContext, runInUserContext } from "./worker-user-context";
 
 const provisionSchema = Type.Object({
   workerId: uuid, instance: uuid, stateDir: absolutePath,
@@ -94,56 +96,74 @@ export function workspacePaths(config: WorkerProvision, scope: WorkerScope, id: 
   return { directory, socketPath: join(directory, "host.sock"), sessionFile: join(directory, "session.jsonl") };
 }
 
-/** Test-only: loopback fixtures launch directly from the endpoint on non-Linux CI. */
-export const TEST_WORKER_CONTEXT_ENV = "OMP_SUPERAGENT_TEST_WORKER_CONTEXT";
-export const directWorkerContext = () => process.env[TEST_WORKER_CONTEXT_ENV] === "direct";
-
 function exactlyOne(argv: string[], timeout: number): { code: number | null; stdout: Buffer } {
   const child = Bun.spawnSync(argv, { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout, killSignal: "SIGKILL" });
   return { code: child.exitCode, stdout: child.stdout };
 }
 
 /**
- * Worker Hosts run like stock OMP started by this account on this machine: in
- * its systemd user manager (not the SSH session, so logout does not end them)
- * with its login-shell environment. Refuse rather than fall back.
+ * Test-only: loopback fixtures launch directly from the endpoint ("direct") on CI
+ * without a user manager, or through the real user context with the endpoint's
+ * own (private-profile) environment standing in for the account's ("forward-env").
  */
-export function requireUserManager(): void {
+export const TEST_WORKER_CONTEXT_ENV = "OMP_SUPERAGENT_TEST_WORKER_CONTEXT";
+export const directWorkerContext = () => process.env[TEST_WORKER_CONTEXT_ENV] === "direct";
+export const forwardedWorkerEnvironment = (): Record<string, string> | undefined => process.env[TEST_WORKER_CONTEXT_ENV] === "forward-env"
+  ? Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)) : undefined;
+
+/**
+ * Worker Hosts run like stock OMP started by this account on this machine: in
+ * its own user context (systemd user manager on Linux, `gui/<uid>` launchd domain
+ * on macOS; not the SSH session, so logout does not end them) with its
+ * login-shell environment. Refuse rather than fall back.
+ */
+export function requireUserManager(scope?: MacosWorkerScope): void {
   if (directWorkerContext()) return;
-  if (process.platform !== "linux") {
-    throw new RemoteWorkerError(`Remote workers currently require Linux with a systemd user manager; ${process.platform} workers are not supported`);
-  }
-  const uid = process.getuid?.();
-  const linger = exactlyOne(["loginctl", "show-user", String(uid), "--property=Linger", "--value"], 5_000);
-  if (linger.code !== 0 || linger.stdout.toString("utf8").trim() !== "yes") {
-    throw new RemoteWorkerError("Worker account needs lingering (loginctl enable-linger) so its Hosts survive SSH logout");
-  }
+  requireUserContext();
+  if (scope && process.platform === "darwin") requireMacosWorkerReady(scope);
 }
 
 export function bootId(): string {
   if (directWorkerContext()) return `direct:${hostname()}`;
+  if (process.platform === "darwin") {
+    const child = Bun.spawnSync(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 5_000, killSignal: "SIGKILL" });
+    const id = child.stdout.toString("utf8").trim();
+    if (child.exitCode !== 0 || !id) throw new RemoteWorkerError("Worker boot session could not be read");
+    return id;
+  }
   return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
 }
 
 /** Variables that describe the transport or service manager, not the account's login environment. */
 const transportOnly = new Set(["OMP_RPC_SOCKET", "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY", "SSH_ORIGINAL_COMMAND",
-  "INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "MANAGERPID", "MAINPID", "NOTIFY_SOCKET", "_", "SHLVL", "PWD", "OLDPWD"]);
+  "INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "MANAGERPID", "MAINPID", "NOTIFY_SOCKET", "XPC_SERVICE_NAME", "XPC_FLAGS",
+  "_", "SHLVL", "PWD", "OLDPWD"]);
+
+/** The account's login shell from the directory service; Bun's `userInfo()` has no shell or user name on macOS. */
+function loginShell(): string | undefined {
+  if (process.platform !== "darwin") return userInfo().shell ?? undefined;
+  const name = exactlyOne(["id", "-un"], 5_000).stdout.toString("utf8").trim();
+  if (!name) return undefined;
+  const { stdout } = exactlyOne(["dscl", "-q", "/Search", "-read", `/Users/${name}`, "UserShell"], 5_000);
+  return /^UserShell: (\S+)$/m.exec(stdout.toString("utf8"))?.[1];
+}
 
 /**
  * The account's login-shell environment (`$SHELL -l -i -c`, NUL-framed after a
- * nonce, stdin /dev/null, bounded). From the SSH endpoint it is measured inside
- * a transient user-manager unit; the launcher already runs in one.
+ * nonce, stdin /dev/null, bounded). From the SSH endpoint (`stateDir` given) it is
+ * measured inside the account's user context; the launcher already runs in one.
  */
-export function loginEnvironment(viaUserManager: boolean): Record<string, string> {
+export async function loginEnvironment(stateDir?: string): Promise<Record<string, string>> {
   if (directWorkerContext()) {
     return Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
   }
-  const shell = userInfo().shell;
+  const shell = loginShell();
   if (!shell || !isAbsolute(shell)) throw new RemoteWorkerError("Worker account has no absolute login shell");
   const marker = `omp-sa-login-${randomUUID()}`;
-  const argv = [...(viaUserManager ? ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--"] : []),
-    shell, "-l", "-i", "-c", `printf '%s\\0' ${marker}; exec env -0`];
-  const { code, stdout } = exactlyOne(argv, 20_000);
+  const argv = [shell, "-l", "-i", "-c", `printf '%s\\0' ${marker}; exec env -0`];
+  const { code, stdout } = stateDir === undefined
+    ? exactlyOne(argv, 20_000)
+    : await runInUserContext(argv, { timeoutMs: 20_000, stateDir, purpose: "login-env", capture: true, env: forwardedWorkerEnvironment() });
   const start = stdout.indexOf(Buffer.from(`${marker}\0`));
   if (code !== 0 || start === -1) throw new RemoteWorkerError("Worker login-shell environment could not be read");
   const env: Record<string, string> = {};

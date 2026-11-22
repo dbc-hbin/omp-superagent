@@ -7,6 +7,8 @@ import { nativeDisabledProviders } from "./native-extension";
 import { offlineMnemopi } from "./native-memory";
 import { sshWorkerSettings } from "./native-remote-worker";
 import { parse } from "../../src/remote-worker-wire";
+import { installWorkerLauncher, launcherPath, supportDirectory } from "../../src/worker-macos";
+import { assertLaunchdOwner, awaitNoWorkerJobs } from "./worker-launchd";
 import { parityModel, parityProbe } from "./native-parity-provider";
 import type * as HostFixtures from "./host-fixture-processes";
 
@@ -116,10 +118,11 @@ export interface ParityFixture {
 /**
  * One HEAD account that runs a local lane and reaches a loopback worker account
  * (no sshd: the `ssh` shim on PATH launches the worker's real `omp-sa-worker`
- * with OMP_SUPERAGENT_TEST_WORKER_CONTEXT=direct). Both accounts load the same
+ * with OMP_SUPERAGENT_TEST_WORKER_CONTEXT=direct, or with `launchd` through the
+ * real gui-domain LaunchAgent on macOS). Both accounts load the same
  * deterministic provider, so the same scripted scenario runs on either lane.
  */
-export async function nativeLaneParityFixture(root: string): Promise<ParityFixture> {
+export async function nativeLaneParityFixture(root: string, launchd = false): Promise<ParityFixture> {
   const workerHome = join(root, "worker-home");
   const stateDir = join(root, "ws");
   const workerCwd = join(workerHome, "workspace");
@@ -133,11 +136,14 @@ export async function nativeLaneParityFixture(root: string): Promise<ParityFixtu
   const head = await headSide(root, probe);
   const workerEnv = await privateProfile(workerHome, root, head.localPath);
   await stageWorker(installation);
+  const support = supportDirectory(workerHome);
+  if (launchd) installWorkerLauncher(support);
   const workerCustody = join(installation, custody);
   const worker: typeof HostFixtures = await import(workerCustody);
   const loopback = { transport: "loopback", destination, startAttempts: head.startAttempts, lostStartReceipt: head.lostStartReceipt,
     argv: [head.bun, "--no-env-file", join(installation, "bin/omp-sa-worker")],
-    env: { ...workerEnv, SA_PROOF_CUSTODY: workerCustody, SA_PROOF_ROOT: stateDir, OMP_SUPERAGENT_TEST_WORKER_CONTEXT: "direct" },
+    env: { ...workerEnv, SA_PROOF_CUSTODY: workerCustody, SA_PROOF_ROOT: stateDir,
+      OMP_SUPERAGENT_TEST_WORKER_CONTEXT: launchd ? "forward-env" : "direct" },
     virtualCwd: workerCwd, workerAlias: workerCwd,
   };
   await Promise.all([
@@ -149,14 +155,18 @@ export async function nativeLaneParityFixture(root: string): Promise<ParityFixtu
   return {
     destination, workerId, instance, probe, workerCwd, stateDir, provider, laneExtension, managedPackage,
     localCwd: head.localCwd, headState: head.headState, headCwd: head.headCwd, command: head.command,
-    transportPath: head.transportPath, headEnv: head.headEnv, accountEnvironment: false,
+    transportPath: head.transportPath, headEnv: head.headEnv, accountEnvironment: launchd,
     async stopWorkers(): Promise<void> {
       const directories = await readdir(stateDir, { withFileTypes: true });
       for (const dir of directories) {
         if (dir.isDirectory() && /^[a-f0-9]{24}$/.test(dir.name)) await worker.stopHostFixtures(join(stateDir, dir.name));
       }
     },
-    async cleanup(): Promise<void> {},
+    async cleanup(): Promise<void> { if (launchd) await awaitNoWorkerJobs(); },
+    ...launchd ? { async workerProcess(ownerPid: number) {
+      assertLaunchdOwner(ownerPid, launcherPath(support));
+      return { launchd: true, launcher: launcherPath(support) };
+    } } : {},
   };
 }
 

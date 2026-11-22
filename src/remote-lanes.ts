@@ -285,6 +285,9 @@ export const MINIMUM_WORKER_OMP: string = (JSON.parse(readFileSync(new URL("../p
 const CLOCK_SKEW_LIMIT_MS = 120_000;
 
 export function requireCompatibleWorker(capability: WorkerCapability, now = Date.now()): void {
+  if (capability.platform !== "linux" && capability.platform !== "darwin") {
+    throw new Error(`Worker platform ${capability.platform} is not supported; workers run on Linux or macOS`);
+  }
   const local = workerPackage();
   if (capability.package.version !== local.version || capability.package.digest !== local.digest) {
     throw new Error(`Worker runs omp-superagent ${capability.package.version} (${capability.package.digest.slice(0, 12)}), `

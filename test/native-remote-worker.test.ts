@@ -17,10 +17,13 @@ import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit
 import { detachedJournalOrder, nativeRemoteWorkerFixture, sshRemoteWorkerFixture, type RemoteWorkerProof } from "./fixtures/native-remote-worker";
 import { recoveryGateMarker, remoteWorkerModel, workspaceProbe } from "./fixtures/native-remote-worker-provider";
 import { nativeRequestEnvelope } from "./fixtures/native-request-envelope";
+import { launchdAvailable } from "./fixtures/worker-launchd";
 
 const nativeTest = process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 // Opt-in proof against an operator-provisioned worker over real OpenSSH; see docs/OPERATIONS.md.
 const sshWorker = process.env.OMP_SUPERAGENT_SSH_WORKER;
+// The worker's Host starts through the real gui-domain LaunchAgent and its fixed launcher (macOS).
+const launchdTest = launchdAvailable ? test : test.skip;
 const sshTest = sshWorker && process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 const route: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: "3", channelId: "4", threadId: "8001" };
 
@@ -85,6 +88,7 @@ async function shutdown(connection: RuntimeHost, identity: WorkerHostIdentity): 
 
 const scenario = "stock OMP recovers a lost start reply and detached completion, then resumes the original worker and thread";
 nativeTest(`${scenario} (loopback worker)`, () => proveRemoteWorker(nativeRemoteWorkerFixture), 180_000);
+launchdTest(`${scenario} (loopback worker, real launchd)`, () => proveRemoteWorker(root => nativeRemoteWorkerFixture(root, true)), 180_000);
 sshTest(`${scenario} (real SSH worker)`, () => proveRemoteWorker(root => sshRemoteWorkerFixture(root, sshWorker!)), 300_000);
 
 async function proveRemoteWorker(provision: (root: string) => Promise<RemoteWorkerProof>): Promise<void> {

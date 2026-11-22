@@ -16,11 +16,14 @@ import { Superagent, type RuntimeHost } from "../src/runtime";
 import { Store } from "../src/store";
 import { stopHostFixtures } from "./fixtures/host-fixture-processes";
 import { nativeLaneParityFixture, sshLaneParityFixture, type ParityFixture } from "./fixtures/native-parity-lanes";
+import { launchdAvailable } from "./fixtures/worker-launchd";
 import { parityLaneReport, parityModel, type ParityLaneReport } from "./fixtures/native-parity-provider";
 
 const nativeTest = process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 // Opt-in proof against an operator-provisioned worker over real OpenSSH; see docs/OPERATIONS.md.
 const sshWorker = process.env.OMP_SUPERAGENT_SSH_WORKER;
+// The worker's Host starts through the real gui-domain LaunchAgent and its fixed launcher (macOS).
+const launchdTest = launchdAvailable ? test : test.skip;
 const sshTest = sshWorker && process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 const parent: Omit<Route, "threadId"> = { platform: "discord", accountId: "2", authorityId: "1", guildId: "3", channelId: "4" };
 type Variant = "model" | "preset";
@@ -193,6 +196,7 @@ const revisionOf = (path: string): string | null => /\/revisions\/([0-9a-f]{40,6
 
 const scenario = "a remote lane behaves like a local lane under one HEAD runtime";
 nativeTest(`${scenario} (loopback worker)`, () => proveParity(nativeLaneParityFixture), 300_000);
+launchdTest(`${scenario} (loopback worker, real launchd)`, () => proveParity(root => nativeLaneParityFixture(root, true)), 300_000);
 sshTest(`${scenario} (real SSH worker)`, () => proveParity(root => sshLaneParityFixture(root, sshWorker!)), 600_000);
 
 async function proveParity(provision: (root: string) => Promise<ParityFixture>): Promise<void> {

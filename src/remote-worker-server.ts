@@ -12,13 +12,15 @@ import { HostConnection, startHost } from "./host";
 import { resolveOmpCommand } from "./installed-omp";
 import { activeManagedUlwRevision, installManagedUlwRevision } from "./managed-ulw";
 import {
-  approvedWorkspace, bootId, directWorkerContext, errorCode, laneEnvironment, loadWorkerProvision, loginEnvironment,
+  approvedWorkspace, bootId, directWorkerContext, errorCode, forwardedWorkerEnvironment, laneEnvironment, loadWorkerProvision, loginEnvironment,
   openPrivateFile, optionalStat, privateWorkerDirectory, requireUserManager, workspacePaths, type WorkerProvision
 } from "./remote-worker-provision";
+import { macosWorkerFacts, workerPayload } from "./worker-macos";
+import { runInUserContext } from "./worker-user-context";
 import { generationSocket, transcriptId, WorkerLaneState, type OwnedReservation } from "./remote-worker-state";
 import {
   decodeHeader, encodeHeader, INPUT_TIMEOUT, MODEL_LISTING_TIMEOUT, hostIdentitySchema, laneId, parse, placementSchema, PROVISION_TIMEOUT,
-  RemoteWorkerError, REQUEST_TIMEOUT, requestSchema, uuid, workerPackage, writeHeader,
+  RemoteWorkerError, REQUEST_TIMEOUT, requestSchema, START_TIMEOUT, uuid, workerPackage, writeHeader,
   type WorkerCapability, type WorkerLane, type WorkerLaunchOptions, type WorkerRequest, type WorkerScope
 } from "./remote-worker-wire";
 import { repositoryRoot } from "./repository";
@@ -51,6 +53,7 @@ async function capability(config: WorkerProvision, env: Record<string, string>):
     package: workerPackage(), platform: process.platform, bootId: bootId(), clock: Date.now(), omp: ompVersion, superkit,
     roots: config.workspaceRoots,
     models: models.flatMap(model => model.kind === "chat" && typeof model.selector === "string" ? [model.selector] : []),
+    ...process.platform === "darwin" && !directWorkerContext() ? { macos: macosWorkerFacts(config) } : {},
   };
 }
 
@@ -133,7 +136,7 @@ async function launch(config: WorkerProvision, scope: WorkerScope, id: string, t
       ...options, command: config.command, socketPath, sessionFile: lane.sessionFile, cwd: lane.cwd,
       extensionPath: fileURLToPath(new URL("./lane-extension.ts", import.meta.url)),
       logPath: join(state.paths.directory, `r${lane.generation.toString(36)}.log`),
-      env: laneEnvironment(loginEnvironment(false), id),
+      env: laneEnvironment(await loginEnvironment(), id),
       managedUlwRevision: launched.superkit,
     });
     const before = optionalStat(socketPath);
@@ -154,30 +157,39 @@ async function launch(config: WorkerProvision, scope: WorkerScope, id: string, t
   } finally { state.close(); }
 }
 
+/** Test-only "direct" context: the endpoint itself parents the launcher, as no user manager exists on the CI host. */
+async function runDirectly(argv: string[], logPath: string): Promise<{ code: number | null }> {
+  const log = openPrivateFile(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT);
+  try {
+    const child = spawn(argv[0]!, argv.slice(1), { detached: true, stdio: ["ignore", log, log] });
+    const [code] = await once(child, "exit");
+    return { code };
+  } finally { closeSync(log); }
+}
+
 async function detachedLaunch(config: WorkerProvision, request: Extract<WorkerRequest, { op: "start" }>, token: string,
   state: WorkerLaneState) {
   const logPath = join(config.stateDir, "launcher.log");
-  const log = openPrivateFile(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT);
-  try {
-    const launcher = [process.execPath, "--no-env-file", fileURLToPath(import.meta.url), "--launch",
-    request.instance, JSON.stringify(request.placement), request.lane.id, token];
-    // The launcher runs as the main process of a transient unit in the account's
-    // user manager, outside the SSH session. KillMode=process leaves the Host it
-    // starts running after the launcher exits; the unit's exit status is the
-    // launcher's. Losing the SSH channel cannot cancel a committed start or erase
-    // its receipt. A crashed launcher stays reserved forever.
-    const unit = `omp-sa-${basename(workspacePaths(config, request, request.lane.id).directory)}-g${request.lane.generation.toString(36)}`;
-    const argv = directWorkerContext() ? launcher : ["systemd-run", "--user", "--quiet", "--wait", "--collect", `--unit=${unit}`,
-      "--property=Type=oneshot", "--property=KillMode=process",
-      `--property=StandardOutput=append:${logPath}`, `--property=StandardError=append:${logPath}`, "--", ...launcher];
-    const child = spawn(argv[0]!, argv.slice(1), { detached: true, stdio: ["ignore", log, log] });
-    const [code] = await once(child, "exit");
-    if (code !== 0) {
-      // An exit status (not a signal) with the reservation still unclaimed proves no Host started.
-      if (typeof code === "number") state.abandon(token);
-      throw new RemoteWorkerError("Worker launch remains unconfirmed; see the worker launcher log");
-    }
-  } finally { closeSync(log); }
+  closeSync(openPrivateFile(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT));
+  const payload = workerPayload();
+  const launcher = [...payload, "--launch", request.instance, JSON.stringify(request.placement), request.lane.id, token];
+  // The launcher runs as the main process of a transient unit in the account's
+  // user manager (Linux) or a one-shot LaunchAgent in its gui domain (macOS),
+  // outside the SSH session. It leaves the Host it starts running after it
+  // exits; the job's exit status is the launcher's. Losing the SSH channel cannot
+  // cancel a committed start or erase its receipt. A crashed launcher stays reserved forever.
+  const unit = `omp-sa-${basename(workspacePaths(config, request, request.lane.id).directory)}-g${request.lane.generation.toString(36)}`;
+  const { code } = directWorkerContext()
+    ? await runDirectly(launcher, logPath)
+    : await runInUserContext(launcher, {
+      timeoutMs: START_TIMEOUT, stateDir: config.stateDir, purpose: "launch", logPath, unit, payloadLength: payload.length,
+      env: forwardedWorkerEnvironment(),
+    });
+  if (code !== 0) {
+    // An exit status (not a signal) with the reservation still unclaimed proves no Host started.
+    if (typeof code === "number") state.abandon(token);
+    throw new RemoteWorkerError("Worker launch remains unconfirmed; see the worker launcher log");
+  }
 }
 
 async function forward(state: WorkerLaneState, lane: WorkerLane, reply: (value: object) => Promise<void>): Promise<void> {
@@ -219,8 +231,9 @@ function workspace(config: WorkerProvision, cwd: string): string {
 async function dispatch(config: WorkerProvision, request: WorkerRequest, reply: (value: object) => Promise<void>) {
   switch (request.op) {
     case "capability": {
+      // A macOS worker reports its launcher readiness here (doctor names what is missing); starting a Host enforces it.
       requireUserManager();
-      return reply(await capability(config, loginEnvironment(true)));
+      return reply(await capability(config, await loginEnvironment(config.stateDir)));
     }
     case "provision": {
       // HEAD's validated immutable package; the worker never fetches its own.
@@ -250,8 +263,8 @@ async function dispatch(config: WorkerProvision, request: WorkerRequest, reply: 
       case "start": {
         // Cheap binding checks first; nothing below runs for a lane this worker must refuse.
         state.evaluate(lane);
-        requireUserManager();
-        const facts = await capability(config, loginEnvironment(true));
+        requireUserManager(config);
+        const facts = await capability(config, await loginEnvironment(config.stateDir));
         if (request.superkit !== null && facts.superkit !== request.superkit) {
           throw new RemoteWorkerError(`Worker omp-superkit is ${facts.superkit ?? "not installed"}; HEAD pinned ${request.superkit}`);
         }

@@ -16,3 +16,4 @@ dist/
 config.local.json
 .state/
 *.tsbuildinfo
+/worker-launcher/bin/
