@@ -26,6 +26,11 @@ Usage:
   omp-sa discord-commands --config FILE [--apply]
   omp-sa telegram-commands --config FILE [--language CODE] [--apply]
   omp-sa slack-commands --config FILE --manifest-token-env NAME [--apply]
+  omp-sa worker add NAME --ssh SETUP_DESTINATION --root ABS_PATH [--root ABS_PATH ...] --config FILE
+      [--dedicated-key [--from CIDR,...|any] [--hostname HOST] [--port PORT]]
+      [--superkit managed|none] [--state-dir ABS_PATH] [--replace] [--dry-run]
+  omp-sa worker doctor NAME --config FILE
+  omp-sa worker list --config FILE
 
 Setup and service lifecycle:
   setup creates FILE interactively, or preserves an existing FILE and prompts for its configured credentials.
@@ -58,6 +63,24 @@ Add a messenger to an existing installation:
   Editing FILE does not reload a running service. The next Gateway start activates all configured blocks.
   Other FILE settings: command (stock OMP argv), headCwd, stateDir, maxHosts (includes HEAD),
   maxSubagents (shared budget), idleMs (idle lane eviction), optional model (HEAD startup model).
+
+Remote Linux workers (optional; see docs/OPERATIONS.md):
+  worker add turns a Linux account you can already SSH into into a verified remote worker, and is safe to re-run.
+  SETUP_DESTINATION is an ordinary SSH destination (alias or user@host) used only by add. Steps, in order: validate
+  config and HEAD's package; preflight over SSH (Linux, systemd user manager, linger, OMP at the required version
+  with models, bun, roots); install HEAD's exact release under ~/.local/share/omp-superagent-worker/releases and verify
+  its digest; ~/.local/bin/omp-sa-worker and its non-interactive PATH; worker.json; the account's OMP memory backend
+  (set to mnemopi only when none is enabled, as HEAD does for its own profile); optionally --dedicated-key; register
+  workers.NAME in FILE; run doctor. --dry-run prints every decision and changes nothing.
+  --dedicated-key creates ~/.ssh/omp-sa-NAME_ed25519, authorizes it on the worker with
+  from="<tailnet ranges>",restrict,command=<omp-sa-worker> (--from overrides, "any" omits), adds Host omp-sa-NAME to
+  ~/.ssh/config (--hostname/--port override the setup destination's) and pins the worker's host key in known_hosts.
+  It refuses an address that ignores authorized_keys options (such as Tailscale SSH) and prints the OpenSSH fix;
+  add never changes sshd or runs as root. Every remote or local file it replaces is copied to FILE.bak-TIME first.
+  doctor checks the registered worker through its runtime destination without launching anything and always probes
+  ssh <destination> whoami: a worker frame is OK; plain output means the destination runs arbitrary commands and ignores
+  authorized_keys options (Tailscale SSH on :22), a WARN, or a FAIL for a dedicated omp-sa-NAME alias. list shows
+  configured workers and their last doctor facts.
 
 Command registration:
 discord-commands uses Discord REST only: dry-run by default, with no Gateway or native runtime activation.
@@ -146,9 +169,14 @@ function laneRows(stateDir: string): Array<Lane & { workerReachability?: unknown
 export async function main(args = process.argv.slice(2)): Promise<void> {
   if (!args.length || args.includes("--help") || args[0] === "help") { console.log(HELP); return; }
   const [command] = args;
-  if (!["setup", "start", "install", "uninstall", "status", "group", "stop", "doctor", "discord-commands", "telegram-commands", "slack-commands"].includes(command!)) throw new Error(`Unknown command: ${command}`);
+  if (!["setup", "start", "install", "uninstall", "status", "group", "stop", "doctor", "worker", "discord-commands", "telegram-commands", "slack-commands"].includes(command!)) throw new Error(`Unknown command: ${command}`);
   const configAt = args.indexOf("--config");
   if (configAt < 0 || !args[configAt + 1]) throw new Error("--config FILE is required");
+  if (command === "worker") {
+    const { runWorkerCommand } = await import("./worker-setup");
+    await runWorkerCommand(args.slice(1));
+    return;
+  }
   if (command === "install" || command === "uninstall") {
     if (args.length !== 3 || configAt !== 1 || args[2]!.startsWith("-"))
       throw new Error(`Usage: ${command} --config FILE`);

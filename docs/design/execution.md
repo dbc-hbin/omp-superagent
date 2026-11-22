@@ -42,6 +42,44 @@ reservation plus verified native identity, never a session-name match, and no
 candidate ranking or automatic placement exists. No external host client,
 report parser, shared ledger or execution layer participates at runtime.
 
+#### One-command worker onboarding
+
+`omp-sa worker add NAME --ssh SETUP_DESTINATION --root PATH…` turns an account the
+operator can already SSH into into a registered worker; `worker doctor` verifies
+it and `worker list` shows what was last measured. The logic lives in
+`src/worker-setup.ts` (planning, parsing, orchestration) and
+`src/worker-setup-remote.ts` (bounded POSIX scripts), wired from `src/cli.ts`.
+
+- Decisions are pure functions of facts: a read-only preflight script reports
+  platform, account, user manager, linger, the login-shell `omp`/`bun`/`git`,
+  roots and existing install state as nonce-framed `key value` lines; the
+  planner turns them into refusals, warnings and per-step decisions, so
+  `--dry-run` and a real run share the same path and differ only in whether the
+  apply scripts run. Platform requirements live in one table (`PLATFORMS`), so a
+  second platform adds an entry and its Host launch path instead of branching
+  through the steps.
+- Every apply script re-checks the worker's state itself, copies a file it
+  replaces to `<file>.bak-<time>`, and writes through a rename, so a lost
+  connection or a second run leaves nothing half-done. Nothing runs as root;
+  administrator commands (`enable-linger`, an OpenSSH listener beside Tailscale
+  SSH) are printed, never executed.
+- Identity is never invented twice: HEAD's `worker:instance` comes from the same
+  `workerInstance()` code a first launch uses; an existing `worker.json` keeps
+  its `workerId` for the same instance, HEAD's registered id wins for a name,
+  and another instance or another registered name is refused without `--replace`.
+- Native memory parity reuses `managed-memory.ts`: the worker's own copy of the
+  helper inspects the account's OMP profile, and only the "no enabled backend,
+  default or global source" case is repaired with the same `mnemopi` default HEAD
+  applies to its own profile. Any other state is reported, not changed.
+- A forced command is the only thing keeping a leaked HEAD key from being a shell,
+  so `add --dedicated-key` and `doctor` prove it: `ssh <alias> whoami` must answer
+  with a worker protocol frame. An address served by Tailscale SSH ignores
+  `authorized_keys` options and answers with `whoami`; that is refused with the
+  OpenSSH-on-another-port fix. `doctor` probes every registered worker's runtime
+  destination this way: a `whoami` answer from an ordinary alias is a warning (the
+  destination runs arbitrary commands), from an omp-sa dedicated alias a failure. The worker host key is pinned from the setup
+  connection (already verified) and a different recorded key is never replaced.
+
 #### Local/remote parity matrix
 
 Goal: a remote lane behaves like stock OMP run by the worker account on that
@@ -59,7 +97,7 @@ HEAD has only `HOME`, `PATH` and credentials).
 | 4 | Launch options | Same option object as a local lane (model/preset snapshot, `subagentConcurrency`, lane extension set); worker adds only its paths, login env and pinned superkit. | parity test (model/preset readback, tools) | P0 | done |
 | 5 | omp-superkit | A launcher that exits before claiming its reservation restores the record it replaced (no Host can exist). Per-worker `superkit`: `managed` (default) pins HEAD's active immutable revision; HEAD ships its validated package (digest-checked archive) over the worker channel; the worker probes and atomically activates it; `start` carries the revision and the Host loads exactly that package (`managedUlwRevision`), never the moving pointer. Mismatch/failed probe refuses. Worker installs use `--ignore-scripts` and never fetch from GitHub. `none` is an explicit non-parity mode: no superkit, workflow-selecting requests refused. | `remote-lanes.test.ts`, `remote-worker.test.ts` (match, mismatch, missing, idempotent provisioning, bad digest), runtime none-mode refusal, native loopback and real Linux worker provisioning | P0 | done |
 | 6 | Capability handshake | Protocol `omp-sa-worker-2`. Before every launch `capability` reports platform, package version and source digest, OMP version, superkit revision, boot ID, clock, approved roots and models (the worker itself refuses a non-Linux platform); HEAD refuses a package mismatch, OMP below the SDK-matched minimum and clock skew over 2 min. `start` and `attach` return the launch facts pinned in the worker reservation (package, OMP, superkit, boot ID), recorded on the lane (`workerLaunch`) and shown in `status`/`lane_inspect`. | `remote-lanes.test.ts`; native assertion on `workerLaunch` | P0 | done |
-| 7 | Worker code provisioning | Operator installs HEAD's exact release; handshake refuses mismatches. HEAD-pushed worker code is a follow-up (per-platform native binaries). | mismatch refusal | P1 | documented |
+| 7 | Worker code provisioning | `omp-sa worker add` installs HEAD's own release on the worker over the operator's ordinary SSH login: a deterministic archive of exactly the files `workerPackage()` digests plus `bun.lock`, `skills/`, `upstream/ulw.json` and the one native Host owner for the worker's architecture, `bun install --frozen-lockfile --ignore-scripts --production`, installed digest verified against HEAD's, atomic `releases/current` switch; old releases stay. The handshake still refuses any mismatch before a launch. | `worker-setup.test.ts` (archive, planning, idempotence decisions); `worker-onboarding.test.ts` (dry run, add, re-add, doctor over a loopback ssh); mismatch refusal | P1 | done |
 | 8 | Model availability | Lane start/resume/model change check the worker's catalog (capability); a live worker lane is checked against its own Host's `get_available_models`; the worker's start preflight requires the exact lane model (HEAD's exact selection, also for presets) in `omp models --json` under the login env. Other preset roles can be aliases, patterns or fallback lists and are left to OMP's own resolution on the worker. A restore launch sends no model: the restored session keeps its own, which is then checked against the Host's catalog. | unit refusals; real Linux worker real-home model listing | P0 | done |
 | 9 | Attachments | Every attachment is stored once, SHA-256 verified, under the lane's private worker directory via the `input` op; the prompt names the worker path. Images are no longer sent only as RPC images. | runtime test; worker test | P0 | done |
 | 10 | Verifying lane evidence | Head tool `lane_evidence` reads bounded, read-only evidence from a lane's own workspace, identically for local lanes (here) and worker lanes (the worker's `evidence` op): a file inside the lane cwd after resolving symlinks (64 KiB per read, offset/limit), `git status`/`log`/`diff --stat` with no optional locks, hooks, pager, fsmonitor or external diff, and the lane Host's current log tail. The head reference forbids reading worker paths with local tools. | `lane-evidence.test.ts` (bounds, escapes, git, log), worker endpoint test, runtime routing test, native loopback and real Linux worker scenario | P0 | done |
@@ -67,7 +105,7 @@ HEAD has only `HOME`, `PATH` and credentials).
 | 12 | Worker unreachable | Transport loss, an unreachable inspect, or a sent start whose reply was lost keeps submissions `submitted` with no notice; `workerReachability` records since/attempts/error; inspection-and-attach retries back off (15 s doubling to 5 min) from the maintenance tick, and a pause recorded meanwhile is delivered on reattach; no local fallback, second launch or replay. Unproven submissions are reported uncertain only once the worker answers (after reattach, or when it proves the Host gone). The lane keeps its `maxHosts` slot while held. | runtime unreachable and lost-start tests; native detached-completion recovery | P0 | done |
 | 13 | Workspace and choice | Worker maps a missing cwd to "Workspace does not exist on the worker"; capability lists approved roots; head reference forbids automatic placement. | worker tests | P0 | done |
 | 14 | Capacity | Remote Hosts count toward `maxHosts`; a held or exiting remote lane keeps its slot until verified, while a launch refused before any Host existed, or a closed lane the worker proved hostless, frees it. Only one remote release is verified at a time for eviction, with backed-off exit checks. Per-worker limits are a follow-up. | runtime refusal test; existing capacity tests | P1 | done (global) |
-| 15 | SSH hardening | Dedicated key with `restrict,command=…omp-sa-worker`; client options fixed in code. Only OpenSSH honors `authorized_keys` options: Tailscale SSH on a tailnet address's port 22 bypasses the forced command, so tailnet workers keep Tailscale SSH and add OpenSSH on the tailnet address at another port; the key line also carries `from=` tailnet ranges. | real-SSH proofs run over the tailnet through a dedicated forced-command key (`whoami` returns a worker frame; port forwarding refused; key refused from outside the tailnet) | P0 | done |
+| 15 | SSH hardening | Dedicated key with `from=<tailnet ranges>,restrict,command=…omp-sa-worker` (`worker add --dedicated-key` writes it and verifies enforcement; `doctor` re-checks and refuses a Tailscale-SSH-served alias with the fix); client options fixed in code. Only OpenSSH honors `authorized_keys` options: Tailscale SSH on a tailnet address's port 22 bypasses the forced command, so tailnet workers keep Tailscale SSH and add OpenSSH on the tailnet address at another port; the key line also carries `from=` tailnet ranges. | real-SSH proofs run over the tailnet through a dedicated forced-command key (`whoami` returns a worker frame; port forwarding refused; key refused from outside the tailnet) | P0 | done |
 | 16 | Parallel editing on a worker | Same routing policy as local; the owner (or a lane on the worker) prepares worker checkouts inside approved roots. | — | P1 | documented |
 | 17 | Stop, close, status | Native shutdown and exit verification over SSH; CLI refuses remote control; status shows placement, `workerLaunch`, reachability. | existing tests | P0 | done |
 | 18 | Clocks and PIDs | Skew bounded by #6. PIDs are pinned with the boot ID; after a reboot recorded PIDs are treated as dead, never as reused live owners. A Host lost in a reboot without an exit receipt needs operator reconciliation. | worker evaluate path | P0 (skew, boot ID) / P1 (reboot reconciliation) | done / documented |

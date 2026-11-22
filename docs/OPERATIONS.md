@@ -28,6 +28,70 @@ Windows 워커와 자동 머신 선택(배치)은 없다. HEAD는 소유자나 �
 AGENTS.md·메모리)을 그대로 쓰므로 메모리는 머신별이다. 레인 정책(lane 확장, 모델·프리셋 스냅샷,
 서브에이전트 동시성, 세션 설정 범위)은 로컬 레인과 같고, omp-superkit은 HEAD가 고정한 리비전이다.
 
+#### 한 번에 설정하기: `omp-sa worker add`
+
+이미 SSH로 로그인할 수 있는 Linux 계정은 HEAD에서 명령 하나로 검증된 워커가 된다. 같은 명령을 다시 실행해도 안전하다.
+아래 1~3의 수동 절차는 각 단계가 무엇을 만드는지 설명하는 참고 자료로 남긴다.
+
+```sh
+omp-sa worker add linux-1 --ssh my-linux-box --root /home/<user>/projects --config config.json --dry-run
+omp-sa worker add linux-1 --ssh my-linux-box --root /home/<user>/projects --config config.json
+omp-sa worker doctor linux-1 --config config.json
+omp-sa worker list --config config.json
+```
+
+- `--ssh`는 운영자가 이미 로그인할 수 있는 일반 SSH 목적지(별칭 또는 `user@host`)로 `add`의 설정 단계에서만 쓴다.
+  `--dedicated-key` 없이 쓰면 HEAD 설정의 `destination`도 같은 별칭이어야 한다(`user@host`는 별칭이 아니므로 거부).
+  접속은 `ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes`(tty 없음, 에이전트·포트 포워딩 금지)로만 한다.
+- `--dry-run`은 각 단계와 그 결정을 출력하고 아무것도 바꾸지 않는다(원격은 읽기 전용 점검만 수행).
+- 단계 순서: ① HEAD 쪽 검증(설정, `coordination.sqlite`의 `worker:instance`, 패키지 신원, 워커 아키텍처용
+  `host-owner/bin/omp-host-owner-linux-<x64|arm64>`) ② 원격 사전 점검(Linux, systemd 사용자 매니저, linger,
+  로그인 셸의 OMP 버전·모델 인증, bun, git, `--root`) ③ HEAD와 같은 릴리스를
+  `~/.local/share/omp-superagent-worker/releases/<버전>-<다이제스트12>/`에 설치하고 설치본의 `workerPackage()`
+  다이제스트를 검증한 뒤 `releases/current`를 원자적으로 전환(이미 검증된 디렉터리는 건너뜀, 이전 릴리스는 유지)
+  ④ `~/.local/bin/omp-sa-worker` 래퍼와 비대화형 SSH PATH(login shell이 bash이고 PATH에 없을 때만 `~/.bashrc` 맨 위에
+  보호된 한 줄 추가) ⑤ `worker.json`(0600, 디렉터리 0700, 조상 디렉터리 쓰기 권한 점검) ⑥ 워커 OMP 메모리 백엔드 ⑦ (선택)
+  `--dedicated-key` ⑧ `workers.<이름>`을 HEAD 설정에 원자적으로 기록 ⑨ `doctor`.
+- 원격 사전 점검은 정확한 사유로 거부한다: 비 Linux, 사용자 매니저 없음, linger 꺼짐(실행할 `loginctl enable-linger <user>`를
+  그대로 출력), OMP 없음 또는 최소 버전 미달, 모델 인증 없음, bun 없음, `--root` 없음. 이미 다른 HEAD의
+  `worker.json`이 있으면 `--replace` 없이는 거부하고, 이 계정이 HEAD에 다른 이름으로 등록돼 있으면 거부한다.
+  `workerId`는 같은 HEAD 인스턴스의 기존 값을 유지한다. 기본 `stateDir`(`~/.local/state/omp-superagent-worker`)가 Unix
+  소켓 경로 한도를 넘으면 더 짧은 `--state-dir`을 요구한다.
+- 워커 계정의 OMP 프로필에 켜진 메모리 백엔드가 없으면 `add`가 HEAD가 자기 프로필에 적용하는 것과 같은 기본값
+  (`memory.backend: mnemopi`)을 워커 설정에 쓰고 보고한다(쓰기 전 `config.yml`을 `config.yml.bak-*`로 복사,
+  `--dry-run`은 보고만). 이미 켜져 있으면 바꾸지 않는다. `doctor`는 백엔드를 보고한다. 강제 명령 키로는 원격 점검을
+  실행할 수 없으므로 마지막으로 기록된 값을 표시한다.
+- 원격·HEAD 쪽 모든 쓰기는 멱등이고, 기존 파일을 바꾸기 전에 `<파일>.bak-<시각>`으로 복사한다. 설정 파일 쓰기는
+  임시 파일 후 이름 변경(원자적)이며 다른 키와 순서·들여쓰기는 그대로 둔다. 비공개 키는 출력하지 않는다.
+  `add`는 원격에서 root 권한이나 sshd 변경을 하지 않는다. 필요한 관리자 명령은 출력만 한다.
+- `--superkit managed|none`은 `workers.<이름>.superkit`이 된다. superkit은 워커에서 GitHub로 받지 않고(`--ignore-scripts`)
+  HEAD가 launch 때 자기 리비전을 전달한다. 릴리스마다 별도 superkit 디렉터리를 쓰므로 새 릴리스의 첫 launch에서
+  `doctor`는 "would provision"을 경고로 표시한다(실패 아님).
+
+**`--dedicated-key`(권장).** HEAD에 `~/.ssh/omp-sa-<이름>_ed25519`를 만들고(있으면 재사용), 워커 `authorized_keys`에
+기본값 `from="100.64.0.0/10,fd7a:115c:a1e0::/48",restrict,command="<워커 홈>/.local/bin/omp-sa-worker" <공개키>` 한 줄만
+추가한다(`--from <CIDR,...>`로 바꾸고 `--from any`면 `from=` 생략, 같은 키가 다른 옵션으로 있으면 거부하고 다른 줄은
+건드리지 않음). HEAD `~/.ssh/config`에 `Host omp-sa-<이름>`(`IdentityFile`+`IdentitiesOnly yes`, `ssh -G <--ssh>`의
+HostName·User·Port·ProxyJump 복사, `--hostname`/`--port`로 재정의)을 없을 때만 추가하고, 이미 있으면 일치하는지 확인한다.
+워커의 `/etc/ssh/ssh_host_ed25519_key.pub`를 설정 연결로 읽어 `known_hosts`에 `[호스트]:포트 키`를 없을 때만 추가한다
+(다른 키가 기록돼 있으면 거부, `StrictHostKeyChecking`은 끄지 않음). 마지막으로 `ssh omp-sa-<이름> whoami`가
+`whoami` 결과가 아니라 워커 프로토콜 프레임을 반환하는지 확인한다. `worker doctor`는 등록된 모든 워커의 런타임 목적지에 대해
+`ssh <목적지> whoami`를 항상 실행한다: 프레임이면 `forced command OK`, `whoami` 출력이면(전용 키 별칭이 아닐 때) `WARN`,
+`omp-sa` 전용 키 별칭이면 `FAIL`(종료 코드 1)이다.
+
+**Tailscale SSH 주소는 거부된다.** Tailscale SSH가 받는 주소는 `authorized_keys` 옵션(`command=`, `from=`, `restrict`)을
+무시하므로 `whoami`가 그대로 실행된다. `add`/`doctor`는 이를 감지해 거부하고 해결책을 출력한다: Tailscale SSH는 :22에
+두고 워커의 tailnet 주소에서 OpenSSH를 다른 포트로 추가로 연다(관리자가 워커에서 실행, `add`는 하지 않음).
+소켓 활성화 sshd(Ubuntu): `/etc/systemd/system/ssh.socket.d/omp-sa.conf`에
+`[Socket]` / `ListenStream=<tailnet-ip>:2222` / `FreeBind=yes`를 두고 `systemctl daemon-reload && systemctl restart ssh.socket`.
+그 밖의 경우: `/etc/ssh/sshd_config.d/omp-sa.conf`에 `ListenAddress 0.0.0.0:22`, `ListenAddress [::]:22`,
+`ListenAddress <tailnet-ip>:2222`를 두고 `sshd -t && systemctl reload ssh`. 이후
+`worker add ... --dedicated-key --hostname <tailnet-ip-또는-이름> --port 2222`로 다시 실행한다.
+
+**지원 범위.** `add`는 Linux 워커만 처리한다. 플랫폼 요구사항은 코드의 한 곳(`worker-setup.ts`의 `PLATFORMS`)에
+모여 있어 다른 플랫폼을 추가할 수 있다. 루프백 테스트는 `OMP_SUPERAGENT_TEST_WORKER_CONTEXT=direct`로 Linux 전용 점검
+(사용자 매니저, linger, 로그인 셸)만 건너뛴다.
+
 #### 1. HEAD 설정
 
 ```json
@@ -43,7 +107,7 @@ AGENTS.md·메모리)을 그대로 쓰므로 메모리는 머신별이다. 레�
 - HEAD는 `coordination.sqlite`의 `metadata`에 `worker:instance` UUID를 기록한다.
   `sqlite3 -readonly <stateDir>/coordination.sqlite "SELECT value FROM metadata WHERE key='worker:instance'"`.
 
-#### 2. 워커 계정 준비 (워커에서, 해당 계정으로)
+#### 2. 워커 계정 준비 (수동 참고: `worker add`가 대신 수행, 워커에서 해당 계정으로)
 
 1. 로그인 유지: `loginctl show-user $USER -p Linger`가 `yes`여야 한다(아니면 관리자가
    `loginctl enable-linger <user>`). 없으면 실행을 거부한다.

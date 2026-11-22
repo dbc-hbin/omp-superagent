@@ -29,7 +29,7 @@ export interface RemoteRecoveryTarget {
   readonly admitted: Map<string, { input: InputRecord }>;
 }
 
-export function workerInstance(store: StorePort): string {
+export function workerInstance(store: Pick<StorePort, "getMeta" | "setMeta">): string {
   const saved = store.getMeta("worker:instance");
   if (saved) return saved;
   const id = randomUUID();

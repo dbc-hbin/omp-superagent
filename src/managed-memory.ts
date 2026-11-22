@@ -113,11 +113,21 @@ export function applyConsentedMnemopi(config: Config, consent: GlobalMemoryCandi
   return runMemoryHelper(config, consent);
 }
 
+const unavailable: ManagedMemoryReport = { memory: { status: "unknown" }, updated: false };
+
+/** The helper's only machine-readable output: a `MANAGED_MEMORY <json>` line. Anything else is unknown. */
+export function parseMemoryHelperOutput(stdout: string): ManagedMemoryReport {
+  const line = stdout.split("\n").findLast(value => value.startsWith("MANAGED_MEMORY "));
+  try {
+    const parsed: unknown = line && JSON.parse(line.slice("MANAGED_MEMORY ".length));
+    return Value.Check(memoryReport, parsed) ? parsed : unavailable;
+  } catch { return unavailable; }
+}
+
 async function runMemoryHelper(config: Config, consent?: GlobalMemoryCandidate): Promise<ManagedMemoryReport> {
   const env = { ...process.env };
   for (const name of credentialEnvNames(config)) delete env[name];
   const helper = fileURLToPath(new URL("./managed-memory-helper.ts", import.meta.url));
-  const unavailable: ManagedMemoryReport = { memory: { status: "unknown" }, updated: false };
   try {
     const operation = consent ? "apply-consented" : "inspect";
     const child = Bun.spawn([process.execPath, "--no-env-file", "--no-install", helper, operation, ...config.command.slice(1)], {
@@ -125,10 +135,7 @@ async function runMemoryHelper(config: Config, consent?: GlobalMemoryCandidate):
       stdout: "pipe", stderr: "ignore", timeout: 30_000, killSignal: "SIGKILL",
     });
     const [stdout, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-    if (code !== 0) return unavailable;
-    const line = stdout.split("\n").findLast(value => value.startsWith("MANAGED_MEMORY "));
-    const parsed: unknown = line && JSON.parse(line.slice("MANAGED_MEMORY ".length));
-    return Value.Check(memoryReport, parsed) ? parsed : unavailable;
+    return code === 0 ? parseMemoryHelperOutput(stdout) : unavailable;
   } catch {
     return unavailable;
   }
