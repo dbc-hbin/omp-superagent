@@ -76,7 +76,7 @@ class WorkerService {
     }
   }
 
-  async probe(ref: WorkerLaneRef): Promise<WorkerProbe> {
+  async probe(ref: WorkerLaneRef, reconcile = false): Promise<WorkerProbe> {
     const lane = this.#lane(ref);
     const observed = this.#receipt(lane);
     const { exitGeneration, ...probe } = await inspectWorkerHost(this.#ledger, lane.paths, observed);
@@ -85,7 +85,10 @@ class WorkerService {
     if (this.#receipt(lane)?.attempt !== observed?.attempt ||
       (observed && observed.generation < ref.generation && (probe.socket || probe.pidAlive || probe.ownerAlive)))
       return { ...probe, uncertain: true, pid: null, sessionId: null };
-    return exitGeneration === ref.generation ? { ...probe, exitGeneration } : probe;
+    const absent = !probe.uncertain && !probe.socket && !probe.pidAlive && !probe.ownerAlive && probe.pid === null;
+    const sealed = absent && this.#ledger.confirmRelease(ref, lane.repo.cwd, { observed, reconcile });
+    return { ...probe, ...(sealed && { sealedGeneration: ref.generation }),
+      ...(sealed && exitGeneration === ref.generation && { exitGeneration }) };
   }
 
   async open(ref: WorkerLaneRef, launch: WorkerLaunch): Promise<{ pid: number }> {
@@ -205,7 +208,7 @@ export async function serveWorker(policy: WorkerPolicy, input: Readable = proces
       else {
         service = new WorkerService(bound);
         switch (request.op) {
-          case "probe": reply = { ok: true, value: await service.probe(request.ref) }; break;
+          case "probe": reply = { ok: true, value: await service.probe(request.ref, request.reconcile) }; break;
           case "open": reply = { ok: true, value: await service.open(request.ref, request.launch) }; break;
           case "attach":
             attach = await service.attach(request.ref);

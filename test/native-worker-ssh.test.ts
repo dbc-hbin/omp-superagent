@@ -174,6 +174,10 @@ sshTest("enroll via the CLI, launch once over SSH, reconnect to the same stock O
     const reg = await lookupWorker(config.stateDir, placement);
     const ref: WorkerLaneRef = { laneId: "lane-ssh-qa", generation: 1, revision: placement.revision, repoId: placement.repoId, subdir: placement.subdir };
     const launch = { model: "socket-host-smoke/local", subagentConcurrency: 1 };
+    const late = { ...ref, laneId: "lane-late-open" };
+    expect((await workerProbe(reg, late)).sealedGeneration).toBeUndefined();
+    expect(await workerProbe(reg, late, true)).toMatchObject({ sealedGeneration: late.generation, socket: false });
+    await expect(workerOpen(reg, late, launch)).rejects.toThrow("sealed");
     // A failure in native launch composition must not consume the sole slot
     // or leave a checkout claim when no session/owner has been started yet.
     const bad = { ...ref, laneId: "lane-preflight" };

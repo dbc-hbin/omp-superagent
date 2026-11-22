@@ -490,13 +490,19 @@ describe("remote lane ownership", () => {
     expect(f.store.lanes().every(lane => lane.generation === 0)).toBe(true);
   });
 
-  function remoteFixture(options: { loseOpenAcknowledgement?: boolean; busy?: boolean; stream?: boolean; verifyExit?: boolean } = {}) {
+  function remoteFixture(options: {
+    loseOpenAcknowledgement?: boolean; delayFirstOpen?: boolean; busy?: boolean; stream?: boolean; verifyExit?: boolean;
+  } = {}) {
     let placement: RemotePlacement | undefined;
     let resident: { ref: WorkerLaneRef; host: HostTransport } | undefined;
     let firstExit: "exact" | "other-generation" | "unverified" | "uncertain" | undefined;
     let availableForPlacement = true;
     let online = true;
     let workspaceReady = !options.busy;
+    let delayedOpen: WorkerLaneRef | undefined;
+    let allowSeal = false;
+    let sealedGeneration: number | undefined;
+    const openedGenerations: number[] = [];
     const lookupWorker = async (stateDir: string, remote: RemotePlacement): Promise<WorkerRegistration> => {
       if (remote.workerId !== placement?.workerId || remote.stateDir !== join(stateDir, "worker-only"))
         throw new Error("No enrolled worker owns that placement");
@@ -504,7 +510,7 @@ describe("remote lane ownership", () => {
         description: { workerId: remote.workerId, platform: "linux", stateDir: remote.stateDir,
           capacity: 1, active: Number(!!resident), repos: [{ id: remote.repoId, cwd: "/worker/repo" }] } };
     };
-    const f = fixture(2, undefined, {
+    const worker = {
       selectWorkerPlacement: async ({ stateDir }, _cwd, selector) => {
         if (selector?.target === "local") return null;
         if (!availableForPlacement) throw new Error("Paired worker no longer accepts new placements");
@@ -514,23 +520,34 @@ describe("remote lane ownership", () => {
       },
       lookupWorker,
       workerPlacementReady: async () => workspaceReady,
-      workerProbe: async (_worker, ref) => {
+      workerProbe: async (_worker, ref, reconcile) => {
         if (!online) throw new Error("Worker is unreachable");
-        if (!resident || resident.ref.laneId !== ref.laneId) return {
-          socket: false, sessionFile: false, pidAlive: false, ownerAlive: false, uncertain: false, pid: null, sessionId: null,
-        };
+        if (!resident || resident.ref.laneId !== ref.laneId) {
+          if (allowSeal && reconcile && delayedOpen?.laneId === ref.laneId && sealedGeneration === undefined) {
+            sealedGeneration = ref.generation;
+            throw new Error("Lost worker seal acknowledgement");
+          }
+          return { socket: false, sessionFile: false, pidAlive: false, ownerAlive: false, uncertain: false,
+            pid: null, sessionId: null, ...(sealedGeneration === ref.generation ? { sealedGeneration } : {}) };
+        }
         if (ref.generation !== resident.ref.generation) throw new Error("Unverified worker generation");
         if (firstExit) return {
           socket: false, sessionFile: true, pidAlive: false, ownerAlive: false, uncertain: firstExit === "uncertain",
           pid: null, sessionId: resident.host.state.sessionId,
+          ...(firstExit !== "uncertain" && { sealedGeneration: ref.generation }),
           ...(firstExit === "unverified" ? {} : { exitGeneration: firstExit === "other-generation" ? ref.generation + 1 : ref.generation }),
         };
         const teardown = options.verifyExit && resident.host.commands.some(command => command.type === "shutdown_host");
         return { socket: !teardown, sessionFile: true, pidAlive: !teardown, ownerAlive: !teardown, uncertain: false,
           pid: teardown ? null : process.pid, sessionId: resident.host.state.sessionId,
-          ...(teardown ? { exitGeneration: ref.generation } : {}) };
+          ...(teardown ? { sealedGeneration: ref.generation, exitGeneration: ref.generation } : {}) };
       },
       workerOpen: async (worker, ref) => {
+        if (options.delayFirstOpen && !delayedOpen) {
+          delayedOpen = ref;
+          throw new Error("Lost SSH open before worker admission");
+        }
+        if (ref.generation <= (sealedGeneration ?? 0)) throw new Error("Worker generation was sealed");
         const first = !resident;
         if (resident && (firstExit !== "exact" || ref.laneId !== resident.ref.laneId || ref.generation !== resident.ref.generation + 1))
           throw new Error("Refusing a second worker owner");
@@ -539,6 +556,7 @@ describe("remote lane ownership", () => {
         host.local = !(first && options.loseOpenAcknowledgement) && !options.stream;
         host.shutdownDisconnect = true;
         resident = { ref, host };
+        openedGenerations.push(ref.generation);
         firstExit = undefined;
         if (first && options.loseOpenAcknowledgement) {
           online = false;
@@ -551,11 +569,29 @@ describe("remote lane ownership", () => {
           throw new Error("Worker Host is not the requested owner");
         return resident.host;
       },
-    });
+    } satisfies Partial<RuntimeAdapters>;
+    const f = fixture(2, undefined, worker);
     return {
       ...f,
       withdrawPlacement: () => { availableForPlacement = false; },
       restoreConnection: () => { online = true; },
+      enableSeal: () => { allowSeal = true; },
+      openedGenerations,
+      deliverDelayedOpen: async () => {
+        if (!delayedOpen || !placement) throw new Error("No delayed open was sent");
+        const ref = delayedOpen;
+        await worker.workerOpen(await lookupWorker(f.config.stateDir, placement), ref);
+      },
+      restartHead: async () => {
+        await f.runtime.stop();
+        const reopened = new Store(join(f.directory, "coordination.sqlite"));
+        const head = new HostTransport(hostPaths(f.config, "main").sessionFile, "session-main");
+        const restarted = new Superagent(f.config, reopened, new MessengerTransport(), join(f.directory, "extension.ts"),
+          error => f.errors.push(error), { ...worker, connect: async () => head });
+        fixtures.find(entry => entry.runtime === f.runtime)!.runtime = restarted;
+        await restarted.start();
+        return restarted;
+      },
       exitFirstHost: async (proof: "exact" | "other-generation" | "unverified" | "uncertain") => {
         if (!resident || firstExit) throw new Error("Expected a live first Host");
         firstExit = proof;
@@ -680,6 +716,46 @@ describe("remote lane ownership", () => {
     expect(f.store.input(handoffId)?.state).toBe("cancelled");
     expect(host.prompts).toEqual([]);
   });
+
+  test.each(["cancelled", "resumed"] as const)(
+    "a lost seal ACK survives head restart without admitting the delayed open when work is %s",
+    async outcome => {
+      const f = remoteFixture({ delayFirstOpen: true });
+      await f.runtime.start();
+      const source = headMessage(`worker-delayed-open-${outcome}`, route("39"));
+      await admit(f.runtime, source);
+      const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Delayed remote open", cwd: f.directory,
+        kickoff: "Check the worker checkout.", placement: { target: "remote" } });
+      await f.runtime.kick();
+      const handoffId = `handoff:${source.id}:lane`;
+      await expect(f.runtime.closeLane(lane.id, "cancelled", "Stop the old launch.")).rejects.toThrow("unresolved");
+      expect(f.store.lane(lane.id)).toMatchObject({ workState: "paused", runtimeState: "interrupted", generation: 1 });
+      f.enableSeal();
+      await expect(f.runtime.closeLane(lane.id, "cancelled", "Stop the old launch.")).rejects.toThrow("Lost worker seal acknowledgement");
+
+      const restarted = await f.restartHead();
+      await restarted.kick();
+      expect(restarted.store.lane(lane.id)).toMatchObject({ workState: "paused", runtimeState: "unloaded", generation: 1, pid: null });
+      expect(restarted.store.input(handoffId)?.state).toBe("pending");
+      await expect(f.deliverDelayedOpen()).rejects.toThrow("sealed");
+      expect(f.openedGenerations).toEqual([]);
+
+      if (outcome === "cancelled") {
+        await restarted.closeLane(lane.id, "cancelled", "Stop the old launch.");
+        await restarted.kick();
+        expect(restarted.store.lane(lane.id)).toMatchObject({ workState: "cancelled", generation: 1 });
+        expect(restarted.store.input(handoffId)?.state).toBe("cancelled");
+        expect(f.openedGenerations).toEqual([]);
+      } else {
+        await restarted.resume(lane.id);
+        await restarted.kick();
+        expect(restarted.store.lane(lane.id)).toMatchObject({ workState: "open", generation: 2 });
+        expect(restarted.store.input(handoffId)?.state).toBe("done");
+        expect(f.openedGenerations).toEqual([2]);
+        expect(f.workerHost().prompts).toHaveLength(1);
+      }
+    },
+  );
 
   test.each(["exact", "other-generation", "unverified", "uncertain"] as const)(
     "closing after a lost first open ACK requires exact worker exit proof (%s)",

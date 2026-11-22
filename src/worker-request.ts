@@ -41,7 +41,7 @@ const envelope = { version: Type.Literal(1) };
 const bound = { ...envelope, workerId: id, ref: laneRefSchema };
 const request = Type.Union([
   Type.Object({ ...envelope, op: Type.Literal("describe"), workspace: Type.Optional(workspace) }, strict),
-  Type.Object({ ...bound, op: Type.Literal("probe") }, strict),
+  Type.Object({ ...bound, op: Type.Literal("probe"), reconcile: Type.Optional(Type.Literal(true)) }, strict),
   Type.Object({ ...bound, op: Type.Literal("open"), launch }, strict),
   Type.Object({ ...bound, op: Type.Literal("attach") }, strict),
 ]);
@@ -57,7 +57,7 @@ export function parseWorkerRequest(line: Buffer): Static<typeof request> {
   try { payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)); }
   catch { throw new WorkerRefusal("Invalid worker request JSON"); }
   if (!Value.Check(request, payload)) throw new WorkerRefusal("Invalid worker request");
-  if ((payload.op === "open" || payload.op === "attach") && payload.ref.generation === 0)
+  if ((payload.op === "open" || payload.op === "attach" || payload.op === "probe" && payload.reconcile) && payload.ref.generation === 0)
     throw new WorkerRefusal("Invalid worker generation");
   const subdir = payload.op === "describe" ? payload.workspace?.subdir : payload.ref.subdir;
   if (subdir && subdir.split("/").some(part => part === "" || part === "." || part === ".." || part.toLowerCase() === ".git"))

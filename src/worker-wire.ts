@@ -34,6 +34,8 @@ export interface WorkerLaneRef {
 export interface WorkerProbe {
   readonly socket: boolean; readonly sessionFile: boolean; readonly pidAlive: boolean; readonly ownerAlive: boolean;
   readonly uncertain: boolean; readonly pid: number | null; readonly sessionId: string | null;
+  /** Exact absent generation that the worker will no longer admit. */
+  readonly sealedGeneration?: number;
   /** Exact generation whose persisted native exit the worker verified. */
   readonly exitGeneration?: number;
 }
@@ -53,7 +55,7 @@ export const WorkerDescriptionSchema = Type.Object({
 const probe = Type.Object({
   socket: Type.Boolean(), sessionFile: Type.Boolean(), pidAlive: Type.Boolean(), ownerAlive: Type.Boolean(),
   uncertain: Type.Boolean(), pid: Type.Union([positive, Type.Null()]), sessionId: Type.Union([text, Type.Null()]),
-  exitGeneration: Type.Optional(positive),
+  sealedGeneration: Type.Optional(positive), exitGeneration: Type.Optional(positive),
 });
 const opened = Type.Object({ pid: positive });
 const attached = Type.Object({ pid: positive, sessionId: text, sessionFile: absolute });
@@ -179,8 +181,9 @@ export function workerRef(lane: Pick<Lane, "id" | "remote" | "generation">): Wor
   return { laneId: lane.id, generation: lane.generation, repoId, revision, subdir };
 }
 
-export async function workerProbe(reg: WorkerRegistration, ref: WorkerLaneRef): Promise<WorkerProbe> {
-  return (await exchange(reg, { op: "probe", workerId: reg.description.workerId, ref }, probe, false)).value;
+export async function workerProbe(reg: WorkerRegistration, ref: WorkerLaneRef, reconcile = false): Promise<WorkerProbe> {
+  return (await exchange(reg, { op: "probe", workerId: reg.description.workerId, ref, ...(reconcile && { reconcile: true }) },
+    probe, false)).value;
 }
 
 export async function workerOpen(reg: WorkerRegistration, ref: WorkerLaneRef, launch: WorkerLaunch) {

@@ -1401,14 +1401,14 @@ export class Superagent {
       : existsSync(lane.socketPath));
   }
 
-  private async inspectRemote(lane: Lane): Promise<RemoteInspection> {
+  private async inspectRemote(lane: Lane, reconcileOpen = false): Promise<RemoteInspection> {
     const remote = lane.remote;
     if (!remote) throw new Error(`Lane ${lane.id} has no remote placement`);
     const paths = remoteLanePaths(remote, lane.id);
     if (paths.socketPath !== lane.socketPath || paths.sessionFile !== lane.sessionFile)
       throw new Error(`Lane ${lane.id} paths differ from its durable remote placement`);
     const registration = await this.adapters.lookupWorker(this.config.stateDir, remote);
-    const probe = await this.adapters.workerProbe(registration, workerRef(lane));
+    const probe = await this.adapters.workerProbe(registration, workerRef(lane), reconcileOpen && this.remoteOpenPending(lane));
     if (probe.uncertain || probe.socket && (!probe.pidAlive || !probe.ownerAlive || !probe.sessionFile
       || probe.pid === null || !probe.sessionId || lane.pid !== null && probe.pid !== lane.pid
       || lane.sessionId !== null && probe.sessionId !== lane.sessionId)) {
@@ -1438,15 +1438,19 @@ export class Superagent {
   private recordRemoteExit(lane: Lane, probe: WorkerProbe): boolean {
     if (probe.uncertain || probe.socket || probe.pidAlive || probe.ownerAlive || probe.pid !== null
       || probe.sessionFile !== (probe.sessionId !== null)
+      || probe.sealedGeneration !== undefined && probe.sealedGeneration !== lane.generation
       || probe.exitGeneration !== undefined && (probe.exitGeneration !== lane.generation || !probe.sessionId)) return false;
     const current = this.requireLane(lane.id);
     const live = this.live.get(lane.id);
     if (current.generation !== lane.generation || current.pid !== null && probe.sessionId === null
       || this.remoteAttaching.has(lane.id) || live && (!live.releasing || !live.lostDuringRelease)) return false;
-    // An ordinary no-owner probe cannot introduce a journal. Only the worker's
-    // exact persisted exit for this pending first launch can supply its ID.
+    const pendingOpen = this.remoteOpenPending(current);
+    // An empty worker snapshot cannot exclude a late SSH open. Pending
+    // launches require a durable, exact seal or an already verified exit.
+    if (pendingOpen && probe.sealedGeneration !== current.generation && probe.exitGeneration !== current.generation) return false;
+    // Only a verified first native exit can introduce an unknown journal ID.
     if (current.sessionId !== probe.sessionId &&
-      (current.sessionId !== null || !probe.sessionId || probe.exitGeneration !== current.generation || !this.remoteOpenPending(current)))
+      (current.sessionId !== null || !probe.sessionId || probe.exitGeneration !== current.generation || !pendingOpen))
       return false;
     if (!this.store.updateLane(current.id, current.generation, { sessionId: probe.sessionId, runtimeState: "unloaded", pid: null }))
       return false;
@@ -3092,7 +3096,9 @@ export class Superagent {
         throw new Error("Existing native ownership exceeds the host budget; reconcile it before resuming");
       if (!live && lane.remote && (this.mayOwnHost(lane) || this.remoteOpenPending(lane)
         || this.blocked.has(id) || source && lane.sessionId !== null)) {
-        const inspection = await this.inspectRemote(lane);
+        if (this.connecting.has(id) && lane.runtimeState === "starting")
+          throw new Error("Cannot resume a lane while its remote Host launch is in progress");
+        const inspection = await this.inspectRemote(lane, true);
         if (inspection.probe.socket) live = await this.attachLane(lane, inspection);
         else if (!this.recordRemoteExit(lane, inspection.probe)) throw new Error(`Lane ${id} remote ownership or transcript is unresolved`);
         else {
@@ -3198,7 +3204,7 @@ export class Superagent {
       if (!live && lane.remote && (this.mayOwnHost(lane) || this.remoteOpenPending(lane))) {
         if (this.connecting.has(id) && lane.runtimeState === "starting")
           throw new Error("Cannot close a lane while its remote Host launch is in progress");
-        const inspection = await this.inspectRemote(lane);
+        const inspection = await this.inspectRemote(lane, true);
         if (inspection.probe.socket) {
           live = await this.attachLane(lane, inspection);
           if (outcome === "cancelled") await this.reconcileUi(live);

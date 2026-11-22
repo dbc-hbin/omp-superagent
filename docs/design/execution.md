@@ -31,6 +31,9 @@ and head assignments waiting to start. Concurrent admissions reserve their
 selection before the next admission decides, without serializing SSH probes.
 On the target, a failure before native session preparation releases the slot;
 after preparation begins, an uncertain attempt keeps its reservation.
+An absent socket alone cannot resolve a pending open: an SSH request may
+still arrive. Explicit close or resume can seal that generation on the worker
+before proceeding. A later open for the sealed generation is refused.
 
 Only an operator-approved head checkout may use a default worker implicitly;
 Git origin and commit identify compatible contents, not permission to send a

@@ -50,6 +50,7 @@ const receipt = Type.Union([
 export type WorkerReceipt = Readonly<Static<typeof receipt>>;
 export type WorkerIdentity = Readonly<Static<typeof identity>>;
 type ReservedReceipt = Extract<WorkerReceipt, { phase: "reserved" }>;
+type WorkerSeal = Pick<WorkerLaneRef, "generation" | "repoId" | "revision" | "subdir"> & { readonly repoRoot: string };
 
 function decode(row: { readonly data: string } | null): WorkerReceipt | null {
   if (!row) return null;
@@ -85,6 +86,10 @@ export class WorkerLedger {
         PRAGMA synchronous = FULL;
         CREATE TABLE IF NOT EXISTS worker_identity (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), worker_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS worker_lanes (id TEXT PRIMARY KEY, phase TEXT NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS worker_seals (
+          id TEXT PRIMARY KEY, generation INTEGER NOT NULL, repoId TEXT NOT NULL,
+          revision TEXT NOT NULL, subdir TEXT NOT NULL, repoRoot TEXT NOT NULL
+        );
       `);
       if (mode === "write") this.#db.transaction(() => {
         this.#db.query("INSERT OR IGNORE INTO worker_identity VALUES (1, ?)").run(policy.workerId);
@@ -113,8 +118,39 @@ export class WorkerLedger {
       .run(value.laneId, value.phase, JSON.stringify(value));
   }
 
+  #sealedGeneration(ref: WorkerLaneRef, repoRoot: string): number | undefined {
+    const seal = this.#db.query<WorkerSeal, [string]>(
+      "SELECT generation, repoId, revision, subdir, repoRoot FROM worker_seals WHERE id = ?").get(ref.laneId);
+    if (seal && (seal.repoId !== ref.repoId || seal.revision !== ref.revision || seal.subdir !== ref.subdir || seal.repoRoot !== repoRoot))
+      throw new WorkerRefusal("Worker lane has a different durable checkout binding");
+    return seal?.generation;
+  }
+
+  confirmRelease(ref: WorkerLaneRef, repoRoot: string, options: {
+    readonly observed: WorkerReceipt | null; readonly reconcile: boolean;
+  }): boolean {
+    const confirm = this.#db.transaction(() => {
+      const current = this.get(ref.laneId);
+      if (current?.attempt !== options.observed?.attempt || current && current.phase !== "released") return false;
+      const sealed = this.#sealedGeneration(ref, repoRoot);
+      if (ref.generation < (sealed ?? 0) || ref.generation < (current?.generation ?? 0))
+        throw new WorkerRefusal("Worker lane generation is stale");
+      if (sealed === ref.generation || current?.generation === ref.generation) return true;
+      if (!options.reconcile) return false;
+      // Keep any previous exit/session receipt intact. Reserve and seal use the
+      // same immediate transaction: either a launch is already admitted, or
+      // even an open request that arrives after this reply must refuse.
+      this.#db.query("INSERT OR REPLACE INTO worker_seals VALUES (?, ?, ?, ?, ?, ?)")
+        .run(ref.laneId, ref.generation, ref.repoId, ref.revision, ref.subdir, repoRoot);
+      return true;
+    });
+    return options.reconcile ? confirm.immediate() : confirm();
+  }
+
   reserve(ref: WorkerLaneRef, binding: { readonly repoRoot: string; readonly gitDir: string; readonly launchDigest: string }, previous: WorkerReceipt | null): ReservedReceipt {
     return this.#db.transaction(() => {
+      if ((this.#sealedGeneration(ref, binding.repoRoot) ?? 0) >= ref.generation)
+        throw new WorkerRefusal("Worker lane generation was sealed and cannot open");
       const current = this.get(ref.laneId);
       if (current && (current.phase !== "released" || current.generation >= ref.generation)
         || current?.attempt !== previous?.attempt || current?.phase !== previous?.phase)

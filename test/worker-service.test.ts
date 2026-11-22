@@ -86,9 +86,34 @@ test("a dirty checkout refuses open, releases its unused slot and never reopens 
     const open = { op: "open", workerId: policy.workerId, ref, launch: { subagentConcurrency: 1 } };
     expect(await request(policy, open)).toMatchObject({ ok: false, error: expect.stringContaining("must be clean") });
     expect(await request(policy, { op: "describe" })).toMatchObject({ ok: true, value: { active: 0 } });
+    expect(await request(policy, { op: "probe", workerId: policy.workerId, ref }))
+      .toMatchObject({ ok: true, value: { sessionFile: false, sealedGeneration: ref.generation } });
     expect(await request(policy, { op: "probe", workerId: policy.workerId, ref: { ...ref, generation: 2 } }))
       .toMatchObject({ ok: true, value: { socket: false, sessionFile: false, pidAlive: false, ownerAlive: false, uncertain: false } });
     expect(await request(policy, open)).toMatchObject({ ok: false, error: expect.stringContaining("cannot reopen") });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("explicitly reconciling an unreceived open prevents a late reserve without consuming worker capacity", async () => {
+  const { root, policy, ref } = await fixture();
+  try {
+    const probe = { op: "probe", workerId: policy.workerId, ref };
+    const absent = { socket: false, sessionFile: false, sessionId: null, pid: null, pidAlive: false, ownerAlive: false, uncertain: false };
+    expect(await request(policy, probe)).toEqual({ ok: true, value: absent });
+    const sealed = { ok: true, value: { ...absent, sealedGeneration: ref.generation } };
+    expect(await request(policy, { ...probe, reconcile: true })).toEqual(sealed);
+    const open = { op: "open", workerId: policy.workerId, ref, launch: { subagentConcurrency: 1 } };
+    expect(await request(policy, open)).toMatchObject({ ok: false, error: expect.stringContaining("was sealed") });
+    expect(await request(policy, probe)).toEqual(sealed);
+    expect(WorkerLedger.count(policy)).toBe(0);
+
+    const next = { ...ref, generation: ref.generation + 1 };
+    expect(await request(policy, { ...probe, ref: next })).toEqual({ ok: true, value: absent });
+    // A later open reaches its configured native preflight, which cannot launch /usr/bin/false.
+    expect(await request(policy, { ...open, ref: next })).toMatchObject({ ok: false });
+    expect(await request(policy, { ...probe, ref: next }))
+      .toEqual({ ok: true, value: { ...absent, sealedGeneration: next.generation } });
+    expect(await request(policy, { ...probe, reconcile: true })).toMatchObject({ ok: false, error: expect.stringContaining("stale") });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -118,19 +143,23 @@ test.each([0, 1])("the persisted first native exit proves its matching generatio
     const exitPath = `${socketPath}.exit.json`;
     const probe = { op: "probe", workerId: policy.workerId, ref };
     writeFileSync(exitPath, JSON.stringify({ ...exit, workerAttempt: crypto.randomUUID() }), { mode: 0o600 });
-    expect(await request(policy, probe)).toEqual({ ok: true, value: {
+    expect(await request(policy, { ...probe, reconcile: true })).toEqual({ ok: true, value: {
       socket: false, sessionFile: true, sessionId: null, pid: null, pidAlive: false, ownerAlive: false, uncertain: true,
     } });
     expect(WorkerLedger.count(policy)).toBe(1);
 
     writeFileSync(exitPath, JSON.stringify({ ...exit, workerAttempt: attempt }));
     const absent = { socket: false, sessionFile: true, sessionId, pid: null, pidAlive: false, ownerAlive: false, uncertain: false };
-    const proved = { ok: true, value: code === 0 ? { ...absent, exitGeneration: ref.generation } : absent };
+    const proved = { ok: true, value: { ...absent, sealedGeneration: ref.generation,
+      ...(code === 0 ? { exitGeneration: ref.generation } : {}) } };
     expect(await request(policy, probe)).toEqual(proved);
     expect(WorkerLedger.count(policy)).toBe(0);
     expect(await request(policy, probe)).toEqual(proved);
     expect(await request(policy, { ...probe, ref: { ...ref, generation: ref.generation + 1 } }))
       .toEqual({ ok: true, value: absent });
+    const next = { ...ref, generation: ref.generation + 1 };
+    expect(await request(policy, { ...probe, ref: next, reconcile: true }))
+      .toEqual({ ok: true, value: { ...absent, sealedGeneration: next.generation } });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
