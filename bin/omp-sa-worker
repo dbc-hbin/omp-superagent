@@ -1,0 +1,10 @@
+#!/usr/bin/env -S bun --no-env-file
+import { workerStdio } from "../src/remote-worker-server";
+
+try {
+  if (process.argv.length !== 2) throw new Error("omp-sa-worker accepts no arguments");
+  await workerStdio();
+} catch (error) {
+  console.error("omp-sa-worker:", error instanceof Error ? error.message : "worker failed");
+  process.exitCode = 1;
+}

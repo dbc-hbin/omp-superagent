@@ -168,6 +168,45 @@ describe("operator execution limits", () => {
   });
 });
 
+describe("operator-configured workers", () => {
+  const build = { destination: "omp-build.internal", workerId: "dbaf439b-f2f3-47b4-abf0-73beee9d7833" };
+  const verify = { destination: "omp_verify", workerId: "450d78a9-fa52-4fc0-bea6-edc3276dd174" };
+
+  test("loads only explicitly configured workers with their SSH aliases and pinned IDs", async () => {
+    const workers = { "build-1": build, verify_2: verify };
+    const loaded = await loadConfig(await config({ workers }));
+    expect({ ...loaded.workers }).toEqual({ "build-1": { ...build, superkit: "managed" }, verify_2: { ...verify, superkit: "managed" } });
+    expect(loaded.workers?.["constructor"]).toBeUndefined();
+  });
+
+  test("keeps an explicitly plain worker", async () => {
+    const loaded = await loadConfig(await config({ workers: { build: { ...build, superkit: "none" } } }));
+    expect(loaded.workers?.build?.superkit).toBe("none");
+  });
+
+  test.each([
+    [null, "workers must be an object"],
+    [[build], "workers must be an object"],
+    [{ "worker/run": build }, "safe worker names"],
+    [{ ["__proto__"]: build }, "safe worker names"],
+    [{ build: [] }, "workers.build must be an object"],
+    [{ build: { ...build, command: ["omp"] } }, "only destination, workerId and superkit"],
+    [{ build: { ...build, superkit: "plain" } }, 'superkit must be "managed" or "none"'],
+    [{ build: { ...build, superkit: null } }, 'superkit must be "managed" or "none"'],
+    [{ build: { ...build, destination: "-Fssh.conf" } }, "SSH config alias"],
+    [{ build: { ...build, destination: "operator@host" } }, "SSH config alias"],
+    [{ build: { ...build, destination: "ssh://host" } }, "SSH config alias"],
+    [{ build: { ...build, destination: "worker\n" } }, "SSH config alias"],
+    [{ build: { destination: build.destination } }, "workers.build.workerId"],
+    [{ build: { ...build, workerId: "build-1" } }, "lowercase UUID"],
+    [{ build: { ...build, workerId: build.workerId.toUpperCase() } }, "lowercase UUID"],
+    [{ build, verify: { ...verify, destination: build.destination.toUpperCase() } }, "duplicates another worker's SSH alias"],
+    [{ build, verify: { ...verify, workerId: build.workerId } }, "duplicates another worker instance ID"],
+  ] as const)("rejects invalid worker config %p", async (workers, error) => {
+    await expect(loadConfig(await config({ workers }))).rejects.toThrow(error);
+  });
+});
+
 describe("installed OMP prerequisite", () => {
   async function runGateway(directory: string, args: readonly string[], env: Readonly<Record<string, string>> = {}) {
     const child = Bun.spawn([await requireGateway(), ...args], {

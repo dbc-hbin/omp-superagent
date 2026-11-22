@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { activeManagedUlw, managedUlwLaunchExtensions, managedUlwStatus, updateManagedUlw, type UlwManifest } from "../src/managed-ulw";
+import { activeManagedUlw, activeManagedUlwRevision, installManagedUlwRevision, managedUlwLaunchExtensions, managedUlwRevisionPackage, managedUlwStatus,
+  packManagedUlwRevision, updateManagedUlw, type UlwManifest } from "../src/managed-ulw";
 import { connect, startHost, type HostOptions } from "../src/host";
 import { getExtensionNameFromPath } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { stopHostFixtures } from "./fixtures/host-fixture-processes";
@@ -569,4 +570,154 @@ console.log('locked'); await Bun.stdin.text();`], { cwd: f.root, stdin: "pipe", 
     expect(activeManagedUlw(f.options)).toBe(secondPath);
     expect(managedUlwStatus(f.options).error).toBeNull();
   } finally { owner.kill("SIGKILL"); await owner.exited; }
+}, 90_000);
+
+// The transfer archive is magic(8) + uint32 BE index length + JSON index + file bytes.
+function rewriteArchive(bytes: Uint8Array, change: (entries: Array<Record<string, unknown>>) => Array<Record<string, unknown>>, tail = new Uint8Array()): Uint8Array {
+  const prefix = 12;
+  const length = new DataView(bytes.buffer, bytes.byteOffset).getUint32(8);
+  const index = JSON.parse(new TextDecoder().decode(bytes.subarray(prefix, prefix + length)));
+  const next = new TextEncoder().encode(JSON.stringify({ ...index, entries: change(index.entries) }));
+  const header = new Uint8Array(prefix);
+  header.set(bytes.subarray(0, 8));
+  new DataView(header.buffer).setUint32(8, next.length);
+  return Buffer.concat([header, next, bytes.subarray(prefix + length), tail]);
+}
+async function packedFixture() {
+  const f = await fixture();
+  // Exercise every archive entry type: executable file, relative symlink, nested directories.
+  await writeFile(join(f.remote, "tool.sh"), "#!/bin/sh\n");
+  await chmod(join(f.remote, "tool.sh"), 0o755);
+  await symlink("resource.txt", join(f.remote, "resource-link"));
+  const first = await f.commit();
+  await updateManagedUlw(f.options);
+  const packed = await packManagedUlwRevision(f.options);
+  const target = { manifestPath: f.manifestPath, root: join(f.root, "worker-managed") };
+  return { ...f, first, packed, target };
+}
+
+test("pack and install round trip activates an identical validated package without git", async () => {
+  const f = await packedFixture();
+  expect(f.packed.provenance.revision).toBe(f.first);
+  expect(f.packed.digest).toMatch(/^[0-9a-f]{64}$/);
+  expect(await packManagedUlwRevision(f.options)).toEqual(f.packed);
+  const result = await installManagedUlwRevision(f.packed, f.target);
+  expect(result).toEqual({ revision: f.first, changed: true });
+  const installed = activeManagedUlwRevision(f.target);
+  expect(installed.provenance).toEqual(f.packed.provenance);
+  expect(installed.packagePath).toBe(join(f.target.root, "revisions", f.first, "package"));
+  expect(managedUlwRevisionPackage(f.first, f.target)).toBe(installed.packagePath);
+  expect(await readFile(join(installed.packagePath, "resource.txt"), "utf8")).toBe("resource-v1");
+  expect((await lstat(join(installed.packagePath, "index.ts"))).mode & 0o222).toBe(0);
+  expect((await lstat(join(installed.packagePath, "tool.sh"))).mode & 0o111).not.toBe(0);
+  expect((await lstat(join(installed.packagePath, "index.ts"))).mode & 0o111).toBe(0);
+  expect(await readlink(join(installed.packagePath, "resource-link"))).toBe("resource.txt");
+  // The worker package re-packs to the very same content digest.
+  const repacked = await packManagedUlwRevision(f.target);
+  expect(repacked.digest).toBe(f.packed.digest);
+  expect(repacked.bytes).toEqual(f.packed.bytes);
+}, 90_000);
+
+test("second install is idempotent and leaves the active pointer untouched", async () => {
+  const f = await packedFixture();
+  await installManagedUlwRevision(f.packed, f.target);
+  const pointer = join(f.target.root, "active.json");
+  const before = await readFile(pointer);
+  const inode = (await lstat(pointer)).ino;
+  expect(await installManagedUlwRevision(f.packed, f.target)).toEqual({ revision: f.first, changed: false });
+  expect(await readFile(pointer)).toEqual(before);
+  expect((await lstat(pointer)).ino).toBe(inode);
+}, 90_000);
+
+test("an already prepared inactive revision is reactivated after probing without re-extraction", async () => {
+  const f = await packedFixture();
+  await installManagedUlwRevision(f.packed, f.target);
+  const pointer = join(f.target.root, "active.json");
+  const active = await readFile(pointer, "utf8");
+  await rm(pointer);
+  expect(await installManagedUlwRevision(f.packed, f.target)).toEqual({ revision: f.first, changed: true });
+  expect(await readFile(pointer, "utf8")).toBe(active);
+  expect((await readdir(f.target.root)).filter(name => name.startsWith(".stage-"))).toEqual([]);
+}, 90_000);
+
+test("digest mismatch is rejected with nothing activated or retained", async () => {
+  const f = await packedFixture();
+  await expect(installManagedUlwRevision({ ...f.packed, digest: "0".repeat(64) }, f.target)).rejects.toThrow("digest does not match");
+  await expect(installManagedUlwRevision({ ...f.packed, digest: "not-a-digest" }, f.target)).rejects.toThrow("Invalid managed ULW package digest");
+  const tampered = rewriteArchive(f.packed.bytes, entries => entries);
+  tampered[tampered.length - 1] ^= 0xff;
+  await expect(installManagedUlwRevision({ ...f.packed, bytes: tampered }, f.target)).rejects.toThrow("digest does not match");
+  expect(() => activeManagedUlw(f.target)).toThrow("not installed");
+  expect(await readdir(f.target.root)).not.toContain("revisions");
+  expect((await readdir(f.target.root)).filter(name => name.startsWith(".stage-"))).toEqual([]);
+}, 90_000);
+
+test("provenance must be a valid revision from the manifest repository", async () => {
+  const f = await packedFixture();
+  await expect(installManagedUlwRevision({ ...f.packed, provenance: { ...f.packed.provenance, revision: "../escape" } }, f.target)).rejects.toThrow("Invalid managed ULW revision provenance");
+  await expect(installManagedUlwRevision({ ...f.packed, provenance: { ...f.packed.provenance, repository: "https://example.invalid/other.git" } }, f.target))
+    .rejects.toThrow("different source repository");
+  expect(() => activeManagedUlw(f.target)).toThrow("not installed");
+}, 90_000);
+
+test("malformed archives are rejected before anything is activated", async () => {
+  const f = await packedFixture();
+  const file = (path: string, size = 1) => ({ path, type: "file", executable: false, size });
+  const cases: Array<[string, Uint8Array, string]> = [
+    ["path traversal", rewriteArchive(f.packed.bytes, entries => [...entries, { path: "../escape", type: "dir" }]), "Invalid managed ULW archive path"],
+    ["nested traversal", rewriteArchive(f.packed.bytes, entries => [...entries, { path: "skills/../../escape", type: "dir" }]), "Invalid managed ULW archive path"],
+    ["absolute path", rewriteArchive(f.packed.bytes, entries => [...entries, { path: "/etc/escape", type: "dir" }]), "Invalid managed ULW archive path"],
+    ["NUL path", rewriteArchive(f.packed.bytes, entries => [...entries, { path: "bad\0name", type: "dir" }]), "Invalid managed ULW archive path"],
+    ["duplicate path", rewriteArchive(f.packed.bytes, entries => [...entries, entries[0]!]), "Duplicate managed ULW archive path"],
+    ["unknown type", rewriteArchive(f.packed.bytes, entries => [...entries, { path: "device", type: "fifo" }]), "Unknown managed ULW archive entry type"],
+    ["size mismatch", rewriteArchive(f.packed.bytes, entries => entries.map(entry => entry.type === "file" && entry.path === "resource.txt" ? { ...entry, size: 3 } : entry)), "Managed ULW archive"],
+    ["trailing bytes", rewriteArchive(f.packed.bytes, entries => entries, new Uint8Array([1])), "trailing bytes"],
+    ["absolute symlink", rewriteArchive(f.packed.bytes, entries => [...entries, { path: "link", type: "symlink", target: "/etc" }]), "Invalid managed ULW archive symlink"],
+    ["write through symlink", rewriteArchive(f.packed.bytes, entries => [...entries, { path: "link", type: "symlink", target: "." }, file("link/x", 0)]), "parent is not a directory"],
+    ["missing parent", rewriteArchive(f.packed.bytes, entries => [...entries, file("nowhere/x", 0)]), "parent is not a directory"],
+    ["not an archive", new TextEncoder().encode("plain text, definitely not an archive"), "Not a managed ULW archive"],
+    ["oversized", new Uint8Array(256 * 1024 * 1024 + 1), "transfer size limit"],
+  ];
+  for (const [name, bytes, message] of cases)
+    await expect(installManagedUlwRevision({ ...f.packed, bytes }, f.target), name).rejects.toThrow(message);
+  expect(() => activeManagedUlw(f.target)).toThrow("not installed");
+  expect((await readdir(f.target.root)).filter(name => name.startsWith(".stage-"))).toEqual([]);
+}, 90_000);
+
+test("a symlink that resolves outside the package is rejected after extraction", async () => {
+  const f = await packedFixture();
+  const escaping = rewriteArchive(f.packed.bytes, entries => [...entries, { path: "outside", type: "symlink", target: "../../.." }]);
+  await expect(installManagedUlwRevision({ ...f.packed, bytes: escaping }, f.target)).rejects.toThrow("symlink leaves its package");
+  expect(() => activeManagedUlw(f.target)).toThrow("not installed");
+  expect((await readdir(f.target.root)).filter(name => name.startsWith(".stage-"))).toEqual([]);
+}, 90_000);
+
+test("an existing revision with different content or provenance is rejected and stays active", async () => {
+  const f = await packedFixture();
+  await installManagedUlwRevision(f.packed, f.target);
+  const pointer = await readFile(join(f.target.root, "active.json"));
+  const other = rewriteArchive(f.packed.bytes, entries => entries);
+  await expect(installManagedUlwRevision({ ...f.packed, digest: "1".repeat(64), bytes: other }, f.target)).rejects.toThrow("different content");
+  const provenancePath = join(f.target.root, "revisions", f.first, "provenance.json");
+  const recorded = await readFile(provenancePath, "utf8");
+  await rm(provenancePath);
+  await writeFile(provenancePath, recorded.replace(f.remote, "https://example.invalid/other.git"));
+  await expect(installManagedUlwRevision(f.packed, f.target)).rejects.toThrow("different provenance");
+  await rm(provenancePath);
+  await writeFile(provenancePath, recorded, { mode: 0o444 });
+  expect(await readFile(join(f.target.root, "active.json"))).toEqual(pointer);
+  expect(activeManagedUlwRevision(f.target).revision).toBe(f.first);
+}, 90_000);
+
+test("revision accessors report missing and mismatched state", async () => {
+  const f = await packedFixture();
+  expect(() => activeManagedUlwRevision(f.target)).toThrow("not installed");
+  expect(() => managedUlwRevisionPackage(f.first, f.target)).toThrow();
+  await installManagedUlwRevision(f.packed, f.target);
+  expect(() => managedUlwRevisionPackage("f".repeat(40), f.target)).toThrow("is not prepared");
+  expect(() => managedUlwRevisionPackage("not-a-revision", f.target)).toThrow("Invalid managed ULW revision");
+  // A prepared but inactive revision stays addressable.
+  await rm(join(f.target.root, "active.json"));
+  expect(managedUlwRevisionPackage(f.first, f.target)).toBe(join(f.target.root, "revisions", f.first, "package"));
+  expect(() => activeManagedUlwRevision(f.target)).toThrow("not installed");
 }, 90_000);

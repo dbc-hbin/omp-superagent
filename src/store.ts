@@ -26,7 +26,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
   HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
   type ActiveInputState, type KickoffHold, type OutputRecord, type Route, type StorePort, type WorkflowActivation,
-  type HeadModelChange, type HeadRecoveryAttempt, type HeadRecoveryEffect,
+  type HeadModelChange, type HeadRecoveryAttempt, type HeadRecoveryEffect, type LaneJournalObservation, type RecoveredLaneSettlement,
 } from "./contracts.ts";
 import type { ApprovalResolution } from "./contracts";
 import { captureDecision, resolveDecision } from "./decisions";
@@ -563,79 +563,120 @@ export class Store implements StorePort {
       if (!this.progressOpen({ inputId: id, generation, sessionId })) return false;
       const input = this.requireInput(id);
       if (!input.target || input.target === "main" || !input.requestId) return false;
-      const lane = this.requireLane(input.target);
-      const seen = `lane-report:${id}:${sessionId}:${eventId}`;
-      const serialized = JSON.stringify(report);
-      const prior = this.getMeta(seen);
-      if (prior !== null) {
-        if (prior !== serialized) throw new Error("Lane report identity conflict");
-        return false;
-      }
-      const previous = lane.observation;
-      const sameInput = previous?.inputId === id && previous.requestId === input.requestId
-        && previous.sessionId === sessionId && previous.generation === generation;
-      if (report.status === "resolved" && (!sameInput || !previous.waiting || !report.waiting
-        || laneWaitKey(previous.waiting.target) !== laneWaitKey(report.waiting))) return false;
-      if (!Number.isSafeInteger(observedAt) || observedAt < 0) throw new Error("Invalid native report timestamp");
-      const now = observedAt;
-      const observation = sameInput ? { ...previous } : {
-        inputId: id, requestId: input.requestId, sessionId, generation,
-        lastReportAt: now, summary: report.summary, lastEvidenceAt: null, lastEvidence: null, waiting: null,
-      };
-      observation.lastReportAt = now;
-      observation.summary = report.summary;
-      let changed = false;
-      for (const evidence of report.evidence) {
-        const fingerprintKey = `lane-evidence:${id}:${sessionId}:${JSON.stringify([
-          evidence.kind, evidence.kind === "tool" ? evidence.fingerprint : evidence.ref,
-        ])}`;
-        if (this.getMeta(fingerprintKey) === evidence.fingerprint) continue;
-        this.setMeta(fingerprintKey, evidence.fingerprint);
-        observation.lastEvidenceAt = now;
-        observation.lastEvidence = { ...evidence, at: now };
-        changed = true;
-      }
-      if (report.status === "waiting" && report.waiting) {
-        const sameTarget = observation.waiting && laneWaitKey(observation.waiting.target) === laneWaitKey(report.waiting);
-        observation.waiting = { target: report.waiting, since: sameTarget ? observation.waiting!.since : now };
-        if (!sameTarget) changed = true;
-      } else if (report.status === "resolved") {
-        observation.waiting = null;
-        changed = true;
-      }
-      this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
-        .run(JSON.stringify({ ...lane, observation }), lane.id, generation);
-      this.setMeta(seen, serialized);
-      // Topic evidence stays inspectable; only assistant commentary is delivered.
-      // Legacy HEAD review needs a new evidence snapshot or waiting transition.
-      if (changed && !this.topicOwner(input)) this.progress(id, generation, sessionId, `structured:${eventId}`, [
-        `Structured lane observation: ${JSON.stringify(observation)}`,
-        "Evidence is observed/worker-selected, not verified acceptance. Waiting and its resolution grant no dispatch, approval or resume authority.",
-      ].join("\n\n"));
-      return changed;
+      return this.writeLaneReport({ input, generation, sessionId }, { eventId, report, observedAt }, true);
     }).immediate();
+  }
+
+  private writeLaneReport(
+    { input, generation, sessionId }: { input: InputRecord; generation: number; sessionId: string },
+    { eventId, report, observedAt }: Omit<Extract<LaneJournalObservation, { kind: "report" }>, "kind">,
+    emitProgress: boolean,
+  ): boolean {
+    if (!input.target || !input.requestId) return false;
+    const lane = this.requireLane(input.target);
+    const id = input.id;
+    const seen = `lane-report:${id}:${sessionId}:${eventId}`;
+    const serialized = JSON.stringify(report);
+    const prior = this.getMeta(seen);
+    if (prior !== null) {
+      if (prior !== serialized) throw new Error("Lane report identity conflict");
+      return false;
+    }
+    const previous = lane.observation;
+    const sameInput = previous?.inputId === id && previous.requestId === input.requestId
+      && previous.sessionId === sessionId && previous.generation === generation;
+    if (report.status === "resolved" && (!sameInput || !previous.waiting || !report.waiting
+      || laneWaitKey(previous.waiting.target) !== laneWaitKey(report.waiting))) return false;
+    if (!Number.isSafeInteger(observedAt) || observedAt < 0) throw new Error("Invalid native report timestamp");
+    const now = observedAt;
+    const observation = sameInput ? { ...previous } : {
+      inputId: id, requestId: input.requestId, sessionId, generation,
+      lastReportAt: now, summary: report.summary, lastEvidenceAt: null, lastEvidence: null, waiting: null,
+    };
+    observation.lastReportAt = now;
+    observation.summary = report.summary;
+    let changed = false;
+    for (const evidence of report.evidence) {
+      const fingerprintKey = `lane-evidence:${id}:${sessionId}:${JSON.stringify([
+        evidence.kind, evidence.kind === "tool" ? evidence.fingerprint : evidence.ref,
+      ])}`;
+      if (this.getMeta(fingerprintKey) === evidence.fingerprint) continue;
+      this.setMeta(fingerprintKey, evidence.fingerprint);
+      observation.lastEvidenceAt = now;
+      observation.lastEvidence = { ...evidence, at: now };
+      changed = true;
+    }
+    if (report.status === "waiting" && report.waiting) {
+      const waiting = observation.waiting;
+      const sameTarget = waiting && laneWaitKey(waiting.target) === laneWaitKey(report.waiting);
+      observation.waiting = { target: report.waiting, since: sameTarget ? waiting.since : now };
+      if (!sameTarget) changed = true;
+    } else if (report.status === "resolved") {
+      observation.waiting = null;
+      changed = true;
+    }
+    this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
+      .run(JSON.stringify({ ...lane, observation }), lane.id, generation);
+    this.setMeta(seen, serialized);
+    // Topic evidence stays inspectable; only assistant commentary is delivered.
+    // Legacy HEAD review needs a new evidence snapshot or waiting transition.
+    if (changed && emitProgress && !this.topicOwner(input)) this.progress(id, generation, sessionId, `structured:${eventId}`, [
+      `Structured lane observation: ${JSON.stringify(observation)}`,
+      "Evidence is observed/worker-selected, not verified acceptance. Waiting and its resolution grant no dispatch, approval or resume authority.",
+    ].join("\n\n"));
+    return changed;
   }
 
   resolveLaneWaiting(id: string, generation: number, sessionId: string, kind: "tool" | "approval", nativeId: string): boolean {
     return this.db.transaction(() => {
       if (!this.progressOpen({ inputId: id, generation, sessionId })) return false;
-      const input = this.requireInput(id);
-      const lane = input.target && input.target !== "main" ? this.requireLane(input.target) : null;
-      const observation = lane?.observation;
-      const waiting = observation?.waiting;
-      if (!lane || !observation || observation.inputId !== id || observation.requestId !== input.requestId
-        || observation.sessionId !== sessionId || observation.generation !== generation
-        || !waiting || waiting.target.kind !== kind || waiting.target.id !== nativeId) return false;
-      const resolved = { ...observation, waiting: null };
-      this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
-        .run(JSON.stringify({ ...lane, observation: resolved }), lane.id, generation);
-      // Completion/cancellation of a wait is not evidence of successful work.
-      if (!this.topicOwner(input)) this.progress(id, generation, sessionId, `resolved:${JSON.stringify([kind, nativeId, waiting.since])}`, [
-        `Native waiting target finished or was cancelled: ${JSON.stringify(waiting.target)}.`,
-        `Structured lane observation: ${JSON.stringify(resolved)}`,
-        "This clears only the matching wait observation. It does not verify success, answer an approval, or resume work.",
-      ].join("\n\n"));
-      return true;
+      return this.clearLaneWaiting({ input: this.requireInput(id), generation, sessionId }, { kind, nativeId }, true);
+    }).immediate();
+  }
+
+  private clearLaneWaiting(
+    { input, generation, sessionId }: { input: InputRecord; generation: number; sessionId: string },
+    { kind, nativeId }: { kind: "tool" | "approval"; nativeId: string },
+    emitProgress: boolean,
+  ): boolean {
+    const lane = input.target && input.target !== "main" ? this.requireLane(input.target) : null;
+    const observation = lane?.observation;
+    const waiting = observation?.waiting;
+    if (!lane || !observation || observation.inputId !== input.id || observation.requestId !== input.requestId
+      || observation.sessionId !== sessionId || observation.generation !== generation
+      || !waiting || waiting.target.kind !== kind || waiting.target.id !== nativeId) return false;
+    const resolved = { ...observation, waiting: null };
+    this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
+      .run(JSON.stringify({ ...lane, observation: resolved }), lane.id, generation);
+    // Completion/cancellation of a wait is not evidence of successful work.
+    if (emitProgress && !this.topicOwner(input)) this.progress(input.id, generation, sessionId, `resolved:${JSON.stringify([kind, nativeId, waiting.since])}`, [
+      `Native waiting target finished or was cancelled: ${JSON.stringify(waiting.target)}.`,
+      `Structured lane observation: ${JSON.stringify(resolved)}`,
+      "This clears only the matching wait observation. It does not verify success, answer an approval, or resume work.",
+    ].join("\n\n"));
+    return true;
+  }
+
+  settleRecoveredLane(settlement: RecoveredLaneSettlement): boolean {
+    return this.db.transaction(() => {
+      const { inputId, generation, sessionId, requestId } = settlement;
+      const input = this.input(inputId);
+      if (!input?.target || (input.state !== "submitted" && input.state !== "uncertain")
+        || input.requestId !== requestId || input.generation !== generation) return false;
+      const lane = this.lane(input.target);
+      const sourceId = this.getMeta(`handoff-source:${input.id}`);
+      const source = sourceId ? this.input(sourceId) : input;
+      if (!lane?.placement || lane.workState !== "open" || lane.sessionId !== sessionId || lane.generation !== generation
+        || !source || source.state === "cancelled" || source.id !== input.id && source.state === "uncertain") return false;
+      const owner = { input, generation, sessionId };
+      for (const observation of settlement.observations) {
+        if (observation.kind === "report") this.writeLaneReport(owner, observation, false);
+        else {
+          this.clearLaneWaiting(owner, { kind: "tool", nativeId: observation.nativeId }, false);
+          this.clearLaneWaiting(owner, { kind: "approval", nativeId: observation.nativeId }, false);
+        }
+      }
+      return this.settle(inputId, settlement.state, settlement.output);
     }).immediate();
   }
 
@@ -928,6 +969,9 @@ export class Store implements StorePort {
         || existing.cwd !== lane.cwd || existing.repoRoot !== lane.repoRoot)) {
         throw new Error("Cannot reuse a lane for a different route or repository");
       }
+      if (existing && !isDeepStrictEqual(existing.placement, lane.placement)) {
+        throw new Error("Cannot reuse a lane with a different worker placement");
+      }
       if (existing && (!sameLaneModel(existing.model, lane.model) || existing.modelPreset !== lane.modelPreset
         || !isDeepStrictEqual(existing.modelPresetSnapshot, lane.modelPresetSnapshot))) {
         throw new Error("Cannot reuse a lane with a different model; inspect/adopt legacy native state before reusing it");
@@ -966,13 +1010,13 @@ export class Store implements StorePort {
   }
 
   updateLane(id: string, generation: number, patch: Partial<Pick<Lane,
-    "workState" | "runtimeState" | "sessionId" | "pid" | "lastActivityAt" | "result"
+    "workState" | "runtimeState" | "sessionId" | "pid" | "lastActivityAt" | "result" | "workerLaunch"
   >>): boolean {
     return this.db.transaction(() => {
       const lane = this.lane(id);
       if (!lane || lane.generation !== generation) return false;
       // Explicitly copy the contract whitelist; runtime callers cannot change identity.
-      for (const key of ["workState", "runtimeState", "sessionId", "pid", "lastActivityAt", "result"] as const) {
+      for (const key of ["workState", "runtimeState", "sessionId", "pid", "lastActivityAt", "result", "workerLaunch"] as const) {
         if (patch[key] !== undefined) Object.assign(lane, { [key]: patch[key] });
       }
       return this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
@@ -987,6 +1031,7 @@ export class Store implements StorePort {
       lane.generation += 1;
       lane.runtimeState = "starting";
       lane.pid = null;
+      delete lane.workerLaunch;
       this.db.query("UPDATE lanes SET generation = ?, data = ? WHERE id = ?")
         .run(lane.generation, JSON.stringify(lane), id);
       return lane;

@@ -132,12 +132,14 @@ Alternative: Discord voice with separately billed OpenAI Live API (no Codex logi
   Full guide: ${join(import.meta.dir, "../docs/discord-voice.md")}
 `;
 
-function laneRows(stateDir: string): Lane[] {
+function laneRows(stateDir: string): Array<Lane & { workerReachability?: unknown }> {
   const path = join(stateDir, "coordination.sqlite");
   if (!existsSync(path)) return [];
   const db = new Database(path, { readonly: true });
   try {
-    return readLaneRows(db);
+    const reachability = db.query<{ value: string }, [string]>("SELECT value FROM metadata WHERE key = ?");
+    return readLaneRows(db).map(lane => lane.placement
+      ? { ...lane, workerReachability: JSON.parse(reachability.get(`remote-unreachable:${lane.id}`)?.value ?? "null") } : lane);
   } finally { db.close(); }
 }
 
@@ -234,6 +236,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       main: { socketPath: hostPaths(config, "main").socketPath },
       lanes: laneRows(config.stateDir).map(l => ({
         id: l.id, title: l.title, cwd: l.cwd, workState: l.workState,
+        ...(l.placement ? {
+          worker: l.placement.worker, workerId: l.placement.workerId, workerLaunch: l.workerLaunch ?? null,
+          workerReachability: l.workerReachability ?? null,
+        } : {}),
         model: l.model, modelReason: l.modelReason, modelPreset: l.modelPreset,
         recordedRuntimeState: l.runtimeState, sessionId: l.sessionId, socketPath: l.socketPath,
       })),
@@ -241,7 +247,8 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     }, null, 2));
     return;
   }
-  if (target !== "main" && !laneRows(config.stateDir).some(l => l.id === target))
+  const lane = target === "main" ? undefined : laneRows(config.stateDir).find(l => l.id === target);
+  if (target !== "main" && !lane)
     throw new Error("Unknown managed lane");
   if (command === "stop") {
     if (target === "main") {
@@ -250,6 +257,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       console.log("Gateway and supervised main host accepted graceful shutdown.");
       return;
     }
+    if (lane?.placement) throw new Error("Remote lanes are controlled by their HEAD. Use the original conversation's /stop to pause the lane.");
     const { connect } = await import("./host");
     const host = await connect(paths.socketPath);
     try {
@@ -266,9 +274,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   const { gatewayPaths } = await import("./gateway-protocol");
   const { launchGateway } = await import("./gateway-native");
   const status = await launchGateway(config);
-  console.log(JSON.stringify({ ...status, gatewaySocketPath: gatewayPaths(config).socketPath,
+  console.log(JSON.stringify({
+    ...status, gatewaySocketPath: gatewayPaths(config).socketPath,
     gatewayLogPath: gatewayPaths(config).logPath,
-    note: "Gateway owns messenger transports. Explicit start may return while initialization is checking/running or blocked. head.ready requires verified native high/middle/low presets; head.initialization reports setup/recovery state separately from approval-reconciled intake readiness. Ordinary input remains durably queued until initialization completes." }, null, 2));
+    note: "Gateway owns messenger transports. Explicit start may return while initialization is checking/running or blocked. head.ready requires verified native high/middle/low presets; head.initialization reports setup/recovery state separately from approval-reconciled intake readiness. Ordinary input remains durably queued until initialization completes."
+  }, null, 2));
 }
 
 if (import.meta.main) {

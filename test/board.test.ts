@@ -8,7 +8,8 @@ import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensio
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { Board, BoardMembershipError, type BoardPost } from "../src/board";
+import { Board, BoardMembershipError, workerRepositoryChannel, type BoardPost } from "../src/board";
+import { serveBoardRequest } from "../src/board-remote";
 import boardExtension from "../src/board-extension";
 import { BoardFixture } from "./fixtures/board";
 
@@ -78,8 +79,10 @@ async function extensionFixture(role: "head" | "lane", kind: "main" | "sub" = "m
   let active = selected.slice();
   loaded.runtime.getActiveTools = () => active.slice();
   loaded.runtime.setActiveTools = async names => { active = names.slice(); };
-  return { f, runner, session, admit, errors, active: () => active,
-    select: (names: string[]) => loaded.runtime.setActiveTools(names) };
+  return {
+    f, runner, session, admit, errors, active: () => active,
+    select: (names: string[]) => loaded.runtime.setActiveTools(names)
+  };
 }
 
 describe("shared durable bulletin board", () => {
@@ -93,8 +96,10 @@ describe("shared durable bulletin board", () => {
     const reply = head.post("reply-call", { text: "A bounded response", replyTo: root.id });
     const nested = lane.post("nested-call", { text: "Supporting evidence", replyTo: reply.id });
     expect([root.id, reply.id, nested.id]).toEqual([1, 2, 3]);
-    expect(root).toMatchObject({ actor: "lane-one", role: "lane", sessionId: "lane-one-session",
-      channel: f.channel, thread: root.id, replyTo: null, mentions: ["head"] });
+    expect(root).toMatchObject({
+      actor: "lane-one", role: "lane", sessionId: "lane-one-session",
+      channel: f.channel, thread: root.id, replyTo: null, mentions: ["head"]
+    });
     expect(root.createdAt).toBeGreaterThanOrEqual(start);
     expect(root.createdAt).toBeLessThanOrEqual(Date.now());
     expect(reply).toMatchObject({ actor: "head", role: "head", channel: f.channel, thread: root.id, replyTo: root.id });
@@ -426,5 +431,68 @@ describe("shared durable bulletin board", () => {
       if (config === undefined) delete process.env.OMP_SUPERAGENT_CONFIG;
       else process.env.OMP_SUPERAGENT_CONFIG = config;
     }
+  });
+});
+
+describe("worker lanes share HEAD's board over their stream", () => {
+  function workerLane(f: BoardFixture, actor = "lane-remote") {
+    const route = { platform: "discord" as const, accountId: "fixture", authorityId: "owner", guildId: null, channelId: actor, threadId: null };
+    const sourceId = `board-source-${actor}`;
+    f.store.receive({ id: sourceId, messageId: sourceId, route, text: "Worker board fixture", receivedAt: Date.now(), attachments: [] }, null);
+    const sessionFile = "/home/worker/.osa/0123456789abcdef01234567/session.jsonl";
+    f.store.createLane({
+      id: actor, route, title: "Worker board", cwd: "/home/worker/repo", repoRoot: "/home/worker/repo",
+      placement: { worker: "builder", destination: "build-alias", workerId: "dbaf439b-f2f3-47b4-abf0-73beee9d7833" },
+      model: { provider: "fixture", id: "fixture" }, modelReason: "Deterministic worker board fixture",
+      modelPreset: null, modelPresetSnapshot: null, brief: "Worker board", acceptance: [],
+      workState: "open", runtimeState: "idle", sessionFile, sessionId: "worker-session",
+      socketPath: "/home/worker/.osa/0123456789abcdef01234567/host.sock",
+      generation: 1, pid: 4242, createdAt: Date.now(), lastActivityAt: Date.now(), result: null
+    }, sourceId);
+    return { actor, sessionFile, channel: workerRepositoryChannel("/home/worker/repo") };
+  }
+
+  test("only the owned head process serves a placed lane, with its worker paths, and a local lane cannot use worker mode", () => {
+    const f = fixture();
+    f.open("head");
+    const lane = workerLane(f);
+    const open = (sessionFile = lane.sessionFile, sessionId = "worker-session") =>
+      new Board(f.path, { role: "lane", actor: lane.actor, sessionId }, lane.channel, sessionFile, { worker: true });
+    // Without worker mode a placed lane is never a member (its session file and PID are on the worker).
+    expect(() => new Board(f.path, { role: "lane", actor: lane.actor, sessionId: "worker-session" }, lane.channel, lane.sessionFile))
+      .toThrow(BoardMembershipError);
+    expect(() => open(lane.sessionFile, "other-session")).toThrow(BoardMembershipError);
+    expect(() => open(`${lane.sessionFile}.other`)).toThrow(BoardMembershipError);
+    const board = open();
+    expect(board.membership()).toEqual({ role: "lane", actor: lane.actor, sessionId: "worker-session" });
+    board.close();
+    f.store.setMeta("gateway:head", JSON.stringify({ pid: process.pid + 1 }));
+    expect(() => open()).toThrow(BoardMembershipError);
+    const local = f.bind("lane-local", "local-session");
+    expect(() => new Board(f.path, { role: "lane", actor: "lane-local", sessionId: "local-session" }, f.channel, local, { worker: true }))
+      .toThrow(BoardMembershipError);
+  });
+
+  test("HEAD answers worker board requests with the stream's identity and the same results as a local board", () => {
+    const f = fixture();
+    const head = f.open("head");
+    const lane = workerLane(f);
+    const remote = new Board(f.path, { role: "lane", actor: lane.actor, sessionId: "worker-session" }, lane.channel, lane.sessionFile, { worker: true });
+    const serve = (request: unknown) => JSON.parse(serveBoardRequest(() => remote, JSON.stringify(request)));
+    expect(serve({ op: "membership" })).toEqual({ ok: true, value: { role: "lane", actor: lane.actor, sessionId: "worker-session" }, repositoryChannel: lane.channel });
+    const posted = serve({ op: "post", toolCallId: "call-1", input: { text: "worker status", mentions: ["head"] } });
+    expect(posted.value).toMatchObject({ actor: lane.actor, sessionId: "worker-session", channel: lane.channel, text: "worker status" });
+    expect(serve({ op: "post", toolCallId: "call-1", input: { text: "worker status", mentions: ["head"] } }).value).toEqual(posted.value);
+    expect(head.read({ channel: lane.channel }).map(message => message.text)).toEqual(["worker status"]);
+    head.post("head-call", { text: "noted", channel: lane.channel, mentions: [lane.actor] });
+    expect(serve({ op: "notices" }).value).toEqual([expect.objectContaining({ actor: "head", channel: lane.channel })]);
+    const read = serve({ op: "read", input: {} }).value;
+    expect(read.messages.map((message: { text: string }) => message.text)).toEqual(["noted"]);
+    expect(read.identity).toEqual({ role: "lane", actor: lane.actor, sessionId: "worker-session" });
+    expect(serve({ op: "subscribe", channels: ["general"] }).value.subscriptions).toEqual(["general"]);
+    expect(serve({ op: "post", toolCallId: "call-2", input: { text: "" } })).toMatchObject({ ok: false, membership: false });
+    f.store.updateLane(lane.actor, 1, { runtimeState: "unloaded" });
+    expect(serve({ op: "membership" })).toMatchObject({ ok: false, membership: true });
+    remote.close();
   });
 });

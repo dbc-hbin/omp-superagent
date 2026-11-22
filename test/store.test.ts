@@ -5,7 +5,7 @@ import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { Client, Collection, type ClientUser, type Message } from "discord.js";
-import { physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
+import { physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route, type WorkerPlacement } from "../src/contracts.ts";
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { Store } from "../src/store.ts";
@@ -58,6 +58,9 @@ function admitLane(store: Store, id = "lane", destination = route()): Lane {
   store.receive(inbound(`source-${id}`, destination), null);
   return store.createLane(lane(id, destination), `source-${id}`);
 }
+const workerPlacement: WorkerPlacement = {
+  worker: "build", destination: "omp-build", workerId: "dbaf439b-f2f3-47b4-abf0-73beee9d7833",
+};
 function approval(id = "approval", target = "lane", generation = 0): Approval {
   return {
     id, target, generation, requestId: "native-dialog", route: route(),
@@ -840,6 +843,39 @@ describe("durable coordination store", () => {
     expect(store.input("source")?.state).toBe("submitted");
     expect(store.input("source")?.target).toBe(selected.id);
     expect(() => store.createLane(lane("another", route(), { cwd: "/unrelated" }), "source")).toThrow("different route or repository");
+  });
+
+  test("reuses the same worker placement after a generation change and store reopen", () => {
+    const { store, path } = fixture();
+    store.receive(inbound("source"), null);
+    const selected = store.createLane(lane("remote", route(), { placement: workerPlacement }), "source");
+    store.nextGeneration(selected.id);
+    store.close();
+
+    const reopened = open(path);
+    reopened.receive(inbound("followup"), null);
+    const reused = reopened.createLane(lane("candidate", route(), { placement: { ...workerPlacement } }), "followup");
+    expect(reused).toMatchObject({ id: selected.id, placement: workerPlacement, generation: 1 });
+    expect(reopened.input("followup")?.target).toBe(selected.id);
+  });
+
+  test.each([
+    ["local to remote", undefined, workerPlacement],
+    ["remote to local", workerPlacement, undefined],
+    ["changed worker name", workerPlacement, { ...workerPlacement, worker: "verify" }],
+    ["changed SSH alias", workerPlacement, { ...workerPlacement, destination: "omp-build-2" }],
+    ["changed instance ID", workerPlacement, { ...workerPlacement, workerId: "450d78a9-fa52-4fc0-bea6-edc3276dd174" }],
+  ] as const)("rejects %s for source replay and route reuse in the same cwd", (_label, initial, replacement) => {
+    const { store } = fixture();
+    store.receive(inbound("source"), null);
+    const selected = store.createLane(lane("original", route(), initial ? { placement: initial } : {}), "source");
+    store.receive(inbound("followup"), null);
+
+    const candidate = lane("candidate", route(), replacement ? { placement: replacement } : {});
+    expect(() => store.createLane(candidate, "source")).toThrow("different worker placement");
+    expect(() => store.createLane(candidate, "followup")).toThrow("different worker placement");
+    expect(store.laneForRoute(route())).toEqual(selected);
+    expect(store.input("followup")?.target).toBeNull();
   });
 
   test("a chosen model and reason survive replays, route reuse, generations, and reopen", () => {

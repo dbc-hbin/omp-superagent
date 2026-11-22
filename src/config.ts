@@ -57,6 +57,7 @@ export interface Config {
   maxSubagents: number;
   idleMs: number;
   model?: string;
+  readonly workers?: Record<string, WorkerConfig>;
   discord?: DiscordConfig;
   telegram?: TelegramConfig;
   slack?: SlackConfig;
@@ -91,6 +92,47 @@ function tokenEnv(value: unknown, name: string): string {
   const result = text(value, name);
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(result)) throw new Error(`${name} must name an environment variable`);
   return result;
+}
+
+/** "managed": HEAD pins and provisions its active omp-superkit revision. "none": explicitly plain worker. */
+export type WorkerSuperkit = "managed" | "none";
+export interface WorkerConfig {
+  readonly destination: string;
+  readonly workerId: string;
+  readonly superkit: WorkerSuperkit;
+}
+
+export const WORKER_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const SSH_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const WORKER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function parseWorkers(value: unknown): NonNullable<Config["workers"]> {
+  const destinations = new Set<string>();
+  const workerIds = new Set<string>();
+  const workers: NonNullable<Config["workers"]> = {};
+  Object.setPrototypeOf(workers, null); // Only configured names can resolve.
+  for (const [worker, candidate] of Object.entries(record(value, "workers"))) {
+    if (!WORKER_NAME_PATTERN.test(worker)) throw new Error("workers keys must be safe worker names");
+    const field = `workers.${worker}`;
+    const entry = record(candidate, field);
+    if (Object.keys(entry).some(key => key !== "destination" && key !== "workerId" && key !== "superkit")) {
+      throw new Error(`${field} must contain only destination, workerId and superkit`);
+    }
+    const superkit = entry.superkit === undefined ? "managed" : entry.superkit;
+    if (superkit !== "managed" && superkit !== "none") throw new Error(`${field}.superkit must be "managed" or "none"`);
+    const destination = text(entry.destination, `${field}.destination`);
+    if (!SSH_ALIAS_PATTERN.test(destination)) throw new Error(`${field}.destination must name an SSH config alias`);
+    const workerId = text(entry.workerId, `${field}.workerId`);
+    if (!WORKER_ID_PATTERN.test(workerId)) throw new Error(`${field}.workerId must be a lowercase UUID`);
+
+    const alias = destination.toLowerCase();
+    if (destinations.has(alias)) throw new Error(`${field}.destination duplicates another worker's SSH alias`);
+    if (workerIds.has(workerId)) throw new Error(`${field}.workerId duplicates another worker instance ID`);
+    destinations.add(alias);
+    workerIds.add(workerId);
+    workers[worker] = { destination, workerId, superkit };
+  }
+  return workers;
 }
 
 export function configuredPlatforms(config: Config): Platform[] {
@@ -245,6 +287,7 @@ export function parseConfig(value: unknown, path: string): Config {
     maxSubagents,
     idleMs: integer(raw.idleMs, "idleMs", 0),
     ...(raw.model === undefined ? {} : { model: text(raw.model, "model") }),
+    ...(raw.workers === undefined ? {} : { workers: parseWorkers(raw.workers) }),
     ...(discord ? { discord: {
       tokenEnv: tokenEnv(discord.tokenEnv, "discord.tokenEnv"),
       ownerId: id(discord.ownerId, "discord.ownerId", /^\d+$/),

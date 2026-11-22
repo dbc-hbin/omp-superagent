@@ -95,6 +95,16 @@ controls Host capacity.
   device is idle after its current run). For integration, settle the shared
   contract and name one owner and verification boundary. Checkout separation is not
   permission to merge, delete a checkout, or touch another lane's uncommitted work.
+- **Worker lanes (`lane_start.worker`):** place work on a configured worker only
+  when the owner or authoritative evidence names that machine; never choose one
+  automatically. Its `cwd` is a worker path inside that worker's approved roots;
+  do not resolve, read or verify it with HEAD-local tools. Verify lane claims
+  with `lane_evidence` (files in the lane cwd, git status/log/diff --stat, Host
+  log), which reads on the worker for worker lanes, or ask the lane for a check
+  it cannot express there. A worker configured with
+  `superkit: "none"` cannot take workflow-selecting work. It shares this board
+  (its default channel names its worker path). `lane_inspect` shows the launch facts and reachability;
+  an unreachable worker is a hold, not a reason to start a local copy.
 - Keep the original route by default. A new topic from inside a bound thread uses
   the exact authorized parent `destination` with `threadId:null` and no `topicId`
   to create a sibling, never a channel or nested thread. Only use an existing

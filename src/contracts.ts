@@ -146,12 +146,41 @@ export interface LaneObservation {
   lastEvidence: (LaneEvidence & { at: number }) | null;
   waiting: { target: LaneWaitTarget; since: number } | null;
 }
+export type LaneJournalObservation =
+  | { readonly kind: "report"; readonly eventId: string; readonly report: LaneReport; readonly observedAt: number }
+  | { readonly kind: "tool-result"; readonly nativeId: string };
+export interface RecoveredLaneSettlement {
+  readonly inputId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly requestId: string;
+  readonly state: "done" | "cancelled";
+  readonly output: Pick<OutputRecord, "id" | "text">;
+  readonly observations: readonly LaneJournalObservation[];
+}
+export interface WorkerPlacement {
+  readonly worker: string;
+  readonly destination: string;
+  readonly workerId: string;
+}
+/** What the worker reported a launched generation actually loaded. */
+export interface WorkerLaunch {
+  readonly package: { readonly version: string; readonly digest: string };
+  readonly omp: string;
+  /** Pinned omp-superkit revision, or null for an operator-declared plain worker. */
+  readonly superkit: string | null;
+  readonly bootId: string;
+}
 export interface Lane {
   id: string;
   title: string;
   route: Route;
   cwd: string;
   repoRoot: string | null;
+  /** Omitted for local lanes; remote placement is pinned at admission. */
+  readonly placement?: WorkerPlacement;
+  /** Remote lanes only: the current generation's launch facts, recorded from the worker. */
+  workerLaunch?: WorkerLaunch;
   brief: string;
   acceptance: string[];
   /** Null only for pre-selection records awaiting native-state adoption. */
@@ -313,6 +342,8 @@ export interface StorePort {
   recordLaneReport(id: string, generation: number, sessionId: string, eventId: string, report: LaneReport, observedAt?: number): boolean;
   resolveLaneWaiting(id: string, generation: number, sessionId: string, kind: "tool" | "approval", nativeId: string): boolean;
   settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange): boolean;
+  /** Atomically restore bounded historical observations and settle an exact remote lane request. Never emits nonterminal progress. */
+  settleRecoveredLane(settlement: RecoveredLaneSettlement): boolean;
   settleCronControl(inputId: string, update: CronUpdate): boolean;
   resolveLaneInput(controlId: string, laneId: string, inputId: string, output: { readonly id: string; readonly text: string }): boolean;
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[];
@@ -328,7 +359,7 @@ export interface StorePort {
   laneForRoute(route: Route): Lane | null;
   lanes(): Lane[];
   updateLane(id: string, generation: number, patch: Partial<Pick<Lane,
-    "workState" | "runtimeState" | "sessionId" | "pid" | "lastActivityAt" | "result"
+    "workState" | "runtimeState" | "sessionId" | "pid" | "lastActivityAt" | "result" | "workerLaunch"
   >>): boolean;
   nextGeneration(id: string): Lane;
   adoptLaneModel(id: string, generation: number, model: LaneModel, reason: string): boolean;

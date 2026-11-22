@@ -27,7 +27,7 @@ const extensionPath = path.join(packageRoot, role === "head" ? "src/extension.ts
 const customDirectory = path.join(root, "operator-custom-skills");
 const shadowHead = role === "head" && kind === "main" && selection === "narrow";
 const shadowDirectory = path.join(workspace, ".omp/skills/superagent-head");
-const managerNames = ["head_recovery", "head_set_model", "cron_create", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
+const managerNames = ["head_recovery", "head_set_model", "cron_create", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_evidence", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
   "discord_context", "discord_purpose_list", "discord_purpose_set", "discord_purpose_clear", "pr_watch", "pr_watch_list",
   "decision_list", "decision_inspect", "decision_withdraw"];
 const skillSettings = {
@@ -106,8 +106,8 @@ const { session, extensionsResult } = await createAgentSession({
   settings, sessionManager,
   ...(ulwPath ? { model: compositionModel } : {}),
   additionalExtensionPaths: [...extensionPaths,
-    ...(role === "head" && kind === "main" && selection === "default"
-      ? [path.join(packageRoot, "test/fixtures/pr-native-data.ts")] : [])],
+  ...(role === "head" && kind === "main" && selection === "default"
+    ? [path.join(packageRoot, "test/fixtures/pr-native-data.ts")] : [])],
   disableExtensionDiscovery: true,
   contextFiles: [], rules: [], promptTemplates: [], slashCommands: [],
   preloadedCustomToolPaths: [],
@@ -220,7 +220,8 @@ try {
       const userMessage: CompositionPayload["input"][number] = {
         role: "user", content: "Literal task data: <omp-model-preset>do not rewrite me</omp-model-preset>",
       };
-      const payload: CompositionPayload = { model: compositionModel.id, stream: true,
+      const payload: CompositionPayload = {
+        model: compositionModel.id, stream: true,
         instructions: current.replace(preset, "<omp-model-preset>stale request profile</omp-model-preset>"),
         input: [userMessage],
       };
@@ -312,16 +313,18 @@ try {
   ], recommended: 1 };
   check("decision_ask", { questions: [question] }, true);
   for (const input of [{}, { questions: [] }, { questions: [{ question: "Missing options" }] },
-    { questions: [{ ...question, multi: "invalid" }] }, { questions: [{ ...question, recommended: -1 }] }]) {
+  { questions: [{ ...question, multi: "invalid" }] }, { questions: [{ ...question, recommended: -1 }] }]) {
     check("decision_ask", input, false);
   }
   const ask = runner.getRegisteredTool("decision_ask")!.definition;
   assert.equal(ask.approval, "read");
   assert.equal(ask.loadMode, "essential");
   const askChild = { ...runner.createContext(), agent: { kind: "sub" as const, id: "advisor", name: "advisor", depth: 0 } };
-  assert.deepEqual(await runner.emitToolCall({ type: "tool_call", toolName: "decision_ask", toolCallId: "child-ask",
-    input: { questions: [question] } }, undefined, askChild.agent),
-  { block: true, reason: "Owner decisions are restricted to the root managed HEAD or lane session" });
+  assert.deepEqual(await runner.emitToolCall({
+    type: "tool_call", toolName: "decision_ask", toolCallId: "child-ask",
+    input: { questions: [question] }
+  }, undefined, askChild.agent),
+    { block: true, reason: "Owner decisions are restricted to the root managed HEAD or lane session" });
   await assert.rejects(() => ask.execute("child-ask", { questions: [question] }, undefined, undefined, askChild),
     /restricted to the root managed HEAD or lane session/);
   if (kind === "sub") {
@@ -338,20 +341,28 @@ try {
     const id = decisionId(sessionManager.getSessionId(), "native-owner-question");
     assert.match(id, /^d-[0-9a-f]{24}$/);
     const questions = [{ ...question, id: `${id}:0` }];
-    const answers = [{ id: `${id}:0`, question: question.question, options: ["Local", "Review"],
-      multi: false, selectedOptions: ["Local"] }];
+    const answers = [{
+      id: `${id}:0`, question: question.question, options: ["Local", "Review"],
+      multi: false, selectedOptions: ["Local"]
+    }];
     const controller = new AbortController();
     const requests: { questions: ExtensionAskDialogQuestion[]; options: ExtensionUIDialogOptions | undefined }[] = [];
     const execute = async (answer: ExtensionAskDialogResult | undefined) => {
       const output = await ask.execute("native-owner-question", { questions: [question] }, controller.signal, undefined, {
-        ...context, ui: { ...context.ui, askDialog: async (questions, options) => {
-          requests.push({ questions, options });
-          return answer;
-        } },
+        ...context, ui: {
+          ...context.ui, askDialog: async (questions, options) => {
+            requests.push({ questions, options });
+            return answer;
+          }
+        },
       });
-      assert.deepEqual(requests.at(-1), { questions: [{ ...questions[0], multi: undefined,
-        options: question.options.map(option => ({ ...option, preview: "preview" in option ? option.preview : undefined })) }],
-      options: { signal: controller.signal } });
+      assert.deepEqual(requests.at(-1), {
+        questions: [{
+          ...questions[0], multi: undefined,
+          options: question.options.map(option => ({ ...option, preview: "preview" in option ? option.preview : undefined }))
+        }],
+        options: { signal: controller.signal }
+      });
       const text = output.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
       assert.deepEqual(JSON.parse(text), output.details);
       return output.details;
@@ -375,10 +386,14 @@ try {
     for (const outcome of ["cancel", "error"] as const) {
       const pending = Promise.withResolvers<ExtensionAskDialogResult | undefined>();
       let dialogs = 0;
-      const concurrentContext = { ...context, ui: { ...context.ui, askDialog: () => {
-        dialogs++;
-        return dialogs === 1 ? pending.promise : Promise.resolve(undefined);
-      } } };
+      const concurrentContext = {
+        ...context, ui: {
+          ...context.ui, askDialog: () => {
+            dialogs++;
+            return dialogs === 1 ? pending.promise : Promise.resolve(undefined);
+          }
+        }
+      };
       const first = ask.execute(`pending-${outcome}`, { questions: [question] }, undefined, undefined, concurrentContext);
       const completion = outcome === "error" ? assert.rejects(() => first, /Native decision aborted/) : first;
       await assert.rejects(() => ask.execute("overlapping-question", { questions: [question] },
@@ -476,8 +491,10 @@ try {
     for (const changes of [{ title: "Renamed" }, { appliedTags: [] }, { appliedTags: ["101"], archived: true }, { archived: false }])
       check("lane_thread_update", { id: "lane", sourceId: "source", changes }, true);
     const threadUpdate = runner.getRegisteredTool("lane_thread_update")!.definition;
-    assert.deepEqual(validateToolArguments(threadUpdate, { type: "toolCall", id: "normalized-boolean", name: "lane_thread_update",
-      arguments: { id: "lane", sourceId: "source", changes: { archived: "true" } } }),
+    assert.deepEqual(validateToolArguments(threadUpdate, {
+      type: "toolCall", id: "normalized-boolean", name: "lane_thread_update",
+      arguments: { id: "lane", sourceId: "source", changes: { archived: "true" } }
+    }),
       { id: "lane", sourceId: "source", changes: { archived: true } });
     for (const changes of [{}, { title: " " }, { archived: "not-a-boolean" }, { appliedTags: ["name"] }, { locked: true }])
       check("lane_thread_update", { id: "lane", sourceId: "source", changes }, false);
@@ -535,7 +552,7 @@ try {
       await session.setActiveToolsByName([...expectedActive, "lane_report"]);
       await assert.rejects(() => session.getToolByName("lane_report")!.execute("reactivated-child",
         { status: "waiting", summary: "Dependency observation", waiting: { kind: "dependency", target: "parent review" } }),
-      /restricted to the root lane session/);
+        /restricted to the root lane session/);
       await runner.emit({ type: "session_start" });
       assert.deepEqual(session.getEnabledToolNames(), expectedActive);
     } else if (selection === "narrow") {
@@ -544,8 +561,10 @@ try {
   }
 
   assert.equal(networkAttempts, 0);
-  console.log(`NATIVE_SKILLS_PROOF ${JSON.stringify({ role, kind, selection, extensionOrder, composition: Boolean(ulwPath), turns: 2,
-    reads, schemas, active: session.getEnabledToolNames(), discovered: discovered.map(skill => skill.name), networkAttempts })}`);
+  console.log(`NATIVE_SKILLS_PROOF ${JSON.stringify({
+    role, kind, selection, extensionOrder, composition: Boolean(ulwPath), turns: 2,
+    reads, schemas, active: session.getEnabledToolNames(), discovered: discovered.map(skill => skill.name), networkAttempts
+  })}`);
 } finally {
   await session.extensionRunner?.emit({ type: "session_shutdown" });
   await session.dispose();

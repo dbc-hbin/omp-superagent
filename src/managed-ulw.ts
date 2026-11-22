@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -39,6 +40,7 @@ interface PackageManifest {
   optionalDependencies?: Record<string, string>;
 }
 export interface ManagedUlwOptions { manifestPath?: string; root?: string }
+export interface ManagedUlwRevision { revision: string; provenance: { revision: string; repository: string; branch: string; preparedAt: string }; packagePath: string }
 
 function isManagedUlwPackageName(name: string | undefined): boolean {
   return name === "omp-superkit" || name === "omp-ulw";
@@ -97,7 +99,7 @@ export function readManagedUlwPackage(packagePath: string) {
 export function validateManagedUlwPackage(packagePath: string): string {
   return readManagedUlwPackage(packagePath).packagePath;
 }
-export function activeManagedUlw(options: ManagedUlwOptions = {}): string {
+export function activeManagedUlwRevision(options: ManagedUlwOptions = {}): ManagedUlwRevision {
   const root = rootFor(options);
   try { assertOwned(root); }
   catch (error) {
@@ -107,10 +109,32 @@ export function activeManagedUlw(options: ManagedUlwOptions = {}): string {
   const active = readActive(root);
   if (!active) throw new Error("Mandatory managed ULW is not installed; run bun run prepare:ulw");
   const revisionRoot = join(root, "revisions", active.revision);
-  const provenance = JSON.parse(readFileSync(join(revisionRoot, "provenance.json"), "utf8")) as ActiveRevision;
+  const provenance = readProvenance(revisionRoot);
   if (provenance.revision !== active.revision || provenance.repository !== active.repository)
     throw new Error("Managed ULW provenance does not match its active pointer");
+  return { revision: active.revision, provenance, packagePath: validateManagedUlwPackage(join(revisionRoot, "package")) };
+}
+export function activeManagedUlw(options: ManagedUlwOptions = {}): string {
+  return activeManagedUlwRevision(options).packagePath;
+}
+/** Validated package of one already-prepared immutable revision, active or not. */
+export function managedUlwRevisionPackage(revision: string, options: ManagedUlwOptions = {}): string {
+  if (!hash.test(revision)) throw new Error("Invalid managed ULW revision");
+  const root = rootFor(options);
+  assertOwned(root);
+  const revisionRoot = join(root, "revisions", revision);
+  let provenance: ActiveRevision;
+  try { provenance = readProvenance(revisionRoot); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Managed ULW revision ${revision} is not prepared`);
+    throw error;
+  }
+  if (provenance.revision !== revision) throw new Error("Managed ULW provenance does not match the requested revision");
   return validateManagedUlwPackage(join(revisionRoot, "package"));
+}
+function readProvenance(revisionRoot: string): ActiveRevision {
+  const { revision, repository, branch, preparedAt } = JSON.parse(readFileSync(join(revisionRoot, "provenance.json"), "utf8")) as ActiveRevision;
+  return { revision, repository, branch, preparedAt };
 }
 export function managedUlwStatus(options: ManagedUlwOptions = {}): ManagedUlwStatus {
   const root = rootFor(options);
@@ -374,12 +398,8 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
   console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ ...composition, memoryWriteDir })}`);
 }
 
-/** Serialized source preparation only. No Gateway, account adapter, or Host starts here. */
-export async function updateManagedUlw(options: ManagedUlwOptions = {}): Promise<ManagedUlwStatus> {
-  const manifest = readUlwManifest(options.manifestPath);
-  const root = rootFor(options, manifest);
-  await mkdir(dirname(root), { recursive: true });
-  await initialize(root);
+/** Serializes every mutation of the managed root across processes via a SQLite write lock. */
+async function withUpdateLock<T>(root: string, manifest: UlwManifest, body: () => Promise<T>): Promise<T> {
   const lock = new Database(join(root, "update.sqlite"));
   lock.exec("PRAGMA busy_timeout=0");
   const deadline = Date.now() + manifest.commandTimeoutMs * 4;
@@ -391,6 +411,18 @@ export async function updateManagedUlw(options: ManagedUlwOptions = {}): Promise
         await Bun.sleep(25);
       }
     }
+    try { return await body(); }
+    finally { lock.exec("ROLLBACK"); }
+  } finally { lock.close(); }
+}
+
+/** Serialized source preparation only. No Gateway, account adapter, or Host starts here. */
+export async function updateManagedUlw(options: ManagedUlwOptions = {}): Promise<ManagedUlwStatus> {
+  const manifest = readUlwManifest(options.manifestPath);
+  const root = rootFor(options, manifest);
+  await mkdir(dirname(root), { recursive: true });
+  await initialize(root);
+  return withUpdateLock(root, manifest, async () => {
     let stage: string | undefined;
     let upstreamRevision: string | null = null;
     const checkedAt = new Date().toISOString();
@@ -496,7 +528,181 @@ export async function updateManagedUlw(options: ManagedUlwOptions = {}): Promise
       // Never delete an immutable revision or any path outside this invocation's
       // exclusively-created staging directory.
       if (stage) await rm(stage, { recursive: true, force: true });
-      lock.exec("ROLLBACK");
     }
-  } finally { lock.close(); }
+  });
+}
+
+// Transfer archive: ARCHIVE_MAGIC, uint32 big-endian index length, a JSON index
+// {version, entries: [{path, type, executable?, size?, target?}]}, then the bytes
+// of every file entry concatenated in index order. Not tar, so no platform metadata.
+const ARCHIVE_MAGIC = new TextEncoder().encode("OMPULW01");
+const ARCHIVE_LIMIT = 256 * 1024 * 1024;
+const sha256 = (data: Uint8Array | string) => createHash("sha256").update(data).digest("hex");
+
+interface TreeEntry { path: string; type: "file" | "dir" | "symlink"; executable?: boolean; size?: number; target?: string; sha256?: string }
+type ScannedEntry = TreeEntry & { content?: Buffer };
+
+/** Entries of a package directory sorted by path; only the executable bit, content and link targets are captured. */
+async function scanTree(directory: string, keepContent: boolean): Promise<ScannedEntry[]> {
+  const entries: ScannedEntry[] = [];
+  let total = 0;
+  const walk = async (current: string, prefix: string): Promise<void> => {
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const path = prefix + entry.name;
+      const absolute = join(current, entry.name);
+      if (entry.isDirectory()) { entries.push({ path, type: "dir" }); await walk(absolute, `${path}/`); }
+      else if (entry.isSymbolicLink()) entries.push({ path, type: "symlink", target: await readlink(absolute) });
+      else if (entry.isFile()) {
+        const stat = await lstat(absolute);
+        total += stat.size;
+        if (total > ARCHIVE_LIMIT) throw new Error("Managed ULW package exceeds the transfer size limit");
+        const content = await readFile(absolute);
+        entries.push({ path, type: "file", executable: (stat.mode & 0o111) !== 0, size: content.length, sha256: sha256(content),
+          ...(keepContent ? { content } : {}) });
+      } else throw new Error(`Managed ULW package contains an unsupported entry: ${path}`);
+    }
+  };
+  await walk(directory, "");
+  return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+function treeDigest(entries: TreeEntry[]): string {
+  return sha256(`omp-superagent-managed-ulw-package-v1\n${JSON.stringify(entries.map(entry =>
+    entry.type === "file" ? ["file", entry.path, !!entry.executable, entry.size, entry.sha256]
+      : entry.type === "symlink" ? ["symlink", entry.path, entry.target] : ["dir", entry.path]))}`);
+}
+
+export async function packManagedUlwRevision(options: ManagedUlwOptions = {}): Promise<{ provenance: ManagedUlwRevision["provenance"]; digest: string; bytes: Uint8Array }> {
+  const { provenance, packagePath } = activeManagedUlwRevision(options);
+  await checkLinks(packagePath);
+  const entries = await scanTree(packagePath, true);
+  const index = new TextEncoder().encode(JSON.stringify({ version: 1, entries: entries.map(({ path, type, executable, size, target }) =>
+    ({ path, type, ...(type === "file" ? { executable, size } : {}), ...(type === "symlink" ? { target } : {}) })) }));
+  const header = new Uint8Array(ARCHIVE_MAGIC.length + 4);
+  header.set(ARCHIVE_MAGIC);
+  new DataView(header.buffer).setUint32(ARCHIVE_MAGIC.length, index.length);
+  const bytes = Buffer.concat([header, index, ...entries.flatMap(entry => entry.content ?? [])]);
+  if (bytes.length > ARCHIVE_LIMIT) throw new Error("Managed ULW package exceeds the transfer size limit");
+  return { provenance, digest: treeDigest(entries), bytes };
+}
+
+function parseArchive(bytes: Uint8Array): { entries: TreeEntry[]; offsets: Map<string, number> } {
+  if (bytes.length > ARCHIVE_LIMIT) throw new Error("Managed ULW archive exceeds the transfer size limit");
+  const prefix = ARCHIVE_MAGIC.length + 4;
+  if (bytes.length < prefix || ARCHIVE_MAGIC.some((byte, i) => bytes[i] !== byte)) throw new Error("Not a managed ULW archive");
+  const indexLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.length).getUint32(ARCHIVE_MAGIC.length);
+  if (indexLength > bytes.length - prefix) throw new Error("Managed ULW archive index is truncated");
+  const index = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(prefix, prefix + indexLength))) as
+    { version?: unknown; entries?: unknown };
+  if (index.version !== 1 || !Array.isArray(index.entries)) throw new Error("Unsupported managed ULW archive index");
+  const entries: TreeEntry[] = [];
+  const offsets = new Map<string, number>();
+  const byPath = new Map<string, TreeEntry>();
+  let offset = prefix + indexLength;
+  for (const raw of index.entries as Array<Record<string, unknown>>) {
+    const { path, type, executable, size, target, ...unknown } = raw ?? {};
+    if (Object.keys(unknown).length) throw new Error("Managed ULW archive entry has unknown fields");
+    if (typeof path !== "string" || !path || path.includes("\0") || path.startsWith("/") ||
+        path.split("/").some(segment => !segment || segment === "." || segment === ".."))
+      throw new Error(`Invalid managed ULW archive path: ${String(path)}`);
+    if (byPath.has(path)) throw new Error(`Duplicate managed ULW archive path: ${path}`);
+    let entry: TreeEntry;
+    if (type === "file") {
+      if (typeof executable !== "boolean" || !Number.isSafeInteger(size) || (size as number) < 0 || target !== undefined)
+        throw new Error(`Invalid managed ULW archive file entry: ${path}`);
+      entry = { path, type, executable, size: size as number };
+      offsets.set(path, offset);
+      offset += size as number;
+      if (offset > bytes.length) throw new Error("Managed ULW archive file data is truncated");
+    } else if (type === "dir") {
+      if (executable !== undefined || size !== undefined || target !== undefined) throw new Error(`Invalid managed ULW archive directory entry: ${path}`);
+      entry = { path, type };
+    } else if (type === "symlink") {
+      if (typeof target !== "string" || !target || target.includes("\0") || isAbsolute(target) || executable !== undefined || size !== undefined)
+        throw new Error(`Invalid managed ULW archive symlink entry: ${path}`);
+      entry = { path, type, target };
+    } else throw new Error(`Unknown managed ULW archive entry type for ${path}`);
+    byPath.set(path, entry);
+    entries.push(entry);
+  }
+  if (offset !== bytes.length) throw new Error("Managed ULW archive has trailing bytes");
+  // Every parent must be an explicit directory, so nothing is created or written
+  // through a symlink or a file.
+  for (const { path } of entries) {
+    const slash = path.lastIndexOf("/");
+    if (slash >= 0 && byPath.get(path.slice(0, slash))?.type !== "dir") throw new Error(`Managed ULW archive parent is not a directory: ${path}`);
+  }
+  return { entries, offsets };
+}
+async function extractArchive(bytes: Uint8Array, destination: string): Promise<void> {
+  const { entries, offsets } = parseArchive(bytes);
+  const ordered = [...entries].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  for (const entry of ordered.filter(entry => entry.type === "dir")) await mkdir(join(destination, entry.path), { mode: 0o755 });
+  for (const entry of ordered.filter(entry => entry.type === "file")) {
+    const start = offsets.get(entry.path)!;
+    await writeFile(join(destination, entry.path), bytes.subarray(start, start + entry.size!), { flag: "wx", mode: entry.executable ? 0o755 : 0o644 });
+  }
+  for (const entry of ordered.filter(entry => entry.type === "symlink")) await symlink(entry.target!, join(destination, entry.path));
+}
+
+/** Worker side: verify, probe, store immutably and atomically activate. Idempotent; never uses git or the network. */
+export async function installManagedUlwRevision(
+  input: { provenance: ManagedUlwRevision["provenance"]; digest: string; bytes: Uint8Array },
+  options: ManagedUlwOptions = {},
+): Promise<{ revision: string; changed: boolean }> {
+  const manifest = readUlwManifest(options.manifestPath);
+  const root = rootFor(options, manifest);
+  const { revision, repository, branch, preparedAt } = input.provenance;
+  if (!hash.test(revision) || typeof repository !== "string" || typeof branch !== "string" || !branch || typeof preparedAt !== "string" || !preparedAt)
+    throw new Error("Invalid managed ULW revision provenance");
+  if (!matchesUlwRepository(repository, manifest.repository))
+    throw new Error("Managed ULW revision comes from a different source repository than the manifest");
+  if (!/^[0-9a-f]{64}$/.test(input.digest)) throw new Error("Invalid managed ULW package digest");
+  await mkdir(dirname(root), { recursive: true });
+  await initialize(root);
+  return withUpdateLock(root, manifest, async () => {
+    const active = readActive(root);
+    if (active && !matchesUlwRepository(active.repository, manifest.repository))
+      throw new Error("Managed ULW source repository changed; explicit operator reconciliation required");
+    const revisionRoot = join(root, "revisions", revision);
+    const incoming: ActiveRevision = { revision, repository, branch, preparedAt };
+    let stage: string | undefined;
+    try {
+      let existing: ActiveRevision | undefined;
+      try { existing = readProvenance(revisionRoot); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (existing) {
+        if (existing.revision !== revision || !matchesUlwRepository(existing.repository, repository))
+          throw new Error("Existing immutable ULW revision has different provenance");
+        const packagePath = validateManagedUlwPackage(join(revisionRoot, "package"));
+        if (treeDigest(await scanTree(packagePath, false)) !== input.digest)
+          throw new Error("Existing immutable ULW revision has different content than the transferred package");
+        if (active?.revision === revision) return { revision, changed: false };
+        stage = await mkdtemp(join(root, ".stage-"));
+        await probe(packagePath, stage, manifest);
+        await atomicJson(join(root, "active.json"), existing);
+        return { revision, changed: true };
+      }
+      stage = await mkdtemp(join(root, ".stage-"));
+      const distribution = join(stage, "distribution");
+      const packagePath = join(distribution, "package");
+      await mkdir(packagePath, { recursive: true, mode: 0o700 });
+      await extractArchive(input.bytes, packagePath);
+      validateManagedUlwPackage(packagePath);
+      await checkLinks(await realpath(packagePath));
+      if (treeDigest(await scanTree(packagePath, false)) !== input.digest)
+        throw new Error("Managed ULW package digest does not match the transferred content");
+      await probe(packagePath, stage, manifest);
+      await writeFile(join(distribution, "provenance.json"), JSON.stringify(incoming, null, 2) + "\n", { mode: 0o444 });
+      await immutableTree(packagePath);
+      await mkdir(join(root, "revisions"), { recursive: true, mode: 0o700 });
+      await rename(distribution, revisionRoot);
+      await rm(stage, { recursive: true, force: true });
+      stage = undefined;
+      // The only activation write; old immutable revisions are never pruned.
+      await atomicJson(join(root, "active.json"), incoming);
+      return { revision, changed: true };
+    } finally {
+      if (stage) await rm(stage, { recursive: true, force: true });
+    }
+  });
 }

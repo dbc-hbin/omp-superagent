@@ -14,7 +14,7 @@ import { HostChannel, type HostResponse, type HostState } from "./host-protocol"
 import { requireHostOwner } from "./host-owner-path";
 import { inspectInstalledOmp, resolveOmpCommand } from "./installed-omp";
 import type { DialogResponse, LanePresetSnapshot } from "./contracts";
-import { activeManagedUlw, managedUlwLaunchExtensions, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
+import { activeManagedUlw, managedUlwLaunchExtensions, managedUlwRevisionPackage, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
 
 const CONNECT_TIMEOUT_MS = 5_000;
 const START_TIMEOUT_MS = 30_000;
@@ -31,6 +31,11 @@ export interface HostOptions {
   managedUlwPath?: string;
   /** Isolated managed-installation root; unlike package injection, follows its active pointer. */
   managedUlwRoot?: string;
+  /**
+   * Remote worker launch only: an exact prepared immutable revision (never the
+   * moving active pointer), or null for an operator-declared plain worker.
+   */
+  managedUlwRevision?: string | null;
   /** Complete child environment; omitted credentials must never be inherited again. */
   env: Record<string, string>;
   logPath: string;
@@ -282,7 +287,7 @@ export async function buildHostArgs(options: HostOptions, configPath = `${option
     fileURLToPath(new URL("../", import.meta.url)), managedUlwPath, options.extensionPath,
     fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
     fileURLToPath(new URL("./host-extension.ts", import.meta.url)),
-  ];
+  ].filter((path): path is string => path !== null);
   return [
     "--mode", "rpc-ui",
     "--session", options.sessionFile, "--cwd", options.cwd,
@@ -292,10 +297,13 @@ export async function buildHostArgs(options: HostOptions, configPath = `${option
   ];
 }
 
-function selectManagedUlw(options: HostOptions): string {
+function selectManagedUlw(options: HostOptions): string | null {
   const fixture = options.managedUlwPath ?? options.env[MANAGED_ULW_FIXTURE_ENV];
   const root = options.managedUlwRoot ?? options.env[MANAGED_ULW_FIXTURE_ROOT_ENV];
-  return fixture ? validateManagedUlwPackage(fixture) : activeManagedUlw(root ? { root } : {});
+  if (fixture) return validateManagedUlwPackage(fixture);
+  if (options.managedUlwRevision === null) return null;
+  if (options.managedUlwRevision !== undefined) return managedUlwRevisionPackage(options.managedUlwRevision, root ? { root } : {});
+  return activeManagedUlw(root ? { root } : {});
 }
 
 /** Launch only a new host. Existing endpoints require the caller's explicit adoption decision. */
@@ -317,8 +325,9 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
   const bun = options.env.OMP_SUPERAGENT_BUN ?? (path.basename(process.execPath) === "bun" ? process.execPath
     : Bun.which("bun", { PATH: options.env.PATH ?? process.env.PATH }));
   if (!bun || !path.isAbsolute(bun)) throw new Error("Managed Host launch requires an explicit installed Bun executable");
-  options = { ...options, command: resolveOmpCommand(options.command, options.env.PATH ?? ""), managedUlwPath,
-    env: { ...options.env, [MANAGED_ULW_ENV]: managedUlwPath,
+  options = { ...options, command: resolveOmpCommand(options.command, options.env.PATH ?? ""),
+    ...(managedUlwPath === null ? {} : { managedUlwPath }),
+    env: { ...options.env, ...(managedUlwPath === null ? {} : { [MANAGED_ULW_ENV]: managedUlwPath }),
     OMP_SUPERAGENT_BUN: bun,
     ...(fixture ? { [MANAGED_ULW_FIXTURE_ENV]: fixture } : {}),
     ...(fixtureRoot ? { [MANAGED_ULW_FIXTURE_ROOT_ENV]: fixtureRoot } : {}) } };
@@ -369,13 +378,15 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
     const extensionPaths = [fileURLToPath(new URL("../", import.meta.url)), managedUlwPath, options.extensionPath,
       fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
       fileURLToPath(new URL("./host-extension.ts", import.meta.url))];
-    const composition = await managedUlwLaunchExtensions({ cwd: options.cwd, managedUlwPath,
-      extensionPaths, configPath, parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
+    // A plain worker Host keeps stock native discovery: no managed package to compose.
+    const composition = managedUlwPath === null ? undefined : await managedUlwLaunchExtensions({ cwd: options.cwd, managedUlwPath,
+      extensionPaths: extensionPaths.filter((path): path is string => path !== null), configPath,
+      parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
       launchArgs: [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
       env: options.env, bunCommand: [bun, "--no-env-file"] });
     const { env: _inheritedEnvironment, ...launchOptions } = options;
     const helperPath = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
-    const manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath, memoryWriteDir: composition.memoryWriteDir,
+    const manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath, memoryWriteDir: composition?.memoryWriteDir ?? null,
       processBackend, helperPath, nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
     // Preparation used to run inside the owner; it shares the same startup budget.
     const deadline = Date.now() + START_TIMEOUT_MS;

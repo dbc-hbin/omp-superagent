@@ -12,6 +12,7 @@ export async function writeStockHostExecutable(file: string, source: string): Pr
   await writeFile(file, `#!${await realpath(process.execPath)} --no-env-file
 if (process.argv[2] === "--version") console.log(${JSON.stringify(`omp/${dependencies["@oh-my-pi/pi-coding-agent"]}`)});
 else if (process.argv[2] === "ps" && process.argv[3] === "--help") console.log("--signal SIGNAL");
+else if (process.argv[2] === "models" && process.argv[3] === "--json") console.log(process.env.STOCK_HOST_MODELS ?? '{"models":[]}');
 else if (process.argv[2] === "--help") console.log("--mode rpc rpc-ui --resume FILE --extension PATH --model MODEL");
 else await import(${JSON.stringify(peer)});
 `, { mode: 0o700 });

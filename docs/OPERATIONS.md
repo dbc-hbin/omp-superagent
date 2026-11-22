@@ -15,6 +15,92 @@ Gateway가 메신저 연결과 헤드 수명을 맡고, 모든 요청·후속 �
 플랫폼·계정·대화·주제 신원은 분리한다. 멀티테넌트 구성이나 OS 보안 샌드박스가 아니다.
 관리 RPC Host의 동일 프로세스 native TUI/herdr attach는 지원하지 않는다.
 
+### 명시적으로 Linux 워커 선택하기
+
+**지원 범위.** 워커는 **Linux + systemd 사용자 매니저** 계정만 지원한다. macOS 워커는
+`gui/<uid>` LaunchAgent 경로가 실기기에서 검증되기 전까지 명확한 오류로 거부하고,
+Windows 워커와 자동 머신 선택(배치)은 없다. HEAD는 소유자나 근거가 지정한 워커에만 레인을 둔다.
+`workers`를 설정하지 않으면 기존 로컬 레인만 사용한다.
+
+**동등성 원칙.** 원격 레인은 그 워커 계정이 자기 PC에서 직접 실행한 stock OMP처럼 동작한다.
+워커 Host는 SSH 세션이 아니라 계정의 systemd 사용자 매니저 안 일시 유닛(`omp-sa-<레인>-g<세대>`)에서
+**로그인 셸 환경**(`$SHELL -l -i -c`로 측정)으로 실행된다. 계정 자신의 OMP 홈(설정·인증·스킬·
+AGENTS.md·메모리)을 그대로 쓰므로 메모리는 머신별이다. 레인 정책(lane 확장, 모델·프리셋 스냅샷,
+서브에이전트 동시성, 세션 설정 범위)은 로컬 레인과 같고, omp-superkit은 HEAD가 고정한 리비전이다.
+
+#### 1. HEAD 설정
+
+```json
+"workers": {
+  "linux-1": { "destination": "omp-linux-1", "workerId": "<워커 고유 소문자 UUID>", "superkit": "managed" }
+}
+```
+
+- `destination`: 운영자가 계정과 호스트 키를 검증한 **전용 SSH 별칭**. 대화에서 받은 호스트명·IP는 쓰지 않는다.
+- `superkit`: `"managed"`(기본)는 HEAD가 활성화한 omp-superkit 리비전을 고정해 워커에 전달한다.
+  `"none"`은 명시적인 plain 워커로, superkit 없이 실행하고 워크플로를 선택하는 요청은 거부한다
+  (로컬 레인과의 의도적인 차이).
+- HEAD는 `coordination.sqlite`의 `metadata`에 `worker:instance` UUID를 기록한다.
+  `sqlite3 -readonly <stateDir>/coordination.sqlite "SELECT value FROM metadata WHERE key='worker:instance'"`.
+
+#### 2. 워커 계정 준비 (워커에서, 해당 계정으로)
+
+1. 로그인 유지: `loginctl show-user $USER -p Linger`가 `yes`여야 한다(아니면 관리자가
+   `loginctl enable-linger <user>`). 없으면 실행을 거부한다.
+2. stock OMP(HEAD가 요구하는 `@oh-my-pi/pi-coding-agent` 버전 이상)와 Bun을 설치하고, 계정에서 직접
+   모델 인증을 마친다. HEAD의 토큰·프로필·환경 파일은 복사하지 않는다.
+3. **HEAD와 같은 omp-superagent 릴리스**를 설치한다. 소스 트리를 쓸 때는 `bun install --frozen-lockfile
+   --ignore-scripts`로 설치해 워커가 GitHub에서 superkit을 따로 준비하지 않게 한다. Linux용
+   `host-owner/bin/omp-host-owner-linux-<arch>`가 있어야 한다(공식 npm 패키지에 포함). 패키지 버전이나
+   소스 다이제스트가 다르면 HEAD가 실행을 거부한다.
+4. `omp-sa-worker`가 비대화형 SSH의 PATH에서 보이도록 `~/.local/bin/omp-sa-worker` 래퍼
+   (`exec <bun> --no-env-file <설치경로>/bin/omp-sa-worker`)를 두고 PATH에 포함한다.
+5. `~/.config/omp-superagent/worker.json`(계정 소유 `0600`, 상위 디렉터리는 그룹·기타 쓰기 금지):
+   `{"workerId":"<위 workerId>","instance":"<worker:instance>","stateDir":"/home/<user>/.osa","workspaceRoots":["/home/<user>/projects"],"command":["omp"]}`.
+   `stateDir`은 짧은 `0700` 디렉터리, `workspaceRoots`는 실제 정규 경로다.
+6. 점검: `ssh <별칭> omp-sa-worker </dev/null`이 프로토콜 오류 프레임을 출력하면 실행 경로가 맞다.
+   설정 오류는 이 명령의 stderr에 이유가 나온다. 워커에서 `omp-sa start`를 실행하지 않는다.
+
+#### 3. SSH 강화 (권장)
+
+HEAD 전용 키를 만들고 워커 계정의 `authorized_keys`에
+`restrict,command="/home/<user>/.local/bin/omp-sa-worker" ssh-ed25519 AAAA… omp-sa-head`처럼 고정 명령과
+`restrict`(포워딩·pty 금지)를 건다. HEAD 쪽 `~/.ssh/config`의 별칭은 그 키만 쓰도록
+`IdentitiesOnly yes`를 둔다. HEAD는 `BatchMode`, `StrictHostKeyChecking=yes`, 에이전트·X11·포트
+포워딩 금지, `ControlPath=none`으로만 접속한다.
+
+`authorized_keys` 옵션은 OpenSSH만 적용한다. Tailscale SSH가 받는 주소(tailnet 주소)는 키와
+`authorized_keys`를 보지 않으므로 고정 명령이 우회된다. 별칭의 `HostName`은 OpenSSH가 받는 주소로 두고,
+`ssh <별칭> whoami`가 `whoami` 결과가 아니라 워커 프로토콜 응답을 내는지로 강제 여부를 확인한다.
+
+#### 4. 사용과 상태
+
+HEAD가 승인된 원본 요청으로 `lane_start`에 `worker:"linux-1"`와 **워커의 절대 cwd**를 전달한다.
+워커가 cwd를 자기 승인 폴더 안에서 확인하며, 없으면 "Workspace does not exist on the worker"로 거부한다.
+모델·프리셋은 워커 계정의 `omp models` 목록에 있어야 한다. 후속 요청·일시정지·재개는 같은 레인 ID를 쓴다.
+`lane_inspect`와 `status`는 `workerLaunch`(패키지 버전·다이제스트, OMP 버전, superkit 리비전, 부팅 ID)와
+`workerReachability`(연결 실패 시각·횟수·오류)를 보여 준다. 기록된 사실이지 현재 실행 확인은 아니다.
+첨부는 크기 제한과 SHA-256 확인을 거쳐 레인의 워커 전용 폴더에 저장되고, 프롬프트에는 워커 경로가 들어간다.
+워커 레인도 로컬 레인과 같은 공유 게시판 도구(`board_post`/`board_read`/`board_subscribe`)와 알림을 쓴다.
+워커의 게시판 확장은 레인 자신의 RPC 스트림으로 HEAD에 요청하고, HEAD가 그 스트림에서 확인한 레인 신원으로
+자기 `coordination.sqlite`에 기록한다. 기본 채널은 워커 경로 기준 `repo:<워커 경로>`다. HEAD와 연결이 끊긴
+동안에는 게시판이 잠시 없는 것으로 처리되고 다시 붙으면 돌아온다. HEAD는 워커 경로를 로컬에서 읽지 않는다.
+검증은 `lane_evidence`로 한다. 로컬 레인과 같은 방식으로 레인 cwd 안의 파일(심볼릭 링크 해석 후, 한 번에 64 KiB),
+`git status`/`log`/`diff --stat`, 레인 Host 로그 끝부분을 읽으며, 워커 레인이면 워커에서 읽어 온다(읽기 전용).
+
+#### 5. 실패 의미
+
+- **실행 전 거부**(예약 없음, 재시도 가능): 비 Linux·linger 없음, 패키지/프로토콜 불일치, OMP 최소 버전
+  미달, 시계 차이 2분 초과, superkit 불일치·프로비저닝·프로브 실패, 워커 모델 없음, cwd 없음.
+- **실행 응답 유실**: 다시 실행하지 않고 워커 예약을 조회해 기존 Host에 붙는다. 아직 확정 전이면 연결 끊김과
+  같이 보류하고 재연결이 붙인다. 런처가 예약을 가져가기 전에 끝나면 예약을 되돌리고, 가져간 뒤
+  확정하지 못한 예약은 영구 보류된다(중복 실행 방지). 워커의 `launcher.log`에서 원인을 확인한다.
+- **워커 연결 끊김**: SSH만 끊기고 Host는 계속 실행된다. HEAD는 제출된 요청을 보류한 채 15초부터
+  최대 5분 간격으로 재연결하고, 로컬 대체 실행이나 프롬프트 재전송은 하지 않는다. 다시 붙은 뒤
+  네이티브 기록으로 증명되지 않는 요청만 "불확실"로 알린다.
+- **워커 재부팅**: 부팅 ID가 바뀌면 이전 PID를 살아 있는 것으로 보지 않는다. 종료 기록 없이 끝난
+  세대는 자동 정리하지 않으므로 운영자가 확인한다.
+
 선택 기능인 [Discord 실시간 음성채팅](discord-voice.md)은 일반 대화를 별도 OpenAI Live 세션에서
 처리한다. `/voice start work`로 시작하면 말로 요청한 작업을 지정 텍스트 채널에 초안으로 게시할 수 있다.
 소유자가 해당 초안에 `/voice confirm`으로 답장해야 HEAD에 접수되며, 결과는 Discord 텍스트로만 받는다.

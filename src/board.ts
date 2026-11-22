@@ -128,7 +128,7 @@ function actorName(value: string): void {
 function channelName(value: string): void {
   if (value === "general") return;
   if (typeof value !== "string" || !value.startsWith("repo:") || value.length > 4096 ||
-      value.includes("\0") || !isAbsolute(value.slice(5)) || resolve(value.slice(5)) !== value.slice(5)) {
+    value.includes("\0") || !isAbsolute(value.slice(5)) || resolve(value.slice(5)) !== value.slice(5)) {
     throw new Error("Board channel must be general or repo:<canonical absolute repository path>");
   }
 }
@@ -150,6 +150,13 @@ export function boardRepositoryChannel(repository: string): string {
   return channel;
 }
 
+/** A worker lane's repository: already canonical on the worker, which owns that path. */
+export function workerRepositoryChannel(repository: string): string {
+  const channel = `repo:${repository}`;
+  channelName(channel);
+  return channel;
+}
+
 /**
  * Independent multi-writer connection to the local coordination ledger. Identity
  * comes from the native host/session, never from tool parameters or message text.
@@ -162,10 +169,17 @@ export class Board {
   private readonly generation: number;
   private closed = false;
 
-  constructor(path: string, identity: BoardIdentity, readonly repositoryChannel: string, sessionFile: string) {
+  /**
+   * `worker`: HEAD serves this lane session for a remote worker lane over that
+   * lane's own verified stream; the session file is a worker path.
+   */
+  private readonly worker: boolean;
+
+  constructor(path: string, identity: BoardIdentity, readonly repositoryChannel: string, sessionFile: string,
+    options: { readonly worker?: boolean } = {}) {
     actorName(identity.actor);
     if ((identity.role !== "head" && identity.role !== "lane") ||
-        (identity.role === "head") !== (identity.actor === "head")) throw new Error("Invalid board role identity");
+      (identity.role === "head") !== (identity.actor === "head")) throw new Error("Invalid board role identity");
     if (typeof identity.sessionId !== "string" || !identity.sessionId || identity.sessionId.length > 1024) {
       throw new Error("A native session ID is required for the board");
     }
@@ -177,7 +191,8 @@ export class Board {
     if (!existsSync(path) || typeof sessionFile !== "string" || !isAbsolute(sessionFile)) throw new BoardMembershipError();
     path = realpathSync(path);
     this.stateDirectory = dirname(path);
-    this.sessionFile = canonicalSessionFile(sessionFile);
+    this.worker = options.worker === true && identity.role === "lane";
+    this.sessionFile = this.worker ? sessionFile : canonicalSessionFile(sessionFile);
     const db = new Database(path, { create: false, strict: true });
     try {
       this.db = db;
@@ -232,7 +247,7 @@ export class Board {
         .get(this.identity.sessionId, toolCallId) as MessageRow | null;
       if (existing) {
         if (existing.channel !== channel || existing.reply_to !== (input.replyTo ?? null) ||
-            existing.text !== input.text || existing.mentions !== JSON.stringify(mentions)) {
+          existing.text !== input.text || existing.mentions !== JSON.stringify(mentions)) {
           throw new Error("Board tool call identity conflict");
         }
         return message(existing);
@@ -356,9 +371,11 @@ export class Board {
         SELECT (SELECT channel FROM board_messages WHERE channel > c.channel ORDER BY channel LIMIT 1)
         FROM channels c WHERE c.channel IS NOT NULL
       ) SELECT channel FROM channels WHERE channel IS NOT NULL`).all();
-    return { identity: { ...this.identity }, readCursor: row.read_cursor, noticeCursor: row.notice_cursor,
+    return {
+      identity: { ...this.identity }, readCursor: row.read_cursor, noticeCursor: row.notice_cursor,
       subscriptions: this.subscriptions(),
-      channels: [...new Set(["general", this.repositoryChannel, ...channels.map(item => item.channel)])].sort() };
+      channels: [...new Set(["general", this.repositoryChannel, ...channels.map(item => item.channel)])].sort()
+    };
   }
 
   membership(): Readonly<BoardIdentity> {
@@ -417,7 +434,7 @@ export class Board {
       // still owned by this Gateway is a member, not a standalone resumed copy.
       // Keep that process admitted during a transient Gateway disconnection.
       if (!ownedHead || ownedHead.pid !== process.pid || ownedHead.sessionId !== this.identity.sessionId ||
-          typeof ownedHead.sessionFile !== "string" || canonicalSessionFile(ownedHead.sessionFile) !== this.sessionFile) {
+        typeof ownedHead.sessionFile !== "string" || canonicalSessionFile(ownedHead.sessionFile) !== this.sessionFile) {
         throw new BoardMembershipError();
       }
       let registeredFile: string;
@@ -431,17 +448,26 @@ export class Board {
         .get(this.identity.actor) as { generation: number; data: string } | null;
       if (!row) throw new BoardMembershipError();
       const lane = JSON.parse(row.data) as Lane;
-      if (lane.id !== this.identity.actor || lane.sessionId !== this.identity.sessionId ||
-          canonicalSessionFile(lane.sessionFile) !== this.sessionFile || lane.pid !== process.pid ||
-          (lane.workState !== "open" && lane.workState !== "paused") ||
-          (lane.runtimeState !== "running" && lane.runtimeState !== "idle") || lane.generation !== row.generation) {
+      // A local lane is its own process. A worker lane is served only by the
+      // Gateway-owned head process that holds that lane's verified stream.
+      const owner = !this.worker ? lane.pid === process.pid : !!lane.placement && this.ownedHead();
+      if (!!lane.placement !== this.worker || !owner || lane.id !== this.identity.actor || lane.sessionId !== this.identity.sessionId ||
+        (this.worker ? lane.sessionFile : canonicalSessionFile(lane.sessionFile)) !== this.sessionFile ||
+        (lane.workState !== "open" && lane.workState !== "paused") ||
+        (lane.runtimeState !== "running" && lane.runtimeState !== "idle") || lane.generation !== row.generation) {
         throw new BoardMembershipError();
       }
       generation = row.generation;
     }
     if (!Number.isSafeInteger(generation) || generation < 0 ||
-        (this.generation !== undefined && generation !== this.generation)) throw new BoardMembershipError();
+      (this.generation !== undefined && generation !== this.generation)) throw new BoardMembershipError();
     return generation;
+  }
+
+  private ownedHead(): boolean {
+    const owner = this.db.query("SELECT value FROM metadata WHERE key = 'gateway:head'").get() as { value: string } | null;
+    try { return (JSON.parse(owner?.value ?? "null") as { pid?: number } | null)?.pid === process.pid; }
+    catch { return false; }
   }
 
   private markRead(ids: number[]): void {

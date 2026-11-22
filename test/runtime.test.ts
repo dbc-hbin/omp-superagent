@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { activeManagedUlwRevision } from "../src/managed-ulw";
+import { MINIMUM_WORKER_OMP } from "../src/remote-lanes";
+import { workerPackage } from "../src/remote-worker-wire";
+
 import { Database } from "bun:sqlite";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { createHash } from "node:crypto";
@@ -27,13 +31,21 @@ import { CronJobs } from "../src/cron-jobs";
 test("a delayed durable receipt cannot cancel a later native run", () => {
   const owner = { sessionId: "native-session", sessionFile: "/private/session.jsonl", requestId: "original", cursor: null };
   const entries = [
-    { id: "start-1", type: "custom", customType: "rpc_agent_start",
-      data: { ...owner, hostPid: 123, runOrdinal: 1 } },
-    { id: "start-2", type: "custom", customType: "rpc_agent_start",
-      data: { ...owner, hostPid: 123, runOrdinal: 2 } },
-    { id: "late-receipt", type: "custom", customType: "rpc_prompt_result",
-      data: { ...owner, hostPid: 123, runOrdinal: 1,
-        frame: { id: "original", status: "aborted", agentInvoked: true } } },
+    {
+      id: "start-1", type: "custom", customType: "rpc_agent_start",
+      data: { ...owner, hostPid: 123, runOrdinal: 1 }
+    },
+    {
+      id: "start-2", type: "custom", customType: "rpc_agent_start",
+      data: { ...owner, hostPid: 123, runOrdinal: 2 }
+    },
+    {
+      id: "late-receipt", type: "custom", customType: "rpc_prompt_result",
+      data: {
+        ...owner, hostPid: 123, runOrdinal: 1,
+        frame: { id: "original", status: "aborted", agentInvoked: true }
+      }
+    },
   ];
   expect(headRecoveryEvidence(entries, owner)?.outcome).toBeNull();
   const data = entries[2]!.data;
@@ -94,10 +106,12 @@ class HostTransport implements RuntimeHost {
   state: RuntimeState;
 
   constructor(sessionFile: string, sessionId: string, model: LaneModel | null = executionModel) {
-    this.state = { sessionFile, sessionId, journalCursorVersion: 1, model, thinkingLevel: "high", isCompacting: false, queuedMessageCount: 0, settingsScope: "session",
+    this.state = {
+      sessionFile, sessionId, journalCursorVersion: 1, model, thinkingLevel: "high", isCompacting: false, queuedMessageCount: 0, settingsScope: "session",
       modelSettings: { modelRoles: { default: "fixture/capable", smol: "fixture/efficient" }, defaultThinkingLevel: Effort.High },
       contextUsage: { tokens: 321, contextWindow: 200_000, percent: 0.1605 },
-      hostPid: process.pid, isSettled: true, isStreaming: false, hasPendingAsyncWork: false, hasOwnedRunningWork: false, pendingUiRequests: [], goal: null };
+      hostPid: process.pid, isSettled: true, isStreaming: false, hasPendingAsyncWork: false, hasOwnedRunningWork: false, pendingUiRequests: [], goal: null
+    };
     const deferred = Promise.withResolvers<void>();
     this.exited = deferred.promise;
     this.exit = () => deferred.resolve();
@@ -175,9 +189,13 @@ class HostTransport implements RuntimeHost {
     }
     if (command.type === "get_available_commands") {
       await this.beforeCapabilities?.();
-      return { success: true, data: { commands: this.workflowAvailable ? WORKFLOW_NAMES.filter(name => name !== "jevify").map(name => ({
-        name, source: "extension", description: `Run the OMP-adapted ${name} workflow`,
-      })) : [] } };
+      return {
+        success: true, data: {
+          commands: this.workflowAvailable ? WORKFLOW_NAMES.filter(name => name !== "jevify").map(name => ({
+            name, source: "extension", description: `Run the OMP-adapted ${name} workflow`,
+          })) : []
+        }
+      };
     }
     if (command.type === "set_model" || command.type === "set_model_preset") {
       await this.beforeSetModel?.();
@@ -198,9 +216,11 @@ class HostTransport implements RuntimeHost {
         }
       }
       if (this.modelSetResult === "throw-after") throw new Error("Native model acknowledgement lost");
-      return { success: true, data: command.type === "set_model_preset"
-        ? { name: command.name, preset: this.state.modelSettings, model: this.state.model, settingsScope: this.state.settingsScope }
-        : this.state.model };
+      return {
+        success: true, data: command.type === "set_model_preset"
+          ? { name: command.name, preset: this.state.modelSettings, model: this.state.model, settingsScope: this.state.settingsScope }
+          : this.state.model
+      };
     }
     if (command.type === "prompt") {
       if (!id) throw new Error("Missing persisted request identity");
@@ -397,11 +417,12 @@ function delegated(store: Store, sourceId: string) {
   return store.input(`handoff:${sourceId}:${lane.id}`);
 }
 
-function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset" | "requestRestart" | "readPrSnapshot" | "readOmpUsage" | "topicMemory">> = {}) {
+function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<RuntimeAdapters> = {}, workers?: Config["workers"]) {
   const directory = realpathSync(mkdtempSync("/tmp/sa-runtime-"));
   const config: Config = {
     path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
     command: [process.execPath], maxHosts, maxSubagents: maxHosts * 2, idleMs: 60_000,
+    ...(workers ? { workers } : {}),
     discord: { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4"] },
   };
   const store = new Store(join(directory, "coordination.sqlite"));
@@ -457,6 +478,14 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], ada
       if (!existsSync(options.sessionFile)) writeFileSync(options.sessionFile, JSON.stringify({ type: "session", version: 3, id: host.state.sessionId, cwd: options.cwd }) + "\n");
       return { pid: launchBehavior.pid ?? process.pid };
     },
+    // A compatible worker that already runs HEAD's superkit and offers the fixture models.
+    remoteCapability: async () => ({
+      package: workerPackage(), platform: "linux", bootId: "fixture-boot", clock: Date.now(), omp: MINIMUM_WORKER_OMP,
+      superkit: activeManagedUlwRevision().revision, roots: ["/worker", "/worker-only"],
+      models: [executionModel, otherModel].map(model => `${model.provider}/${model.id}`),
+    }),
+    remoteProvision: async () => { throw new Error("Unexpected worker provisioning"); },
+    remoteInput: async () => { throw new Error("Unexpected worker input transfer"); },
     ...adapters,
   });
   fixtures.push({ runtime, directory });
@@ -656,6 +685,263 @@ describe("explicit outbound result attachments", () => {
   });
 });
 
+test("a worker whose launch reply is lost gets one kickoff, one launch and one prompt on its original generation", async () => {
+  const worker = "linux-1";
+  const pin = { destination: "test-builder", workerId: "b2bfb510-b840-446f-8a10-74eca948b590" };
+  const cwd = "/worker-only/build";
+  const sessionFile = "/worker-only/state/session.jsonl";
+  const host = new HostTransport(sessionFile, "worker-journal");
+  Object.assign(host.state, { instanceKey: "worker-instance", generation: 1, hostPid: 16001 });
+  const launches: number[] = [];
+  const { runtime, store, messenger, launched } = fixture(2, undefined, {
+    remoteWorkspace: async (placement, requested) => {
+      expect(placement).toEqual({ worker, ...pin });
+      expect(requested).toBe(cwd);
+      return { cwd, repoRoot: cwd, socketPath: "/worker-only/state/host.sock", sessionFile };
+    },
+    remoteInspect: async () => ({ alive: !!launches.length, socket: !!launches.length, transcript: !!launches.length }),
+    remoteStart: async (_placement, _instance, lane) => {
+      launches.push(lane.generation);
+      throw new Error("Worker started; response lost");
+    },
+    remoteConnect: async () => host,
+  }, { [worker]: { ...pin, superkit: "managed" } });
+  await runtime.start();
+  const source = message("991", route("92"));
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  store.settle(source.id, "done");
+  const input = { ...selection, sourceId: source.id, title: "Build remotely", worker, cwd, kickoff: "Checking on the worker." };
+  const reportId = "report:previous";
+  store.receive(message(reportId, source.route, "Untrusted lane report."), "main");
+  store.settle(reportId, "done");
+  await expect(runtime.startLane({ ...input, sourceId: reportId })).rejects.toThrow("original authorized user input");
+  await expect(runtime.startLane({ ...input, worker: "unlisted" })).rejects.toThrow("not configured");
+  expect(messenger.sent).toHaveLength(0);
+  const lane = await runtime.startLane(input);
+  await runtime.kick();
+  await expect(runtime.messageLane(lane.id, "Do more work", reportId)).rejects.toThrow("original authorized user input");
+  expect(store.lane(lane.id)).toMatchObject({ placement: { worker, ...pin }, cwd, generation: 1, pid: 16001, sessionId: "worker-journal" });
+  await runtime.startLane(input);
+  await runtime.kick();
+  expect(launches).toEqual([1]);
+  expect(launched).toHaveLength(0);
+  expect(host.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(source.id)]);
+  expect(messenger.sent.filter(out => out.id === `${source.id}:kickoff`)).toMatchObject([{ route: source.route, text: input.kickoff }]);
+});
+
+test("a worker lane gets attachments as verified files in its private worker directory", async () => {
+  const worker = "linux-1";
+  const pin = { destination: "test-builder", workerId: "b2bfb510-b840-446f-8a10-74eca948b590" };
+  const cwd = "/worker-only/build";
+  const host = new HostTransport("/worker-only/state/session.jsonl", "worker-journal");
+  Object.assign(host.state, { instanceKey: "worker-instance", generation: 1, hostPid: 16002 });
+  const transferred: Array<{ name: string; text: string; lane: string }> = [];
+  let started = false;
+  const { runtime, store, directory } = fixture(2, async () => new Response("worker notes"), {
+    remoteWorkspace: async () => ({ cwd, repoRoot: null, socketPath: "/worker-only/state/host.sock", sessionFile: "/worker-only/state/session.jsonl" }),
+    remoteInspect: async () => ({ alive: started, socket: started, transcript: started }),
+    remoteStart: async () => {
+      started = true;
+      return { pid: 16002, launched: { package: workerPackage(), omp: MINIMUM_WORKER_OMP, superkit: activeManagedUlwRevision().revision, bootId: "b" } };
+    },
+    remoteConnect: async () => host,
+    remoteInput: async (_placement, _instance, lane, name, bytes) => {
+      transferred.push({ name, text: new TextDecoder().decode(bytes), lane: lane.id });
+      return `/worker-only/state/inputs/0123456789abcdef-${name}`;
+    },
+  }, { [worker]: { ...pin, superkit: "managed" } });
+  await runtime.start();
+  const source = { ...message("993", route("94")), attachments: [{ id: "a1", name: "notes.txt", url: "https://cdn.discordapp.com/attachments/4/a1/notes.txt", size: 12 }] };
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  store.settle(source.id, "done");
+  const lane = await runtime.startLane({ ...selection, sourceId: source.id, title: "Read notes remotely", worker, cwd, kickoff: "Reading on the worker." });
+  await runtime.kick();
+  expect(transferred).toEqual([{ name: "notes.txt", text: "worker notes", lane: lane.id }]);
+  expect(store.lane(lane.id)?.workerLaunch?.superkit).toBe(activeManagedUlwRevision().revision);
+  expect(host.prompts.map(prompt => prompt.command.message)).toEqual([
+    expect.stringContaining("worker file /worker-only/state/inputs/0123456789abcdef-notes.txt"),
+  ]);
+  expect(String(host.prompts[0]!.command.message)).not.toContain(directory);
+});
+
+test("a worker refused before launch frees its host slot and is not held as unreachable", async () => {
+  const pin = { destination: "test-builder", workerId: "b2bfb510-b840-446f-8a10-74eca948b590" };
+  let starts = 0;
+  const { runtime, store, errors } = fixture(2, undefined, {
+    remoteWorkspace: async () => ({ cwd: "/worker-only/build", repoRoot: null, socketPath: "/worker-only/state/host.sock", sessionFile: "/worker-only/state/session.jsonl" }),
+    remoteInspect: async () => ({ alive: false, socket: false, transcript: false }),
+    remoteCapability: async () => ({
+      package: { ...workerPackage(), digest: "0".repeat(64) }, platform: "linux", bootId: "b", clock: Date.now(), omp: MINIMUM_WORKER_OMP,
+      superkit: activeManagedUlwRevision().revision, roots: ["/worker-only"], models: [`${executionModel.provider}/${executionModel.id}`],
+    }),
+    remoteStart: async () => { starts++; throw new Error("Refused workers must never receive a start"); },
+  }, { builder: { ...pin, superkit: "managed" } });
+  await runtime.start();
+  const source = message("996", route("97"));
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  store.settle(source.id, "done");
+  const lane = await runtime.startLane({ ...selection, sourceId: source.id, title: "Old worker", worker: "builder", cwd: "/worker-only/build", kickoff: "Starting." });
+  await runtime.kick();
+  expect(starts).toBe(0);
+  expect(store.lane(lane.id)).toMatchObject({ runtimeState: "unloaded", pid: null });
+  expect(store.getMeta(`remote-unreachable:${lane.id}`)).toBeNull();
+  expect(errors.map(String)).toEqual([expect.stringContaining("install HEAD's exact release")]);
+});
+
+test("a start whose reply is lost while the worker still launches is held, then attached without a second launch", async () => {
+  const pin = { destination: "test-builder", workerId: "b2bfb510-b840-446f-8a10-74eca948b590" };
+  const host = new HostTransport("/worker-only/state/session.jsonl", "worker-journal");
+  Object.assign(host.state, { instanceKey: "worker-instance", generation: 1, hostPid: 16003 });
+  const launches: number[] = [];
+  let confirmed = false;
+  const { runtime, store } = fixture(2, undefined, {
+    remoteWorkspace: async () => ({ cwd: "/worker-only/build", repoRoot: null, socketPath: "/worker-only/state/host.sock", sessionFile: "/worker-only/state/session.jsonl" }),
+    remoteInspect: async () => {
+      if (!launches.length) return { alive: false, socket: false, transcript: false };
+      if (!confirmed) throw new Error("Worker launch reservation is not confirmed; refusing duplicate launch or release");
+      return { alive: true, socket: true, transcript: true };
+    },
+    remoteStart: async (_placement, _instance, lane) => { launches.push(lane.generation); throw new Error("Worker did not respond before the control timeout"); },
+    remoteConnect: async () => host,
+  }, { builder: { ...pin, superkit: "managed" } });
+  await runtime.start();
+  const source = message("997", route("98"));
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  store.settle(source.id, "done");
+  const lane = await runtime.startLane({ ...selection, sourceId: source.id, title: "Slow worker", worker: "builder", cwd: "/worker-only/build", kickoff: "Starting." });
+  await runtime.kick();
+  expect(launches).toEqual([1]);
+  expect(JSON.parse(store.getMeta(`remote-unreachable:${lane.id}`)!)).toMatchObject({ attempts: 1, error: expect.stringContaining("not confirmed") });
+  expect(host.prompts).toEqual([]);
+  confirmed = true;
+  const internals = runtime as unknown as { remoteRetries: Map<string, { due: number }>; retryUnreachableWorkers(): void; tasks: Set<Promise<unknown>> };
+  internals.remoteRetries.get(lane.id)!.due = 0;
+  internals.retryUnreachableWorkers();
+  await Promise.allSettled([...internals.tasks]);
+  await runtime.kick();
+  expect(launches).toEqual([1]);
+  expect(store.getMeta(`remote-unreachable:${lane.id}`)).toBe("null");
+  expect(store.lane(lane.id)).toMatchObject({ generation: 1, pid: 16003 });
+  expect(host.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(source.id)]);
+});
+
+test("lane evidence reads a local lane's workspace here and a worker lane's on its worker", async () => {
+  const pin = { destination: "test-builder", workerId: "b2bfb510-b840-446f-8a10-74eca948b590" };
+  const asked: unknown[] = [];
+  const { runtime, store, directory } = fixture(2, undefined, {
+    remoteEvidence: async (placement, _instance, lane, request) => {
+      asked.push({ placement, lane: lane.id, request });
+      return { kind: "file", cwd: lane.cwd, text: "worker text", bytes: 11, truncated: false };
+    },
+  }, { worker: { ...pin, superkit: "managed" } });
+  const source = message("82", route("825"));
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  const base = {
+    route: source.route, repoRoot: null, ...selection, modelPreset: null, modelPresetSnapshot: null, brief: "Work", acceptance: [],
+    workState: "open" as const, runtimeState: "unloaded" as const, generation: 1, sessionId: null, pid: null,
+    createdAt: 1, lastActivityAt: 1, result: null,
+  };
+  writeFileSync(join(directory, "local-proof.txt"), "local text");
+  store.createLane({ ...base, id: "lane-here", title: "Local", cwd: directory, socketPath: join(directory, "h.sock"), sessionFile: join(directory, "h.jsonl") }, source.id);
+  const other = message("83", route("826"));
+  store.receive(other, "main", { [`user-source:${other.id}`]: "true" });
+  store.createLane({
+    ...base, route: other.route, id: "lane-away", title: "Remote", cwd: "/worker/repo", placement: { worker: "worker", ...pin },
+    socketPath: "/worker/h.sock", sessionFile: "/worker/h.jsonl"
+  }, other.id);
+  expect(await runtime.laneEvidence("lane-here", { kind: "file", path: "local-proof.txt" })).toMatchObject({ text: "local text", cwd: directory });
+  expect(await runtime.laneEvidence("lane-away", { kind: "file", path: "notes.md" })).toMatchObject({ text: "worker text" });
+  expect(asked).toEqual([{ placement: { worker: "worker", ...pin }, lane: "lane-away", request: { kind: "file", path: "notes.md" } }]);
+});
+
+test("a plain worker refuses workflow-selecting lane work", async () => {
+  const pin = { destination: "plain-builder", workerId: "c2bfb510-b840-446f-8a10-74eca948b590" };
+  const { runtime, store } = fixture(2, undefined, {}, { plain: { ...pin, superkit: "none" } });
+  await runtime.start();
+  const source = message("994", route("95"), "/ulw build it");
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  await expect(runtime.startLane({
+    ...selection, sourceId: source.id, title: "Plain", worker: "plain", cwd: "/worker",
+    kickoff: "Starting.", workflow: { name: "ulw", reason: "Owner asked for ULW" }
+  })).rejects.toThrow("configured without omp-superkit");
+});
+
+test("an unreachable worker keeps submissions held without a notice and reattaches without replay", async () => {
+  const pin = { destination: "test-builder", workerId: "b2bfb510-b840-446f-8a10-74eca948b590" };
+  const host = new HostTransport("/worker/data/session.jsonl", "remote-id");
+  Object.assign(host.state, { hostPid: process.pid });
+  let reachable = false;
+  const { runtime, store, messenger } = fixture(2, undefined, {
+    remoteConnect: async () => { if (!reachable) throw new Error("ssh: connect to host test-builder: No route to host"); return host; },
+    remoteInspect: async () => { if (!reachable) throw new Error("ssh: connect to host test-builder: No route to host"); return { socket: true, alive: true, transcript: true }; },
+  }, { worker: { ...pin, superkit: "managed" } });
+  const source = message("81", route("815"));
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  store.createLane({
+    id: "lane-away", title: "Running remotely", route: source.route, cwd: "/worker", repoRoot: null,
+    placement: { worker: "worker", ...pin }, ...selection, modelPreset: null, modelPresetSnapshot: null,
+    brief: "Original work", acceptance: [], workState: "open", runtimeState: "running",
+    generation: 1, sessionId: "remote-id", pid: process.pid, socketPath: "/worker/host.sock",
+    sessionFile: "/worker/data/session.jsonl", createdAt: 1, lastActivityAt: 1, result: null,
+  }, source.id);
+  store.settle(source.id, "done");
+  const handoff = message("handoff:81:lane-away", source.route, "work");
+  store.receive(handoff, "lane-away");
+  store.submit(handoff.id, "native-request-1", 1);
+  await runtime.start();
+  expect(store.input(handoff.id)?.state).toBe("submitted");
+  expect(messenger.sent.filter(output => output.id.includes("interrupted"))).toEqual([]);
+  expect((await runtime.inspect("lane-away") as { workerReachability?: unknown }).workerReachability).toMatchObject({ attempts: 1, error: expect.stringContaining("No route to host") });
+  reachable = true;
+  const internals = runtime as unknown as { remoteRetries: Map<string, { due: number }>; retryUnreachableWorkers(): void; tasks: Set<Promise<unknown>> };
+  internals.remoteRetries.get("lane-away")!.due = 0;
+  internals.retryUnreachableWorkers();
+  await Promise.allSettled([...internals.tasks]);
+  expect(store.getMeta("remote-unreachable:lane-away")).toBe("null");
+  expect(host.prompts).toEqual([]);
+  // Reattached: this hand-made admission has no native journal binding, so it
+  // is reported unconfirmed only now, after the worker answered, never replayed.
+  expect(store.input(handoff.id)?.state).toBe("uncertain");
+});
+
+test("an offline worker exit check holds its slot without blocking unrelated HEAD input", async () => {
+  const pin = { destination: "test-builder", workerId: "b2bfb510-b840-446f-8a10-74eca948b590" };
+  const host = new HostTransport("/worker/data/session.jsonl", "remote-id");
+  host.shutdownDisconnect = true;
+  const checkingExit = Promise.withResolvers<void>();
+  const offline = Promise.withResolvers<void>();
+  const { runtime, store, config, main, launched } = fixture(2, undefined, {
+    remoteConnect: async () => host,
+    remoteInspect: async () => {
+      if (host.commands.some(command => command.type === "shutdown_host")) {
+        checkingExit.resolve();
+        await offline.promise;
+        throw new Error("Worker unreachable after shutdown ACK");
+      }
+      return { socket: true, alive: true, transcript: true };
+    },
+  }, { worker: { ...pin, superkit: "managed" } });
+  config.idleMs = 0;
+  const source = message("71", route("715"));
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  store.createLane({
+    id: "lane-worker", title: "Already resident", route: source.route, cwd: "/worker", repoRoot: null,
+    placement: { worker: "worker", ...pin }, ...selection, modelPreset: null, modelPresetSnapshot: null,
+    brief: "Original work", acceptance: [], workState: "open", runtimeState: "idle",
+    generation: 1, sessionId: "remote-id", pid: process.pid, socketPath: "/worker/host.sock",
+    sessionFile: "/worker/data/session.jsonl", createdAt: 1, lastActivityAt: 1, result: null,
+  }, source.id);
+  store.settle(source.id, "done");
+  try {
+    await runtime.start();
+    await checkingExit.promise;
+    await admit(runtime, headMessage("72", route("716"), "Independent HEAD work"));
+    expect(main.prompts).toHaveLength(1);
+    expect(store.lane("lane-worker")?.pid).toBe(process.pid);
+    expect(launched).toHaveLength(0);
+  } finally { offline.resolve(); }
+});
+
 test("cron controls scope job management to the original thread and send one HEAD result after route verification", async () => {
   const { runtime, messenger, main, store, errors, directory } = fixture();
   const origin = route("11");
@@ -722,7 +1008,7 @@ test("cron controls scope job management to the original thread and send one HEA
 
 test("pausing a cron job while HEAD is busy cancels its pending execution without interrupting HEAD", async () => {
   const { runtime, messenger, main, store, errors } = fixture();
-  messenger.assertRoute = () => {};
+  messenger.assertRoute = () => { };
   await runtime.start();
   const origin = route("11");
   await admit(runtime, message("211", origin, '/cron add "every 30m" Check CI'));
@@ -766,7 +1052,7 @@ test("natural-language cron registration is active-owner-bound and cannot recrea
 test.each(["stop", "pause", "remove"] as const)("recovered %s control takes effect before the scheduler can submit a run", async action => {
   const { runtime, store, config, messenger, main } = fixture();
   const origin = route("11");
-  messenger.assertRoute = () => {};
+  messenger.assertRoute = () => { };
   // Crash window: both the registration and the subsequent operator input
   // reached SQLite, but the controller did not apply the latter command.
   const registered = message("221", origin, '/cron add "in 1s" Do not run after stop');
@@ -795,17 +1081,23 @@ test("PR feedback after lane closure reaches only HEAD and its registered conver
   const { runtime, store, main, messenger, launched, directory, hosts } = fixture(3, undefined, {
     readPrSnapshot: async () => {
       reads++;
-      return { head: "a".repeat(40), state: "open", mergedSha: null, self: "owner", headChange: "unknown", failures: [],
-        feedback: reads === 1 ? [] : [{ key: "review:1", actor: "reviewer", kind: "review",
-          url: "https://github.com/example/project/pull/7#review", text: "Please correct the parsing boundary." }] };
+      return {
+        head: "a".repeat(40), state: "open", mergedSha: null, self: "owner", headChange: "unknown", failures: [],
+        feedback: reads === 1 ? [] : [{
+          key: "review:1", actor: "reviewer", kind: "review",
+          url: "https://github.com/example/project/pull/7#review", text: "Please correct the parsing boundary."
+        }]
+      };
     },
   });
   await runtime.start();
   const original = message("pr-owner", route());
   store.receive(original, "main", { "user-source:pr-owner": "true" });
   store.settle(original.id, "done");
-  const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "PR work",
-    kickoff: "Implement and verify the requested change.", cwd: directory });
+  const lane = await runtime.startLane({
+    ...selection, sourceId: original.id, title: "PR work",
+    kickoff: "Implement and verify the requested change.", cwd: directory
+  });
   await runtime.kick();
   const laneHost = hosts.get(lane.socketPath);
   if (!laneHost) throw new Error("Expected managed lane host");
@@ -868,8 +1160,10 @@ describe("source-bound Discord topic management", () => {
     await runtime.start();
     const original = headMessage("tagged-topic", route(null));
     await admit(runtime, original);
-    const start = { ...selection, sourceId: original.id, title: "Tagged topic", kickoff: "Inspect and verify.", cwd: directory,
-      appliedTags: ["101"] };
+    const start = {
+      ...selection, sourceId: original.id, title: "Tagged topic", kickoff: "Inspect and verify.", cwd: directory,
+      appliedTags: ["101"]
+    };
     const { appliedTags: _tags, ...unselected } = start;
     await expect(runtime.startLane(unselected)).rejects.toThrow("forum tag is required");
     expect(messenger.threads).toEqual([]);
@@ -886,16 +1180,20 @@ describe("source-bound Discord topic management", () => {
     await runtime.start();
     const original = headMessage("existing-topic", route("123"));
     await admit(runtime, original);
-    await expect(runtime.startLane({ ...selection, sourceId: original.id, title: "Existing", kickoff: "Inspect.",
-      cwd: directory, appliedTags: ["101"] })).rejects.toThrow("lane_thread_update");
+    await expect(runtime.startLane({
+      ...selection, sourceId: original.id, title: "Existing", kickoff: "Inspect.",
+      cwd: directory, appliedTags: ["101"]
+    })).rejects.toThrow("lane_thread_update");
     expect(messenger.threads).toEqual([]);
   });
 
   function managedThread(instance: ReturnType<typeof fixture>) {
     const { store, config, messenger } = instance;
     const lane = savedLane(store, config, "managed-thread", route("123"));
-    let current: ThreadInfo = { route: lane.route, title: "Original", archived: false,
-      requiresTag: false, availableTags: [{ id: "101", name: "Work", moderated: false }], appliedTags: ["101"] };
+    let current: ThreadInfo = {
+      route: lane.route, title: "Original", archived: false,
+      requiresTag: false, availableTags: [{ id: "101", name: "Work", moderated: false }], appliedTags: ["101"]
+    };
     const edits: ThreadUpdate[] = [];
     messenger.inspectThread = async () => structuredClone(current);
     messenger.updateThread = async (destination, changes) => {
@@ -1012,8 +1310,12 @@ describe("same-HEAD evidence recovery", () => {
     return [
       nativeEntry(main, "original-start", "rpc_agent_start"),
       { id: "original-user", type: "message", message: { role: "user", content: "Original authorized work" } },
-      { id: "original-assistant", type: "message", message: { role: "assistant",
-        stopReason: outcome === "completed" ? "stop" : outcome, content: [{ type: "text", text: "Not an acceptance receipt" }] } },
+      {
+        id: "original-assistant", type: "message", message: {
+          role: "assistant",
+          stopReason: outcome === "completed" ? "stop" : outcome, content: [{ type: "text", text: "Not an acceptance receipt" }]
+        }
+      },
       nativeEntry(main, "original-receipt", "rpc_prompt_result", { frame: { id: requestId, status: outcome, agentInvoked: true } }),
     ];
   }
@@ -1021,8 +1323,10 @@ describe("same-HEAD evidence recovery", () => {
     const { store, main } = instance;
     store.receive(message(id, route("original-recovery-route")), "main", { [`user-source:${id}`]: "true" });
     store.submit(id, `native-${id}`, 0);
-    store.setMeta(`head-native-owner:${id}`, JSON.stringify({ requestId: `native-${id}`, generation: 0,
-      sessionId: main.state.sessionId, sessionFile: main.state.sessionFile, cursor: null }));
+    store.setMeta(`head-native-owner:${id}`, JSON.stringify({
+      requestId: `native-${id}`, generation: 0,
+      sessionId: main.state.sessionId, sessionFile: main.state.sessionFile, cursor: null
+    }));
     main.entries = journal(main, `native-${id}`);
     main.journalLeaf = true;
     return id;
@@ -1031,8 +1335,10 @@ describe("same-HEAD evidence recovery", () => {
     return JSON.parse(instance.store.getMeta(`head:recovery:${id}`)!);
   }
   function decision(value: HeadRecoveryAttempt, choice: "release" | "hold" = "release"): HeadRecoveryDecision {
-    return { attemptId: value.attemptId, decision: choice, evidenceEntryIds: value.evidenceEntryIds,
-      reason: "Exact native receipt and latest attributable run were inspected." };
+    return {
+      attemptId: value.attemptId, decision: choice, evidenceEntryIds: value.evidenceEntryIds,
+      reason: "Exact native receipt and latest attributable run were inspected."
+    };
   }
   function settleControl(instance: ReturnType<typeof fixture>, value: HeadRecoveryAttempt) {
     instance.main.state.isSettled = true;
@@ -1064,8 +1370,10 @@ describe("same-HEAD evidence recovery", () => {
     const value = attempt(instance, "lost-original");
     const snapshot = JSON.parse(String(main.prompts[1]!.command.message).split("\n").find(line =>
       line.startsWith("HEAD recovery snapshot: "))!.slice("HEAD recovery snapshot: ".length));
-    expect(snapshot).toMatchObject({ attemptId: value.attemptId, inputId: "lost-original",
-      evidenceEntryIds: value.evidenceEntryIds, evidence: { outcome: "done", receiptStatus: "completed" } });
+    expect(snapshot).toMatchObject({
+      attemptId: value.attemptId, inputId: "lost-original",
+      evidenceEntryIds: value.evidenceEntryIds, evidence: { outcome: "done", receiptStatus: "completed" }
+    });
     expect(store.input("lost-original")?.state).toBe("uncertain");
     await admit(runtime, headMessage("queued-after-loss", route("later-route")));
     expect(store.input("queued-after-loss")?.state).toBe("pending");
@@ -1365,27 +1673,39 @@ describe("event-driven nonterminal progress", () => {
     const emit = (id: string, report: LaneReport, timestamp: number) => {
       const details = { type: "superagent-lane-report", sessionId: worker.state.sessionId, reportId: id, report };
       worker.emit({
-        type: "message_end", message: { role: "toolResult", toolName: id === "proof" ? "write" : "lane_report", toolCallId: id, timestamp,
-          details: id === "proof" ? { xdev: { tool: "lane_report", mode: "execute", inner: details } } : details },
+        type: "message_end", message: {
+          role: "toolResult", toolName: id === "proof" ? "write" : "lane_report", toolCallId: id, timestamp,
+          details: id === "proof" ? { xdev: { tool: "lane_report", mode: "execute", inner: details } } : details
+        },
       });
     };
     const now = Date.now();
-    const progress: LaneReport = { status: "progress", summary: "Selected result artifact changed",
-      evidence: [{ kind: "file", ref: "/workspace/result", fingerprint: "a".repeat(64) }] };
+    const progress: LaneReport = {
+      status: "progress", summary: "Selected result artifact changed",
+      evidence: [{ kind: "file", ref: "/workspace/result", fingerprint: "a".repeat(64) }]
+    };
     emit("proof", progress, now - 1000);
     emit("same-proof", progress, now - 900);
-    const waiting: LaneReport = { status: "waiting", summary: "Native verification is running",
-      waiting: { kind: "tool", id: "verification", target: "Native verification command" }, evidence: [] };
+    const waiting: LaneReport = {
+      status: "waiting", summary: "Native verification is running",
+      waiting: { kind: "tool", id: "verification", target: "Native verification command" }, evidence: []
+    };
     emit("wait", waiting, now - 800);
     emit("same-wait", waiting, now - 700);
-    worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse",
-      content: [{ type: "text", text: "Still waiting; this is not new proof." }] } });
+    worker.emit({
+      type: "message_end", message: {
+        role: "assistant", stopReason: "toolUse",
+        content: [{ type: "text", text: "Still waiting; this is not new proof." }]
+      }
+    });
     await runtime.kick();
     const inspection = await runtime.inspect(lane.id);
-    expect(inspection).toMatchObject({ observation: {
-      inputId: input.id, requestId: input.requestId, sessionId: worker.state.sessionId,
-      lastEvidenceAt: now - 1000, waiting: { since: now - 800, target: waiting.waiting },
-    }, observationState: { ownerCurrent: true } });
+    expect(inspection).toMatchObject({
+      observation: {
+        inputId: input.id, requestId: input.requestId, sessionId: worker.state.sessionId,
+        lastEvidenceAt: now - 1000, waiting: { since: now - 800, target: waiting.waiting },
+      }, observationState: { ownerCurrent: true }
+    });
     expect("observationState" in inspection && inspection.observationState?.waitingAgeMs).toBeGreaterThanOrEqual(800);
     await admit(runtime, message("structured-status", lane.route, "/status"));
     const status = messenger.sent.find(output => output.sourceId === "structured-status")!.text;
@@ -1409,42 +1729,72 @@ describe("event-driven nonterminal progress", () => {
     await admit(runtime, headMessage("eval-observation-head", route("other-topic")));
     await delegate(runtime, message("eval-observation-source", lane.route));
     const worker = hosts.get(lane.socketPath)!;
-    const report: LaneReport = { status: "waiting", summary: "Native eval owns this dependency",
-      waiting: { kind: "dependency", target: "Selected verification artifact" }, evidence: [] };
+    const report: LaneReport = {
+      status: "waiting", summary: "Native eval owns this dependency",
+      waiting: { kind: "dependency", target: "Selected verification artifact" }, evidence: []
+    };
     const event = { type: "superagent-lane-report", sessionId: worker.state.sessionId, reportId: "js-lane_report-native", report };
-    worker.emit({ type: "message_end", message: { role: "toolResult", toolName: "eval", toolCallId: "printed-only",
-      content: [{ type: "text", text: JSON.stringify(event) }] } });
+    worker.emit({
+      type: "message_end", message: {
+        role: "toolResult", toolName: "eval", toolCallId: "printed-only",
+        content: [{ type: "text", text: JSON.stringify(event) }]
+      }
+    });
     await runtime.kick();
     expect(store.lane(lane.id)?.observation).toBeUndefined();
-    worker.entries.push({ id: "native-eval-receipt", type: "custom", customType: "superagent-lane-report",
-      timestamp: new Date(1000).toISOString(), data: event });
-    worker.emit({ type: "message_end", message: { role: "toolResult", toolName: "eval", toolCallId: "actual-eval",
-      timestamp: 2000, content: [{ type: "text", text: "No structured result forwarded by the eval bridge" }] } });
+    worker.entries.push({
+      id: "native-eval-receipt", type: "custom", customType: "superagent-lane-report",
+      timestamp: new Date(1000).toISOString(), data: event
+    });
+    worker.emit({
+      type: "message_end", message: {
+        role: "toolResult", toolName: "eval", toolCallId: "actual-eval",
+        timestamp: 2000, content: [{ type: "text", text: "No structured result forwarded by the eval bridge" }]
+      }
+    });
     await runtime.kick();
     expect(store.lane(lane.id)?.observation).toMatchObject({ waiting: { since: 1000, target: report.waiting }, lastEvidenceAt: null });
-    worker.entries.push({ id: "native-eval-duplicate", type: "custom", customType: "superagent-lane-report",
-      timestamp: new Date(3000).toISOString(), data: { ...event, reportId: "js-lane_report-repeated" } });
+    worker.entries.push({
+      id: "native-eval-duplicate", type: "custom", customType: "superagent-lane-report",
+      timestamp: new Date(3000).toISOString(), data: { ...event, reportId: "js-lane_report-repeated" }
+    });
     worker.emit({ type: "message_end", message: { role: "toolResult", toolName: "eval", toolCallId: "next-eval", timestamp: 4000 } });
     await runtime.kick();
     expect(store.lane(lane.id)?.observation).toMatchObject({ waiting: { since: 1000 }, lastReportAt: 3000 });
     worker.entries.push(
-      { id: "first-appended", type: "custom", customType: "superagent-lane-report",
-        timestamp: new Date(4500).toISOString(), data: { ...event, reportId: "first-appended",
-          report: { ...report, waiting: { kind: "dependency", target: "First appended target" } } } },
-      { id: "last-appended", type: "custom", customType: "superagent-lane-report",
-        timestamp: new Date(4100).toISOString(), data: { ...event, reportId: "last-appended",
-          report: { ...report, waiting: { kind: "dependency", target: "Last appended target" } } } },
+      {
+        id: "first-appended", type: "custom", customType: "superagent-lane-report",
+        timestamp: new Date(4500).toISOString(), data: {
+          ...event, reportId: "first-appended",
+          report: { ...report, waiting: { kind: "dependency", target: "First appended target" } }
+        }
+      },
+      {
+        id: "last-appended", type: "custom", customType: "superagent-lane-report",
+        timestamp: new Date(4100).toISOString(), data: {
+          ...event, reportId: "last-appended",
+          report: { ...report, waiting: { kind: "dependency", target: "Last appended target" } }
+        }
+      },
     );
     worker.emit({ type: "message_end", message: { role: "toolResult", toolName: "eval", toolCallId: "append-order", timestamp: 4700 } });
     await runtime.kick();
     expect(store.lane(lane.id)?.observation).toMatchObject({
       waiting: { since: 4100, target: { kind: "dependency", target: "Last appended target" } }, lastReportAt: 4100,
     });
-    worker.entries.push({ id: "earlier-hidden-report", type: "custom", customType: "superagent-lane-report",
-      timestamp: new Date(5000).toISOString(), data: { ...event, reportId: "earlier-hidden",
-        report: { ...report, waiting: { kind: "dependency", target: "Earlier hidden target" } } } });
-    worker.emit({ type: "message_end", message: { role: "toolResult", toolName: "lane_report", toolCallId: "later-direct", timestamp: 6000,
-      details: { ...event, reportId: "later-direct", report: { ...report, waiting: { kind: "dependency", target: "Latest direct target" } } } } });
+    worker.entries.push({
+      id: "earlier-hidden-report", type: "custom", customType: "superagent-lane-report",
+      timestamp: new Date(5000).toISOString(), data: {
+        ...event, reportId: "earlier-hidden",
+        report: { ...report, waiting: { kind: "dependency", target: "Earlier hidden target" } }
+      }
+    });
+    worker.emit({
+      type: "message_end", message: {
+        role: "toolResult", toolName: "lane_report", toolCallId: "later-direct", timestamp: 6000,
+        details: { ...event, reportId: "later-direct", report: { ...report, waiting: { kind: "dependency", target: "Latest direct target" } } }
+      }
+    });
     await runtime.kick();
     expect(store.lane(lane.id)?.observation).toMatchObject({
       waiting: { since: 6000, target: { kind: "dependency", target: "Latest direct target" } }, lastReportAt: 6000,
@@ -1466,8 +1816,10 @@ describe("event-driven nonterminal progress", () => {
     if (!worker) throw new Error("Missing native lane owner");
     const report = (id: string, target: string, timestamp: number) => ({
       role: "toolResult", toolName: "lane_report", toolCallId: id, timestamp,
-      details: { type: "superagent-lane-report", sessionId: worker.state.sessionId, reportId: id,
-        report: { status: "waiting", summary: "Waiting for native evidence", waiting: { kind: "dependency", target }, evidence: [] } },
+      details: {
+        type: "superagent-lane-report", sessionId: worker.state.sessionId, reportId: id,
+        report: { status: "waiting", summary: "Waiting for native evidence", waiting: { kind: "dependency", target }, evidence: [] }
+      },
     });
     worker.entries.push({ id: "original-cursor", type: "message", message: report("original", "Original target", 1000) });
     worker.emit({ type: "message_end", message: report("original", "Original target", 1000) });
@@ -1491,10 +1843,14 @@ describe("event-driven nonterminal progress", () => {
     await admit(runtime, headMessage("structured-fence-head", route("other-topic")));
     await delegate(runtime, message("structured-fence-source", lane.route));
     const worker = hosts.get(lane.socketPath)!;
-    const report: LaneReport = { status: "waiting", summary: "Owner decision pending",
-      waiting: { kind: "approval", id: "native-approval", target: "Native tool permission" }, evidence: [] };
-    const reportMessage = { role: "toolResult", toolName: "lane_report", toolCallId: "wait", timestamp: 1000,
-      details: { type: "superagent-lane-report", sessionId: worker.state.sessionId, reportId: "wait", report } };
+    const report: LaneReport = {
+      status: "waiting", summary: "Owner decision pending",
+      waiting: { kind: "approval", id: "native-approval", target: "Native tool permission" }, evidence: []
+    };
+    const reportMessage = {
+      role: "toolResult", toolName: "lane_report", toolCallId: "wait", timestamp: 1000,
+      details: { type: "superagent-lane-report", sessionId: worker.state.sessionId, reportId: "wait", report }
+    };
     worker.emit({ type: "message_end", message: reportMessage });
     await runtime.kick();
     const before = store.lane(lane.id)?.observation;
@@ -1526,18 +1882,24 @@ describe("event-driven nonterminal progress", () => {
     await runtime.start();
     const original = headMessage(`head-${kind}-progress`, route("original-topic"));
     await admit(runtime, original);
-    const progress = { role: "assistant", stopReason: kind === "toolUse" ? "toolUse" : "stop", content: [
-      { type: "thinking", thinking: "Private reasoning" },
-      { type: "text", text: "Located the defect; applying the bounded fix.",
-        ...(kind === "commentary" ? { textSignature: JSON.stringify({ v: 1, id: "native-progress", phase: "commentary" }) } : {}) },
-      ...(kind === "toolUse" ? [{ type: "toolCall", id: "native-tool", name: "read", arguments: {} }] : []),
-    ] };
+    const progress = {
+      role: "assistant", stopReason: kind === "toolUse" ? "toolUse" : "stop", content: [
+        { type: "thinking", thinking: "Private reasoning" },
+        {
+          type: "text", text: "Located the defect; applying the bounded fix.",
+          ...(kind === "commentary" ? { textSignature: JSON.stringify({ v: 1, id: "native-progress", phase: "commentary" }) } : {})
+        },
+        ...(kind === "toolUse" ? [{ type: "toolCall", id: "native-tool", name: "read", arguments: {} }] : []),
+      ]
+    };
     main.emit({ type: "message_end", message: progress });
     await messenger.whenSent(1);
     expect(store.input(original.id)?.state).toBe("submitted");
     expect(main.state.isSettled).toBe(false);
-    expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route,
-      text: "Located the defect; applying the bounded fix." }]);
+    expect(messenger.sent).toMatchObject([{
+      sourceId: original.id, route: original.route,
+      text: "Located the defect; applying the bounded fix."
+    }]);
     main.emit({ type: "message_end", message: structuredClone(progress) });
     main.emit({ type: "agent_end", isTerminal: true, messages: [progress, { role: "assistant", stopReason: "stop", content: [] }] });
     main.complete("");
@@ -1553,10 +1915,12 @@ describe("event-driven nonterminal progress", () => {
     await runtime.start();
     const original = headMessage("mixed-native-progress");
     await admit(runtime, original);
-    const mixed = { role: "assistant", stopReason: "stop", content: [
-      { type: "text", text: "Verification is running.", textSignature: JSON.stringify({ v: 1, id: "comment", phase: "commentary" }) },
-      { type: "text", text: "Verified final result.", textSignature: JSON.stringify({ v: 1, id: "answer", phase: "final_answer" }) },
-    ] };
+    const mixed = {
+      role: "assistant", stopReason: "stop", content: [
+        { type: "text", text: "Verification is running.", textSignature: JSON.stringify({ v: 1, id: "comment", phase: "commentary" }) },
+        { type: "text", text: "Verified final result.", textSignature: JSON.stringify({ v: 1, id: "answer", phase: "final_answer" }) },
+      ]
+    };
     main.emit({ type: "message_end", message: mixed });
     await messenger.whenSent(1);
     main.emit({ type: "agent_end", isTerminal: true, messages: [mixed] });
@@ -1571,8 +1935,10 @@ describe("event-driven nonterminal progress", () => {
     await runtime.start();
     const original = headMessage("progress-parent-source", route(null));
     await admit(runtime, original);
-    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Progress work",
-      kickoff: "I will inspect, implement, and verify this work in its own topic.", cwd: directory });
+    const lane = await runtime.startLane({
+      ...selection, sourceId: original.id, title: "Progress work",
+      kickoff: "I will inspect, implement, and verify this work in its own topic.", cwd: directory
+    });
     await runtime.kick();
     main.complete("");
     await runtime.kick();
@@ -1592,8 +1958,10 @@ describe("event-driven nonterminal progress", () => {
     expect(messenger.sent).toHaveLength(beforeProgress);
     main.complete("Root cause identified; implementation is still underway.");
     await messenger.whenSent(beforeProgress + 1);
-    expect(messenger.sent.at(-1)).toMatchObject({ sourceId: receipt.id, route: lane.route,
-      text: "Root cause identified; implementation is still underway." });
+    expect(messenger.sent.at(-1)).toMatchObject({
+      sourceId: receipt.id, route: lane.route,
+      text: "Root cause identified; implementation is still underway."
+    });
     worker.emit({ type: "message_end", message: structuredClone(progress) });
     await runtime.kick();
     expect(main.prompts).toHaveLength(2);
@@ -1698,9 +2066,11 @@ describe("event-driven nonterminal progress", () => {
     const worker = hosts.get(lane.socketPath)!;
     let observed = false;
     worker.onFrame(() => { observed = true; });
-    expect(() => worker.emit({ type: "message_end", message: {
-      role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Progress must not escape its source." }],
-    } })).not.toThrow();
+    expect(() => worker.emit({
+      type: "message_end", message: {
+        role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Progress must not escape its source." }],
+      }
+    })).not.toThrow();
     expect(observed).toBe(true);
     expect(errors.map(error => String(error))).toEqual([expect.stringContaining("Invalid head-selected delivery binding")]);
     expect(store.inputs("main").filter(input => input.id.startsWith("progress:"))).toEqual([]);
@@ -2175,8 +2545,10 @@ describe("thread kickoff before execution", () => {
     store.queueOutput({ id: "earlier-output", sourceId: original.id, route: original.route, text: "Earlier response" });
     const draining = runtime.kick();
     await entered.promise;
-    const starting = runtime.startLane({ ...selection, sourceId: original.id, title: "Work", cwd: directory,
-      kickoff: "I will trace the queue and verify the fix." });
+    const starting = runtime.startLane({
+      ...selection, sourceId: original.id, title: "Work", cwd: directory,
+      kickoff: "I will trace the queue and verify the fix."
+    });
     try { await queued.promise; }
     finally { release.resolve(); }
     await draining;
@@ -2192,8 +2564,10 @@ describe("thread kickoff before execution", () => {
     await runtime.start();
     const first = headMessage("kickoff-race-first");
     await admit(runtime, first);
-    const lane = await runtime.startLane({ ...selection, sourceId: first.id, title: "Work", cwd: directory,
-      kickoff: "I will inspect the first request and verify it." });
+    const lane = await runtime.startLane({
+      ...selection, sourceId: first.id, title: "Work", cwd: directory,
+      kickoff: "I will inspect the first request and verify it."
+    });
     await runtime.kick();
     const worker = hosts.get(lane.socketPath);
     if (!worker) throw new Error("Expected resident lane");
@@ -2221,8 +2595,10 @@ describe("thread kickoff before execution", () => {
     messenger.beforeSend = async output => {
       if (output.id === `${third.id}:kickoff`) { kickoffEntered.resolve(); await releaseKickoff.promise; }
     };
-    const starting = runtime.startLane({ ...selection, sourceId: third.id, title: "More work", cwd: directory,
-      kickoff: "I will inspect the additional requirements before continuing." });
+    const starting = runtime.startLane({
+      ...selection, sourceId: third.id, title: "More work", cwd: directory,
+      kickoff: "I will inspect the additional requirements before continuing."
+    });
     try {
       await kickoffEntered.promise;
       releasePreparation.resolve();
@@ -2313,10 +2689,12 @@ describe("dedicated HEAD startup preset initialization", () => {
   test("bootstrap holds ordered user input, never delivers its text, and requires actual readback", async () => {
     let created = false;
     const { runtime, store, main, messenger } = fixture(3, undefined, {
-      inspectPresets: async () => ({ settings: { modelRoles: { default: "fixture/capable" } },
+      inspectPresets: async () => ({
+        settings: { modelRoles: { default: "fixture/capable" } },
         configuredDefault: { available: true }, availableModels: [executionModel],
         presets: ["high", "middle", "low"].map(name => ({ name, status: created ? "valid" : "missing", available: created, globalEntry: created })),
-        bootstrap: { missing: created ? [] : ["high", "middle", "low"], blocked: [] } }),
+        bootstrap: { missing: created ? [] : ["high", "middle", "low"], blocked: [] }
+      }),
     });
     await runtime.start();
     expect(main.prompts).toHaveLength(1);
@@ -2341,8 +2719,10 @@ describe("dedicated HEAD startup preset initialization", () => {
   test("skipped or completed-without-creation initializers never become complete", async () => {
     for (const skipped of [false, true]) {
       const { runtime, main, store, messenger } = fixture(3, undefined, {
-        inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
-          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+        inspectPresets: async () => ({
+          settings: { modelRoles: {} }, configuredDefault: { available: true },
+          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] }
+        }),
       });
       main.local = skipped;
       await runtime.start();
@@ -2363,12 +2743,16 @@ describe("dedicated HEAD startup preset initialization", () => {
   test("all prior terminal/ambiguous lifecycles fence automatic recreation, including prior no-op complete", async () => {
     for (const prior of ["running", "failed", "blocked", "uncertain", "complete", "checking"] as const) {
       const { runtime, store, main } = fixture(3, undefined, {
-        inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
-          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+        inspectPresets: async () => ({
+          settings: { modelRoles: {} }, configuredDefault: { available: true },
+          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] }
+        }),
       });
-      store.setMeta("head:preset-bootstrap", JSON.stringify({ sessionId: "session-main", state: prior,
+      store.setMeta("head:preset-bootstrap", JSON.stringify({
+        sessionId: "session-main", state: prior,
         ...(prior === "running" ? { requestId: "original-bootstrap" } : {}),
-        ...(prior === "checking" ? { replayBlocked: true } : {}), detail: "Earlier lifecycle" }));
+        ...(prior === "checking" ? { replayBlocked: true } : {}), detail: "Earlier lifecycle"
+      }));
       await runtime.start();
       expect(main.prompts).toEqual([]);
       expect(JSON.parse(store.getMeta("head:preset-bootstrap")!).state).not.toBe("complete");
@@ -2379,8 +2763,10 @@ describe("dedicated HEAD startup preset initialization", () => {
 
   test("native-only bootstrap approval stays pending and owner stop prevents replay", async () => {
     const { runtime, main, store } = fixture(3, undefined, {
-      inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
-        availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+      inspectPresets: async () => ({
+        settings: { modelRoles: {} }, configuredDefault: { available: true },
+        availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] }
+      }),
     });
     await runtime.start();
     const dialog = { id: "bootstrap-approval", method: "confirm", title: "Native setup permission" };
@@ -2403,13 +2789,17 @@ describe("dedicated HEAD startup preset initialization", () => {
       inspectPresets: async () => {
         expect(f.messenger.shown.get(id)?.remoteId).toBe("original-card");
         expect(f.main.responses).toEqual([]);
-        return { settings: { modelRoles: {} }, configuredDefault: { available: true },
-          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } };
+        return {
+          settings: { modelRoles: {} }, configuredDefault: { available: true },
+          availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] }
+        };
       },
     });
     f.main.state.pendingUiRequests = [frame];
-    f.store.putApproval({ id, target: "main", generation: 0, requestId: frame.id, route: route(),
-      request: frame, state: "pending", remoteId: "original-card" });
+    f.store.putApproval({
+      id, target: "main", generation: 0, requestId: frame.id, route: route(),
+      request: frame, state: "pending", remoteId: "original-card"
+    });
     await f.runtime.start();
     expect(f.main.prompts).toEqual([]);
     expect(JSON.parse(f.store.getMeta("head:preset-bootstrap")!).state).toBe("blocked");
@@ -2420,11 +2810,15 @@ describe("dedicated HEAD startup preset initialization", () => {
 
   test("restart retains a native-only setup dialog and never repeats its original initializer", async () => {
     const { runtime, main, store } = fixture(3, undefined, {
-      inspectPresets: async () => ({ settings: { modelRoles: {} }, configuredDefault: { available: true },
-        availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }),
+      inspectPresets: async () => ({
+        settings: { modelRoles: {} }, configuredDefault: { available: true },
+        availableModels: [executionModel], presets: [], bootstrap: { missing: ["high", "middle", "low"], blocked: [] }
+      }),
     });
-    store.setMeta("head:preset-bootstrap", JSON.stringify({ sessionId: "session-main", state: "running",
-      requestId: "original-bootstrap", detail: "Interrupted setup" }));
+    store.setMeta("head:preset-bootstrap", JSON.stringify({
+      sessionId: "session-main", state: "running",
+      requestId: "original-bootstrap", detail: "Interrupted setup"
+    }));
     main.state.pendingUiRequests = [{ id: "original-setup-dialog", method: "confirm", title: "Native owner permission" }];
     main.state.isSettled = false;
     await runtime.start();
@@ -2477,11 +2871,13 @@ function restartFixture() {
   const requests: GatewayRestartRequest[] = [];
   const handoff: { respond?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord> } = {};
   let sessionFile = "";
-  const instance = fixture(3, undefined, { requestRestart: async request => {
-    requests.push(structuredClone(request));
-    if (handoff.respond) return handoff.respond(request);
-    return { ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main", sessionFile, state: "accepted" };
-  } });
+  const instance = fixture(3, undefined, {
+    requestRestart: async request => {
+      requests.push(structuredClone(request));
+      if (handoff.respond) return handoff.respond(request);
+      return { ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main", sessionFile, state: "accepted" };
+    }
+  });
   sessionFile = hostPaths(instance.config, "main").sessionFile;
   return { ...instance, requests, handoff };
 }
@@ -2489,17 +2885,21 @@ function restartFixture() {
 function savedRestart(instance: Pick<Superagent, "store" | "config">, state: GatewayRestartRecord["state"] = "started", oldOwnerPid = 2_000_000_001) {
   const input = applicationCommand("1750000000000000700", route("original-restart-route"), "/restart");
   instance.store.receive(input, "main", { [`user-source:${input.id}`]: "true" });
-  const restart = { requestId: crypto.randomUUID(),
+  const restart = {
+    requestId: crypto.randomUUID(),
     inputId: input.id, ackOutputId: `${input.id}:restart-ack`, ownerPid: oldOwnerPid,
-    sessionId: "session-main", sessionFile: hostPaths(instance.config, "main").sessionFile, state: "accepted" };
+    sessionId: "session-main", sessionFile: hostPaths(instance.config, "main").sessionFile, state: "accepted"
+  };
   instance.store.settle(input.id, "done", { id: restart.ackOutputId, text: "Original restart ACK" });
   instance.store.claimOutput(restart.ackOutputId);
   instance.store.finishOutput(restart.ackOutputId, "sent", "original-ack-receipt");
   instance.store.setMeta(`head:restart:${input.id}`, JSON.stringify(restart));
   instance.store.setMeta("head:restart-fence", JSON.stringify(restart));
-  const receipt: GatewayRestartRecord = { requestId: restart.requestId, inputId: input.id, ackOutputId: restart.ackOutputId,
+  const receipt: GatewayRestartRecord = {
+    requestId: restart.requestId, inputId: input.id, ackOutputId: restart.ackOutputId,
     headPid: oldOwnerPid, gatewayPid: 2_000_000_002, sessionId: restart.sessionId, sessionFile: restart.sessionFile,
-    state, successorPid: process.pid, replacementPid: process.pid };
+    state, successorPid: process.pid, replacementPid: process.pid
+  };
   instance.store.setMeta(`gateway:restart:${restart.requestId}`, JSON.stringify(receipt));
   instance.store.setMeta("gateway:restart", JSON.stringify(receipt));
   instance.store.setMeta("gateway:head", JSON.stringify({ pid: process.pid, sessionId: restart.sessionId, sessionFile: restart.sessionFile }));
@@ -2517,19 +2917,24 @@ describe("controlled Gateway AND HEAD restart", () => {
     const gatewayStore = new GatewayStore(config.stateDir);
     const accepted: GatewayRestartRequest[] = [];
     const executed: string[] = [];
-    const server = new GatewayServer({ socketPath: gatewayPaths(config).socketPath, store: gatewayStore, messenger,
+    const server = new GatewayServer({
+      socketPath: gatewayPaths(config).socketPath, store: gatewayStore, messenger,
       authorizeHead: async pid => { if (pid !== process.pid) throw new DeliveryError("Foreign head", "rejected"); },
-      status: () => ({ gateway: { pid: process.pid, ready: true, admissionReady: true, pendingEvents: 0, stopping: false },
-        head: { pid: process.pid, ready: true, connected: true, socketPath: hostPaths(config, "main").socketPath, error: null } }),
+      status: () => ({
+        gateway: { pid: process.pid, ready: true, admissionReady: true, pendingEvents: 0, stopping: false },
+        head: { pid: process.pid, ready: true, connected: true, socketPath: hostPaths(config, "main").socketPath, error: null }
+      }),
       stop: async () => { throw new Error("This acceptance regression must not stop a process"); },
       restart: async request => {
         accepted.push(structuredClone(request));
-        const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
-          sessionId: "session-main", sessionFile: hostPaths(config, "main").sessionFile, state: "accepted" };
+        const receipt: GatewayRestartRecord = {
+          ...request, gatewayPid: process.pid, headPid: process.pid,
+          sessionId: "session-main", sessionFile: hostPaths(config, "main").sessionFile, state: "accepted"
+        };
         gatewayStore.setRestart(receipt);
         return receipt;
       },
-      runRestart: requestId => { executed.push(requestId); }, onError: () => {},
+      runRestart: requestId => { executed.push(requestId); }, onError: () => { },
     });
     const savedToken = process.env.OMP_SUPERAGENT_GATEWAY_TOKEN;
     process.env.OMP_SUPERAGENT_GATEWAY_TOKEN = gatewayStore.token();
@@ -2540,7 +2945,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     }
     try {
       await server.listen();
-      await client.start({ message: async () => {}, answer: async () => {} });
+      await client.start({ message: async () => { }, answer: async () => { } });
       await server.initialReady.promise;
       await runtime.start();
       const original = applicationCommand("1750000000000000699", route("gateway-rpc-restart"), "/restart");
@@ -2569,8 +2974,10 @@ describe("controlled Gateway AND HEAD restart", () => {
     const { runtime, config, main, store, messenger, requests } = restartFixture();
     config.telegram = { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: ["3"] };
     config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "1", teamId: "TTEAM", allowedChannelIds: ["4"] };
-    const destination = route("10", { platform, ...(platform === "telegram" ? { channelId: "3" }
-      : platform === "slack" ? { accountId: "TTEAM:UBOT", guildId: "TTEAM" } : {}) });
+    const destination = route("10", {
+      platform, ...(platform === "telegram" ? { channelId: "3" }
+        : platform === "slack" ? { accountId: "TTEAM:UBOT", guildId: "TTEAM" } : {})
+    });
     const original = { ...message("restart-owner", destination, "/restart"), messageId: platform === "slack" ? "1750000000.000070" : "700" };
     await runtime.start();
     await admit(runtime, original);
@@ -2663,8 +3070,10 @@ describe("controlled Gateway AND HEAD restart", () => {
     hosts.set(lane.socketPath, laneHost);
     await runtime.start();
     await delegate(runtime, message("active-lane-request", lane.route));
-    store.putApproval({ id: "durable-restart-approval", target: lane.id, generation: 0, requestId: "original-ui", route: lane.route,
-      request: { method: "confirm" }, state: "pending", remoteId: "original-card" });
+    store.putApproval({
+      id: "durable-restart-approval", target: lane.id, generation: 0, requestId: "original-ui", route: lane.route,
+      request: { method: "confirm" }, state: "pending", remoteId: "original-card"
+    });
     await admit(runtime, message("restart-with-approval", route(), "/restart"));
     expect(store.approval("durable-restart-approval")?.state).toBe("pending");
     expect(requests).toHaveLength(1);
@@ -2702,7 +3111,7 @@ describe("controlled Gateway AND HEAD restart", () => {
       goalActive: true, goalSourceId: "restart-active-head", model: executionModel,
       thinkingLevel: "high", configuredThinkingLevel: "auto",
     });
-    await messenger.handlers!.answer(card.id, { confirmed: true }, card.route).catch(() => {});
+    await messenger.handlers!.answer(card.id, { confirmed: true }, card.route).catch(() => { });
     expect(main.responses).not.toContainEqual({ id: card.requestId, response: { confirmed: true } });
     expect(await messenger.handlers!.reconcileAnswer!(card.id, card.route)).toBe("rejected");
     await admit(runtime, original);
@@ -2802,9 +3211,11 @@ describe("controlled Gateway AND HEAD restart", () => {
     restart.ownerPid = 2_000_000_001;
     store.setMeta(`head:restart:${control.id}`, JSON.stringify(restart));
     store.setMeta("head:restart-fence", JSON.stringify(restart));
-    const receipt: GatewayRestartRecord = { requestId: restart.requestId, inputId: control.id, ackOutputId: restart.ackOutputId,
+    const receipt: GatewayRestartRecord = {
+      requestId: restart.requestId, inputId: control.id, ackOutputId: restart.ackOutputId,
       gatewayPid: 2_000_000_002, headPid: restart.ownerPid, sessionId: main.state.sessionId,
-      sessionFile: hostPaths(config, "main").sessionFile, state: "started", successorPid: process.pid, replacementPid: process.pid };
+      sessionFile: hostPaths(config, "main").sessionFile, state: "started", successorPid: process.pid, replacementPid: process.pid
+    };
     store.setMeta(`gateway:restart:${restart.requestId}`, JSON.stringify(receipt));
     store.setMeta("gateway:head", JSON.stringify({ pid: process.pid, sessionId: main.state.sessionId, sessionFile: main.state.sessionFile }));
     store.setMeta("gateway:socket", JSON.stringify({ pid: process.pid }));
@@ -2831,8 +3242,12 @@ describe("controlled Gateway AND HEAD restart", () => {
   test("an unowned native goal holds only automatic resume and never adopts the restart source", async () => {
     const instance = restartFixture();
     const { restart } = savedRestart(instance);
-    const checkpoint = { ...restart, checkpoint: { goalActive: true, goalId: "native-only-unowned-goal",
-      model: executionModel, thinkingLevel: "high", residents: [] } };
+    const checkpoint = {
+      ...restart, checkpoint: {
+        goalActive: true, goalId: "native-only-unowned-goal",
+        model: executionModel, thinkingLevel: "high", residents: []
+      }
+    };
     instance.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
     instance.store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
     instance.main.state.goal = { enabled: false, mode: "active", goal: { id: "native-only-unowned-goal", status: "paused" } };
@@ -2903,8 +3318,10 @@ describe("controlled Gateway AND HEAD restart", () => {
     messenger.beforeSend = async output => { if (output.id === "existing-drain") { started.resolve(); await release.promise; } };
     handoff.respond = async request => {
       expect(store.output(request.ackOutputId)?.state).toBe("sent");
-      return { ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main",
-        sessionFile: hostPaths(config, "main").sessionFile, state: "accepted" };
+      return {
+        ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main",
+        sessionFile: hostPaths(config, "main").sessionFile, state: "accepted"
+      };
     };
     const draining = runtime.kick();
     await started.promise;
@@ -2962,8 +3379,10 @@ describe("controlled Gateway AND HEAD restart", () => {
   test("a rejection cannot release a restart that already has durable Gateway acceptance", async () => {
     const { runtime, store, requests, handoff, config } = restartFixture();
     handoff.respond = async request => {
-      const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
-        sessionId: "session-main", sessionFile: hostPaths(config, "main").sessionFile, state: "accepted" };
+      const receipt: GatewayRestartRecord = {
+        ...request, gatewayPid: process.pid, headPid: process.pid,
+        sessionId: "session-main", sessionFile: hostPaths(config, "main").sessionFile, state: "accepted"
+      };
       store.setMeta(`gateway:restart:${request.requestId}`, JSON.stringify(receipt));
       throw new DeliveryError("A rejected response is not authority to undo prior acceptance", "rejected");
     };
@@ -3005,8 +3424,10 @@ describe("controlled Gateway AND HEAD restart", () => {
     const original = applicationCommand("1750000000000000901", route("uncertain-original"), "/restart");
     await admit(runtime, original);
     const request = requests[0]!;
-    const receipt: GatewayRestartRecord = { ...request, gatewayPid: process.pid, headPid: process.pid,
-      sessionId: "session-main", sessionFile: hostPaths(runtime.config, "main").sessionFile, state: "uncertain" };
+    const receipt: GatewayRestartRecord = {
+      ...request, gatewayPid: process.pid, headPid: process.pid,
+      sessionId: "session-main", sessionFile: hostPaths(runtime.config, "main").sessionFile, state: "uncertain"
+    };
     store.setMeta(`gateway:restart:${request.requestId}`, JSON.stringify(receipt));
     const notice = { requestId: request.requestId, outcome: "uncertain" as const, reason: "secret shutdown response" };
     await messenger.handlers!.restart!(notice);
@@ -3061,8 +3482,12 @@ describe("controlled Gateway AND HEAD restart", () => {
   ] as const)("restart holds an absent effort when reasoning changes from %s to %s or effort becomes %s", async (before, after, effort) => {
     const instance = restartFixture();
     const { input, restart } = savedRestart(instance);
-    const checkpoint = { ...restart, checkpoint: { goalActive: false, residents: [],
-      model: { ...executionModel, reasoning: before } } };
+    const checkpoint = {
+      ...restart, checkpoint: {
+        goalActive: false, residents: [],
+        model: { ...executionModel, reasoning: before }
+      }
+    };
     instance.store.setMeta(`head:restart:${input.id}`, JSON.stringify(checkpoint));
     instance.store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
     const resumed = { ...executionModel, reasoning: after };
@@ -3132,18 +3557,24 @@ describe("controlled Gateway AND HEAD restart", () => {
     store.receive(original, lane.id);
     store.submit(original.id, "observation-request", lane.generation);
     const { restart } = savedRestart(instance);
-    const checkpoint = { ...restart, checkpoint: {
-      goalActive: false, model: executionModel, thinkingLevel: "high",
-      residents: [{ id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
-        inputId: original.id, requestIds: ["observation-request"], ownedRuns: 1, entryId: "observation-cursor" }],
-    } };
+    const checkpoint = {
+      ...restart, checkpoint: {
+        goalActive: false, model: executionModel, thinkingLevel: "high",
+        residents: [{
+          id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
+          inputId: original.id, requestIds: ["observation-request"], ownedRuns: 1, entryId: "observation-cursor"
+        }],
+      }
+    };
     store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
     store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
     const toolResult = (id: string, target: string, timestamp: number) => ({
       role: "toolResult", toolName: "lane_report", toolCallId: id, timestamp, details: {
         type: "superagent-lane-report", sessionId: native.state.sessionId, reportId: id,
-        report: { status: "waiting", summary: `Waiting on ${target}`,
-          waiting: { kind: "dependency", target }, evidence: [] },
+        report: {
+          status: "waiting", summary: `Waiting on ${target}`,
+          waiting: { kind: "dependency", target }, evidence: []
+        },
       },
     });
     const originalWait = toolResult("journal-wait", "original-dependency", 1000);
@@ -3156,8 +3587,10 @@ describe("controlled Gateway AND HEAD restart", () => {
       const start = { id: "observation-source-start", type: "custom", customType: "source-start" };
       native.entries = [
         ...(timing === "eval-journal" ? [native.entries[0], start] : []),
-        { id: "native-eval-report", type: "custom", customType: "superagent-lane-report",
-          timestamp: new Date(1000).toISOString(), data: originalWait.details },
+        {
+          id: "native-eval-report", type: "custom", customType: "superagent-lane-report",
+          timestamp: new Date(1000).toISOString(), data: originalWait.details
+        },
         { id: "observation-cursor", type: "custom", customType: "checkpoint" },
       ];
       store.setMeta(`lane-observation-owner:${original.id}`, JSON.stringify({
@@ -3192,109 +3625,121 @@ describe("controlled Gateway AND HEAD restart", () => {
   });
 
   for (const outcome of ["completed", "error", "aborted"] as const)
-  test.each(["before-attachment", "after-attachment", "between-state-and-entries", "entries-snapshot", "publication"] as const)(`surviving lane ${outcome} %s is recovered from authoritative runs without replay`, async timing => {
-    const instance = restartFixture();
-    const { store, config, hosts, main, runtime, messenger } = instance;
-    const lane = savedLane(store, config, "restart-surviving-lane", route("surviving-topic"), process.pid);
-    const native = new HostTransport(lane.sessionFile, `session-${lane.id}`);
-    hosts.set(lane.socketPath, native);
-    main.local = true;
-    const window = timing !== "before-attachment" && timing !== "after-attachment";
-    const original = message("surviving-original-request", lane.route);
-    const source = window ? message("surviving-parent-user", route("original-window-source")) : original;
-    if (window) {
-      store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
-      store.settle(source.id, "done");
-    }
-    store.receive(original, lane.id, window ? { [`handoff-source:${original.id}`]: source.id } : {});
-    store.submit(original.id, "surviving-native-request", lane.generation);
-    const { restart } = savedRestart(instance);
-    const checkpoint = { ...restart, checkpoint: {
-      goalActive: false, model: executionModel, thinkingLevel: "high",
-      residents: [{ id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
-        inputId: original.id, requestIds: ["surviving-native-request"], ownedRuns: 1, entryId: "snapshot-leaf" }],
-    } };
-    store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
-    store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
-    native.entries = [{ id: "snapshot-leaf", type: "custom", customType: "checkpoint" }];
-    const recordYield = () => {
-      const message = { role: "assistant", stopReason: "stop",
-        content: [{ type: "text", text: window ? "Earlier successful native yield" : "Recovered original lane result" }] };
-      native.entries.push({ type: "message", id: "final-assistant", message }, {
-        type: "custom", customType: "rpc_prompt_result", data: {
-          sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
-          frame: { id: "surviving-native-request", status: "completed", agentInvoked: true },
-        },
-      });
-      return message;
-    };
-    const start = { type: "custom", customType: "rpc_agent_start", data: {
-      sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
-    } };
-    if (window) { recordYield(); native.entries.push(start); }
-    const recordCompletion = () => {
-      let message = window
-        ? { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Recovered original lane result" }] } : recordYield();
-      if (outcome !== "completed" || window) {
-        message = { role: "assistant", stopReason: outcome === "completed" ? "stop" : outcome,
-          content: [{ type: "text", text: outcome === "completed" ? "Recovered original lane result" : "Private detached continuation diagnostics" }] };
-        if (!window) native.entries.push({ type: "custom", customType: "rpc_agent_start", data: {
-          sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
-        } });
-        native.entries.push({ type: "message", id: "continuation-assistant", message });
+    test.each(["before-attachment", "after-attachment", "between-state-and-entries", "entries-snapshot", "publication"] as const)(`surviving lane ${outcome} %s is recovered from authoritative runs without replay`, async timing => {
+      const instance = restartFixture();
+      const { store, config, hosts, main, runtime, messenger } = instance;
+      const lane = savedLane(store, config, "restart-surviving-lane", route("surviving-topic"), process.pid);
+      const native = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+      hosts.set(lane.socketPath, native);
+      main.local = true;
+      const window = timing !== "before-attachment" && timing !== "after-attachment";
+      const original = message("surviving-original-request", lane.route);
+      const source = window ? message("surviving-parent-user", route("original-window-source")) : original;
+      if (window) {
+        store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+        store.settle(source.id, "done");
       }
-      native.state.isSettled = true;
-      native.state.isStreaming = false;
-      return message;
-    };
-    if (timing === "before-attachment") recordCompletion();
-    else { native.state.isSettled = false; native.state.isStreaming = true; }
-    const terminal = () => {
-      const message = recordCompletion();
-      native.emit({ type: "message_end", message });
-      native.emit({ type: "agent_end", isTerminal: true, messages: [message] });
-      native.emit({ type: "session_settled" });
-    };
-    if (timing === "between-state-and-entries") native.beforeEntries = async () => {
-      native.beforeEntries = undefined;
-      const question = { type: "extension_ui_request", method: "confirm", id: "window-question", title: "Confirm original work" };
-      native.state.pendingUiRequests = [question];
-      native.emit(question);
-      await messenger.whenApproval();
-      native.state.pendingUiRequests = [];
-      native.emit({ type: "extension_ui_request", method: "cancel", targetId: question.id });
-      terminal();
-    };
-    if (timing === "entries-snapshot" || timing === "publication") native.afterEntries = () => {
-      native.afterEntries = undefined;
-      if (timing === "publication") queueMicrotask(terminal);
-      else terminal();
-    };
-    await runtime.start();
-    if (timing === "after-attachment") {
-      expect(store.input(original.id)?.state).toBe("submitted");
-      if (outcome !== "completed") native.emit({ type: "agent_start" });
-      native.emit({ type: "message_end", message: recordCompletion() });
-      // prompt_result is deliberately NOT delivered to this replacement client.
-      native.emit({ type: "session_settled" });
-    }
-    await main.whenPrompts(1);
-    await runtime.kick();
-    expect(store.input(original.id)?.state).toBe(outcome === "completed" ? "done" : outcome === "error" ? "uncertain" : "cancelled");
-    expect(store.input(`report:${original.id}`)).toMatchObject({ route: source.route });
-    expect(store.getMeta(`activity-source:report:${original.id}`)).toBe(source.id);
-    expect(store.input(`report:${original.id}`)?.text).toContain(native.state.sessionId);
-    expect(store.input(`report:${original.id}`)?.text).toContain(lane.sessionFile);
-    if (timing === "between-state-and-entries") {
-      expect([...messenger.shown.values()]).toMatchObject([{ route: original.route, generation: lane.generation, requestId: "window-question" }]);
-      expect(messenger.dismissed).toHaveLength(1);
-    }
-    if (outcome === "completed") expect(store.input(`report:${original.id}`)?.text).toContain("Recovered original lane result");
-    else expect(store.input(`report:${original.id}`)?.text).not.toContain("Private detached continuation diagnostics");
-    expect(native.prompts).toEqual([]);
-    expect(native.abortCount).toBe(0);
-    expect(main.prompts).toHaveLength(1);
-  });
+      store.receive(original, lane.id, window ? { [`handoff-source:${original.id}`]: source.id } : {});
+      store.submit(original.id, "surviving-native-request", lane.generation);
+      const { restart } = savedRestart(instance);
+      const checkpoint = {
+        ...restart, checkpoint: {
+          goalActive: false, model: executionModel, thinkingLevel: "high",
+          residents: [{
+            id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
+            inputId: original.id, requestIds: ["surviving-native-request"], ownedRuns: 1, entryId: "snapshot-leaf"
+          }],
+        }
+      };
+      store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
+      store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
+      native.entries = [{ id: "snapshot-leaf", type: "custom", customType: "checkpoint" }];
+      const recordYield = () => {
+        const message = {
+          role: "assistant", stopReason: "stop",
+          content: [{ type: "text", text: window ? "Earlier successful native yield" : "Recovered original lane result" }]
+        };
+        native.entries.push({ type: "message", id: "final-assistant", message }, {
+          type: "custom", customType: "rpc_prompt_result", data: {
+            sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+            frame: { id: "surviving-native-request", status: "completed", agentInvoked: true },
+          },
+        });
+        return message;
+      };
+      const start = {
+        type: "custom", customType: "rpc_agent_start", data: {
+          sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+        }
+      };
+      if (window) { recordYield(); native.entries.push(start); }
+      const recordCompletion = () => {
+        let message = window
+          ? { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Recovered original lane result" }] } : recordYield();
+        if (outcome !== "completed" || window) {
+          message = {
+            role: "assistant", stopReason: outcome === "completed" ? "stop" : outcome,
+            content: [{ type: "text", text: outcome === "completed" ? "Recovered original lane result" : "Private detached continuation diagnostics" }]
+          };
+          if (!window) native.entries.push({
+            type: "custom", customType: "rpc_agent_start", data: {
+              sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+            }
+          });
+          native.entries.push({ type: "message", id: "continuation-assistant", message });
+        }
+        native.state.isSettled = true;
+        native.state.isStreaming = false;
+        return message;
+      };
+      if (timing === "before-attachment") recordCompletion();
+      else { native.state.isSettled = false; native.state.isStreaming = true; }
+      const terminal = () => {
+        const message = recordCompletion();
+        native.emit({ type: "message_end", message });
+        native.emit({ type: "agent_end", isTerminal: true, messages: [message] });
+        native.emit({ type: "session_settled" });
+      };
+      if (timing === "between-state-and-entries") native.beforeEntries = async () => {
+        native.beforeEntries = undefined;
+        const question = { type: "extension_ui_request", method: "confirm", id: "window-question", title: "Confirm original work" };
+        native.state.pendingUiRequests = [question];
+        native.emit(question);
+        await messenger.whenApproval();
+        native.state.pendingUiRequests = [];
+        native.emit({ type: "extension_ui_request", method: "cancel", targetId: question.id });
+        terminal();
+      };
+      if (timing === "entries-snapshot" || timing === "publication") native.afterEntries = () => {
+        native.afterEntries = undefined;
+        if (timing === "publication") queueMicrotask(terminal);
+        else terminal();
+      };
+      await runtime.start();
+      if (timing === "after-attachment") {
+        expect(store.input(original.id)?.state).toBe("submitted");
+        if (outcome !== "completed") native.emit({ type: "agent_start" });
+        native.emit({ type: "message_end", message: recordCompletion() });
+        // prompt_result is deliberately NOT delivered to this replacement client.
+        native.emit({ type: "session_settled" });
+      }
+      await main.whenPrompts(1);
+      await runtime.kick();
+      expect(store.input(original.id)?.state).toBe(outcome === "completed" ? "done" : outcome === "error" ? "uncertain" : "cancelled");
+      expect(store.input(`report:${original.id}`)).toMatchObject({ route: source.route });
+      expect(store.getMeta(`activity-source:report:${original.id}`)).toBe(source.id);
+      expect(store.input(`report:${original.id}`)?.text).toContain(native.state.sessionId);
+      expect(store.input(`report:${original.id}`)?.text).toContain(lane.sessionFile);
+      if (timing === "between-state-and-entries") {
+        expect([...messenger.shown.values()]).toMatchObject([{ route: original.route, generation: lane.generation, requestId: "window-question" }]);
+        expect(messenger.dismissed).toHaveLength(1);
+      }
+      if (outcome === "completed") expect(store.input(`report:${original.id}`)?.text).toContain("Recovered original lane result");
+      else expect(store.input(`report:${original.id}`)?.text).not.toContain("Private detached continuation diagnostics");
+      expect(native.prompts).toEqual([]);
+      expect(native.abortCount).toBe(0);
+      expect(main.prompts).toHaveLength(1);
+    });
 
   test.each(["retained", "before-checkpoint", "error", "aborted", "retry"] as const)("surviving lane empty-tail recovery respects its checkpoint boundary: %s", async scenario => {
     const instance = restartFixture();
@@ -3307,28 +3752,38 @@ describe("controlled Gateway AND HEAD restart", () => {
     store.receive(original, lane.id);
     store.submit(original.id, "retention-recovery-native", lane.generation);
     const { restart } = savedRestart(instance);
-    const checkpoint = { ...restart, checkpoint: {
-      goalActive: false, model: executionModel, thinkingLevel: "high",
-      residents: [{ id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
-        inputId: original.id, requestIds: ["retention-recovery-native"], ownedRuns: 1, entryId: "retention-checkpoint" }],
-    } };
+    const checkpoint = {
+      ...restart, checkpoint: {
+        goalActive: false, model: executionModel, thinkingLevel: "high",
+        residents: [{
+          id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
+          inputId: original.id, requestIds: ["retention-recovery-native"], ownedRuns: 1, entryId: "retention-checkpoint"
+        }],
+      }
+    };
     store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
     store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
-    const assistant = (text: string, stopReason = "stop") => ({ type: "message", message: {
-      role: "assistant", stopReason, content: [{ type: "text", text }],
-    } });
+    const assistant = (text: string, stopReason = "stop") => ({
+      type: "message", message: {
+        role: "assistant", stopReason, content: [{ type: "text", text }],
+      }
+    });
     native.entries = [assistant("Unrelated old session secret"), {
       id: "retention-checkpoint", ...assistant("Unowned pre-checkpoint answer"),
     }];
     if (scenario !== "before-checkpoint") native.entries.push(assistant("Earlier owned answer"));
-    native.entries.push({ type: "custom", customType: "rpc_prompt_result", data: {
-      sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
-      frame: { id: "retention-recovery-native", status: scenario === "retry" ? "error" : "completed", agentInvoked: true },
-    } });
-    if (scenario === "error" || scenario === "aborted" || scenario === "retry") {
-      native.entries.push({ type: "custom", customType: "rpc_agent_start", data: {
+    native.entries.push({
+      type: "custom", customType: "rpc_prompt_result", data: {
         sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
-      } }, assistant("Private detached diagnostics", scenario === "retry" ? "error" : scenario));
+        frame: { id: "retention-recovery-native", status: scenario === "retry" ? "error" : "completed", agentInvoked: true },
+      }
+    });
+    if (scenario === "error" || scenario === "aborted" || scenario === "retry") {
+      native.entries.push({
+        type: "custom", customType: "rpc_agent_start", data: {
+          sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+        }
+      }, assistant("Private detached diagnostics", scenario === "retry" ? "error" : scenario));
     }
     if (scenario === "retained" || scenario === "retry") native.entries.push(assistant("Latest owned answer"));
     if (scenario !== "error" && scenario !== "aborted") native.entries.push(
@@ -3364,24 +3819,32 @@ describe("controlled Gateway AND HEAD restart", () => {
     store.receive(original, lane.id);
     store.submit(original.id, "newer-run-native", lane.generation);
     const { restart } = savedRestart(instance);
-    const checkpoint = { ...restart, checkpoint: {
-      goalActive: false, model: executionModel, thinkingLevel: "high",
-      residents: [{ id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
-        inputId: original.id, requestIds: ["newer-run-native"], ownedRuns: 1, entryId: "newer-run-checkpoint" }],
-    } };
+    const checkpoint = {
+      ...restart, checkpoint: {
+        goalActive: false, model: executionModel, thinkingLevel: "high",
+        residents: [{
+          id: lane.id, generation: lane.generation, pid: process.pid, sessionId: native.state.sessionId,
+          inputId: original.id, requestIds: ["newer-run-native"], ownedRuns: 1, entryId: "newer-run-checkpoint"
+        }],
+      }
+    };
     store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(checkpoint));
     store.setMeta("head:restart-fence", JSON.stringify(checkpoint));
-    const start = () => ({ type: "custom", customType: "rpc_agent_start", data: {
-      sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
-    } });
+    const start = () => ({
+      type: "custom", customType: "rpc_agent_start", data: {
+        sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
+      }
+    });
     native.entries = [{ id: "newer-run-checkpoint", type: "custom", customType: "checkpoint" }, {
       type: "custom", customType: "rpc_prompt_result", data: {
         sessionId: native.state.sessionId, sessionFile: lane.sessionFile,
         frame: { id: "newer-run-native", status: "completed", agentInvoked: true },
       },
-    }, start(), { type: "message", message: {
-      role: "assistant", stopReason: olderOutcome, content: [{ type: "text", text: "Older private failure" }],
-    } }];
+    }, start(), {
+      type: "message", message: {
+        role: "assistant", stopReason: olderOutcome, content: [{ type: "text", text: "Older private failure" }],
+      }
+    }];
     let started = false;
     native.afterEntries = () => {
       native.afterEntries = undefined;
@@ -3432,9 +3895,13 @@ describe("controlled Gateway AND HEAD restart", () => {
   });
 
   test("replacement initialization failure sends a fixed original-route failure without a model turn or unsafe fence release", async () => {
-    const instance = fixture(3, undefined, { inspectPresets: async () => ({ settings: { modelRoles: {} },
-      configuredDefault: { available: true }, availableModels: [executionModel], presets: [],
-      bootstrap: { missing: ["high", "middle", "low"], blocked: [] } }) });
+    const instance = fixture(3, undefined, {
+      inspectPresets: async () => ({
+        settings: { modelRoles: {} },
+        configuredDefault: { available: true }, availableModels: [executionModel], presets: [],
+        bootstrap: { missing: ["high", "middle", "low"], blocked: [] }
+      })
+    });
     const { input } = savedRestart(instance);
     await instance.runtime.start();
     await instance.runtime.kick();
@@ -4151,13 +4618,13 @@ describe("priority native head commands", () => {
           window: { id: "5h", label: "5 Hour", resetsAt: new Date(2027, 0, 10, 20, 15).getTime() },
         }],
       }, {
-        provider: "anthropic", fetchedAt: 3,
-        limits: [{
-          id: "sonnet", label: "Claude 7 Day (Sonnet)", scope: { provider: "anthropic" },
-          amount: { unit: "percent", remaining: 7 },
-          window: { id: "7d", label: "7 Day" },
+          provider: "anthropic", fetchedAt: 3,
+          limits: [{
+            id: "sonnet", label: "Claude 7 Day (Sonnet)", scope: { provider: "anthropic" },
+            amount: { unit: "percent", remaining: 7 },
+            window: { id: "7d", label: "7 Day" },
+          }],
         }],
-      }],
       accountsWithoutUsage: [{ provider: "openai-codex", email: "private-unreported@example.test" }],
       disabledCredentials: [{ provider: "openai-codex", email: "private-disabled@example.test" }],
     };
@@ -4220,8 +4687,10 @@ exit ${code}
       for (const [index, text] of ["/status", "/help", "/context", "/usage"].entries()) {
         const input = command(platform === "slack" ? `busy-${text}` : `175000000000000000${index + 1}`, destination, text);
         await admit(runtime, input);
-        expect(store.input(input.id)).toMatchObject({ messageId: null, state: "done",
-          ...(platform === "slack" ? { invocationId: input.invocationId } : { interactionId: input.interactionId }) });
+        expect(store.input(input.id)).toMatchObject({
+          messageId: null, state: "done",
+          ...(platform === "slack" ? { invocationId: input.invocationId } : { interactionId: input.interactionId })
+        });
         const expected = text === "/usage" ? "OMP 사용량" : "HEAD";
         expect(messenger.sent.some(output => output.sourceId === input.id && output.text.includes(expected))).toBe(true);
       }
@@ -4482,9 +4951,11 @@ exit ${code}
     const lane = savedLane(store, config, "preset-unmodified", route("preset-unmodified"));
     const beforeLane = structuredClone(lane);
     main.state.modelSettings!.modelRoles.obsolete = "fixture/capable";
-    nativePresets.set("exact-custom", { model: otherModel, preset: "exact-custom", snapshot: {
-      modelRoles: { default: "fixture/efficient", smol: "fixture/capable", judge: "fixture/efficient", vision: "fixture/capable" }, defaultThinkingLevel: Effort.Low,
-    } });
+    nativePresets.set("exact-custom", {
+      model: otherModel, preset: "exact-custom", snapshot: {
+        modelRoles: { default: "fixture/efficient", smol: "fixture/capable", judge: "fixture/efficient", vision: "fixture/capable" }, defaultThinkingLevel: Effort.Low,
+      }
+    });
     const originalPresets = structuredClone([...nativePresets]);
     main.beforeSetModel = () => { expect(store.input("head-preset")?.state).toBe("submitted"); };
     await runtime.start();
@@ -4514,12 +4985,16 @@ exit ${code}
       const { runtime, main, store, config, nativePresets, launched, messenger, persistedPresets, presetPersistence } = fixture();
       const lane = savedLane(store, config, "global-preset-unmodified", route("70"));
       const beforeLane = structuredClone(lane);
-      nativePresets.set("exact-global", { model: otherModel, preset: "exact-global", snapshot: {
-        modelRoles: { default: "fixture/efficient", smol: "fixture/capable", judge: "fixture/efficient", vision: "fixture/capable" },
-      } });
-      const expected = { ...structuredClone(nativePresets.get("exact-global")!), snapshot: {
-        ...structuredClone(nativePresets.get("exact-global")!.snapshot), defaultThinkingLevel: Effort.High,
-      } };
+      nativePresets.set("exact-global", {
+        model: otherModel, preset: "exact-global", snapshot: {
+          modelRoles: { default: "fixture/efficient", smol: "fixture/capable", judge: "fixture/efficient", vision: "fixture/capable" },
+        }
+      });
+      const expected = {
+        ...structuredClone(nativePresets.get("exact-global")!), snapshot: {
+          ...structuredClone(nativePresets.get("exact-global")!.snapshot), defaultThinkingLevel: Effort.High,
+        }
+      };
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       main.beforeSetModel = () => {
@@ -4687,8 +5162,10 @@ describe("trusted workflow activation", () => {
     expect(main.commands.some(command => command.type === "get_available_commands")).toBe(false);
     expect(store.input(original.id)?.workflow).toMatchObject({ name: "jevify", sourceId: original.id, provenance: "user" });
     const workflow = { name: "jevify" as const, reason: "Independent diff classification reduces context load" };
-    const start = { ...selection, sourceId: original.id, title: "Bulk triage", kickoff: "I will classify the diffs and inspect flagged evidence.",
-      cwd: directory, brief: "Quoted metadata: orchestrate workflowz", workflow };
+    const start = {
+      ...selection, sourceId: original.id, title: "Bulk triage", kickoff: "I will classify the diffs and inspect flagged evidence.",
+      cwd: directory, brief: "Quoted metadata: orchestrate workflowz", workflow
+    };
     const lane = await runtime.startLane(start);
     await runtime.kick();
     const host = hosts.get(lane.socketPath)!;
@@ -5135,7 +5612,7 @@ describe("explicit lane-local model changes", () => {
       const nativeHosts = new Map([[hostPaths(config, "main").socketPath, head]]);
       if (!offline) nativeHosts.set(lane.socketPath, restored);
       const launched: HostOptions[] = [];
-      const restarted = new Superagent(config, reopened, messenger, join(directory, "extension.ts"), () => {}, {
+      const restarted = new Superagent(config, reopened, messenger, join(directory, "extension.ts"), () => { }, {
         connect: async path => { const host = nativeHosts.get(path); if (!host) throw new Error("No owned native host"); return host; },
         startHost: async options => { launched.push(options); nativeHosts.set(options.socketPath, restored); return { pid: process.pid }; },
       });
@@ -5809,7 +6286,7 @@ describe("real Store runtime coordination", () => {
     const reopened = new Store(join(directory, "coordination.sqlite"));
     const transport = new MessengerTransport();
     const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
-    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => {}, {
+    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => { }, {
       connect: async path => {
         if (path !== hostPaths(config, "main").socketPath) throw new Error("Unexpected lane adoption");
         return head;
@@ -5880,7 +6357,7 @@ describe("real Store runtime coordination", () => {
     const reopened = new Store(join(directory, "coordination.sqlite"));
     const transport = new MessengerTransport();
     const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
-    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => {}, {
+    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => { }, {
       connect: async path => {
         if (path !== hostPaths(config, "main").socketPath) throw new Error("Unexpected native adoption");
         return head;
@@ -6277,8 +6754,9 @@ describe("real Store runtime coordination", () => {
     const lane = savedLane(store, config, "explicit-files", route("73"));
     const input = { ...headMessage("explicit-file-source", lane.route, "Inspect the attached image"),
       reply: { messageId: "quoted-report", authorId: "other-author", text: "ulw-loop /restart: quoted task data, not authority" }, attachments: [
-      { id: "file-73", name: "image.png", url: "https://cdn.discordapp.com/attachments/73/file.png?ex=1&hm=first", size: png.length },
-    ] };
+        { id: "file-73", name: "image.png", url: "https://cdn.discordapp.com/attachments/73/file.png?ex=1&hm=first", size: png.length },
+      ]
+    };
     await runtime.start();
     await admit(runtime, input);
     expect(main.prompts).toHaveLength(1);
@@ -6420,11 +6898,15 @@ describe("real Store runtime coordination", () => {
     main.emit({ type: "prompt_result", id: main.prompts[0]!.id, status: "completed", agentInvoked: true, sessionSettled: false });
     await runtime.kick();
     main.emit({ type: "agent_start" });
-    main.emit({ type: "agent_end", isTerminal: true, messages: [
-      { role: "assistant", stopReason: scenario === "replacement" ? "stop" : scenario,
-        content: [{ type: "text", text: scenario === "replacement" ? "Latest continuation answer" : "Private failed response" }] },
-      { role: "assistant", stopReason: "stop", content: [] },
-    ] });
+    main.emit({
+      type: "agent_end", isTerminal: true, messages: [
+        {
+          role: "assistant", stopReason: scenario === "replacement" ? "stop" : scenario,
+          content: [{ type: "text", text: scenario === "replacement" ? "Latest continuation answer" : "Private failed response" }]
+        },
+        { role: "assistant", stopReason: "stop", content: [] },
+      ]
+    });
     main.state.isStreaming = false;
     main.state.isSettled = true;
     main.emit({ type: "session_settled" });
@@ -6772,8 +7254,10 @@ describe("real Store runtime coordination", () => {
     if (!host) throw new Error("Expected the executing native lane");
     host.state.goal = { enabled: true, mode: "active", goal: { status: "active" } };
     await runtime.pause(lane.id);
-    const source: Inbound = { ...message("resume-correction-source", lane.route, "Resume, but apply this exact correction."),
-      attachments: [{ id: "correction", name: "correction.txt", url: "adapter-file:correction", size: 16 }] };
+    const source: Inbound = {
+      ...message("resume-correction-source", lane.route, "Resume, but apply this exact correction."),
+      attachments: [{ id: "correction", name: "correction.txt", url: "adapter-file:correction", size: 16 }]
+    };
     store.receive(source, "main");
     store.settle(source.id, "done");
     await runtime.resume(lane.id, source.id);
@@ -6836,9 +7320,11 @@ describe("real Store runtime coordination", () => {
       if (outcome !== "no-run") {
         host.state.isSettled = true;
         host.state.isStreaming = false;
-        host.emit({ type: "agent_end", messages: [{
-          role: "assistant", stopReason: outcome, content: [{ type: "text", text: "Unverified success" }],
-        }] });
+        host.emit({
+          type: "agent_end", messages: [{
+            role: "assistant", stopReason: outcome, content: [{ type: "text", text: "Unverified success" }],
+          }]
+        });
         host.emit({ type: "session_settled" });
       }
       await main.whenPrompts(1);
@@ -6924,8 +7410,10 @@ describe("real Store runtime coordination", () => {
     await f.runtime.start();
     await admit(f.runtime, headMessage("decision-source"));
     const id = decisionId(f.main.state.sessionId, "decision-call");
-    const frame = { type: "extension_ui_request", method: "ask", id: "decision-native",
-      questions: [{ id: `${id}:0`, question: "Which database?", options: [{ label: "SQLite" }, { label: "Redis" }], recommended: 0 }] };
+    const frame = {
+      type: "extension_ui_request", method: "ask", id: "decision-native",
+      questions: [{ id: `${id}:0`, question: "Which database?", options: [{ label: "SQLite" }, { label: "Redis" }], recommended: 0 }]
+    };
     f.main.state.pendingUiRequests = [frame];
     f.main.emit(frame);
     await f.messenger.whenApproval();
@@ -6947,8 +7435,10 @@ describe("real Store runtime coordination", () => {
     const host = f.hosts.get(lane.socketPath);
     if (!host) throw new Error("Lane native Host was not launched");
     const decision = decisionId(host.state.sessionId, "lane-choice-call");
-    const frame = { type: "extension_ui_request", method: "ask", id: "lane-choice-native",
-      questions: [{ id: `${decision}:0`, question: "Which local cache layout?", options: [{ label: "Flat" }, { label: "Nested" }] }] };
+    const frame = {
+      type: "extension_ui_request", method: "ask", id: "lane-choice-native",
+      questions: [{ id: `${decision}:0`, question: "Which local cache layout?", options: [{ label: "Flat" }, { label: "Nested" }] }]
+    };
     host.state.pendingUiRequests = [frame];
     host.emit(frame);
     f.main.complete("");
@@ -6961,14 +7451,20 @@ describe("real Store runtime coordination", () => {
     const f = await laneDecision();
     expect(f.messenger.shown.size).toBe(0);
     await expect(f.messenger.handlers!.answer(f.approval.approvalId, { answers: f.answers }, f.source.route)).rejects.toMatchObject({ certainty: "rejected" });
-    await expect(f.runtime.reviewLaneDecision({ id: f.decision, reason: "Local and reversible",
-      answers: [{ ...f.answers[0]!, selectedOptions: ["Invented"] }] })).rejects.toMatchObject({ certainty: "rejected" });
+    await expect(f.runtime.reviewLaneDecision({
+      id: f.decision, reason: "Local and reversible",
+      answers: [{ ...f.answers[0]!, selectedOptions: ["Invented"] }]
+    })).rejects.toMatchObject({ certainty: "rejected" });
     expect(f.host.responses).toEqual([]);
 
-    f.main.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [
-      { type: "text", text: "Internal review in progress" },
-      { type: "toolCall", id: "choose", name: "lane_review_decision", arguments: {} },
-    ] } });
+    f.main.emit({
+      type: "message_end", message: {
+        role: "assistant", stopReason: "toolUse", content: [
+          { type: "text", text: "Internal review in progress" },
+          { type: "toolCall", id: "choose", name: "lane_review_decision", arguments: {} },
+        ]
+      }
+    });
     const selected = await f.runtime.reviewLaneDecision({ id: f.decision, reason: "Local and reversible", answers: f.answers });
     f.main.complete("Internal review result");
     await admit(f.runtime, headMessage("after-choice", f.source.route));
@@ -7011,8 +7507,10 @@ describe("real Store runtime coordination", () => {
     const f = fixture();
     const lane = savedLane(f.store, f.config, "approval-lane", route("44"), process.pid);
     const host = new HostTransport(lane.sessionFile, "session-approval-lane");
-    const frame = { type: "extension_ui_request", method: "select", id: "execution-approval", title: "Allow external action?",
-      options: ["Approve", "Deny"] };
+    const frame = {
+      type: "extension_ui_request", method: "select", id: "execution-approval", title: "Allow external action?",
+      options: ["Approve", "Deny"]
+    };
     host.state.pendingUiRequests = [frame];
     f.hosts.set(lane.socketPath, host);
     await f.runtime.start();
@@ -7034,8 +7532,10 @@ describe("real Store runtime coordination", () => {
     store.receive(message(synthetic), "main", { [`activity-source:${synthetic}`]: "handoff-source" });
     await runtime.kick();
     const id = decisionId(main.state.sessionId, `${kind}-decision`);
-    const frame = { type: "extension_ui_request", method: "ask", id: `${kind}-question`,
-      questions: [{ id: `${id}:0`, question: "Which scope?", options: [{ label: "Local" }] }] };
+    const frame = {
+      type: "extension_ui_request", method: "ask", id: `${kind}-question`,
+      questions: [{ id: `${id}:0`, question: "Which scope?", options: [{ label: "Local" }] }]
+    };
     main.state.pendingUiRequests = [frame];
     main.emit(frame);
     await messenger.whenApproval();
@@ -7048,9 +7548,11 @@ describe("real Store runtime coordination", () => {
 
   test("owner decisions use the existing authenticated card and preserve answers without duplicate delivery", async () => {
     const { runtime, messenger, main, id, frame, approval, response, store } = await ownerDecision();
-    expect(runtime.listDecisions()).toMatchObject([{ id, state: "pending", sourceId: "decision-source", target: "main",
+    expect(runtime.listDecisions()).toMatchObject([{
+      id, state: "pending", sourceId: "decision-source", target: "main",
       requestId: frame.id, route: route(), remoteId: `card-${approval.id}`,
-      questions: [{ question: "Which database?", recommended: 0 }] }]);
+      questions: [{ question: "Which database?", recommended: 0 }]
+    }]);
     await expect(messenger.handlers!.answer(approval.id, response, route("foreign"))).rejects.toMatchObject({ certainty: "rejected" });
     expect(runtime.inspectDecision(id).state).toBe("pending");
     expect(main.responses).toEqual([]);
@@ -7089,8 +7591,10 @@ describe("real Store runtime coordination", () => {
     store.receive(message("foreign-owner-source", route("foreign")), "main", { "user-source:foreign-owner-source": "true" });
     await expect(runtime.withdrawDecision(id, "foreign-owner-source", "Another topic")).rejects.toThrow("another conversation");
     const result = await runtime.withdrawDecision(id, "decision-source", "The original requirement was withdrawn");
-    expect(result).toMatchObject({ state: "withdrawn", confirmedAt: expect.any(Number),
-      withdrawal: { sourceId: "decision-source", reason: "The original requirement was withdrawn" } });
+    expect(result).toMatchObject({
+      state: "withdrawn", confirmedAt: expect.any(Number),
+      withdrawal: { sourceId: "decision-source", reason: "The original requirement was withdrawn" }
+    });
     expect(result.response).toBeUndefined();
     expect(runtime.listDecisions()).toEqual([]);
     expect(main.responses).toEqual([{ id: frame.id, response: { cancelled: true } }]);
@@ -7240,7 +7744,7 @@ describe("real Store runtime coordination", () => {
     let queued: Promise<void> | undefined;
     messenger.onStart = handlers => {
       queued = handlers.answer(id, { confirmed: true }, lane.route);
-      void queued.catch(() => {});
+      void queued.catch(() => { });
       intakeStarted.resolve();
     };
     const starting = runtime.start();
@@ -7268,8 +7772,8 @@ describe("real Store runtime coordination", () => {
       captured = handlers;
       queuedMessage = handlers.message(message("queued-on-failure", destination));
       queuedAnswer = handlers.answer("unrestored-card", { confirmed: true }, destination);
-      void queuedMessage.catch(() => {});
-      void queuedAnswer.catch(() => {});
+      void queuedMessage.catch(() => { });
+      void queuedAnswer.catch(() => { });
     };
     await expect(runtime.start()).rejects.toThrow("No native host");
     await expect(queuedMessage!).rejects.toThrow("stopped before intake readiness");
@@ -7292,11 +7796,11 @@ describe("real Store runtime coordination", () => {
     messenger.onStart = handlers => {
       captured = handlers;
       queued = handlers.message(message("queued-on-stop", route(null, { guildId: null })));
-      void queued.catch(() => {});
+      void queued.catch(() => { });
       intakeStarted.resolve();
     };
     const starting = runtime.start();
-    void starting.catch(() => {});
+    void starting.catch(() => { });
     await intakeStarted.promise;
     await runtime.stop();
     await expect(queued!).rejects.toThrow("stopped before intake readiness");
@@ -7585,7 +8089,7 @@ describe("real Store runtime coordination", () => {
     host.state.hostPid = 2147483647;
     hosts.set(one.socketPath, host);
     mkdirSync(dirname(one.socketPath), { recursive: true });
-    const socket = Bun.listen({ unix: one.socketPath, socket: { data() {} } });
+    const socket = Bun.listen({ unix: one.socketPath, socket: { data() { } } });
     try {
       await runtime.start();
       await delegate(runtime, message("socket-waiting", two.route));
@@ -7623,20 +8127,22 @@ describe("real Store runtime coordination", () => {
       const state = await readState();
       if (!firstRead) { trace.push("fresh state"); return state; }
       firstRead = false;
-      Object.defineProperty(state, "isSettled", { get() {
-        trace.push("busy state");
-        // finishOnce returns immediately after reading false. The first hop
-        // queues the event behind the inner drain's final condition check; the
-        // second emits it before the outer finish() await can resume. There is
-        // no sleep, polling, replaced runtime method, or extra later wakeup.
-        queueMicrotask(() => queueMicrotask(() => {
-          trace.push("late native settle");
-          host.state.isSettled = true;
-          host.state.hasPendingAsyncWork = false;
-          host.emit({ type: "session_settled" });
-        }));
-        return false;
-      } });
+      Object.defineProperty(state, "isSettled", {
+        get() {
+          trace.push("busy state");
+          // finishOnce returns immediately after reading false. The first hop
+          // queues the event behind the inner drain's final condition check; the
+          // second emits it before the outer finish() await can resume. There is
+          // no sleep, polling, replaced runtime method, or extra later wakeup.
+          queueMicrotask(() => queueMicrotask(() => {
+            trace.push("late native settle");
+            host.state.isSettled = true;
+            host.state.hasPendingAsyncWork = false;
+            host.emit({ type: "session_settled" });
+          }));
+          return false;
+        }
+      });
       return state;
     };
     host.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "native lane result" }] } });
@@ -7812,7 +8318,7 @@ describe("real Store runtime coordination", () => {
     const reopened = new Store(join(directory, "coordination.sqlite"));
     const transport = new MessengerTransport();
     const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
-    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => {}, {
+    const restarted = new Superagent(config, reopened, transport, join(directory, "extension.ts"), () => { }, {
       connect: async path => {
         if (path !== hostPaths(config, "main").socketPath) throw new Error("Unexpected native adoption");
         return head;
@@ -8001,7 +8507,8 @@ describe("real Store runtime coordination", () => {
     const input: Inbound = { ...headMessage(`unknown-limit-${mode}`, dm),
       attachments: Array.from({ length: mode === "request" ? 3 : 1 }, (_, index) => ({
         id: `file-${index}`, name: "file", url: `telegram-file:file-${index}`, size: null,
-      })) };
+      }))
+    };
     await runtime.start();
     await admit(runtime, input);
     expect(store.input(input.id)?.state).toBe("cancelled");
@@ -8096,10 +8603,12 @@ describe("real Store runtime coordination", () => {
       const host = hosts.get(lane.socketPath)!;
       host.state.goal = { enabled: true, mode: "active" };
       host.state.isStreaming = false;
-      host.emit({ type: "message_end", message: {
-        role: "assistant", content: [{ type: "text", text: "Earlier successful yield" }],
-        stopReason: "stop", api: "openai-responses", provider: "openai", model: "fixture", timestamp: 100,
-      } });
+      host.emit({
+        type: "message_end", message: {
+          role: "assistant", content: [{ type: "text", text: "Earlier successful yield" }],
+          stopReason: "stop", api: "openai-responses", provider: "openai", model: "fixture", timestamp: 100,
+        }
+      });
       host.emit({ type: "prompt_result", id: host.prompts[0]!.id, status: "completed", agentInvoked: true, sessionSettled: false });
       await runtime.kick();
       expect(delegated(store, "230")?.state).toBe("submitted");
@@ -8141,10 +8650,12 @@ describe("real Store runtime coordination", () => {
     await runtime.kick();
     host.state.isStreaming = true;
     host.emit({ type: "agent_start" });
-    host.emit({ type: "message_end", message: {
-      role: "assistant", content: [], stopReason: "error", errorMessage: "Transient provider failure",
-      api: "openai-responses", provider: "openai", model: "fixture", timestamp: 101,
-    } });
+    host.emit({
+      type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "Transient provider failure",
+        api: "openai-responses", provider: "openai", model: "fixture", timestamp: 101,
+      }
+    });
     const recovered = {
       role: "assistant", content: [{ type: "text", text: "Recovered final response" }], stopReason: "stop",
       api: "openai-responses", provider: "openai", model: "fixture", timestamp: 102,
@@ -8169,13 +8680,17 @@ describe("real Store runtime coordination", () => {
     await runtime.start();
     await delegate(runtime, message("232", lane.route));
     const host = hosts.get(lane.socketPath)!;
-    host.emit({ type: "message_end", message: {
-      role: "assistant", content: [{ type: "text", text: "Partial original response" }], stopReason: "stop",
-    } });
+    host.emit({
+      type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "Partial original response" }], stopReason: "stop",
+      }
+    });
     host.state.isStreaming = false;
     host.state.isSettled = true;
-    host.emit({ type: "prompt_result", id: host.prompts[0]!.id, status: "error", agentInvoked: true, sessionSettled: true,
-      error: { message: "Native command-level failure", retryable: false } });
+    host.emit({
+      type: "prompt_result", id: host.prompts[0]!.id, status: "error", agentInvoked: true, sessionSettled: true,
+      error: { message: "Native command-level failure", retryable: false }
+    });
     host.emit({ type: "session_settled" });
     await runtime.kick();
     expect(delegated(store, "232")?.state).toBe("uncertain");

@@ -13,6 +13,7 @@
   "type": "module",
   "packageManager": "bun@1.4.4",
   "files": [
+    "bin/omp-sa-worker",
     "src/",
     "scripts/",
     "skills/",
@@ -27,7 +28,8 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "bin": {
-    "omp-sa": "src/cli.ts"
+    "omp-sa": "src/cli.ts",
+    "omp-sa-worker": "bin/omp-sa-worker"
   },
   "scripts": {
     "build:owner": "bun --no-env-file scripts/build-host-owner.ts --owner",
