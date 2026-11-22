@@ -290,7 +290,7 @@ is a separate explicit apply, not a side effect of setup, doctor or start. Comma
 intake must not wait for a model; Discord's ephemeral admission reply and Slack's
 Socket Mode acknowledgement are not the actual command result.
 
-The head sends model and effort menus through its normal outbox. The Gateway
+The head sends model, effort, and saved-reset menus through its normal outbox. The Gateway
 renders native components and binds each click to the owner, exact sent card,
 physical conversation, and displayed page. Navigation and cancellation only
 edit the card. One final click admits an ordinary durable control receipt on
@@ -301,6 +301,31 @@ minutes, on Gateway restart, or when a new menu of the same kind replaces them
 on the same route.
 The interaction pattern was compared with [Hermes Agent at 242315ce](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/gateway/slash_commands_model.py#L516-L567);
 the catalogue and mutation remain native OMP, and no upstream picker code is used.
+
+`/usage reset` chooses an exact linked account from the configured OMP profile.
+The first click only changes the displayed card revision; Confirm on that
+revision is the only action that admits a reset request. Cancel closes the card
+without admitting any request. The head checks the original sent card and live
+availability, then persists the attempt before asking the installed CLI to
+redeem one currently usable ticket on that account. The native CLI selects
+the ticket; the chat card does not authorize or pin an individual grant.
+Duplicate or interrupted attempts are never replayed. Native success is
+recorded before checking the refreshed balance; a missing receipt never
+implies the ticket was or was not spent. An uncertain attempt holds further
+redemptions for a matching or indistinguishable provider account, even after
+re-login changes the local row or adds identity fields. The operator must check
+the balance and close the original hold with `/resolve` (`!resolve` in Slack).
+Banked tickets that cannot currently be spent are reported separately from
+the selectable accounts, without a Confirm action.
+An admitted reset holds restart handoff until its outcome is durably recorded.
+Account options show the native selector number and, when available, a short
+masked account or organization hint; raw identities never enter the card.
+Capability is checked against the configured binary's `omp usage --help`.
+The [OMP 19.0.0 CLI source](https://github.com/can1357/oh-my-pi/blob/57771ae562b9345e0579bceb2d68d585e3e6927e/packages/coding-agent/src/cli/usage-cli.ts)
+and the installed 19.1.0 CLI expose a read-only `usage reset --json` list
+and a separate `usage reset <provider>/<credential id>` redemption.
+Older executables without the exact-target command show an unsupported state;
+there is no provider fallback or mutation of local quota counters.
 
 Thread capability comes from the authenticated adapter. Permission or network
 failure is not permission to fall back to another destination. Preserve the
@@ -321,9 +346,14 @@ skip archived threads. They do not change tags, archive state, or lane execution
 
 `/help`, `/status`, `/context` and `/usage` are code-handled reads with no model
 turn. [`/usage`](../../src/omp-usage.ts) invokes the configured executable and
-profile with `usage --json --redact --no-extensions` and projects provider quota
-and reset data, without sending account identifiers or raw responses. Unknown
-quota is not zero or an estimate of this session's usage. `/compact` uses native
+profile with `usage --json --redact`, so OMP discovers built-in and extension-provided
+usage sources. Both usage and reset preserve explicit `--no-extensions`,
+`--extension`, `--hook` and `--config` inputs from the configured launch command.
+Neither subprocess receives the Gateway bearer or configured messenger credentials.
+The reply includes safe OMP-masked account names when available, never full
+email addresses, raw IDs, or raw responses. Unrecognized meter names use
+numbered labels rather than publishing provider-controlled text.
+Unknown quota is not zero or an estimate of this session's usage. `/compact` uses native
 compaction and requires an idle eligible head; status and priority stop remain
 available while it runs. `/stop` pauses the bound lane. In an unbound topic a
 reply can select the exact pending placement or the running HEAD request on

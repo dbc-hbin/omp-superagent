@@ -375,7 +375,7 @@ describe("Slack authenticated intake and durable ACK", () => {
       "!newspaper", "!models", "!effortless",
       "quoted !new request", "quoted !model", " !main", " !effort high",
       "!help", "!status", "!stop head", "!stop lane-example", "!context",
-      "!compact preserve the API contract", "!usage", "!model preset", "!model preset high",
+      "!compact preserve the API contract", "!usage", "!usage reset", "!model preset", "!model preset high",
       "!helper", "!statusline", "!contextual", "!compacted", "!usages",
       "quoted !help", " !status", "please !compact now", "trailing !usage",
     ];
@@ -391,7 +391,7 @@ describe("Slack authenticated intake and durable ACK", () => {
       "!newspaper", "!models", "!effortless",
       "quoted !new request", "quoted !model", " !main", " !effort high",
       "/help", "/status", "/stop head", "/stop lane-example", "/context",
-      "/compact preserve the API contract", "/usage", "/model preset", "/model preset high",
+      "/compact preserve the API contract", "/usage", "/usage reset", "/model preset", "/model preset high",
       "!helper", "!statusline", "!contextual", "!compacted", "!usages",
       "quoted !help", " !status", "please !compact now", "trailing !usage",
     ];

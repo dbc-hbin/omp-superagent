@@ -4,7 +4,7 @@
   { "name": "status", "description": "Inspect Superagent HEAD and this conversation's lane, including while busy." },
   { "name": "restart", "description": "Interrupt HEAD work and restart Superagent Gateway and HEAD with the same session and memory." },
   { "name": "context", "description": "Inspect Superagent HEAD context without starting a model turn." },
-  { "name": "usage", "description": "Show Superagent's OMP account quotas and reset times." },
+  { "name": "usage", "description": "Show Superagent's OMP quotas or open the saved reset picker.", "text": "Omit to view quotas, or enter reset to choose an account and confirm using one saved reset." },
   { "name": "cron", "description": "Schedule and manage Superagent jobs in this conversation.", "text": "Use help, add, list, show, edit, pause, resume, run or remove." },
   { "name": "resume", "description": "Resume the Superagent lane bound to this conversation." },
   { "name": "resolve", "description": "Close an uncertain Superagent HEAD or bound lane input without replay.", "text": "Exact uncertain HEAD input ID, or --lane followed by the bound lane's exact input ID." },

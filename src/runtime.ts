@@ -32,7 +32,7 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
 import { headRecoveryEvidence } from "./head-recovery";
 import { isPrObservation, PrWatcher, type PrWatchCommand } from "./pr-watch";
 import { CRON_RUN_PREFIX, CronJobs, type CronCreate } from "./cron-jobs";
-import { readOmpUsage } from "./omp-usage";
+import { couldMatchResetAccount, listOmpUsageResets, OmpResetUnsupported, readOmpUsage, redeemOmpUsageReset, type OmpResetAccount } from "./omp-usage";
 import type { readPrSnapshot } from "./pr-github";
 import { acknowledgeDecision, decisionRequestId, decisionViews, validateDecisionResponse, type DecisionView } from "./decisions";
 import { HEAD_ROTATION_KEY, HEAD_SESSION_FILE_KEY, MIN_HEAD_IDLE_MS, activeHeadSessionFile, readHeadRotation,
@@ -364,6 +364,7 @@ export class Superagent {
   private readonly threadEditQueues = new Map<string, Promise<unknown>>();
   private priorityTail: Promise<void> = Promise.resolve();
   private headCompaction?: { id: string; cancelled: boolean };
+  private headUsageResetActive = false;
   private headStopping = 0;
   private laneMutations = 0;
   private headStopTail: Promise<void> = Promise.resolve();
@@ -505,7 +506,9 @@ export class Superagent {
         const owner = this.store.getMeta(`steering-owner:${input.id}`);
         this.store.settle(input.id, "uncertain", !owner || owner === input.id ? {
           id: `${input.id}:interrupted`,
-          text: "연결이 중단되어 요청 결과가 불확실합니다. 실행을 반복하지 않았습니다. 원래 세션을 확인해 주세요.",
+          text: input.pickerSelection?.confirmed === true
+            ? this.uncertainUsageReset(input)
+            : "연결이 중단되어 요청 결과가 불확실합니다. 실행을 반복하지 않았습니다. 원래 세션을 확인해 주세요.",
         } : undefined);
       }
       for (const live of this.live.values()) {
@@ -1968,14 +1971,19 @@ export class Superagent {
       const argument = Number.isSafeInteger(selection.group) && selection.group >= 0
         && Number.isSafeInteger(selection.option) && selection.option >= 0
         ? picker?.groups[selection.group]?.options[selection.option] : undefined;
-      if (!output || !picker || opener?.name !== picker.kind || opener.argument || !argument
+      const reset = picker?.kind === "usage-reset";
+      const matchesOpener = reset
+        ? opener?.name === "usage" && opener.argument === "reset" && !opener.picker
+          && selection.confirmed === true && selection.group === 0
+        : opener?.name === picker?.kind && opener?.argument === "" && selection.confirmed === undefined;
+      if (!output || !picker || !matchesOpener || !argument
         || input.id !== `picker:${output.id}` || routeKey(input.route) !== routeKey(output.route)
         || typeof selection.cardId !== "string" || !selection.cardId
         || input.messageId !== null || input.interactionId !== undefined || input.invocationId !== undefined
         || input.text !== "" || input.attachments.length) {
         throw new DeliveryError("Picker selection does not match its original owner command and card", "rejected");
       }
-      input = { ...input, route: output.route, text: `/${picker.kind} ${argument}` };
+      input = { ...input, route: output.route, text: reset ? "/usage reset" : `/${picker.kind} ${argument}` };
     }
     const eventId = selection ? null : this.eventOrderId(input);
     const placement = placementText(input);
@@ -3990,7 +3998,7 @@ export class Superagent {
   private restartControllerBusy(): boolean {
     // Pending/uncertain inputs and resident lane execution are durable state to
     // recover, not reasons to refuse a service lifecycle operation.
-    return this.connecting.size > 0 || this.operations.size > 0 || this.laneMutations > 0
+    return this.headUsageResetActive || this.connecting.size > 0 || this.operations.size > 0 || this.laneMutations > 0
       || this.modelChanges.size > 0 || this.callbacks.size > 0 || this.groups?.busy === true
       || [...this.live.values()].some(live => live.preparing > 0 || !!live.releasing);
   }
@@ -4517,7 +4525,8 @@ export class Superagent {
     const preset = this.headPresetCommand(command);
     // /resolve mutates only the durable ledger, never native session state, so it
     // must stay available while the HEAD is busy or its native state is unknown.
-    return command.name === "resolve" || ["help", "status", "context", "usage"].includes(command.name)
+    return command.name === "resolve" || ["help", "status", "context"].includes(command.name)
+      || command.name === "usage" && !command.picker
       || command.name === "effort" && !command.argument
       || !!preset && (!!preset.error || !preset.name)
       || command.name === "model" && ["", "list"].includes(command.argument);
@@ -4575,6 +4584,7 @@ export class Superagent {
         "Supported owner commands (Slack uses ! instead of /, e.g. !status):",
         "/help; /status; /context — read current shared HEAD, even while busy; no model turn.",
         "/usage — view account quotas and reset times from the configured OMP profile; no model turn.",
+        "/usage reset — list usable saved reset tickets. Choose an account and use Confirm to spend one ticket on it. Slack: !usage reset or /superagent-usage reset.",
         "/model and /effort open selection menus. Text commands: /model list; /model <exact provider/id>; /model preset; /model preset list; /model preset <exact-name>; /effort <advertised-level>. Changes require idle, unambiguous HEAD state.",
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
@@ -4916,13 +4926,13 @@ export class Superagent {
     this.background(this.kick().catch(this.report));
   }
 
-  private async headControl(input: InputRecord, command: HeadCommand, earlierMain: boolean, stopTarget?: string): Promise<void> {
-    if (command.name === "cron") { this.cronControl(input.id, command.argument); return; }
-    if (command.name === "usage") {
-      if (command.argument) {
-        this.controlReply(input, "Invalid syntax. Use /usage with no arguments.", "cancelled");
-        return;
-      }
+  private uncertainUsageReset(input: InputRecord): string {
+    const prefix = input.route.platform === "slack" ? "!" : "/";
+    return `OMP가 리셋권 사용을 확인하지 못했습니다. 자동으로 재시도하지 않았습니다. \`${prefix}usage reset\`으로 남은 리셋권을 확인한 뒤 \`${prefix}resolve ${input.id}\`로 보류를 해제할 수 있습니다.`;
+  }
+
+  private async usageControl(input: InputRecord, argument: string): Promise<void> {
+    if (!argument) {
       let text: string;
       try { text = await this.adapters.readOmpUsage(this.config); }
       catch {
@@ -4933,6 +4943,118 @@ export class Superagent {
       this.controlReply(input, text);
       return;
     }
+    if (argument !== "reset") {
+      this.controlReply(input, "Invalid syntax. Use /usage or /usage reset. A ticket can only be spent from the confirmation card.", "cancelled");
+      return;
+    }
+    const prefix = input.route.platform === "slack" ? "!" : "/";
+    const resetCommand = `${prefix}usage reset`;
+    const savedKey = this.store.getMeta("usage-reset:identity-key");
+    const identityKey = savedKey ?? crypto.randomUUID();
+    if (savedKey === null) this.store.setMeta("usage-reset:identity-key", identityKey);
+    const selection = input.pickerSelection;
+    const head = this.live.get("main");
+    if (selection) {
+      if (this.store.output(selection.outputId)?.state === "sending") await this.outbound;
+      const output = this.store.output(selection.outputId);
+      const picker = output?.picker;
+      const stale = () => !head || !this.current(head) || picker?.kind !== "usage-reset"
+        || picker.expiresAt <= Date.now() || picker.generation !== head.generation || picker.sessionId !== head.sessionId
+        || this.stopped || this.headStopping > 0 || !!this.restartFence() || this.headRotationHeld()
+        || !authorizeRoute(this.config, input.route);
+      const account = picker?.kind === "usage-reset" && selection.group === 0 ? picker.accounts[selection.option] : undefined;
+      if (selection.confirmed !== true || output?.state !== "sent" || output.remoteId !== selection.cardId
+        || routeKey(output.route) !== routeKey(input.route) || !account?.identity || stale()) {
+        this.controlReply(input, `만료되었거나 확인할 수 없는 카드입니다. 사용한 리셋권은 없습니다. \`${resetCommand}\`을 다시 열어 주세요.`, "cancelled");
+        return;
+      }
+      const held = this.store.inputs("main", "uncertain").some(prior => {
+        const receipt = prior.pickerSelection;
+        if (receipt?.confirmed !== true) return false;
+        const original = this.store.output(receipt.outputId)?.picker;
+        const priorAccount = original?.kind === "usage-reset" ? original.accounts[receipt.option] : undefined;
+        return !!priorAccount && couldMatchResetAccount(priorAccount, account);
+      });
+      if (held) {
+        this.controlReply(input, `${account.label}: 이전 리셋권 사용 결과가 아직 불확실합니다. 이전 요청의 보류를 해제하기 전에는 이 계정의 리셋권을 다시 사용하지 않습니다.`, "cancelled");
+        return;
+      }
+      let current: OmpResetAccount | undefined;
+      try { current = (await listOmpUsageResets(this.config, identityKey)).find(row => row.target === account.target); }
+      catch {
+        this.controlReply(input, "선택한 계정의 리셋권을 다시 확인할 수 없습니다. 사용한 리셋권은 없습니다.", "cancelled");
+        return;
+      }
+      if (!current || current.unavailable || current.redeemableCount === 0 || current.offer !== account.offer || stale() || !head) {
+        this.controlReply(input, `카드가 만료되었거나 계정의 리셋권 상태가 바뀌었습니다. 사용한 리셋권은 없습니다. \`${resetCommand}\`을 다시 열어 주세요.`, "cancelled");
+        return;
+      }
+      // Persist the one attempt before invoking the CLI. Crash recovery holds
+      // submitted inputs as uncertain; neither callback replay nor recovery spends again.
+      if (!this.store.submit(input.id, `sg-usage-reset-${key(input.id)}`, head.generation)) return;
+      this.headUsageResetActive = true;
+      try {
+        let outcome: Awaited<ReturnType<typeof redeemOmpUsageReset>>;
+        try { outcome = await redeemOmpUsageReset(this.config, current); }
+        catch { outcome = "unconfirmed"; }
+        if (outcome !== "reset") {
+          if (outcome === "unconfirmed") this.controlReply(input, `${account.label}: ${this.uncertainUsageReset(input)}`, "uncertain");
+          else this.controlReply(input, `${account.label}: OMP가 이번 요청에서 리셋권을 사용하지 않았다고 확인했습니다. \`${resetCommand}\`에서 잔액을 확인할 수 있습니다.`, "cancelled");
+          return;
+        }
+        this.controlReply(input, `${account.label}: OMP가 리셋권 1개 사용을 확인했습니다.`);
+        let updated: OmpResetAccount | undefined;
+        try { updated = (await listOmpUsageResets(this.config, identityKey)).find(row => row.target === account.target); }
+        catch { /* Success is authoritative; the independent balance read may fail. */ }
+        const availability = updated && !updated.unavailable
+          ? `남은 리셋권 ${updated.availableCount}개 (지금 사용 가능 ${updated.redeemableCount}개).`
+          : "현재 남은 리셋권은 다시 조회하지 못했습니다.";
+        this.store.queueOutput({ id: `${input.id}:usage-reset-balance`, sourceId: input.id, route: input.route,
+          text: `${account.label}: ${availability}` });
+      } finally {
+        this.headUsageResetActive = false;
+      }
+      return;
+    }
+
+    let accounts: readonly OmpResetAccount[];
+    try { accounts = await listOmpUsageResets(this.config, identityKey); }
+    catch (error) {
+      const detail = error instanceof OmpResetUnsupported
+        ? "설치된 OMP의 `omp usage` CLI는 계정 지정 리셋권 사용을 지원하지 않습니다."
+        : "OMP 리셋권을 조회할 수 없습니다. 로컬에서 같은 프로필로 `omp usage reset`을 확인해 주세요.";
+      this.controlReply(input, detail, "cancelled");
+      return;
+    }
+    const eligible = accounts.filter(row => !row.unavailable && row.redeemableCount > 0);
+    const unavailable = accounts.filter(row => row.unavailable).length;
+    const total = eligible.reduce((sum, row) => sum + BigInt(row.redeemableCount), 0n);
+    const banked = accounts.filter(row => !row.unavailable && row.availableCount > 0 && row.redeemableCount === 0)
+      .map(row => `${row.label} · 보유 ${row.availableCount}개 / 지금 사용 가능 0개`);
+    const summary = `OMP 리셋권 · 사용 가능 계정 ${eligible.length}개 · 지금 사용 가능 ${total}개`
+      + (unavailable ? `\n조회하거나 사용할 수 없는 계정 ${unavailable}개는 합계에서 제외했습니다.` : "");
+    if (!eligible.length || !head || !this.current(head)) {
+      this.controlReply(input, `${summary}\n${eligible.length ? "현재 확인 카드를 열 수 없습니다."
+        : unavailable ? "확인된 사용 가능 리셋권이 없습니다." : "지금 사용할 수 있는 리셋권이 없습니다."}`
+        + (banked.length ? `\n\n${banked.join("\n")}` : ""));
+      return;
+    }
+    const settled = this.store.settle(input.id, "done", {
+      id: `${input.id}:head-control`, text: `${summary}\n계정을 고른 뒤 Confirm을 누르면 그 계정에서 지금 사용 가능한 리셋권 1개가 사용됩니다.`,
+      picker: {
+        kind: "usage-reset", sessionId: head.sessionId, generation: head.generation, expiresAt: Date.now() + headPickerLifetimeMs,
+        groups: [{ label: "OMP 리셋권", options: eligible.map(row =>
+          `${row.label} · 사용 가능 ${row.redeemableCount}개${row.availableCount === row.redeemableCount ? "" : ` / 보유 ${row.availableCount}개`}`) }],
+        accounts: eligible.map(({ target, label, identity, offer }) => ({ target, label, identity, offer })),
+      },
+    });
+    if (settled && banked.length) this.store.queueOutput({ id: `${input.id}:usage-reset-banked`, sourceId: input.id, route: input.route,
+      text: `OMP 리셋권 · 현재 사용 불가\n\n${banked.join("\n")}` });
+  }
+
+  private async headControl(input: InputRecord, command: HeadCommand, earlierMain: boolean, stopTarget?: string): Promise<void> {
+    if (command.name === "cron") { this.cronControl(input.id, command.argument); return; }
+    if (command.name === "usage") { await this.usageControl(input, command.argument); return; }
     if (command.name === "restart") {
       if (this.restartActive === input.id || this.admitRestart(input, command)) await this.runHeadRestart(input);
       return;

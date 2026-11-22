@@ -4,6 +4,7 @@ import type { CronUpdate } from "./cron-jobs";
 import type { GroupReply, GroupRequest } from "./group-policy";
 import type { StagedResultAttachment } from "./result-attachment";
 import type { RemotePlacement } from "./worker-wire";
+import type { OmpResetAccount } from "./omp-usage";
 
 /** Coordination records only. OMP owns transcripts and execution state. */
 export type Platform = "discord" | "telegram" | "slack";
@@ -113,6 +114,8 @@ export interface Inbound {
     readonly cardId: string;
     readonly group: number;
     readonly option: number;
+    /** Emitted only by the reset picker's separate Confirm action. */
+    readonly confirmed?: true;
   };
   text: string;
   /** Physical Discord content when `text` is an addressed command or a confirmed voice draft. */
@@ -226,6 +229,7 @@ export type HeadPicker = {
 } & (
   | { readonly kind: "model"; readonly currentProvider?: string }
   | { readonly kind: "effort"; readonly forModel: LaneModel }
+  | { readonly kind: "usage-reset"; readonly accounts: readonly Pick<OmpResetAccount, "target" | "label" | "identity" | "offer">[] }
 );
 
 export interface KickoffHold {

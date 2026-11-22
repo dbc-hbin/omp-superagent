@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
 import { physicalRouteKey, routeKey } from "../src/contracts";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
@@ -4718,14 +4718,213 @@ describe("messenger head session controls", () => {
 });
 
 describe("priority native head commands", () => {
-  test("usage shows each provider account's remaining quota and resets only in the requesting thread", async () => {
+  test("restart cannot hand off while a confirmed OMP reset is spending", async () => {
+    const { runtime, config, store, messenger, directory, requests, handoff } = restartFixture();
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const readingBalance = Promise.withResolvers<void>();
+    const releaseBalance = Promise.withResolvers<void>();
+    const attemptedHandoff = Promise.withResolvers<void>();
+    handoff.respond = async () => {
+      attemptedHandoff.resolve();
+      throw new Error("Unexpected handoff while the reset still owns its effect");
+    };
+    const provider = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      async fetch(request) {
+        if (new URL(request.url).pathname === "/balance") {
+          readingBalance.resolve();
+          await releaseBalance.promise;
+          return Response.json({ accounts: [] });
+        }
+        started.resolve();
+        await release.promise;
+        return new Response("Reset applied for synthetic account (Codex) — your rate-limit window has been refreshed.\n");
+      },
+    });
+    const executable = join(directory, "omp-reset-in-progress");
+    config.command = [executable];
+    writeFileSync(executable, `#!/bin/sh
+case "$*" in
+  "usage --help") printf '%s\\n' 'omp usage [ACTION] [TARGET]' 'omp usage reset codex/3' ;;
+  "usage reset --json")
+    if [ -f spent ]; then
+      exec curl -fsS --noproxy '*' --max-time 10 "${new URL("/balance", provider.url)}"
+    fi
+    echo '{"accounts":[{"provider":"openai-codex","credentialId":7,"email":"sy*","availableCount":1,"redeemableCount":1,"credits":[{"id":"synthetic"}]}]}' ;;
+  "usage reset openai-codex/7 --redact")
+    touch spent; exec curl -fsS --noproxy '*' --max-time 10 "${provider.url}" ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o700 });
+    try {
+      await runtime.start();
+      await admit(runtime, message("reset-before-restart", route(), "/usage reset"));
+      const card = messenger.sent.find(output => output.sourceId === "reset-before-restart");
+      if (!card?.picker) throw new Error("Expected a sent reset picker");
+      const click = pickerClick(card, 0, 0);
+      if (!click.pickerSelection) throw new Error("Expected a card interaction");
+      await runtime.receive({ ...click, pickerSelection: { ...click.pickerSelection, confirmed: true } });
+      const settlement = runtime.kick();
+      await Promise.race([started.promise, settlement.then(() => { throw new Error("The reset command did not reach the loopback provider"); })]);
+      expect(store.input(click.id)?.state).toBe("submitted");
+      const checkpointResult = messenger.whenSent(messenger.sent.length + 2);
+      await runtime.receive(message("restart-during-reset", route(), "/restart"));
+      await Promise.race([checkpointResult, attemptedHandoff.promise]);
+      expect(requests).toEqual([]);
+      expect(store.output("restart-during-reset:restart-result")?.text).toContain("checkpoint is held");
+      release.resolve();
+      await Promise.race([readingBalance.promise, settlement.then(() => { throw new Error("No balance read followed the confirmed reset"); })]);
+      expect(store.input(click.id)?.state).toBe("done");
+      expect(store.output(`${click.id}:head-control`)?.text).toContain("리셋권 1개 사용을 확인했습니다");
+    } finally {
+      release.resolve();
+      releaseBalance.resolve();
+      await provider.stop();
+      await runtime.kick();
+    }
+  });
+
+  test.each(["reset", "unconfirmed", "refused", "fenced", "no longer usable", "changed offer"] as const)("confirmation handles %s without repeating or changing the selected account", async outcome => {
+    const { runtime, config, main, store, messenger, directory } = fixture();
+    const executable = join(directory, "omp-reset-fixture");
+    config.command = [executable, "--profile", "work", "--no-extensions", "--hook", "provider-extension.ts"];
+    if (outcome === "unconfirmed") config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP",
+      ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+    const alpha = { provider: "openai-codex", credentialId: 7, email: "alpha-private@test", credits: [{ id: "private-codex-credit" }],
+      availableCount: 3, redeemableCount: 2 };
+    const beta = { provider: "anthropic", credentialId: 9, email: "Beta-private@test",
+      ...(outcome === "unconfirmed" ? {} : { accountId: "beta-private-id" }),
+      credits: [{ id: "private-claude-credit" }],
+      availableCount: 1, redeemableCount: 1 };
+    const rows = [alpha, beta, { ...alpha, credentialId: 21, availableCount: 0, redeemableCount: 0 },
+      { ...beta, credentialId: 27, error: "provider secret failure" },
+      { ...beta, credentialId: 28, email: undefined, orgName: "Beta private organization",
+        accountId: "third-private-id", availableCount: 2, redeemableCount: 0 }];
+    writeFileSync(executable, `#!/bin/sh
+case "$*" in
+  "--profile=work usage --help")
+    printf '%s\\n' 'omp usage [ACTION] [TARGET]' 'omp usage reset codex/3' ;;
+  "--profile=work usage reset --json --no-extensions --extension=provider-extension.ts")
+    if [ -f spent ]; then
+      echo '${JSON.stringify({ accounts: [alpha, { ...beta, credentialId: 13, email: "different-private@test" },
+        { ...beta, availableCount: 0, redeemableCount: 0 }, ...rows.slice(2)] })}'
+    elif [ -f changed ]; then
+      echo '${JSON.stringify({ accounts: [alpha, { ...beta, credits: [{ id: "different-credit" }] }, ...rows.slice(2)] })}'
+    elif [ -f relogin ]; then
+      echo '${JSON.stringify({ accounts: [alpha, { ...beta, credentialId: 12, accountId: "new-private-id", orgId: "new-private-org" }, ...rows.slice(2)] })}'
+    else
+      echo '${JSON.stringify({ accounts: rows })}'
+    fi ;;
+  "--profile=work usage reset anthropic/9 --redact --no-extensions --extension=provider-extension.ts")
+    printf '%s\\n' 'anthropic/9' >> attempts
+    ${outcome === "reset" ? "touch spent; printf '%s\\n' 'Reset applied for beta-private-id (Claude) — your rate-limit window has been refreshed.'"
+      : outcome === "refused" ? `echo "be* (Claude): nothing to reset right now — your covered limits aren't constrained, so no credit was spent." >&2; exit 1`
+      : outcome === "fenced" ? `echo 'be* (Claude): another omp process spent a saved reset on this account 1s ago, so this one was not spent. Check \`omp usage\` before spending another.' >&2; exit 1`
+      : outcome === "no longer usable" ? "echo 'be* [Claude]: no saved resets usable right now (private reason).' >&2; exit 1"
+      : `echo 'be* (Claude): couldn’t confirm whether the reset applied — check /usage before trying again — provider-private (Claude): that reset was already redeemed.' >&2; exit 1`} ;;
+  *"usage reset "*)
+    printf '%s\\n' "$*" >> attempts
+    exit 2 ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o700 });
+    await runtime.start();
+    const slackRoute = route("1750000000.000001", { platform: "slack", accountId: "TTEAM:UBOT",
+      authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" });
+    const open = outcome === "unconfirmed" ? message("1750000000.000010", slackRoute, "/usage reset")
+      : applicationCommand("1750000000000000041", route("12"), "/usage reset");
+    await admit(runtime, open);
+    const card = messenger.sent.find(output => output.sourceId === open.id);
+    if (card?.picker?.kind !== "usage-reset") throw new Error("Expected a sent reset picker");
+    expect(card.text).toContain("사용 가능 계정 2개 · 지금 사용 가능 3개");
+    expect(card.text).toContain("계정 1개는 합계에서 제외");
+    const banked = messenger.sent.find(output => output.id === `${open.id}:usage-reset-banked`);
+    expect(banked?.text).toContain("Claude · 계정 #28 · Be… · 보유 2개 / 지금 사용 가능 0개");
+    expect(banked?.route).toEqual(open.route);
+    expect(banked?.picker).toBeUndefined();
+    expect(card.picker.groups[0]?.options).toEqual([
+      "Codex · 계정 #7 · al… · 사용 가능 2개 / 보유 3개", "Claude · 계정 #9 · Be… · 사용 가능 1개",
+    ]);
+    expect(JSON.stringify(card)).not.toContain("private");
+
+    const click = pickerClick(card, 0, 1);
+    if (!click.pickerSelection) throw new Error("Expected a card interaction");
+    const confirmed: Inbound = { ...click, pickerSelection: { ...click.pickerSelection, confirmed: true } };
+    await expect(runtime.receive(click)).rejects.toThrow();
+    await expect(runtime.receive({ ...confirmed, route: { ...open.route, threadId: "13" } })).rejects.toThrow();
+    await expect(runtime.receive({ ...confirmed, route: { ...open.route, authorityId: "8" } })).rejects.toThrow();
+    await admit(runtime, { ...message("usage-reset-text-target", open.route, "/usage reset anthropic/9"),
+      ...(outcome === "unconfirmed" ? { messageId: "1750000000.000002" } : {}) });
+    expect(await Bun.file(join(directory, "attempts")).exists()).toBe(false);
+
+    if (outcome === "changed offer") writeFileSync(join(directory, "changed"), "");
+    await admit(runtime, confirmed);
+    await admit(runtime, confirmed);
+    const attempts = Bun.file(join(directory, "attempts"));
+    if (outcome === "changed offer") expect(await attempts.exists()).toBe(false);
+    else expect(await attempts.text()).toBe("anthropic/9\n");
+    expect(store.input(confirmed.id)?.state).toBe(outcome === "reset" ? "done" : outcome === "unconfirmed" ? "uncertain" : "cancelled");
+    const result = messenger.sent.find(output => output.sourceId === confirmed.id);
+    expect(result?.route).toEqual(open.route);
+    expect(result?.text).toContain(outcome === "reset" ? "리셋권 1개 사용을 확인했습니다"
+      : outcome === "unconfirmed" ? `!resolve ${confirmed.id}`
+      : outcome === "changed offer" ? "리셋권 상태가 바뀌었습니다" : "리셋권을 사용하지 않았다고 확인했습니다");
+    expect(result?.text).not.toContain("private");
+    if (outcome === "reset") {
+      const balance = messenger.sent.find(output => output.id === `${confirmed.id}:usage-reset-balance`);
+      expect(balance?.route).toEqual(open.route);
+      expect(balance?.text).toContain("남은 리셋권 0개");
+    }
+    expect(main.prompts).toEqual([]);
+    if (outcome === "unconfirmed") {
+      expect(result?.text).toContain("!usage reset");
+      writeFileSync(join(directory, "relogin"), "");
+      const secondOpen = message("1750000000.000012", open.route, "/usage reset");
+      await admit(runtime, secondOpen);
+      const freshCard = messenger.sent.find(output => output.sourceId === secondOpen.id);
+      if (freshCard?.picker?.kind !== "usage-reset") throw new Error("Expected a new live balance");
+      const freshClick = pickerClick(freshCard, 0, 1);
+      if (!freshClick.pickerSelection) throw new Error("Expected a fresh card interaction");
+      expect(freshCard.picker.groups[0]?.options[1]).toContain("계정 #12");
+      await admit(runtime, { ...freshClick, pickerSelection: { ...freshClick.pickerSelection, confirmed: true } });
+      expect(await attempts.text()).toBe("anthropic/9\n");
+      expect(store.input(freshClick.id)?.state).toBe("cancelled");
+    }
+  });
+
+  test.each(["empty", "unavailable", "unsupported"] as const)("saved reset discovery distinguishes %s without creating a confirmation card", async state => {
+    const { runtime, config, store, messenger, directory } = fixture();
+    const executable = join(directory, "omp-reset-discovery");
+    config.command = [executable];
+    const row = { provider: "openai-codex", credentialId: 7, credits: [], availableCount: 0, redeemableCount: 0,
+      ...(state === "unavailable" ? { error: "provider diagnostics must never be posted" } : {}) };
+    writeFileSync(executable, `#!/bin/sh
+case "$*" in
+  "usage --help") printf '%s\\n' '${state === "unsupported" ? "omp usage [ACTION]" : "omp usage [ACTION] [TARGET]\nomp usage reset codex/3"}' ;;
+  "usage reset --json") echo '${JSON.stringify({ accounts: [row] })}' ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o700 });
+    await runtime.start();
+    const open = message(`usage-reset-${state}`, route(), "/usage reset");
+    await admit(runtime, open);
+    const output = messenger.sent.find(item => item.sourceId === open.id);
+    expect(output?.picker).toBeUndefined();
+    expect(store.input(open.id)?.state).toBe(state === "unsupported" ? "cancelled" : "done");
+    expect(output?.text).toContain(state === "empty" ? "지금 사용할 수 있는 리셋권이 없습니다"
+      : state === "unavailable" ? "계정 1개는 합계에서 제외" : "CLI는 계정 지정 리셋권 사용을 지원하지 않습니다");
+    expect(output?.text).not.toContain("diagnostics");
+  });
+
+  test("usage shows masked names and quotas from all OMP usage providers only in the requesting thread", async () => {
     const { runtime, config, main, store, messenger, directory } = fixture(3, undefined, { readOmpUsage });
     const executable = join(directory, "omp-usage-fixture");
     config.command = [executable, "--profile", "work", "--model", "fixture/capable"];
     // Opposite ends of the same local day can fall on different UTC dates.
     const generatedAt = new Date(2027, 0, 9, 0, 5).getTime();
     const report = {
-      provider: "openai-codex", fetchedAt: 1, metadata: { email: "private@example.test" }, raw: { token: "private-token" },
+      provider: "openai-codex", fetchedAt: 1, metadata: { email: "wo*d*", orgName: "Te*" }, raw: { token: "private-token" },
       limits: [{
         id: "weekly", label: "All models", scope: { provider: "openai-codex", accountId: "private-account-id" },
         amount: { unit: "percent", remainingFraction: 0.625 },
@@ -4738,7 +4937,7 @@ describe("priority native head commands", () => {
     const snapshot = {
       generatedAt,
       reports: [report, {
-        provider: "openai-codex", fetchedAt: 2, metadata: { email: "private-other@example.test" },
+        provider: "openai-codex", fetchedAt: 2, metadata: { email: "private-other@example.test", accountId: "a9*" },
         limits: [{
           id: "five-hour", label: "5 Hour", scope: { provider: "openai-codex" },
           amount: { unit: "percent", usedFraction: 0.09 },
@@ -4751,12 +4950,21 @@ describe("priority native head commands", () => {
           amount: { unit: "percent", remaining: 7 },
           window: { id: "7d", label: "7 Day" },
         }],
+      }, {
+        provider: "deepai-code", fetchedAt: 4,
+        limits: [{ label: "Daily for meter-private@example.test", scope: { accountId: "de*" },
+          window: { id: "daily", label: "Daily quota org_7b2" },
+          amount: { unit: "requests", remaining: 140, limit: 200 } },
+        { label: "org_7b2", amount: { unit: "account_76532", remaining: 9, limit: 10 } }],
+      }, {
+        provider: "google-antigravity", fetchedAt: 5, metadata: { projectId: "pr*" },
+        limits: [],
       }],
-      accountsWithoutUsage: [{ provider: "openai-codex", email: "private-unreported@example.test" }],
-      disabledCredentials: [{ provider: "openai-codex", email: "private-disabled@example.test" }],
+      accountsWithoutUsage: [{ provider: "openai-codex", email: "un*" }],
+      disabledCredentials: [{ provider: "openai-codex", email: "private-disabled@example.test", orgName: "**Unexpected heading**" }],
     };
     writeFileSync(executable, `#!/bin/sh
-[ "$*" = "--profile=work usage --json --redact --no-extensions" ] || exit 2
+[ "$*" = "--profile=work usage --json --redact" ] || exit 2
 cat <<'EOF'
 ${JSON.stringify(snapshot)}
 EOF
@@ -4769,14 +4977,39 @@ EOF
     const output = messenger.sent.find(output => output.sourceId === input.id);
     expect(output?.route).toEqual(input.route);
     expect(output?.text).toContain(`OMP 사용량 · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
-    expect(output?.text).toContain("Codex · 계정 1\n• 주간 (All models)  62.5% 남음 · 오늘 23:34 초기화");
+    expect(output?.text).toContain("Codex · 계정 1 · wo…d… / Te…\n• 주간 (All models)  62.5% 남음 · 오늘 23:34 초기화");
     expect(output?.text).toContain("0% 남음 · 0 credits 남음 · 한도 도달");
-    expect(output?.text).toMatch(/Codex · 계정 2\n• 5시간  91% 남음 · [^\n]*10[^\n]* 20:15 초기화/);
-    expect(output?.text).toContain("Codex · 계정 3\n• 남은 한도 미확인");
+    expect(output?.text).toMatch(/Codex · 계정 2 · a9…\n• 5시간  91% 남음 · [^\n]*10[^\n]* 20:15 초기화/);
+    expect(output?.text).toContain("Codex · 계정 3 · un…\n• 남은 한도 미확인");
     expect(output?.text).toContain("Codex · 계정 4\n• 계정 비활성화됨");
     expect(output?.text).toContain("Claude\n• 주간 (Sonnet)  7% 남음");
+    expect(output?.text).toContain("deepai-code · de…\n• 일간  70% 남음 · 140 requests 남음\n• 사용량 항목 2  90% 남음");
+    expect(output?.text).toContain("google-antigravity · pr…\n• 남은 한도 미확인");
     expect(output?.text).not.toContain("private");
+    expect(output?.text).not.toMatch(/org_7b2|account_76532/);
+    expect(output?.text).not.toContain("Unexpected heading");
     expect(main.prompts).toHaveLength(1);
+  });
+
+  test("usage respects configured extension policy and overlay order", async () => {
+    const { runtime, config, store, messenger, directory } = fixture(3, undefined, {
+      readOmpUsage: config => readOmpUsage(config, { ...process.env, PI_CONFIG_FILES: "base.yml",
+        OMP_SUPERAGENT_GATEWAY_TOKEN: "fixture-gateway-secret" }),
+    });
+    const executable = join(directory, "omp-usage-explicit-extension");
+    config.command = [executable, "--config", "extra.yml", "--no-extensions", "-e", "local provider.ts",
+      "--config=final policy.yml", "--hook", "usage hook.ts"];
+    writeFileSync(executable, `#!/bin/sh
+[ -z "$OMP_SUPERAGENT_GATEWAY_TOKEN" ] && [ "$PI_CONFIG_FILES" = "base.yml${delimiter}extra.yml${delimiter}final policy.yml" ] &&
+  [ "$#" -eq 6 ] && [ "$1" = usage ] && [ "$2" = --json ] && [ "$3" = --redact ] &&
+  [ "$4" = --no-extensions ] && [ "$5" = "--extension=local provider.ts" ] && [ "$6" = "--extension=usage hook.ts" ] || exit 2
+echo '{"reports":[{"provider":"explicit-extension","limits":[]}]}'
+`, { mode: 0o700 });
+    await runtime.start();
+    const input = message("usage-explicit-extension", route(), "/usage");
+    await admit(runtime, input);
+    expect(store.input(input.id)?.state).toBe("done");
+    expect(messenger.sent.find(output => output.sourceId === input.id)?.text).toContain("explicit-extension");
   });
 
   test.each([0, 1])("usage reports failure without exposing stdout or stderr (CLI exit %i)", async code => {

@@ -10,16 +10,19 @@ use super::socket::Ack;
 use super::wire::{Route, Ts, decode, same_optional, slack_id};
 
 pub(super) fn menu_blocks(menu: &Menu) -> Vec<Value> {
-    let options: Vec<_> = menu
-        .options
-        .iter()
-        .map(|item| json!({ "text": plain(&item.label), "value": item.value }))
-        .collect();
-    let select = json!({
-        "type": "static_select", "action_id": menu.select_id,
-        "placeholder": plain("Choose an option"), "options": options,
+    let select = (!menu.options.is_empty()).then(|| {
+        let options: Vec<_> = menu
+            .options
+            .iter()
+            .map(|item| json!({ "text": plain(&item.label), "value": item.value }))
+            .collect();
+        json!({
+            "type": "static_select", "action_id": menu.select_id,
+            "placeholder": plain("Choose an option"), "options": options,
+        })
     });
-    let elements: Vec<_> = std::iter::once(select)
+    let elements: Vec<_> = select
+        .into_iter()
         .chain(menu.buttons.iter().map(|item| {
             json!({
                 "type": "button", "action_id": item.control,
