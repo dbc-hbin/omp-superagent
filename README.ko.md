@@ -103,7 +103,7 @@ OS 샌드박스가 아닙니다. 자세한 내용은 [설계(영문)](DESIGN.md)
 ## 배포 형태
 
 [npm 패키지](https://www.npmjs.com/package/omp-superagent)를 Bun 또는 npm으로 설치하거나
-[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.8)의 소스·npm tarball을 받으세요.
+[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.7)의 소스·npm tarball을 받으세요.
 실행에는 Bun이 필요하며 독립 실행 바이너리는 아닙니다. 설치 시 관리형 의존성을 준비합니다.
 Host를 실행하려면 별도로 설치한 OMP가 필요하며, 이 프로젝트가 패치하거나 빌드하지 않습니다.
 
@@ -140,7 +140,7 @@ OMP 19 데몬은 이전 브로커의 서비스를 인수하지 않습니다.
 OMP 자체를 설치하려면 [공식 설치 안내](https://github.com/can1357/oh-my-pi#install)를 참고하세요.
 
 ```sh
-bun add --global --trust omp-superagent@0.1.8
+bun add --global --trust omp-superagent@0.1.7
 omp-sa --help
 ```
 
@@ -153,7 +153,7 @@ omp-sa --help
 Bun이 `PATH`에 있다면 npm으로도 설치할 수 있습니다.
 
 ```sh
-npm install --global omp-superagent@0.1.8
+npm install --global omp-superagent@0.1.7
 ```
 
 postinstall이 필수 관리형 omp-superkit 통합을 준비하므로 설치 스크립트를 생략하지 마세요.
@@ -400,7 +400,7 @@ bun run test:ci
 | [실행과 조율(영문)](docs/design/execution.md) | 레인·native Host 수명·모델·workflow·관리형 통합·모니터링·게시판. |
 | [운영 가이드](docs/OPERATIONS.md) | 설치·설정·명령·복구 절차. |
 | [Discord 음성채팅](docs/discord-voice.md) | Codex 구독 음성 또는 별도 과금되는 API 음성 선택. |
-| 릴리즈 | [릴리즈 노트](docs/releases/0.1.8.md) 및 [과거 검증 기록](docs/releases/0.1.0.md#verification-records). |
+| 릴리즈 | [릴리즈 노트](docs/releases/0.1.7.md) 및 [과거 검증 기록](docs/releases/0.1.0.md#verification-records). |
 
 [oh-my-pi](https://github.com/can1357/oh-my-pi)를 기반으로 하며, workflow에는 [omp-superkit](https://github.com/dbc-hbin/omp-superkit)을 사용합니다.
 
