@@ -69,9 +69,25 @@ HEAD 전용 키를 만들고 워커 계정의 `authorized_keys`에
 `IdentitiesOnly yes`를 둔다. HEAD는 `BatchMode`, `StrictHostKeyChecking=yes`, 에이전트·X11·포트
 포워딩 금지, `ControlPath=none`으로만 접속한다.
 
-`authorized_keys` 옵션은 OpenSSH만 적용한다. Tailscale SSH가 받는 주소(tailnet 주소)는 키와
-`authorized_keys`를 보지 않으므로 고정 명령이 우회된다. 별칭의 `HostName`은 OpenSSH가 받는 주소로 두고,
-`ssh <별칭> whoami`가 `whoami` 결과가 아니라 워커 프로토콜 응답을 내는지로 강제 여부를 확인한다.
+`authorized_keys` 옵션은 OpenSSH만 적용한다. Tailscale SSH는 tailnet 주소의 22번 포트를 가로채
+키와 `authorized_keys`를 보지 않으므로 고정 명령이 우회된다. tailnet을 쓰는 워커는 Tailscale SSH(22번)를
+그대로 두고, OpenSSH를 **tailnet 주소의 별도 포트에서만** 받게 한다. 소켓 활성화를 쓰는 Ubuntu 예
+(관리자 권한, 기존 리스너 유지):
+
+```ini
+# /etc/systemd/system/ssh.socket.d/omp-sa-tailnet.conf
+[Socket]
+ListenStream=<tailnet IPv4>:2222
+ListenStream=[<tailnet IPv6>]:2222
+FreeBind=yes
+```
+
+`sshd -t`로 검증한 뒤 `systemctl daemon-reload && systemctl restart ssh.socket`. 소켓 활성화가 아니면
+`sshd_config.d`의 `ListenAddress`로 기존 주소와 함께 추가한다. 워커 키 줄에는 tailnet 대역 제한을 더한다:
+`from="100.64.0.0/10,fd7a:115c:a1e0::/48",restrict,command="…/omp-sa-worker" ssh-ed25519 …`.
+HEAD 별칭은 tailnet 주소와 그 포트(`Port 2222`), 전용 키, `IdentitiesOnly yes`를 쓰고 그 포트의 호스트 키를
+`known_hosts`에 고정한다. `ssh <별칭> whoami`가 `whoami` 결과가 아니라 워커 프로토콜 응답을 내는지,
+`-L` 포워딩이 거부되는지로 확인한다.
 
 #### 4. 사용과 상태
 
