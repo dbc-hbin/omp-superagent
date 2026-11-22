@@ -14,6 +14,7 @@ import { userSshdFacts } from "./worker-user-sshd";
  *     bin/omp-sa-worker-launcher   the ONE fixed, ad-hoc signed LaunchAgent executable; installed once, never replaced
  *     payload                      0600 pointer: the launcher's payload argv (bun + versioned release), one entry per line
  *     grants.json                  0600 record of the one-time privacy grants, written by setup
+ *     boots.json                   0600 the boot the worker was first seen on and later boots its login agents came back on
  */
 export const LAUNCHER_IDENTIFIER = "com.omp-superagent.worker-launcher";
 const SUPPORT_NAME = "omp-superagent-worker";
@@ -26,6 +27,7 @@ export const supportDirectory = (home = homedir()) => join(home, "Library", "App
 export const launcherPath = (support = supportDirectory()) => join(support, "bin", "omp-sa-worker-launcher");
 export const payloadPointerPath = (support = supportDirectory()) => join(support, "payload");
 export const grantsPath = (support = supportDirectory()) => join(support, "grants.json");
+export const bootsPath = (support = supportDirectory()) => join(support, "boots.json");
 
 /** The launcher's pointer grammar: non-empty single-line entries, the first absolute, bounded. */
 export function parsePayloadPointer(text: string): string[] {
@@ -202,17 +204,37 @@ export function macosWorkerStatus(scope: MacosWorkerScope, support = supportDire
   };
 }
 
+/**
+ * Records this boot for the reboot check: the first boot a capability ran on,
+ * and every later boot on which the login brought the worker's launchd agents
+ * back by itself. A capability runs in the GUI login session, so reaching this
+ * code after a reboot proves the login happened; with an own sshd, it must
+ * also be running and listening again. Returns null before the launcher exists.
+ */
+export function recordBoot(support: string, boot: string, agentsBack: boolean): { first: string; verified: string | null } | null {
+  if (!existsSync(launcherPath(support))) return null;
+  let record: { first: string; verified: string[] } | null = null;
+  try { record = JSON.parse(readFileSync(bootsPath(support), "utf8")) as { first: string; verified: string[] }; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (record && (typeof record.first !== "string" || !Array.isArray(record.verified))) throw new RemoteWorkerError("Worker boots record is malformed; remove it and run worker doctor again");
+  const next = record ? { first: record.first, verified: [...record.verified] } : { first: boot, verified: [] };
+  if (boot !== next.first && agentsBack && !next.verified.includes(boot)) next.verified = [...next.verified, boot].slice(-8);
+  if (!isDeepStrictEqual(next, record)) writePrivateFile(bootsPath(support), `${JSON.stringify(next)}\n`);
+  return { first: next.first, verified: next.verified.at(-1) ?? null };
+}
+
 /** The launcher readiness a capability reports (doctor shows it); never touches a protected folder. */
-export function macosWorkerFacts(scope: MacosWorkerScope, support = supportDirectory()): NonNullable<WorkerCapability["macos"]> {
+export function macosWorkerFacts(scope: MacosWorkerScope, boot: string, support = supportDirectory()): NonNullable<WorkerCapability["macos"]> {
   const status = macosWorkerStatus(scope, support);
   let pointer: "current" | "stale" | "absent" = "absent";
   try { pointer = isDeepStrictEqual(parsePayloadPointer(readFileSync(payloadPointerPath(support), "utf8")), workerPayload()) ? "current" : "stale"; }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") pointer = "stale"; }
   const userSshd = userSshdFacts();
+  const reboot = recordBoot(support, boot, !userSshd || (userSshd.state === "running" && userSshd.listening.length > 0));
   return {
     launcher: status.launcher && { path: status.launcher.path, cdhash: status.launcher.cdhash },
     launcherChanged: status.launcherChanged, pointer, missing: status.missing, setup: setupScript(),
-    ...userSshd && { userSshd },
+    ...userSshd && { userSshd }, ...reboot && { reboot },
   };
 }
 

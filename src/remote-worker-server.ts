@@ -49,11 +49,12 @@ async function capability(config: WorkerProvision, env: Record<string, string>):
   let superkit: string | null = null;
   try { superkit = activeManagedUlwRevision().revision; }
   catch { /* Not provisioned (or unusable): HEAD provisions or refuses; never launch it. */ }
+  const boot = bootId();
   return {
-    package: workerPackage(), platform: process.platform, bootId: bootId(), clock: Date.now(), omp: ompVersion, superkit,
+    package: workerPackage(), platform: process.platform, bootId: boot, clock: Date.now(), omp: ompVersion, superkit,
     roots: config.workspaceRoots,
     models: models.flatMap(model => model.kind === "chat" && typeof model.selector === "string" ? [model.selector] : []),
-    ...process.platform === "darwin" && !directWorkerContext() ? { macos: macosWorkerFacts(config) } : {},
+    ...process.platform === "darwin" && !directWorkerContext() ? { macos: macosWorkerFacts(config, boot) } : {},
   };
 }
 

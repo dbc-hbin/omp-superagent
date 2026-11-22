@@ -220,7 +220,18 @@ export function macosDoctorRows(capability: WorkerCapability): DoctorRow[] {
   rows.push(macos.missing.length
     ? { check: "macos grants", status: "fail", detail: `the launcher cannot read ${describeScope(macos.missing)}; ${grantInstruction(macos.launcher.path, macos.setup, macos.missing)}` }
     : { check: "macos grants", status: "ok", detail: "every privacy-protected root and the state directory is covered (or none is protected)" });
-  return [...rows, ...sshdRows];
+  return [...rows, ...sshdRows, ...rebootRows(capability.bootId, macos.reboot)];
+}
+
+/** Whether the launchd agents came back after a reboot and login without anyone at the Mac (recorded by the worker on each capability). */
+function rebootRows(boot: string, reboot: NonNullable<WorkerCapability["macos"]>["reboot"]): DoctorRow[] {
+  if (!reboot) return [];
+  if (reboot.verified) {
+    return [{ check: "macos reboot", status: "ok", detail: `came back after a reboot and login (boot ${reboot.verified.slice(0, 12)}): the GUI session and launchd agents started unattended` }];
+  }
+  return [reboot.first === boot
+    ? { check: "macos reboot", status: "ok", detail: `no reboot since setup (boot ${boot.slice(0, 12)}); the first doctor or launch after the next reboot and login verifies the agents come back` }
+    : { check: "macos reboot", status: "warn", detail: `rebooted since setup (boot ${boot.slice(0, 12)}), but the worker's own sshd is not running and listening again yet` }];
 }
 const PLATFORMS: Readonly<Record<string, PlatformPolicy>> = {
   linux: {

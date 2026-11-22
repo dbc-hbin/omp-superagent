@@ -617,4 +617,13 @@ describe("macOS onboarding", () => {
     // Also reported when the launcher is missing (its own row fails first).
     expect(sshdRow({ state: "running", listening: ["100.64.0.9:2222"] }, { ...ready, launcher: null } as never)).toMatchObject({ status: "ok" });
   });
+
+  test("doctor reports whether the login agents came back after a reboot", () => {
+    const rebootRow = (reboot: { first: string; verified: string | null }) => macosDoctorRows(capability({ ...ready, reboot })).find(row => row.check === "macos reboot");
+    expect(macosDoctorRows(capability(ready)).some(row => row.check === "macos reboot")).toBe(false);
+    // capability() reports boot "b".
+    expect(rebootRow({ first: "b", verified: null })).toMatchObject({ status: "ok", detail: expect.stringContaining("no reboot since setup") });
+    expect(rebootRow({ first: "a", verified: "b" })).toMatchObject({ status: "ok", detail: expect.stringContaining("came back after a reboot and login") });
+    expect(rebootRow({ first: "a", verified: null })).toMatchObject({ status: "warn", detail: expect.stringContaining("not running and listening again") });
+  });
 });

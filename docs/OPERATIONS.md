@@ -176,6 +176,10 @@ omp-sa worker add <이름> --ssh <목적지> --root /Users/<user>/projects --con
 - 전용 키 단계는 `known_hosts`에 이 sshd의 호스트 키(`~/.omp-sa-sshd/ssh_host_ed25519_key.pub`)를 고정한다. 응용 프로그램 방화벽은 Apple 서명
   `/usr/sbin/sshd`의 수신을 대화상자 없이 허용했다.
 - `worker doctor`는 이 LaunchAgent가 있으면 `user sshd` 행으로 launchd 상태와 듣고 있는 소켓을 보여 준다(대화상자 없음).
+- 재부팅·로그아웃 뒤에는 워커 계정이 데스크톱에 다시 로그인해야 이 LaunchAgent와 Host가 돌아온다(로그인 전에는 `gui/<uid>` 도메인이 없다).
+  워커는 capability를 처리할 때마다 지원 디렉터리의 `boots.json`(0600)에 처음 본 부팅과, 그 뒤 로그인만으로 sshd가 다시 실행·수신 중인
+  부팅을 기록한다. `worker doctor`의 `macos reboot` 행은 아직 재부팅이 없으면 그렇다고, 재부팅 뒤 돌아왔으면 그 부팅을 확인됨으로 보여 주고,
+  재부팅했는데 sshd가 돌아오지 않았으면 경고한다. 따라서 다음 실제 재부팅과 로그인 뒤 첫 `doctor`나 레인 시작이 이를 자동으로 확인한다.
 
 멈추려면 워커에서 `launchctl bootout gui/$(id -u)/com.omp-superagent.sshd`를 실행하고 plist와 `~/.omp-sa-sshd/`를 지운다.
 

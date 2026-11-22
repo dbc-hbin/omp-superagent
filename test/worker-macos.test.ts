@@ -5,8 +5,8 @@ import { mkdir, mkdtemp, readdir, realpath, rm, stat, symlink } from "node:fs/pr
 import { homedir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  codesignIdentity, installWorkerLauncher, launcherPath, macosWorkerStatus, parsePayloadPointer, payloadPointerPath, protectedPaths,
-  readGrants, requireMacosWorkerReady, serializePayloadPointer, supportDirectory, tccCategory, writeGrants, writePayloadPointer
+  bootsPath, codesignIdentity, installWorkerLauncher, launcherPath, macosWorkerStatus, parsePayloadPointer, payloadPointerPath, protectedPaths,
+  readGrants, recordBoot, requireMacosWorkerReady, serializePayloadPointer, supportDirectory, tccCategory, writeGrants, writePayloadPointer
 } from "../src/worker-macos";
 import { prepareMacosWorker, setupMacosWorker } from "../src/worker-macos-setup";
 import { macosPrepareScript, newNonce, parseFacts, userSshdApplyScript, userSshdInspectScript } from "../src/worker-setup-remote";
@@ -50,6 +50,19 @@ test("privacy-protected folders are classified by canonical path, and everything
   }
   expect(protectedPaths({ stateDir: "/Users/worker/.osa", workspaceRoots: ["/Users/worker/projects", "/Volumes/E/code"] }, home))
     .toEqual([{ path: "/Volumes/E/code", category: "removable-or-network" }]);
+});
+
+test("the boots record keeps the setup boot and adds later boots only when the login agents came back", async () => {
+  const support = await privateRoot();
+  expect(recordBoot(support, "boot-1", true)).toBeNull();
+  await mkdir(join(support, "bin"), { recursive: true });
+  writeFileSync(launcherPath(support), "");
+  expect(recordBoot(support, "boot-1", true)).toEqual({ first: "boot-1", verified: null });
+  expect(recordBoot(support, "boot-2", false)).toEqual({ first: "boot-1", verified: null });
+  expect(recordBoot(support, "boot-2", true)).toEqual({ first: "boot-1", verified: "boot-2" });
+  expect(recordBoot(support, "boot-2", true)).toEqual({ first: "boot-1", verified: "boot-2" });
+  expect(JSON.parse(readFileSync(bootsPath(support), "utf8"))).toEqual({ first: "boot-1", verified: ["boot-2"] });
+  expect((await stat(bootsPath(support))).mode & 0o777).toBe(0o600);
 });
 
 test("a worker without the launcher is refused with the setup step, before any launch", async () => {

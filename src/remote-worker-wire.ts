@@ -87,6 +87,8 @@ export const capabilitySchema = Type.Object({
     userSshd: Type.Optional(Type.Object({
       state: text(64), listening: Type.Array(text(128), { maxItems: 16 }),
     }, { additionalProperties: false })),
+    /** The boot the worker was first seen on, and the latest later boot whose login brought its launchd agents back unattended. */
+    reboot: Type.Optional(Type.Object({ first: text(64), verified: Type.Union([text(64), Type.Null()]) }, { additionalProperties: false })),
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 /** What a launched Host actually loaded, pinned in the worker reservation. */
