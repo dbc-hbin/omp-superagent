@@ -5,7 +5,7 @@ import {
   renameSync, rmSync, unlinkSync, type Stats,
 } from "node:fs";
 import { dirname, isAbsolute, join, normalize } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 import { privateDirectory } from "./config";
 import { stagePrivateFile } from "./credentials";

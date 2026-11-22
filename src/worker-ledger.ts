@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { closeSync, constants, fstatSync, lstatSync, openSync } from "node:fs";
 import { join } from "node:path";
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 import { releaseCheckout } from "./worker-checkout";
 import { WorkerRefusal } from "./worker-request";

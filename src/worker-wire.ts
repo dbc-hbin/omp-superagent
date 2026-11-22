@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { isAbsolute, join } from "node:path";
-import { Type, type Static, type TSchema } from "@sinclair/typebox";
+import { Type, type Static, type TSchema } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 import type { Lane } from "./contracts";
 import type { HostOptions } from "./host";

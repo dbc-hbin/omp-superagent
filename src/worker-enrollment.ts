@@ -5,7 +5,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "@sinclair/typebox";
+import { Type } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 import { stagePrivateFile } from "./credentials";
 import {

@@ -51,6 +51,20 @@ async function request(policy: WorkerPolicy, payload: object): Promise<unknown> 
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+test("worker requests use data schemas even under the native OMP extension loader", () => {
+  // The stock extension loader remaps the TypeBox package root to callable
+  // tool schemas. Exercise its real module graph in a separate Bun process.
+  const output = execFileSync(process.execPath, ["--no-env-file", "-e", `
+    const { loadLegacyPiModule } = await import("@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat");
+    const { parseWorkerRequest } = await loadLegacyPiModule(${JSON.stringify(join(import.meta.dir, "../src/worker-request.ts"))});
+    const parse = input => parseWorkerRequest(Buffer.from(JSON.stringify(input)));
+    console.log(parse({ version: 1, op: "describe" }).op);
+    try { parse({ version: 1, op: "describe", command: "unexpected" }); }
+    catch (error) { console.log(error.message); }
+  `], { encoding: "utf8", timeout: 20_000 });
+  expect(output.trim().split("\n")).toEqual(["describe", "Invalid worker request"]);
+});
+
 test("scoped describe verifies the pinned directory without allocating worker state", async () => {
   const { root, cwd, policy, ref: { repoId, revision, subdir } } = await fixture();
   try {

@@ -1,6 +1,6 @@
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 import type { WorkerPolicy } from "./worker-wire";
 

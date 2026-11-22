@@ -30,8 +30,8 @@ jobs:
       matrix:
         include:
           # Ubuntu runs three full stock OMP suites; macOS runs two and the oracle replay.
-          - { os: ubuntu-24.04, timeout: 60 }
-          - { os: macos-15, timeout: 45 }
+          - { os: ubuntu-24.04, timeout: 75 }
+          - { os: macos-15, timeout: 60 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
