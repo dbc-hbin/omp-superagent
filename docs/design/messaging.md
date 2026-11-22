@@ -135,25 +135,58 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
 
 ## Topic routing and controls
 
-- The head **controller** receives ordinary input; its **model** does not. Each
-  authenticated original records its intended topic owner at admission. The
-  controller creates a source-bound handoff to that session. A new topic may reuse a
-  workspace, never another topic's transcript. The controller matches repository or
-  directory names in owner text against placed lanes of the same authenticated channel
-  or DM. A reply to a placed original or a sent message on its physical route supplies
-  that task's workspace; the quote body is not evidence. `/new` in a bound thread can
-  reuse that thread's workspace. An explicit `cwd: /absolute/path` takes precedence.
-  With no unique existing directory, ask on the original route; a known name or absolute
-  path selects just one pending original. Neither an edited confirmation nor a stale
-  answer to the workspace question becomes another task. A Slack reply uses the sent question's root timestamp.
-  A retrospective request with a task description can search previous managed native
+- The head **controller** admits authenticated owner inputs and preserves their
+  original source and route. Ordinary messages in a bound topic continue its
+  native session and journal; input for an opening topic stays with that
+  placement. Neither needs a turn in the shared model.
+- Other ordinary unbound inputs go to the shared HEAD model as original,
+  source-bound requests, even if the text names a repository. HEAD answers
+  questions that need no workspace directly. For repository work, it uses scoped
+  evidence from the owner's request and context to discover and verify a directory
+  before dispatch. It asks a focused question only if a material ambiguity remains.
+  Neither a default repository nor the last active lane or chat is evidence of
+  intent. If the original route is an unbound Discord thread, use that thread for
+  any assigned work; create a sibling only on explicit request.
+  An implicit workspace question left over from an older release is not a
+  session binding. A follow-up can reference a single unstarted request in its
+  current Discord thread or DM, or by replying to the exact sent question
+  (including its Slack root timestamp). Submission rechecks that it is still
+  awaiting placement; neither its excerpt nor hints based on it are reused
+  after placement or cancellation. An exact workspace selection still answers
+  the original question without replay.
+- Where there are eligible managed sessions, ordinary HEAD routing automatically
+  checks relevant original owner text against scoped Mnemopi recall and a bounded
+  search of authorized native journals. The read-only pass adds only matching
+  lane, workspace, and session coordinates to the HEAD input, never raw
+  recall results or journal excerpts. Matches do not dispatch work, authorize
+  approvals, or reopen a session. If recall is unavailable, direct journal
+  matches can still inform HEAD; a missing hint does not block ordinary chat.
+  Lookup does not reserve a standalone turn for a steering input after its
+  original turn ends. HEAD verifies useful leads or asks only if material
+  ambiguity remains. Native file and model references in historical data are
+  inert, unlike references in the current owner's task.
+- Explicit `cwd: /absolute/path`, `/new` with a task, an exact reply to a placed
+  original or its delivered message with a verified workspace, and intentional
+  historical lookup use controller placement. Invalid explicit cwd is rejected,
+  not sent to HEAD as ordinary input. A new topic may reuse a workspace, never
+  another topic's transcript. The quote body is not placement evidence; `/new`
+  in a bound thread can reuse that thread's workspace. When explicit placement
+  needs workspace clarification, a known name or absolute path selects just one
+  pending original on its original route. Neither an edited confirmation nor a
+  stale answer becomes another task. A Slack reply uses the sent question's root timestamp.
+- A retrospective request with a task description can search previous managed native
   sessions across the configured owner's currently allowed channels. Search the
-  operator's text, not reply bodies or attachments. Restricted group rooms, HEAD,
-  other bot accounts and unrelated local OMP sessions are not candidates. Natural
+  operator's text, not reply bodies, pasted commands or attachments. Telegram
+  quote and code entities are excluded from lookup, not from the delivered
+  message. Older Telegram records without a verified prose view cannot supply
+  that evidence. For a manager-opened session, verify the live account on the
+  original route as well as the destination, and match the opening request's own
+  completed native receipt even if another input steered the run. Restricted
+  group rooms, HEAD, other bot accounts and unrelated local OMP sessions are not candidates. Natural
   language dates refer to the original request timestamp, using UTC calendar boundaries.
-  This path requires active, searchable Mnemopi on the live head; another
-  enabled backend can satisfy managed startup but is not a substitute for this
-  search. The controller calls the head extension's public `ctx.memory.search`,
+  Unlike ordinary advisory routing, this path requires active, searchable Mnemopi
+  on the live head. Another enabled backend can satisfy managed startup but is not
+  a substitute for this search. The controller calls the head extension's public `ctx.memory.search`,
   which runs the same scoped lookup (`recallResultsScoped`) as OMP's Mnemopi
   `recall` tool. The head does not run a model turn or save a memory. A memory
   hit is a search hint, never a routing decision. Combine corroborated memory
@@ -193,7 +226,7 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   their existing topic behavior.
 - `/head <request>` explicitly addresses the shared coordination model (Slack:
   `!head` or `/superagent-head`). Its manager handoffs keep the original review
-  path. Ordinary topic commentary and final answers instead pass through the
+  path. Bound-topic commentary and final answers instead pass through the
   controller's source-bound outbox without a synthesis turn. Approval cards
   also stay with their original native session and authorized route.
 - Thread-first work sends a short kickoff to the selected topic. The durable
@@ -204,7 +237,9 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   input context without altering previous bindings, approvals or work. Topic
   boundaries are durable; redelivery uses the original binding and editing an
   admitted control cannot move its boundary. Ordinary edits are new revisions,
-  not rollback of effects.
+  not rollback of effects. A DM edit whose original request was placed by HEAD
+  reuses that verified lane, even if a newer topic is now active. If placement
+  is still in progress or cannot be verified, the edit creates no topic.
 - For an active native run, eligible ordinary same-route follow-ups use native
   `steer`. Match the full route including account, authority, thread and topic;
   controls, internal reports and workflow selection do not join the run. Keep
@@ -258,9 +293,12 @@ profile with `usage --json --redact --no-extensions` and projects provider quota
 and reset data, without sending account identifiers or raw responses. Unknown
 quota is not zero or an estimate of this session's usage. `/compact` uses native
 compaction and requires an idle eligible head; status and priority stop remain
-available while it runs. `/stop` pauses the bound lane. In an unbound topic it
-cancels work awaiting workspace clarification, or stops head work when there
-is no such request. Use `/stop head` or a lane ID to name a target. Once admitted to the
+available while it runs. `/stop` pauses the bound lane. In an unbound topic a
+reply can select the exact pending placement or the running HEAD request on
+that route. If the bare command could mean either, or the referenced physical
+message's revisions do not identify one target, report the ambiguity on the
+original route instead of cancelling one by guesswork. Use `/stop head` for
+the global control, or name a lane ID to pause it. Once admitted to the
 head, priority controls and approval answers do not wait for an ordinary model
 turn to finish. [Restart](../../DESIGN.md#explicit-restart)
 is distinct from stopping a task or resuming a topic. `/cron` controls

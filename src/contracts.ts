@@ -100,6 +100,8 @@ export interface Inbound {
     readonly option: number;
   };
   text: string;
+  /** Adapter-verified routing-only view; an empty string excludes the entire message. */
+  readonly routingText?: string;
   receivedAt: number;
   attachments: Attachment[];
   reply?: ReplyContext;
@@ -304,8 +306,19 @@ export interface StorePort {
   kickoffHold(target: string): KickoffHold | null;
   /** The first authorized revision on the physical route, even after settlement. */
   firstAdmittedMessage(route: Route, messageId: string): InputRecord | null;
+  /** Exact logical child of a parent reply; unverified evidence must not select a stop target. */
+  repliedParentTopic(route: Route, messageId: string): Lane | "unverified" | null;
   /** Workspace evidenced by a placed owner message or a confirmed bot reply on this physical route. */
   repliedTopicWorkspace(route: Route, messageId: string): string | null;
+  /** Exact HEAD lane_start placement, including its confirmed kickoff. */
+  headLanePlacement(sourceId: string): Lane | "unverified" | null;
+  /** Resolve one physical reply without treating its quoted content as identity. */
+  repliedStop(route: Route, messageId: string):
+    | { readonly kind: "lane"; readonly lane: Lane; readonly unplaced: readonly InputRecord[] }
+    | { readonly kind: "workspace"; readonly sourceId: string }
+    | { readonly kind: "sources"; readonly sources: readonly InputRecord[] }
+    | { readonly kind: "unverified" | "unknown" };
+  isDiscordWorkspaceQuestion(route: Route, messageId: string): boolean;
   sentOutputForMessage(route: Route, messageId: string): OutputRecord | null;
   /** Actual authorized message IDs in durable admission order; not invocation or edit IDs. */
   admittedMessageIds(route: Route): Iterable<string>;
@@ -415,8 +428,8 @@ export interface Messenger {
   }): Promise<void>;
   send(output: OutputRecord): Promise<string>;
   sendGroup?(reply: GroupReply): Promise<string>;
-  /** Verify against the currently authenticated adapter without sending or fetching messages. */
-  assertRoute?(route: Route): void | Promise<void>;
+  /** Verify the authenticated adapter. History is read-only and may run before intake is acknowledged. */
+  assertRoute?(route: Route, purpose?: "history"): void | Promise<void>;
   /** Cosmetic own reactions on the original message; never an admission or completion receipt. */
   setActivity?(message: MessageReference, activity: MessageActivity): Promise<void>;
   showApproval(approval: Approval): Promise<string>;

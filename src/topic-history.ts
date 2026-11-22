@@ -6,7 +6,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 import { resolveSessionLeafId, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { parseSessionContent } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import type { Lane } from "./contracts";
+import type { Inbound, Lane } from "./contracts";
 import { parseLaneReportResult } from "./lane-report";
 
 export interface TopicMatch {
@@ -38,13 +38,24 @@ const enResume = /\b(?:resume|pick (?:back )?up|go back to|return to|carry on wi
 const enLead = /(?:^|[.!?,]\s+)(?:(?:please|can you|could you|would you|let['’]s)\s+)*(?:resume|pick|go back to|return to|carry on with|continue)\b/iu;
 const koPast = /지난\s*(?:번|주|달)|저번(?:에|주|달)?|이전(?:에)?|예전(?:에)?|그때|아까|어제|(?:하|보|고치|잡|찾|다루|만들|살펴보|해보)던|(?:했|봤|다뤘|고쳤|만들었)던|하던\s*데서|보던\s*데서/gu;
 const koResume = /계속(?:해서|해\s*줘|해줘|해|하|봐\s*줘|봐줘|봐)?|이어서|이어\s*(?:서|가|해\s*줘|해줘|해|봐\s*줘|봐줘|봐)|재개(?:해\s*줘|해줘|해|하)?|마저/gu;
-const inlineQuotes = /"[^"\r\n]*"|“[^”\r\n]*”|‘[^’\r\n]*’|(?<![\p{L}\p{N}])'[^'\r\n]*'|`[^`\r\n]*`/gu;
+const inlineQuotes = /"(?:\\[^\r\n]|[^"\\\r\n])*"|“[^”\r\n]*”|‘[^’\r\n]*’|(?<![\p{L}\p{N}])'(?:\\[^\r\n]|[^'\\\r\n]|'(?=[\p{L}\p{N}]))*'(?![\p{L}\p{N}])/gu;
+const inlineCode = /(?<!`)(`+)(?!`)[^\r\n]*?(?<!`)\1(?!`)/gu;
 const ignored = new Set(`a about again also an and as at back be by can could current day did do for from had have how i in is it last left let me month my of off old on original or our please prior previous same so stuff task that the then there thing this time to topic up us was we were what when where which will with work worked working would you your look looking investigation investigate check track tracking handle tell thanks
 거 걸 것 그 그거 그거를 거기 거기서 거기부터 이거 저거 나 네 다시 다음 데 데서 도 좀 뒤 때 에서 요 여기 이 일 일단 작업 저 제 중 지금 처음 해 하던 해줘 해주세요 봐 봐줘 봐주세요 주세요 처리 처리해 처리해줘 처리해주세요 진행해 진행해줘 진행해주세요 확인해줘 확인해주세요 확인 진행 검토 조사 부탁 과제 관련 부터 까지 보던 봤던 들던 했던 계속 이어서 이어 재개 마저
 ulw ultrawork mass jevify orchestrate workflowz ultrathink`.split(/\s+/));
 const categories = new Set(["bug", "test", "feature", "migration", "change", "inspection", "review", "analysis", "incident"]);
 const recallBoilerplate = new Set(`action agent app assistant authorized build call change code complete confirm context continue conversation current data default detail discuss docs evidence execute file follow help history implement information input journal label lane latest mean memory message model native need nickname note output owner past pending private proceed project prompt record recall recent remember repetition report repo repository request result resume route run search session source standard start status step summary superagent support update use user verify workspace
 결과 계속 기록 내용 대화 메시지 메모 모델 문서 변경 요약 확인 요청 자료 이전 정보 진행 설정 세션 사용자 작업 작업공간 저장소 참고 관련 기본 완료 반복 이어서 재개 워크스페이스`.split(/\s+/));
+const routingBoilerplate = new Set(`action add apply attached build call change compare complete confirm current deploy diagnose discuss examine execute explain find first follow give help implement inspect introduce latest make migrate need new output quick read refactor remove repair replace report reproduce resolve restore review revise run search see set show solve something source specific start step take think troubleshoot try update use verify want write
+검사해줘 고쳐줘 넣어줘 돼 도와줘 봐줄래 수정 수정해줘 알려줘 적용 적용해줘 점검 점검해줘 해결 해결해줘 해줄래`.split(/\s+/));
+const routingCommand = /^(?:![a-z][\w-]*(?:\s|$)|cwd\s*:|[$%❯]\s|(?:\.\.?)?\/\S|go\s+(?:build|run|test|vet)(?:\s|$)|(?:adb|bash|bunx?|cargo|cd|chmod|cp|curl|docker|git|kubectl|ls|node|npx?|npm|pnpm|pwd|python[23]?|rg|rm|sh|sudo|uvx?|yarn|zsh)(?:\s|$))/u;
+const pastedCode = /^(?: {4}| {0,3}(?:\t|(?:const|let|var)\s+\S+\s*=|(?:import|export)\s+(?:\{|["'])|(?:async\s+)?function\s+\w+\s*\(|[\w$.]+\([^)]*\)\s*;?\s*$))/u;
+const shellMultilineCommand = /^(?:cat|echo|env|printf|tee)(?:\s|$)/u;
+const shellEscape = /(?<!\\)(?:\\\\)*\\[ \t]*$/u;
+const shellHereDoc = /^<<(-?)[ \t]*(?:'([^'\r\n]+)'|"([^"\r\n]+)"|\\?([\w.-]+))(?=\s|[;&|<>]|$)/u;
+const shellPrompt = /^[ \t]*[$%❯][ \t]+/u;
+const shellSecondaryPrompt = /^ {0,3}>[ \t]/u;
+const routingHeader = /^\s*\/(?:new|head)(?:[ \t]+|$)/u;
 const aliases = new Map([
   ["로그인", "login"], ["signin", "login"], ["로그아웃", "logout"], ["인증", "authentication"], ["auth", "authentication"],
   ["버그", "bug"], ["문제", "bug"], ["오류", "bug"], ["에러", "bug"], ["issue", "bug"],
@@ -54,18 +65,110 @@ const aliases = new Map([
   ["리다이렉트", "redirect"], ["리디렉션", "redirect"], ["리다이렉션", "redirect"], ["redirection", "redirect"],
 ]);
 
-/** Exclude pasted blocks and quote lines, not inline names of the task. */
-function directText(text: string): string {
+type ShellQuote = "" | "'" | '"' | "`";
+type HereDoc = { readonly delimiter: string; readonly stripTabs: boolean };
+type ShellLine = { readonly quote: ShellQuote; readonly continued: boolean; readonly documents: readonly HereDoc[] };
+
+// Scan only lines already identified as shell. An open string, pipe or heredoc
+// can carry with it arbitrary unindented payload lines that look like requests.
+function shellLine(line: string, opener: ShellQuote): ShellLine {
+  const text = line.trimEnd();
+  const documents: HereDoc[] = [];
+  let quote = opener;
+  let escape = false;
+  let operator = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charAt(i);
+    if (escape) { escape = false; continue; }
+    if (ch === "\\" && quote !== "'") { operator = ""; escape = true; continue; }
+    if (quote) { if (ch === quote) quote = ""; continue; }
+    if (ch === "#" && (i === 0 || /[ \t]/u.test(text.charAt(i - 1)))) break;
+    if (ch === "'" || ch === '"' || ch === "`") { operator = ""; quote = ch; continue; }
+    if (ch === "<" && text.charAt(i - 1) !== "<" && text.charAt(i + 1) === "<") {
+      const match = shellHereDoc.exec(text.slice(i));
+      const delimiter = match?.[2] ?? match?.[3] ?? match?.[4];
+      if (match && delimiter) {
+        documents.push({ delimiter, stripTabs: match[1] === "-" });
+        i += match[0].length - 1;
+      }
+    }
+    if (ch === "|" || ch === "&") operator += ch;
+    else if (ch !== " " && ch !== "\t") operator = "";
+  }
+  return { quote, continued: !!quote || escape || ["|", "|&", "||", "&&"].includes(operator), documents };
+}
+
+function filterOwnerProse(text: string, syntax: string, preserveHeader: boolean): string {
+  const projected = text.split(/\r\n?|\n/u);
+  const source = text === syntax ? projected : syntax.split(/\r\n?|\n/u);
+  if (projected.length !== source.length) return "";
+  const lines: string[] = [];
+  const documents: HereDoc[] = [];
   let fence = "";
-  return text.split(/\r?\n/).filter(line => {
+  let quote: ShellQuote = "";
+  let shellContinued = false;
+  let interactiveShell = false;
+  for (const [index, line] of source.entries()) {
+    const document = documents[0];
+    if (document && !shellContinued) {
+      const value = interactiveShell ? line.replace(shellSecondaryPrompt, "") : line;
+      if ((document.stripTabs ? value.replace(/^\t+/u, "") : value) === document.delimiter) documents.shift();
+      continue;
+    }
     const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
     if (fence) {
       if (marker && marker[1].startsWith(fence) && !marker[2].trim()) fence = "";
-      return false;
+      continue;
     }
-    if (marker) { fence = marker[1]; return false; }
-    return !/^ {0,3}>/.test(line);
-  }).join("\n");
+    if (marker && !shellContinued) { fence = marker[1]; continue; }
+    if (/^ {0,3}>>>(?:\s|$)/u.test(line)) break;
+    const visible = projected[index] ?? "";
+    // Preserve the placement grammar for the controller, but still scan for
+    // shell pasted after an intact /new or /head prefix on this line.
+    const header = preserveHeader && !shellContinued ? routingHeader.exec(visible)?.[0] : undefined;
+    if (preserveHeader && !shellContinued && /^\s*cwd:/u.test(visible)) {
+      lines.push(visible);
+      continue;
+    }
+    const body = header === undefined ? line : line.replace(routingHeader, "");
+    const stripped = body.replace(inlineCode, " ").replace(inlineQuotes, " ");
+    if (!shellContinued && /^ {0,3}>/u.test(line)) continue;
+    const start = stripped.trimStart().normalize("NFKC");
+    const command = routingCommand.test(start);
+    const escaped = shellEscape.test(stripped);
+    if (shellContinued || command || escaped || shellMultilineCommand.test(start)) {
+      // An interactive paste can contain PS2 prompts before continuation lines.
+      if (!shellContinued) interactiveShell = shellPrompt.test(body);
+      const shell = shellLine(interactiveShell ? body.replace(shellContinued ? shellSecondaryPrompt : shellPrompt, "") : body, quote);
+      if (shellContinued || command || escaped || shell.continued || shell.documents.length) {
+        ({ quote, continued: shellContinued } = shell);
+        documents.push(...shell.documents);
+        if (header !== undefined) lines.push(header.trimEnd());
+        continue;
+      }
+    }
+    if (!pastedCode.test(body)) {
+      lines.push(header !== undefined ? visible : text === syntax ? stripped : visible.replace(inlineCode, " ").replace(inlineQuotes, " "));
+    }
+  }
+  return lines.join("\n").trim();
+}
+
+/** Recover only owner prose, never quoted text, pasted code or shell input. */
+export function ownerRoutingProse(text: string): string {
+  return filterOwnerProse(text, text, false);
+}
+
+/**
+ * Preserve transport entity exclusions while recognizing a shell continuation
+ * whose opener itself was hidden. Raw bytes may discard lines, never add text.
+ */
+export function transportRoutingProse(input: Inbound): string {
+  if (input.route.platform !== "telegram") return input.text;
+  const filtered = input.routingText;
+  if (filtered === undefined) return ""; // Pre-upgrade Telegram formatting is not recoverable.
+  if (!filtered || filtered === input.text) return filtered;
+  return filterOwnerProse(filtered, input.text, true);
 }
 
 function wordTokens(text: string): readonly string[] {
@@ -102,13 +205,12 @@ function* excerptWindows(text: string): Iterable<string> {
 }
 
 function visibleLine(text: string, limit: number): string {
-  return directText(text.slice(0, limit)).replace(/[\s\p{Cc}\p{Cf}]+/gu, " ").trim();
+  return ownerRoutingProse(text).slice(0, limit).replace(/[\s\p{Cc}\p{Cf}]+/gu, " ").trim();
 }
 
 function request(text: string) {
-  if (text.length > MAX_QUERY) return null;
-  const clean = directText(text).normalize("NFKC").trim();
-  const intent = clean.replace(inlineQuotes, '""');
+  if (text.length > MAX_QUERY || text.trimStart().startsWith("/")) return null;
+  const intent = ownerRoutingProse(text).normalize("NFKC").trim();
   if (!intent || intent.startsWith("/") || /\b(?:do not|don['’]t|never|not)\s+(?:resume|continue|go back|pick up)\b|(?:계속하|재개하|이어서 하)지\s*마|(?:말고|대신)\s*(?:새|다른)/iu.test(intent)) return null;
   const en = intent.match(enResume) ?? [];
   const historical = [...timePhrases, enPast, koPast].some(pattern => intent.match(pattern));
@@ -116,7 +218,7 @@ function request(text: string) {
     || /^(?:(?:please|can you|could you|would you)\s+)*continue\s+(?:work(?:ing)? on|the|our|that)\b/i.test(intent);
   if (!(en.length && enLead.test(intent) && (qualifiedEnglish || historical)
     || intent.match(koResume) && (historical || /이어서|이어\s*(?:가|해|봐)|재개|마저/u.test(intent)))) return null;
-  const subject = clean.split(/(?:\b(?:and (?:then|also|add|check|fix|verify|run)|then)\b|[.!?]\s+|\n{2,})/iu, 1)[0];
+  const subject = intent.split(/(?:\b(?:and (?:then|also|add|check|fix|verify|run)|then)\b|[.!?]\s+|\n{2,})/iu, 1)[0];
   const terms = words([...timePhrases, enPast, enResume, koPast, koResume]
     .reduce((value, pattern) => value.replace(pattern, " "), subject));
   return terms.size <= 16 && [...terms].some(word => !categories.has(word)) ? { terms, intent, subject: subject.trim() } : null;
@@ -129,6 +231,25 @@ export function refersToPastTopic(text: string): boolean {
 /** Send only the owner's historical subject to native memory, in its original language. */
 export function pastTopicQuery(text: string): string | null {
   return request(text)?.subject ?? null;
+}
+
+function routingRequest(text: string) {
+  if (text.length > MAX_QUERY) return null;
+  const subject = ownerRoutingProse(text).replace(/[\s\p{Cc}\p{Cf}]+/gu, " ").trim();
+  // Past-topic aliases treat "fix" as a bug descriptor. In ordinary text an
+  // action alone should not make one otherwise ambiguous term a direct match.
+  const terms = new Set(wordTokens(subject.replace(/\b(?:fix(?:es|ed|ing)?|debug(?:s|ged|ging)?)\b/giu, " "))
+    .filter(word => !routingBoilerplate.has(word)));
+  return terms.size >= 2 && terms.size <= 16 && [...terms].some(concreteTerm) ? { subject, terms } : null;
+}
+
+export function routingSubject(text: string): string | null {
+  return routingRequest(text)?.subject ?? null;
+}
+
+/** An exact, same-conversation owner source need not pass a search relevance threshold. */
+export function routingExcerpt(text: string): string {
+  return ownerRoutingProse(text).slice(0, EXCERPT);
 }
 
 type RecallItem = { readonly content: string; readonly id?: string; readonly source?: string };
@@ -159,7 +280,7 @@ function recallAnchors(terms: ReadonlySet<string>, items: readonly RecallItem[])
   // Otherwise native semantic search can suggest a turn only with much stronger
   // corroboration: a substantial ordered phrase independently present in its journal.
   for (const { content } of items) {
-    for (const paragraph of directText(content).split(/\n\s*\n/)) {
+    for (const paragraph of ownerRoutingProse(content).split(/\n\s*\n/)) {
       for (const phrase of concretePhrases(paragraph, SEMANTIC_ANCHOR)) anchors.add(phrase.join(" "));
       for (const excerpt of excerptWindows(paragraph)) {
         const seen = words(excerpt);
@@ -178,7 +299,7 @@ function recalledExcerpt(task: string, anchors: ReadonlySet<string>): string {
   // Check the phrase in the original owner lines as well as in the rendered
   // excerpt, where line breaks are collapsed.
   const grounded = new Set<string>();
-  for (const phrase of concretePhrases(task.replace(inlineQuotes, "\n"), RECALL_ANCHORS)) {
+  for (const phrase of concretePhrases(ownerRoutingProse(task), RECALL_ANCHORS)) {
     const key = phrase.join(" ");
     if (anchors.has(key)) grounded.add(key);
   }
@@ -226,7 +347,7 @@ function promptText(content: unknown): string {
 }
 
 /** OMP journals the RPC completion ID; the fenced request identifies its input. */
-function requestDigest(raw: string, lane: Lane): string | undefined {
+function journalRequest(raw: string, lane: Lane) {
   const headers = [...raw.matchAll(/^(`{3,})superagent-runtime-context\nRequest ID: ([^\r\n]{1,512})\n/gm)]
     .sort((a, b) => b[1].length - a[1].length);
   const header = headers[0];
@@ -234,17 +355,23 @@ function requestDigest(raw: string, lane: Lane): string | undefined {
   const scope = raw.slice(header.index + header[0].length, header.index + header[0].length + 4096).split("\n", 12);
   if (scope.includes(`Independent lane ${lane.id}; cwd: ${lane.cwd}`)) {
     // Same request identity used by runtime's prompt submission, excluding generation.
-    return createHash("sha256").update(header[2]).digest("hex").slice(0, 24);
+    const inputId = header[2];
+    const closing = `\n${header[1]}`;
+    const manager = scope.includes("Delivery mode: manager handoff.");
+    const fencedManager = manager && header.index === 0 && raw.endsWith(closing)
+      && !raw.slice(header[0].length, -closing.length).includes(header[1]);
+    const topicReply = scope.includes("Delivery mode: topic reply.");
+    return { inputId, digest: createHash("sha256").update(inputId).digest("hex").slice(0, 24), manager, fencedManager, topicReply };
   }
 }
 
-function completedRequest(data: unknown, lane: Lane, digest: string): boolean {
-  if (!record(data) || data.sessionId !== lane.sessionId || data.sessionFile !== lane.sessionFile || !record(data.frame)) return false;
+function journalReceipt(data: unknown, lane: Lane) {
+  if (!record(data) || data.sessionId !== lane.sessionId || data.sessionFile !== lane.sessionFile || !record(data.frame)) return;
   const { id, type, status, agentInvoked } = data.frame;
-  if (typeof id !== "string" || !id.startsWith(`sg-${digest}-`)) return false;
-  const generation = id.slice(digest.length + 4);
-  return /^[1-9]\d{0,9}$/.test(generation) && Number(generation) <= lane.generation
-    && type === "prompt_result" && status === "completed" && agentInvoked === true;
+  if (typeof id !== "string" || type !== "prompt_result") return;
+  const match = /^sg-([a-f0-9]{24})-([1-9]\d{0,9})$/.exec(id);
+  if (!match || Number(match[2]) > lane.generation) return;
+  return { id, digest: match[1], completed: status === "completed" && agentInvoked === true };
 }
 
 function activeBranch(entries: readonly SessionEntry[]): readonly SessionEntry[] {
@@ -318,6 +445,7 @@ type MatchedTurn = {
   readonly excerpts: readonly [string, ...string[]];
   readonly direct: boolean;
   readonly digest: string | undefined;
+  readonly ownerRequestId: string | undefined;
   proposed?: Checkpoint;
   checkpoint?: Checkpoint;
   summaryInWindow?: boolean;
@@ -332,6 +460,9 @@ type TopicQuery = {
 
 type TopicSelection = { readonly anchors: ReadonlySet<string> } | { readonly entryId: string };
 type JournalQuery = TopicQuery & { readonly selection: TopicSelection };
+/** Resolve durable owner prose only after verifying its route and the exact completion. */
+type OwnerOpening = (lane: Lane, inputId: string, mode: "manager" | "topic",
+  hasCompletion: (requestId: string) => boolean) => Promise<{ readonly text: string; readonly requestId: string } | null>;
 
 function topicQuery(text: string, receivedAt: number): TopicQuery | null {
   const query = request(text);
@@ -339,37 +470,76 @@ function topicQuery(text: string, receivedAt: number): TopicQuery | null {
   return query && window ? { terms: query.terms, window, receivedAt } : null;
 }
 
-function matchJournal(entries: readonly SessionEntry[], lane: Lane, query: JournalQuery): readonly MatchedTurn[] {
+async function matchJournal(entries: readonly SessionEntry[], lane: Lane, query: JournalQuery,
+  ownerOpening?: OwnerOpening): Promise<readonly MatchedTurn[]> {
   const matches: MatchedTurn[] = [];
   const within = (at: number | undefined) => at !== undefined && at >= query.window[0] && at < query.window[1];
+  const entryTime = (entry: SessionEntry) => typeof entry.timestamp === "string" && entry.timestamp.length <= 40
+    ? Date.parse(entry.timestamp) : NaN;
+  const eligible = (at: number) => Number.isFinite(at) && at >= 0 && at <= query.receivedAt;
+  // A steered input can be written before the original completion. Index the
+  // active branch by exact RPC ID instead of letting another turn or receipt
+  // consume the opener's proof. Reports have no such ID; keep their narrower scope.
+  const receipts = new Map<string, { readonly index: number; readonly completed: boolean }>();
+  if (ownerOpening) {
+    for (const [index, entry] of entries.entries()) {
+      if (entry.type !== "custom" || entry.customType !== "rpc_prompt_result" || !eligible(entryTime(entry))) continue;
+      const receipt = journalReceipt(entry.data, lane);
+      if (receipt && !receipts.has(receipt.id)) receipts.set(receipt.id, { index, completed: receipt.completed });
+    }
+  }
   const { selection } = query;
   let current: MatchedTurn | undefined;
-  for (const entry of entries) {
-    const at = typeof entry.timestamp === "string" && entry.timestamp.length <= 40 ? Date.parse(entry.timestamp) : NaN;
+  for (const [index, entry] of entries.entries()) {
+    const at = entryTime(entry);
     const user = entry.type === "message" && record(entry.message) && entry.message.role === "user" ? entry.message : null;
     // Any later native user turn ends the previous request's checkpoint scope,
     // even when its content or date is not usable as evidence.
     if (user) current = undefined;
-    if (!Number.isFinite(at) || at < 0 || at > query.receivedAt) continue;
+    if (!eligible(at)) continue;
     if (user) {
       if ("entryId" in selection && entry.id !== selection.entryId) continue;
       if (user.synthetic === true || user.parentIrc || user.attribution === "agent") continue;
       const raw = promptText(user.content);
-      const task = directText(raw).trim().slice(0, MAX_FIELD);
+      const request = journalRequest(raw, lane);
+      // A manager fence can contain generated instructions and quotes. Use
+      // only the independent original source, never the fenced task bytes.
+      // Telegram's formatting entities are not recoverable from native text.
+      // Workflow envelopes may put raw instructions before or after the fence;
+      // recognizing manager delivery must not depend on the entire turn being fenced.
+      if (request?.manager && !request.fencedManager) continue;
+      const mode = request?.manager ? "manager" : lane.route.platform === "telegram" ? "topic" : null;
+      let ownerText: string;
+      let ownerRequestId: string | undefined;
+      if (mode !== null) {
+        if (!ownerOpening || !request || mode === "topic" && !request.topicReply) continue;
+        const hasCompletion = (id: string) => {
+          const receipt = receipts.get(id);
+          return id.startsWith(`sg-${request.digest}-`) && receipt?.completed === true && receipt.index > index;
+        };
+        const opening = await ownerOpening(lane, request.inputId, mode, hasCompletion);
+        if (opening === null || !hasCompletion(opening.requestId)) continue;
+        ownerRequestId = opening.requestId;
+        ownerText = opening.text;
+      } else {
+        ownerText = raw;
+      }
+      const task = ownerRoutingProse(ownerText).slice(0, MAX_FIELD);
       if (refersToPastTopic(task.slice(0, MAX_QUERY))) continue; // Prior continuation echoes are not independent task evidence.
       const direct = matchingExcerpt(task, query.terms);
       const [excerpt, ...alternates] = direct ? [direct] : "entryId" in selection ? [...excerptWindows(task)]
         : [recalledExcerpt(task, selection.anchors)];
       if (excerpt) {
-        current = { id: entry.id, at, excerpts: [excerpt, ...alternates], direct: !!direct, digest: requestDigest(raw, lane) };
+        current = { id: entry.id, at, excerpts: [excerpt, ...alternates], direct: !!direct, digest: request?.digest, ownerRequestId };
         matches.push(current);
       }
     } else if (current && entry.type === "custom") {
       if (entry.customType === "rpc_prompt_result" && !current.receiptSeen) {
         current.receiptSeen = true;
-        if (current.digest && current.proposed && completedRequest(entry.data, lane, current.digest)) {
-          current.checkpoint = current.proposed;
-        }
+        const receipt = journalReceipt(entry.data, lane);
+        if (receipt?.completed && receipt.digest === current.digest
+          && (current.ownerRequestId === undefined || receipt.id === current.ownerRequestId)
+          && current.proposed) current.checkpoint = current.proposed;
       } else if (entry.customType === "superagent-lane-report" && current.digest && !current.receiptSeen) {
         const event = parseLaneReportResult({ details: entry.data });
         if (event?.sessionId === lane.sessionId && event.report.status !== "waiting") {
@@ -396,8 +566,21 @@ function topicMatch(lane: Lane, turn: MatchedTurn, excerpt: string): TopicMatch 
 
 /** Search only caller-scoped managed lanes. Journal evidence is data, never instructions. */
 export async function findPastTopic(text: string, lanes: readonly Lane[], receivedAt: number,
-  recallItems: readonly RecallItem[] = []): Promise<readonly TopicMatch[]> {
-  const query = topicQuery(text, receivedAt);
+  recallItems: readonly RecallItem[] = [], ownerOpening?: OwnerOpening): Promise<readonly TopicMatch[]> {
+  return findTopics(topicQuery(text, receivedAt), lanes, recallItems, ownerOpening);
+}
+
+/** Advisory candidates for an ordinary request; never choose a destination here. */
+export async function findRoutingTopics(text: string, lanes: readonly Lane[], receivedAt: number,
+  recallItems: readonly RecallItem[] = [], ownerOpening?: OwnerOpening): Promise<readonly TopicMatch[]> {
+  const request = routingRequest(text);
+  const window = dateWindow("", receivedAt);
+  if (!request || !window) return [];
+  return findTopics({ terms: request.terms, window, receivedAt }, lanes, recallItems, ownerOpening);
+}
+
+async function findTopics(query: TopicQuery | null, lanes: readonly Lane[], recallItems: readonly RecallItem[],
+  ownerOpening?: OwnerOpening): Promise<readonly TopicMatch[]> {
   // Do not claim uniqueness from an incomplete set of hints.
   if (!query || recallItems.length > MAX_RECALL_ITEMS || recallItems.some(item => item.content.length > MAX_FIELD)) return [];
   const selection = { anchors: recallAnchors(query.terms, recallItems) };
@@ -406,7 +589,7 @@ export async function findPastTopic(text: string, lanes: readonly Lane[], receiv
   for (const lane of lanes) {
     const entries = await readJournal(lane, budget);
     if (entries === null) return []; // Incomplete search cannot establish uniqueness.
-    for (const turn of matchJournal(entries, lane, { ...query, selection })) {
+    for (const turn of await matchJournal(entries, lane, { ...query, selection }, ownerOpening)) {
       matches.set(JSON.stringify([lane.id, lane.sessionId, turn.id]), topicMatch(lane, turn, turn.excerpts[0]));
     }
   }
@@ -415,12 +598,12 @@ export async function findPastTopic(text: string, lanes: readonly Lane[], receiv
 
 /** Revalidate an admitted evidence pin against its exact active journal entry, without recall. */
 export async function readPastTopic(text: string, lane: Lane, receivedAt: number, entryId: string,
-  evidenceHash: string): Promise<TopicMatch | null> {
+  evidenceHash: string, ownerOpening?: OwnerOpening): Promise<TopicMatch | null> {
   const query = topicQuery(text, receivedAt);
   if (!query || !nativeId.test(entryId) || !/^[a-f0-9]{64}$/.test(evidenceHash)) return null;
   const entries = await readJournal(lane, { remaining: MAX_SEARCH });
   if (entries === null) return null;
-  for (const turn of matchJournal(entries, lane, { ...query, selection: { entryId } })) {
+  for (const turn of await matchJournal(entries, lane, { ...query, selection: { entryId } }, ownerOpening)) {
     for (const excerpt of turn.excerpts) {
       const match = topicMatch(lane, turn, excerpt);
       if (createHash("sha256").update(match.evidence).digest("hex") === evidenceHash) return match;

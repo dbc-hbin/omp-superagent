@@ -6,6 +6,7 @@ mod approval;
 mod cards;
 mod dialog;
 mod effects;
+mod entities;
 mod files;
 mod ingress;
 mod model;

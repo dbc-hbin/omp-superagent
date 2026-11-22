@@ -351,6 +351,23 @@ describe("durable coordination store", () => {
     expect(reopened.input(edited.id)?.discordContext).toEqual(edited.discordContext);
   });
 
+  test("Telegram routing snapshots survive reopen without changing text or legacy replay identity", () => {
+    const { store, path } = fixture();
+    const telegram = route({ platform: "telegram", accountId: "900", authorityId: "42", guildId: null, channelId: "42", threadId: null });
+    const legacy = { ...inbound("telegram:900:42:10:original", telegram), messageId: "10", text: "Legacy quote" };
+    const quoted = { ...inbound("telegram:900:42:11:original", telegram), messageId: "11", text: "Copied plan", routingText: "" };
+    expect(store.receive(legacy, "main")).toBe(true);
+    expect(store.receive(quoted, "main")).toBe(true);
+    store.close();
+
+    const reopened = open(path);
+    expect(reopened.receive({ ...legacy, routingText: "" }, "main")).toBe(false);
+    expect(reopened.receive({ ...quoted, routingText: quoted.text }, "main")).toBe(false);
+    expect(reopened.input(legacy.id)?.routingText).toBeUndefined();
+    expect(reopened.input(quoted.id)).toMatchObject({ text: quoted.text, messageId: "11", routingText: "" });
+    expect(() => reopened.receive({ ...quoted, text: "Different message" }, "main")).toThrow("identity conflict");
+  });
+
   test("nonterminal lane progress coalesces durable receipts without settling or externally delivering lane work", () => {
     const { store, path } = fixture();
     const managed = admitLane(store);

@@ -187,7 +187,9 @@ async fn dispatch(hub: &Arc<Hub>, finish: OnFinish, request: Request) -> WireRes
         "/ready" => hub.mark_ready(revision)?,
         "/receipt" => hub.receipt(revision, &data)?,
         "/detach" => hub.detach(revision)?,
-        "/route" => hub.assert_route(revision, &data).await?,
+        "/route" | "/history/route" => {
+            hub.assert_route(revision, &data, endpoint == "/route").await?;
+        }
         "/effect" => {
             hub.state()?.controller(revision)?;
             return Ok(Json(hub.effect(data).await?).into_response());
@@ -253,7 +255,12 @@ async fn read_json(body: Body) -> WireResult<Value> {
 }
 
 impl Hub {
-    async fn assert_route(&self, revision: u64, data: &Map<String, Value>) -> WireResult<()> {
+    async fn assert_route(
+        &self,
+        revision: u64,
+        data: &Map<String, Value>,
+        require_drained_intake: bool,
+    ) -> WireResult<()> {
         {
             let mut state = self.state()?;
             let client = state.controller(revision)?;
@@ -264,7 +271,9 @@ impl Hub {
             {
                 return Err(rejected("Authenticated messenger route is not ready"));
             }
-            if self.store.pending()? != 0 {
+            // Scheduled dispatch needs the stronger idle-intake fence. Read-only
+            // history runs inside an ingress handler, before that handler's ACK.
+            if require_drained_intake && self.store.pending()? != 0 {
                 return Err(rejected("Gateway intake is still pending"));
             }
         }
@@ -296,6 +305,11 @@ impl Hub {
         self.adapters
             .effect("assertRoute", &[Value::Object(selector)])
             .await?;
+        let mut state = self.state()?;
+        if state.closing {
+            return Err(rejected("Gateway is stopping"));
+        }
+        state.controller(revision)?;
         Ok(())
     }
 }

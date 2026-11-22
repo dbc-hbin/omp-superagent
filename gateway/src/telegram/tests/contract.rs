@@ -58,7 +58,8 @@ async fn poll_ack_only_follows_durable_identity_bound_admission() -> Result<()> 
         original.event,
         json!({
             "kind":"message","input":{"id":"telegram:900:-100:10:original","route":route(),
-                "messageId":"10","receivedAt":100000,"text":"/status  keep 😀","attachments":[]}
+                "messageId":"10","receivedAt":100000,"text":"/status  keep 😀",
+                "routingText":"/status  keep 😀","attachments":[]}
         })
     );
     assert_eq!(
@@ -188,5 +189,117 @@ fn edited_voice_identity_matches_the_prior_gateway_and_excludes_reply_context() 
             "contentType":"audio/ogg","voice":true,"durationSeconds":3.0
         })
     );
+    Ok(())
+}
+
+#[test]
+fn telegram_routing_view_uses_utf16_text_entities_without_changing_the_message() -> Result<()> {
+    let me = serde_json::from_value(json!({"id":900,"is_bot":true,"username":"room_bot"}))?;
+    let policy = Policy::new("42", &["-100".to_owned()])?;
+    let text = "😀 Retry callback\ncopied plan\nmore history\nline two\nfirst();\nsecond();\nchecktokenresult";
+    let entity = |kind, span: &str| -> Result<Value> {
+        let offset = text.find(span).context("entity fixture missing")?;
+        Ok(json!({"type":kind,"offset":text[..offset].encode_utf16().count(),
+            "length":span.encode_utf16().count()}))
+    };
+    let message = serde_json::from_value(json!({
+        "message_id":10,"date":100,"chat":group(),"message_thread_id":7,
+        "from":{"id":42,"is_bot":false},"text":text,
+        "entities":[entity("code", "token")?,entity("bold", "callback")?,
+            entity("blockquote", "copied plan")?,entity("pre", "first();\nsecond();")?,
+            entity("expandable_blockquote", "more history\nline two")?],
+        "caption_entities":[{"type":"code","offset":1,"length":2}]
+    }))?;
+    let input = ingress::normalize(&policy, &me, &message).context("owner message rejected")?;
+    let input = serde_json::to_value(input)?;
+    assert_eq!(input["id"], "telegram:900:-100:10:original");
+    assert_eq!(input["messageId"], "10");
+    assert_eq!(input["text"], text);
+    assert_eq!(input["routingText"], "😀 Retry callback\n\n\n\n\n\ncheck result");
+    Ok(())
+}
+
+#[test]
+fn telegram_invalid_utf16_bounds_exclude_routing_without_dropping_the_owner_input() -> Result<()> {
+    let me = serde_json::from_value(json!({"id":900,"is_bot":true,"username":"room_bot"}))?;
+    let policy = Policy::new("42", &["-100".to_owned()])?;
+    let text = "😀 Resume the cache";
+    let cases = [
+        json!({"type":"pre","offset":1,"length":1}),
+        json!({"type":"pre","offset":0,"length":1}),
+        json!({"type":"code","offset":2,"length":0}),
+        json!({"type":"code","offset":2,"length":100}),
+        json!({"type":"blockquote","offset":2,"length":u64::MAX}),
+        json!({"type":"blockquote","offset":-1,"length":2}),
+        json!({"type":"blockquote","offset":2,"length":"2"}),
+        json!({"type":"expandable_blockquote","offset":2}),
+    ];
+    for entity in cases {
+        let message = serde_json::from_value(json!({
+            "message_id":10,"date":100,"chat":group(),"message_thread_id":7,
+            "from":{"id":42,"is_bot":false},"text":text,"entities":[entity]
+        }))?;
+        let input = ingress::normalize(&policy, &me, &message).context("owner message rejected")?;
+        let input = serde_json::to_value(input)?;
+        assert_eq!(input["text"], text);
+        assert_eq!(input["routingText"], "", "malformed entity {entity}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn telegram_routing_view_survives_caption_edits_and_gateway_replay() -> Result<()> {
+    let mut fixture = Fixture::start().await?;
+    let legacy = json!({"kind":"message","input":{"id":"telegram:900:-100:10:original","route":route(),
+        "messageId":"10","receivedAt":100000,"text":"copied plan","attachments":[]}});
+    assert!(fixture.store.admit(&legacy)?);
+    fixture.hub.ready.send_replace(true);
+    let (_, reply) = fixture.poll().await?;
+    let qualified = "/new@room_bot";
+    let caption = format!("{qualified}\n😀 copied plan\nResume callback review.");
+    let caption_edit = |date, formatted| {
+        let mut entities = vec![json!({"type":"bot_command","offset":0,"length":qualified.len()})];
+        if formatted {
+            entities.push(json!({"type":"blockquote","offset":qualified.len()+1,
+                "length":"😀 copied plan".encode_utf16().count()}));
+        }
+        json!({
+            "message_id":11,"date":101,"edit_date":date,"chat":group(),"message_thread_id":7,
+            "from":{"id":42,"is_bot":false},"caption":caption,"caption_entities":entities,
+            "document":{"file_id":"document_1","file_unique_id":"unique"}
+        })
+    };
+    let original = json!({"message_id":10,"date":100,"chat":group(),"message_thread_id":7,
+        "from":{"id":42,"is_bot":false},"text":"copied plan",
+        "entities":[{"type":"pre","offset":0,"length":11}]});
+    reply
+        .send(json!([
+            {"update_id":4,"message":original},
+            {"update_id":5,"edited_message":caption_edit(102, true)},
+            {"update_id":6,"edited_message":caption_edit(102, false)},
+            {"update_id":7,"edited_message":caption_edit(103, false)}
+        ]))
+        .expect("poll receiver");
+    let (next_poll, _outstanding) = fixture.poll().await?;
+    assert_eq!(next_poll["offset"], 8, "metadata-only replay must not poison the cursor");
+    assert_eq!(fixture.store.pending()?, 3);
+
+    let original = fixture.store.next(None)?.context("original message missing")?;
+    assert_eq!(original.event, legacy);
+    fixture.store.receipt(original.sequence, GatewayReceipt::Accepted)?;
+    let first = fixture.store.next(None)?.context("first edit missing")?;
+    fixture.store.receipt(first.sequence, GatewayReceipt::Accepted)?;
+    let later = fixture.store.next(None)?.context("later edit missing")?;
+    let first = &first.event["input"];
+    let later = &later.event["input"];
+    let visible = "/new\n😀 copied plan\nResume callback review.";
+    assert_eq!(first["text"], visible);
+    assert_eq!(first["routingText"], "/new\n\nResume callback review.");
+    assert_eq!(later["text"], visible);
+    assert_eq!(later["routingText"], visible);
+    assert_ne!(first["id"], later["id"]);
+    assert_eq!(first["messageId"], "11");
+    assert_eq!(later["messageId"], "11");
+    fixture.hub.stop().await?;
     Ok(())
 }

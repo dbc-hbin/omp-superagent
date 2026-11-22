@@ -127,6 +127,7 @@ const toApproval = (row: ApprovalRow): Approval => ({
 });
 const inboundData = (input: Inbound): Inbound => ({
   id: input.id, route: input.route, messageId: input.messageId, text: input.text,
+  ...(input.routingText === undefined ? {} : { routingText: input.routingText }),
   ...(input.interactionId === undefined ? {} : { interactionId: input.interactionId }),
   ...(input.invocationId === undefined ? {} : { invocationId: input.invocationId }),
   ...(input.pickerSelection === undefined ? {} : { pickerSelection: input.pickerSelection }),
@@ -135,9 +136,9 @@ const inboundData = (input: Inbound): Inbound => ({
   receivedAt: input.receivedAt, attachments: input.attachments,
 });
 function inboundIdentity(input: Inbound) {
-  // Referenced messages can be edited/deleted independently. A redelivery never
-  // replaces the contextual snapshot admitted with the owner's original event.
-  const { reply: _reply, discordContext: _context, ...data } = inboundData(input);
+  // Derived routing text and independently edited references do not change the
+  // event identity. Keep the first snapshot, including on pre-upgrade replay.
+  const { reply: _reply, discordContext: _context, routingText: _routingText, ...data } = inboundData(input);
   return {
     ...data,
     // Slack supplies no command timestamp. A transport redelivery has a fresh
@@ -295,10 +296,25 @@ export class Store implements StorePort {
     const revisionOf = this.getMeta(`topic-revision:${source.id}`);
     const original = revisionOf === null ? source : source.messageId === null ? null : this.firstAdmittedMessage(source.route, source.messageId);
     if (!original || revisionOf !== null && (original.id !== revisionOf || original.id === source.id
-      || routeKey(original.route) !== routeKey(source.route) || this.getMeta(`topic-owner:${original.id}`) !== input.target)) {
+      || routeKey(original.route) !== routeKey(source.route))) {
       throw new Error(`Invalid topic revision ancestry: ${source.id}`);
     }
-    const route = this.deliveryRoute(original, input.target);
+    let route: Route;
+    if (revisionOf !== null && original.target === "main" && original.route.guildId === null && original.route.threadId === null) {
+      const placement = this.headLanePlacement(original.id);
+      if (!placement || placement === "unverified" || placement.id !== input.target
+        || routeKey(placement.route) !== routeKey(input.route)
+        || input.id !== `handoff:${source.id}:${placement.id}`
+        || this.getMeta(`handoff-source:${input.id}`) !== source.id) {
+        throw new Error(`Invalid HEAD topic revision placement: ${source.id}`);
+      }
+      route = placement.route;
+    } else {
+      if (revisionOf !== null && this.getMeta(`topic-owner:${original.id}`) !== input.target) {
+        throw new Error(`Invalid topic revision owner: ${source.id}`);
+      }
+      route = this.deliveryRoute(original, input.target);
+    }
     // Preserve the original identity on its own route. A selected work thread
     // uses its exact handoff (which still links to the original owner source).
     const outputSourceId = routeKey(route) === routeKey(source.route) ? source.id : input.id;
@@ -428,31 +444,144 @@ export class Store implements StorePort {
     return row ? toInput(row) : null;
   }
 
+  private admittedMessageRevisions(route: Route, messageId: string): InputRecord[] {
+    return this.db.query<InputRow, [string, string, string, string, string | null, string | null, string]>(
+      `SELECT inputs.* ${ADMITTED_MESSAGE_SCOPE} AND json_extract(inputs.data, '$.messageId') = ? ORDER BY inputs.sequence`,
+    ).all(route.platform, route.channelId, route.accountId, route.authorityId, route.guildId, route.threadId, messageId).map(toInput);
+  }
+
+  /** Recognize a misplaced choice without exposing another thread's question or granting it a vote. */
+  isDiscordWorkspaceQuestion(route: Route, messageId: string): boolean {
+    if (route.platform !== "discord") return false;
+    return this.db.query(`SELECT 1 FROM outputs WHERE state = 'sent' AND (remote_id = ? OR id = ?)
+      AND id = source_id || ':workspace' AND json_extract(route, '$.platform') = 'discord'
+      AND json_extract(route, '$.accountId') = ? AND json_extract(route, '$.authorityId') = ?
+      AND json_extract(route, '$.guildId') IS ? AND json_extract(route, '$.channelId') = ? LIMIT 1`)
+      .get(messageId, this.getMeta(`discord:output-part:${messageId}`), route.accountId, route.authorityId, route.guildId, route.channelId) !== null;
+  }
+
   sentOutputForMessage(route: Route, messageId: string): OutputRecord | null {
+    const scoped = this.outputReceiptsForMessage(route, messageId).filter(output => output.state === "sent");
+    return scoped.length === 1 ? scoped[0] ?? null : null;
+  }
+
+  private outputReceiptsForMessage(route: Route, messageId: string): OutputRecord[] {
     const part = route.platform === "discord" ? this.getMeta(`discord:output-part:${messageId}`) : null;
+    // The Gateway can know a completed multipart send before this controller
+    // durably records its confirmation. Such a part identifies, but does not prove, placement.
     const rows = this.db.query<OutputRow, [string, string | null]>(
-      "SELECT * FROM outputs WHERE state = 'sent' AND (remote_id = ? OR id = ?)",
+      "SELECT * FROM outputs WHERE (state = 'sent' AND remote_id = ?) OR id = ?",
     ).all(messageId, part);
-    const scoped = rows.map(toOutput).filter(output => physicalRouteKey(output.route) === physicalRouteKey(route));
-    return scoped.length === 1 ? scoped[0]! : null;
+    return rows.map(toOutput).filter(output => physicalRouteKey(output.route) === physicalRouteKey(route));
+  }
+
+  repliedParentTopic(route: Route, messageId: string): Lane | "unverified" | null {
+    const placement = this.repliedPlacement(route, messageId, "logical");
+    return placement === "unverified" || placement?.route.topicId ? placement : null;
   }
 
   repliedTopicWorkspace(route: Route, messageId: string): string | null {
-    const original = this.firstAdmittedMessage(route, messageId);
-    const output = this.sentOutputForMessage(route, messageId);
+    const placement = this.repliedPlacement(route, messageId, "workspace");
+    return placement === "unverified" ? null : placement?.cwd ?? null;
+  }
+
+  repliedStop(route: Route, messageId: string): ReturnType<StorePort["repliedStop"]> {
+    const revisions = this.admittedMessageRevisions(route, messageId);
+    const outputs = this.outputReceiptsForMessage(route, messageId);
+    const [output] = outputs;
+    if (outputs.length > 1 || output && (revisions.length || output.state !== "sent" || !output.remoteId)) return { kind: "unverified" };
+    if (output && output.id === `${output.sourceId}:workspace`) return { kind: "workspace", sourceId: output.sourceId };
+    const placement = this.replyLanes(route, revisions, output, "stop");
+    if (placement === "unverified") return { kind: "unverified" };
+    if (placement.lane) return { kind: "lane", lane: placement.lane, unplaced: placement.unplaced };
     const source = output && this.ownerSource(output.sourceId);
-    const sourceIds = new Set([original?.id, source?.id]);
-    const workspaces = new Set<string>();
-    for (const id of sourceIds) {
-      if (!id) continue;
-      const owner = this.getMeta(`topic-owner:${id}`);
-      if (!owner) continue;
-      const creation = this.getMeta(`topic-creator:${id}`);
-      if (this.input(`handoff:${id}:${creation ? "lane" : owner}`)?.target !== owner) continue;
-      const lane = this.lane(owner);
-      if (lane) workspaces.add(lane.cwd);
+    if (source && physicalRouteKey(source.route) === physicalRouteKey(route)) return { kind: "sources", sources: [source] };
+    return revisions.length ? { kind: "sources", sources: revisions } : { kind: "unknown" };
+  }
+
+  private repliedPlacement(route: Route, messageId: string, mode: "logical" | "workspace"): Lane | "unverified" | null {
+    const revisions = this.admittedMessageRevisions(route, messageId);
+    const outputs = this.outputReceiptsForMessage(route, messageId);
+    const [output] = outputs;
+    if (outputs.length > 1 || revisions.length && output) return "unverified";
+    const placement = this.replyLanes(route, revisions, output, mode);
+    return placement === "unverified" ? placement : placement.lane;
+  }
+
+  private replyLanes(route: Route, revisions: readonly InputRecord[], output: OutputRecord | undefined,
+    mode: "logical" | "workspace" | "stop"): { readonly lane: Lane | null; readonly unplaced: readonly InputRecord[] } | "unverified" {
+    // A physical owner message can name several admitted revisions. Exact bot
+    // receipts instead name one source, independent of other revisions.
+    let placement: Lane | null = null;
+    const unplaced: InputRecord[] = [];
+    for (const original of revisions.length ? revisions : [null]) {
+      const lane = this.replyLane(route, original, output, mode);
+      if (lane === "unverified" || lane && placement && lane.id !== placement.id) return "unverified";
+      if (lane) placement = lane;
+      else if (original) unplaced.push(original);
     }
-    return workspaces.size === 1 ? [...workspaces][0]! : null;
+    return { lane: placement, unplaced };
+  }
+
+  private replyLane(route: Route, original: InputRecord | null, output: OutputRecord | undefined,
+    mode: "logical" | "workspace" | "stop"): Lane | "unverified" | null {
+    const head = this.repliedHeadPlacement(original, output, mode === "stop");
+    if (head === "unverified") return head;
+    if (head) return mode === "logical" && head.route.topicId && physicalRouteKey(head.route) !== physicalRouteKey(route) ? "unverified" : head;
+    if (output && output.state !== "sent") return null;
+    const source = original ?? (output ? this.ownerSource(output.sourceId) : null);
+    const owner = source && this.getMeta(`topic-owner:${source.id}`);
+    if (!source || !owner) return null;
+    const creation = this.getMeta(`topic-creator:${source.id}`);
+    const handoff = this.input(`handoff:${source.id}:${creation ? "lane" : owner}`);
+    if (!handoff) return mode === "stop" && source.state !== "pending" && source.state !== "cancelled" ? "unverified" : null;
+    const lane = this.lane(owner);
+    if (!lane || handoff.target !== owner) return mode === "stop" ? "unverified" : null;
+    if (mode === "logical" && (physicalRouteKey(lane.route) !== physicalRouteKey(route)
+      || physicalRouteKey(source.route) !== physicalRouteKey(route))) return null;
+    if (mode !== "workspace") {
+      const kickoff = creation ? this.output(`${source.id}:kickoff`) : null;
+      if (routeKey(handoff.route) !== routeKey(lane.route) || this.getMeta(`handoff-source:${handoff.id}`) !== source.id
+        || creation && (kickoff?.state !== "sent" || !kickoff.remoteId || kickoff.sourceId !== handoff.id
+          || routeKey(kickoff.route) !== routeKey(lane.route))) return mode === "stop" ? "unverified" : null;
+    }
+    return lane;
+  }
+
+  private repliedHeadPlacement(original: InputRecord | null, output: OutputRecord | undefined,
+    includeExplicitHead: boolean): Lane | "unverified" | null {
+    const notice = output?.id.endsWith(":topic-bound");
+    const suffix = notice ? ":topic-bound" : ":kickoff";
+    const origin = original ?? (output?.id.endsWith(suffix) ? this.input(output.id.slice(0, -suffix.length)) : null);
+    if (!origin || origin.target !== "main" || !includeExplicitHead && this.getMeta(`head-routing:${origin.id}`) !== "true") return null;
+    const lane = this.headLanePlacement(origin.id);
+    if (!lane || lane === "unverified" || !output) return lane;
+    if (notice ? output.state !== "sent" || !output.remoteId || output.sourceId !== origin.id || routeKey(output.route) !== routeKey(origin.route)
+      || this.getMeta(`handoff-native:${origin.id}`) !== "true" : output.id !== `${origin.id}:kickoff`) return "unverified";
+    return lane;
+  }
+
+  headLanePlacement(sourceId: string): Lane | "unverified" | null {
+    const origin = this.input(sourceId);
+    if (!origin || origin.target !== "main") return null;
+    const handoff = this.input(`handoff:${sourceId}:lane`);
+    if (!handoff && this.getMeta(`handoff-intent:${sourceId}`) === null) return null;
+    if (this.getMeta(`user-source:${origin.id}`) !== "true" || !handoff
+      || this.getMeta(`handoff-source:${handoff.id}`) !== origin.id) return "unverified";
+    // lane_start registers its exact creation source here; lane_message only
+    // enqueues another input. The deterministic handoff ID alone is not proof.
+    const binding = this.db.query<{ lane_id: string }, [string]>(
+      "SELECT lane_id FROM lane_sources WHERE source_id = ?",
+    ).get(handoff.id);
+    const lane = binding && this.lane(binding.lane_id);
+    if (!lane || handoff.target !== lane.id || routeKey(handoff.route) !== routeKey(lane.route)
+      || (lane.route.topicId ? physicalRouteKey(origin.route) !== physicalRouteKey(lane.route)
+        : physicalRouteKey({ ...origin.route, threadId: null }) !== physicalRouteKey({ ...lane.route, threadId: null }))) return "unverified";
+    const kickoffId = `${origin.id}:kickoff`;
+    const kickoff = this.output(kickoffId);
+    if (this.getMeta(`kickoff-output:${handoff.id}`) !== kickoffId || kickoff?.state !== "sent" || !kickoff.remoteId
+      || kickoff.sourceId !== handoff.id || routeKey(kickoff.route) !== routeKey(lane.route)) return "unverified";
+    return lane;
   }
 
   *admittedMessageIds(route: Route): Iterable<string> {

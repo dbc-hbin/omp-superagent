@@ -4,8 +4,10 @@ Superagent connects one OMP head to Discord, Telegram, and Slack. The head can
 work directly or delegate to independent native OMP sessions called **lanes**.
 The Gateway keeps the messenger connection and durable intake alive without
 running a model. All configured messenger owners are the **same trusted operator**.
-Ordinary owner work stays in the native session bound to its topic. In a
-[bound Discord work thread](docs/design/messaging.md#topic-routing-and-controls),
+Ordinary owner work stays in the native session bound to its topic. Otherwise,
+HEAD takes ordinary requests to answer directly or verify a workspace and assign
+work. Explicit placement and historical lookup remain controller paths.
+In a [bound Discord work thread](docs/design/messaging.md#topic-routing-and-controls),
 historical continuation and its replies stay there unless the operator explicitly
 asks to split. Separately,
 [restricted group rooms](docs/design/messaging.md#restricted-group-rooms) opt
@@ -33,7 +35,7 @@ or lanes. This is not a multitenant service or an OS sandbox.
 | --- | --- | --- |
 | CLI and setup | Configuration, credentials, doctor, start/status/stop and one-shot macOS registration. | [CLI](src/cli.ts), [config](src/config.ts), [setup](src/setup.ts), [credentials](src/credentials.ts), [autostart](src/autostart.ts) |
 | Gateway | One Rust process authenticates the configured adapters, admits intake durably, proxies scoped messenger effects and supervises exactly one head. It never connects to lane RPC or decides work. | [Gateway](gateway/src/main.rs), [server](gateway/src/server.rs), [ingress ledger](gateway/src/store.rs), [client](src/gateway-client.ts), [adapter hub](gateway/src/adapter.rs) |
-| Head | Its controller owns intake, placement, approvals and delivery. The shared model handles explicit `/head` work and manager coordination, not ordinary topic prompts or their answers. | [Head extension](src/extension.ts), [runtime](src/runtime.ts), [coordination store](src/store.ts) |
+| Head | Its controller owns intake, placement, approvals and delivery. The shared model handles ordinary unbound requests, explicit `/head` work and manager coordination, not ordinary bound-topic prompts or their answers. | [Head extension](src/extension.ts), [runtime](src/runtime.ts), [coordination store](src/store.ts) |
 | Lane | Runs its assigned work in its own native session with its own cwd, model and context; reports to the head, not directly to a messenger. | [Lane extension](src/lane-extension.ts), [lane reporting](src/lane-report.ts), [role instructions](skills/lane/SKILL.md) |
 | Host | One installed OMP process owns each managed root session. A detached Rust process owns its stdin/stdout and private reconnectable socket; it does not run inference, tools, or supervision policy. | [Host client](src/host.ts), [stdio owner](host-owner/src/main.rs), [SDK helper](src/host-sdk-helper.ts), [native lifecycle extension](src/host-extension.ts) |
 | Board | An informational log in `coordination.sqlite` shared by registered head/lane sessions in the same instance. Not a command, approval, or delivery bus. | [Board](src/board.ts), [board extension](src/board-extension.ts) |

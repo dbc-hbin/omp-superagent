@@ -22,6 +22,9 @@ impl Adapter for Recorder {
     async fn effect(&self, operation: &str, args: &[Value]) -> Result<Value, EffectError> {
         self.0.send((operation.to_owned(), json!(args)))
             .map_err(|_| EffectError::uncertain("Fixture transport disconnected"))?;
+        if operation == "assertRoute" && args.first().is_none_or(|route| route["accountId"] != "900") {
+            return Err(EffectError::rejected("Fixture bot account does not match"));
+        }
         Ok(json!("sent"))
     }
     async fn attachment(&self, route: &Value, file: &Value) -> Result<reqwest::Response, EffectError> {
@@ -67,6 +70,45 @@ fn admit(ctx: &Context, route: Value, text: &str) -> Result<()> {
 
 fn rpc(operation: &str, args: Value) -> Value {
     json!({"id":Uuid::new_v4().to_string(),"operation":operation,"args":args})
+}
+
+#[tokio::test]
+async fn history_route_verifies_the_live_account_without_draining_pending_intake() -> Result<()> {
+    let root = SocketDir::new()?;
+    let store = Arc::new(Store::open(&root.0)?);
+    let (calls, mut observed) = mpsc::unbounded_channel();
+    let (adapters, _) = make_adapters(&store, "history", &calls)?;
+    adapters.start().await?;
+    let fixture = GatewayClient::with_adapters(&root, store.clone(), Arc::new(LifecycleFixture), adapters).await?;
+    let owner = json!({
+        "platform":"telegram","guildId":null,"channelId":"42","authorityId":"42","accountId":"900","threadId":null
+    });
+    let lookup = json!({"route":owner});
+    assert_eq!(fixture.call("/history/route", &lookup).await?["certainty"], "rejected");
+    assert_eq!(fixture.call("/ready", &json!({})).await?["ok"], true);
+    assert!(store.admit(&json!({"kind":"message","input":{
+        "id":"history-request","route":owner,"text":"Resume the earlier work","messageId":"17","attachments":[]
+    }}))?);
+
+    assert_eq!(fixture.call("/route", &lookup).await?["error"], "Gateway intake is still pending");
+    assert_eq!(fixture.call("/history/route", &lookup).await?["ok"], true);
+    assert_eq!(observed.try_recv()?, ("assertRoute".to_owned(), json!([owner])));
+    let mut wrong_account = lookup.clone();
+    wrong_account["route"]["accountId"] = json!("other-bot");
+    assert_eq!(fixture.call("/history/route", &wrong_account).await?["certainty"], "rejected");
+    assert_eq!(observed.try_recv()?.1, json!([wrong_account["route"]]));
+    assert_eq!(fixture.call("/history/route", &json!({"route":route("-100")})).await?["certainty"], "rejected");
+
+    let mut foreign = fixture.headers.clone();
+    foreign.insert("x-gateway-client", Uuid::new_v4().to_string().parse()?);
+    let denied: Value = fixture.client.post("http://localhost/history/route")
+        .headers(foreign).json(&lookup).send().await?.json().await?;
+    assert_eq!(denied["certainty"], "rejected");
+    assert_eq!(fixture.call("/detach", &json!({})).await?["ok"], true);
+    assert_eq!(fixture.call("/history/route", &lookup).await?["certainty"], "rejected");
+    assert!(observed.try_recv().is_err());
+    assert_eq!(store.pending()?, 1);
+    fixture.server.close().await
 }
 
 #[tokio::test]

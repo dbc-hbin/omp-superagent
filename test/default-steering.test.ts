@@ -419,6 +419,184 @@ describe("native topic binding", () => {
     expect(messenger.creations).toHaveLength(0);
   });
 
+  test.each([
+    ["telegram", "original"],
+    ["discord", "kickoff"],
+  ] as const)("a %s reply to an ordinary HEAD placement's %s stops only its logical lane", async (platform, reference) => {
+    const { runtime, store, messenger, main, select } = fixture(3);
+    messenger.supported = false;
+    const parent = platform === "telegram" ? route(null, { platform, guildId: "-3", channelId: "-3" }) : route(null);
+    await runtime.start();
+    const original = inbound("810", parent, "Inspect the parser");
+    await receive(runtime, original);
+    const first = await runtime.startLane(select(original.id));
+    await receive(runtime, inbound("811", parent, "Investigate an unrelated task"));
+    const second = await runtime.startLane(select("811"));
+    await drain(runtime);
+    expect(first.id).not.toBe(second.id);
+    expect(store.input(original.id)).toMatchObject({ target: "main", state: "submitted", route: parent });
+    expect(store.getMeta(`topic-owner:${original.id}`)).toBeNull();
+    expect(messenger.creations).toEqual([]);
+    const kickoff = store.output(`${original.id}:kickoff`);
+    const messageId = reference === "original" ? original.messageId : kickoff?.remoteId;
+    if (!messageId) throw new Error("Missing exact reply address");
+    const reply = { messageId, authorId: null, text: null };
+    expect(store.repliedTopicWorkspace(parent, messageId)).toBe(first.cwd);
+
+    await receive(runtime, { ...inbound("812", parent, "/stop"), reply });
+    await drain(runtime);
+
+    expect(store.input("812")).toMatchObject({ route: first.route, state: "cancelled" });
+    expect(store.lane(first.id)?.workState).toBe("paused");
+    expect(store.lane(second.id)?.workState).toBe("open");
+    expect(store.input(original.id)?.state).toBe("submitted");
+    expect(main.state.isStreaming).toBe(true);
+  });
+
+  test.each(["edit only", "ambiguous original", "exact kickoff"] as const)(
+    "Telegram reply stop resolves physical message revisions: %s", async target => {
+      const { runtime, store, messenger, main, select } = fixture(3);
+      messenger.supported = false;
+      const parent = route(null, { platform: "telegram", guildId: "-3", channelId: "-3" });
+      const original = inbound("840", parent, "Inspect the first implementation");
+      const edit = { ...original, id: "telegram:2:840:edit:1", text: "Inspect the revised implementation" };
+      await runtime.start();
+      await receive(runtime, original);
+      await receive(runtime, edit);
+      const first = target === "edit only" ? null : await runtime.startLane(select(original.id));
+      const revised = await runtime.startLane(select(edit.id));
+      const reference = target === "exact kickoff" ? store.output(`${edit.id}:kickoff`)?.remoteId : original.messageId;
+      if (!reference) throw new Error("Missing exact reply address");
+      const stop = { ...inbound("841", parent, "/stop"), reply: { messageId: reference, authorId: null, text: null } };
+
+      await receive(runtime, stop);
+      await drain(runtime);
+
+      expect(store.lane(revised.id)?.workState).toBe(target === "ambiguous original" ? "open" : "paused");
+      if (first) expect(store.lane(first.id)?.workState).toBe("open");
+      expect(main.state.isStreaming).toBe(true);
+      expect(store.input(original.id)?.state).toBe("submitted");
+      expect(store.input(edit.id)?.state).toBe("submitted");
+      if (target === "ambiguous original") {
+        expect(store.output(`${stop.id}:control`)).toMatchObject({
+          route: parent, sourceId: stop.id, state: "sent", text: expect.stringContaining("/stop head"),
+        });
+      } else {
+        expect(store.output(`${stop.id}:head-control`)).toMatchObject({
+          route: revised.route, sourceId: stop.id, state: "sent", text: expect.stringContaining(revised.id),
+        });
+      }
+    },
+  );
+
+  test("Telegram reply stop refuses a physical message shared by a lane and an independently active HEAD revision", async () => {
+    const { runtime, store, messenger, main, select } = fixture(2);
+    messenger.supported = false;
+    const parent = route(null, { platform: "telegram", guildId: "-3", channelId: "-3" });
+    const original = inbound("850", parent, "Inspect the first implementation");
+    const edit = { ...original, id: "telegram:2:850:edit:1", text: "Inspect the revised implementation" };
+    await runtime.start();
+    await receive(runtime, original);
+    const lane = await runtime.startLane(select(original.id));
+    main.yield("The original revision was assigned to the lane.");
+    main.result(0);
+    await drain(runtime);
+    expect(store.input(original.id)?.state).toBe("done");
+    await receive(runtime, edit);
+    expect(store.input(edit.id)?.state).toBe("submitted");
+    const stop = { ...inbound("851", parent, "/stop"), reply: { messageId: "850", authorId: null, text: null } };
+
+    await receive(runtime, stop);
+    await drain(runtime);
+
+    expect(store.lane(lane.id)?.workState).toBe("open");
+    expect(store.input(edit.id)?.state).toBe("submitted");
+    expect(main.state.isStreaming).toBe(true);
+    expect(store.output(`${stop.id}:control`)).toMatchObject({
+      route: parent, sourceId: stop.id, state: "sent", text: expect.stringContaining("/stop head"),
+    });
+  });
+
+  test.each(["uncertain kickoff", "unconfirmed Discord kickoff part", "conflicting sent receipts"] as const)("bare reply stop never falls back to HEAD on %s", async failure => {
+    const { runtime, store, messenger, main, select } = fixture(2);
+    messenger.supported = false;
+    if (failure !== "conflicting sent receipts") {
+      const send = messenger.send.bind(messenger);
+      messenger.send = async output => {
+        if (output.id === "820:kickoff") throw new Error("Kickoff send outcome lost");
+        return send(output);
+      };
+    }
+    const parent = route(null);
+    await runtime.start();
+    const original = inbound("820", parent, "Inspect the parser");
+    await receive(runtime, original);
+    let messageId = original.id;
+    if (failure !== "conflicting sent receipts") {
+      await expect(runtime.startLane(select(original.id))).rejects.toThrow("Kickoff delivery is not confirmed");
+      expect(store.output(`${original.id}:kickoff`)?.state).toBe("uncertain");
+      if (failure === "unconfirmed Discord kickoff part") {
+        messageId = "824";
+        store.setMeta(`discord:output-part:${messageId}`, `${original.id}:kickoff`);
+      }
+    } else {
+      await runtime.startLane(select(original.id));
+      const kickoff = store.output(`${original.id}:kickoff`);
+      if (!kickoff?.remoteId) throw new Error("Missing kickoff receipt");
+      messageId = kickoff.remoteId;
+      store.queueOutput({ id: "collision", sourceId: original.id, route: parent, text: "A different delivered output" });
+      store.claimOutput("collision");
+      store.finishOutput("collision", "sent", messageId);
+    }
+    const reply = { messageId, authorId: null, text: null };
+    const [lane] = store.lanes();
+    if (!lane) throw new Error("Missing registered lane");
+
+    const stop = { ...inbound("821", parent, "/stop"), reply };
+    await receive(runtime, stop);
+    await drain(runtime);
+    await receive(runtime, stop);
+
+    expect(store.repliedTopicWorkspace(parent, messageId)).toBeNull();
+    expect(store.input(stop.id)).toMatchObject({ route: parent, state: "cancelled" });
+    expect(store.output(`${stop.id}:control`)).toMatchObject({ route: parent, sourceId: stop.id, state: "sent",
+      text: expect.stringContaining("/stop head") });
+    expect(messenger.sent.filter(output => output.sourceId === stop.id)).toHaveLength(1);
+    expect(main.state.isStreaming).toBe(true);
+    expect(store.lane(lane.id)?.workState).toBe("open");
+    await receive(runtime, { ...headInbound("822", parent, "Keep this coordination turn in HEAD"), reply });
+    expect(store.input("822")).toMatchObject({ route: parent, target: "main" });
+    await receive(runtime, { ...inbound("823", parent, "/stop head"), reply });
+    await drain(runtime);
+    expect(main.state.isStreaming).toBe(false);
+    expect(store.lane(lane.id)?.workState).toBe("open");
+  });
+
+  test("workspace reuse recognizes the exact HEAD kickoff and native binding notice, not a general HEAD reply or foreign route", async () => {
+    const { runtime, store, main, select } = fixture(2);
+    const parent = route(null);
+    await runtime.start();
+    const original = inbound("830", parent, "Inspect the parser");
+    await receive(runtime, original);
+    const lane = await runtime.startLane(select(original.id));
+    main.yield("Acknowledged.");
+    main.result(0);
+    await drain(runtime);
+    const kickoff = store.output(`${original.id}:kickoff`)?.remoteId;
+    const notice = store.output(`${original.id}:topic-bound`)?.remoteId;
+    const answer = store.output(`${original.id}:answer`)?.remoteId;
+    if (!kickoff || !notice || !answer) throw new Error("Missing confirmed native placement and HEAD receipts");
+
+    expect(store.repliedTopicWorkspace(lane.route, kickoff)).toBe(lane.cwd);
+    expect(store.repliedTopicWorkspace(parent, notice)).toBe(lane.cwd);
+    expect(store.repliedTopicWorkspace(parent, answer)).toBeNull();
+    for (const other of [
+      { ...parent, accountId: "99" }, { ...parent, authorityId: "99" },
+      { ...parent, guildId: "99" }, { ...parent, channelId: "99" },
+      { ...parent, threadId: "99" }, { ...parent, platform: "telegram" as const },
+    ]) expect(store.repliedTopicWorkspace(other, notice)).toBeNull();
+  });
+
   test("capability failure is not unsupported, and ambiguous creation is never replayed", async () => {
     const { runtime, store, messenger, select } = fixture();
     await runtime.start();

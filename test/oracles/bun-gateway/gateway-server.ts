@@ -232,17 +232,18 @@ export class GatewayServer {
       client.events?.destroy();
       this.client = undefined;
       json(response, { ok: true });
-    } else if (endpoint === "/route") {
+    } else if (endpoint === "/route" || endpoint === "/history/route") {
       const messenger = this.options.messenger;
       if (!this.admissionReady || !client.ready || !client.reconciled || client.reconciliation || !messenger.assertRoute)
         throw new DeliveryError("Authenticated messenger route is not ready", "rejected");
-      if (this.options.store.pending() !== 0) throw new DeliveryError("Gateway intake is still pending", "rejected");
+      if (endpoint === "/route" && this.options.store.pending() !== 0) throw new DeliveryError("Gateway intake is still pending", "rejected");
       const { platform, accountId, authorityId, guildId, channelId, threadId, topicId } = record(data.route);
       if ((platform !== "discord" && platform !== "telegram" && platform !== "slack")
         || typeof accountId !== "string" || typeof authorityId !== "string" || typeof channelId !== "string"
         || guildId !== null && typeof guildId !== "string" || threadId !== null && typeof threadId !== "string"
         || topicId !== undefined && typeof topicId !== "string") throw new DeliveryError("Invalid messenger route", "rejected");
       await messenger.assertRoute({ platform, accountId, authorityId, guildId, channelId, threadId, ...(topicId === undefined ? {} : { topicId }) });
+      if (this.closing || this.client !== client) throw new DeliveryError("Gateway client is detached or stopping", "rejected");
       json(response, { ok: true });
     } else if (endpoint === "/effect") {
       const task = this.effect(data, response);
