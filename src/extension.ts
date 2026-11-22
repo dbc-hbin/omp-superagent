@@ -14,6 +14,7 @@ import { NativePresetManager } from "./native-presets";
 import { publishNativeSession } from "./native-sessions";
 import { MODEL_PRESET_NAMES, WORKFLOW_NAMES } from "./contracts";
 import type { PrWatchCommand } from "./pr-watch";
+import type { LaneWatchCommand } from "./lane-watch";
 import { registerDecisionAsk } from "./decision-tool";
 import { registerResultAttach, RESULT_ATTACH_TOOL } from "./result-attachment";
 import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent, type RotationProbeEvent } from "./head-rotation";
@@ -27,7 +28,9 @@ const managerTools: Record<string, true> = {
   lane_models: true, lane_init_presets: true, lane_set_model: true, lane_review_decision: true,
   lane_start: true, lane_inspect: true, lane_message: true,
   lane_pause: true, lane_resume: true, lane_close: true,
+  lane_watch: true,
   thread_inspect: true, lane_thread_update: true,
+  messenger_presence: true,
   discord_context: true, discord_purpose_list: true, discord_purpose_set: true, discord_purpose_clear: true,
   pr_watch: true, pr_watch_list: true,
   decision_list: true, decision_inspect: true, decision_withdraw: true,
@@ -78,6 +81,18 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     if (!runtime) throw new Error("The head controller is unavailable for result delivery");
     return runtime.requestResultAttachment(intent);
   });
+  pi.registerTool({
+    name: "messenger_presence", label: "Inspect or change this bot's presence", approval: "exec",
+    description: "Use for an explicit owner request to keep this bot online, inspect its presence, or turn its online indicator off. Use the current original owner sourceId. Scope is this messenger account, not a person, PR or lane. Pass platform if the owner named one. start/stop change Discord presence only; stop requests invisible without stopping message intake. Report desired vs lastSent on the authenticated connection, never a confirmed visible dot or HEAD readiness. Slack/Telegram return a capability limitation.",
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("start"), Type.Literal("status"), Type.Literal("stop")]),
+      sourceId: Type.String({ minLength: 1 }),
+      platform: Type.Optional(Type.Union([Type.Literal("discord"), Type.Literal("slack"), Type.Literal("telegram")])),
+    }, { additionalProperties: false }),
+    async execute(_id, params, _signal, _update, ctx) {
+      return result(await requireRuntime(ctx).messengerPresence(params.sourceId, params.action, params.platform));
+    },
+  });
   const nativePresets = (ctx: ExtensionContext): Promise<NativePresetManager> => {
     requireRuntime(ctx);
     return presets ??= Settings.loadReadOnly({ cwd: ctx.cwd }).then(settings => new NativePresetManager(
@@ -108,6 +123,10 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     if (scoped.length !== active.length) await pi.setActiveTools(scoped);
   });
   pi.on("tool_call", (event, ctx) => {
+    if (runtime?.prObservationActive())
+      return { block: true, reason: "PR observation turns cannot use tools; summarize the observed evidence only" };
+    if (event.toolName === "lane_watch" && ctx.agent.kind !== "main")
+      return { block: true, reason: "Lane watches are restricted to the main superagent head" };
     if (event.toolName === "head_recovery" && ctx.agent.kind !== "main")
       return { block: true, reason: "HEAD recovery is restricted to the original main head" };
     if (["cron_create", "decision_list", "decision_inspect", "decision_withdraw"].includes(event.toolName) && ctx.agent.kind !== "main")
@@ -282,15 +301,17 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "pr_watch_list", label: "Inspect tracked pull requests", approval: "read",
-    description: "List explicitly tracked GitHub PRs, original source/lane, cadence, last baseline, errors and stop holds. Read-only status, not proof of current GitHub state. No tracking or network read is started.",
-    parameters: Type.Object({}, { additionalProperties: false }),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
-      return result(requireRuntime(ctx).listPrWatches());
+    description: "On the current original owner request, inspect tracking in that exact conversation. Optionally filter by PR URL or owner/repo#N. Reports the quiet first baseline (if saved), latest observed head/state/CI, cadence, errors and holds. Read-only; no GitHub read or tracking is started. A CI pass describes observed current-head checks and statuses, not mergeability.",
+    parameters: Type.Object({
+      sourceId: Type.String({ minLength: 1 }), ref: Type.Optional(Type.String({ minLength: 1 })),
+    }, { additionalProperties: false }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return result(requireRuntime(ctx).listPrWatches(params));
     },
   });
   pi.registerTool({
     name: "pr_watch", label: "Track pull request changes", approval: "exec",
-    description: "Explicit original-user-source registration or removal of GitHub.com PR follow-up. track requires ref (PR URL or owner/repo#N), sourceId and an explicit intervalSeconds; optional laneId is informational and ignoreAuthors excludes logins. First successful read is a quiet baseline. Ordinary code observes reviews/comments, current-head CI failures, external head movement and state changes, durably reporting to HEAD on the original registration conversation even after lane completion. No automatic lane resume, comments, pushes or merges. Uses installed gh authentication. /stop head holds existing watches until a new source-bound registration. Replaying an old mutation returns its historical receipt, not renewed tracking.",
+    description: "On the current explicit owner request, start or stop GitHub.com PR tracking in that exact conversation. track requires ref (PR URL or owner/repo#N) and sourceId; intervalSeconds defaults to 300, laneId is informational, and ignoreAuthors excludes logins. The first successful read is a quiet baseline. Report new reviews/comments, observed current-head CI passes and failures, external head changes and PR state changes on the original registration conversation, even after lane completion. Never resume or retry work, push, comment or merge automatically. Uses installed gh authentication. /stop head holds existing watches until a new source-bound registration. Replaying an old mutation returns its historical receipt, not renewed tracking.",
     // Keep all keys in the object grammar: native argument repair otherwise
     // drops branch-local unknowns before enforcing the action's constraints.
     parameters: Type.Unsafe<PrWatchCommand>({
@@ -303,9 +324,8 @@ export default function superagentExtension(pi: ExtensionAPI): void {
         ignoreAuthors: Type.Array(Type.String({ pattern: "^[a-zA-Z0-9_\\[\\]-]+$", minLength: 1, maxLength: 100 })),
       },
       required: ["action", "ref", "sourceId"], additionalProperties: false,
-      if: { properties: { action: { const: "track" } } },
-      then: { required: ["intervalSeconds"] },
-      else: { not: { anyOf: ["intervalSeconds", "laneId", "ignoreAuthors"].map(name => ({ required: [name] })) } },
+      if: { properties: { action: { const: "untrack" } } },
+      then: { not: { anyOf: ["intervalSeconds", "laneId", "ignoreAuthors"].map(name => ({ required: [name] })) } },
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return result(requireRuntime(ctx).watchPr(params));
@@ -394,6 +414,24 @@ export default function superagentExtension(pi: ExtensionAPI): void {
       return result(Array.isArray(inspected)
         ? inspected.map(lane => ({ ...lane, placement: lanePlacement(lane) }))
         : { ...inspected, placement: lanePlacement(inspected) });
+    },
+  });
+  pi.registerTool({
+    name: "lane_watch", label: "Track independent lane observations", approval: "write",
+    description: "On explicit owner request, track, inspect status, or untrack a managed lane using the current original sourceId and exact laneId. Status without laneId lists watches on that source's exact conversation only. Tracking starts with a quiet baseline. Structured evidence, durable stalls, native execution errors, pauses and explicit closure may produce an informational notice on the original registration conversation, not the lane's destination. Silence and native turn end do not imply stalls or task completion. /stop head holds existing subscriptions until the owner explicitly tracks again from a new source; untrack stops notifications only, and neither action pauses, resumes, or wakes a lane.",
+    parameters: Type.Unsafe<LaneWatchCommand>({
+      type: "object",
+      properties: {
+        action: Type.Union([Type.Literal("track"), Type.Literal("status"), Type.Literal("untrack")]),
+        sourceId: Type.String({ minLength: 1 }),
+        laneId: Type.String({ pattern: "^[a-zA-Z0-9_-]{1,128}$" }),
+      },
+      required: ["action", "sourceId"], additionalProperties: false,
+      if: { properties: { action: { enum: ["track", "untrack"] } } },
+      then: { required: ["laneId"] },
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return result(await requireRuntime(ctx).watchLane(params));
     },
   });
   pi.registerTool({

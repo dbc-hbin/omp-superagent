@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, jest, test } from "bun:test";
 import { openLive } from "./oracles/bun-gateway/openai-live.ts";
 
 const providerKey = "sk-fixture-secret";
@@ -180,15 +180,25 @@ test("ignores cancelled work and never delivers an in-flight result after abort"
   expect(state.ended).toBe(1);
 });
 
-test("forces socket teardown when the graceful abort receives no closing acknowledgment", async () => {
-  const { provider, controller, state } = await start();
-  const closed = Promise.withResolvers<void>();
-  provider.addEventListener("close", () => closed.resolve(), { once: true });
-  controller.abort();
-  expect(provider.sent.at(-1)).toEqual({ type: "session.close" });
-  await closed.promise;
-  expect(provider.readyState).toBe(3);
-  expect(state.ended).toBe(1);
+test.serial("forces socket teardown when the graceful abort receives no closing acknowledgment", async () => {
+  jest.useFakeTimers();
+  try {
+    const { provider, controller, state } = await start();
+    const closed = Promise.withResolvers<void>();
+    provider.addEventListener("close", () => closed.resolve(), { once: true });
+    controller.abort();
+    expect(provider.sent.at(-1)).toEqual({ type: "session.close" });
+    // Exercise the full grace period on the clock of this in-process fixture.
+    jest.advanceTimersByTime(1_999);
+    expect(provider.readyState).toBe(ProviderFixture.OPEN);
+    expect(state.ended).toBe(0);
+    jest.advanceTimersByTime(1);
+    expect(provider.readyState).toBe(3);
+    await closed.promise;
+    expect(state.ended).toBe(1);
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 test.each(["response.failed", "response.incomplete"])("closes without forwarding or retrying after %s", async (type) => {

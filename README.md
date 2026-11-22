@@ -114,7 +114,7 @@ service or an OS sandbox; see [Design](DESIGN.md).
 
 Install from [npm](https://www.npmjs.com/package/omp-superagent) or use the source
 and npm tarballs from the
-[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.7).
+[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.8).
 Install with Bun or npm below. Bun is still required at runtime; this is not a
 standalone binary. Installation prepares the managed dependencies. Running a Host
 requires a separately installed OMP; this project neither patches nor builds it.
@@ -123,8 +123,8 @@ requires a separately installed OMP; this project neither patches nor builds it.
 
 This checkout requires Git, **Bun >= 1.4.4**, and local Unix sockets. Installing the
 package does not require OMP. To run a Host, install stock OMP separately; the
-CLI checks capabilities, not a version range. The tested releases are
-**OMP 18.20.3, 18.22.2, and 19.0.0**.
+CLI checks capabilities, not a version range. CI tests **OMP 19.0.0**;
+**18.20.3 and 18.22.2** were tested in earlier releases.
 Windows is unsupported.
 Configure `command` with the installed OMP executable followed by native CLI flags;
 runtime/script wrappers are unsupported.
@@ -134,9 +134,9 @@ runtime/script wrappers are unsupported.
 
 The SDK stays pinned to **19.0.0**, from upstream `v19.0.0` commit
 [`57771ae562b9345e0579bceb2d68d585e3e6927e`](https://github.com/can1357/oh-my-pi/commit/57771ae562b9345e0579bceb2d68d585e3e6927e).
-`bun run test:ci` tests the installed OMP. To reproduce CI, use
-`bun run test:baseline` for the SDK-matched CLI or `bash scripts/test-omp.sh v18.22.2`
-(or `v18.20.3`) for OMP 18. Each verifies the release binary and runs the same suite.
+`bun run test:ci` tests the installed OMP. Use `bun run test:baseline` to reproduce
+the SDK-matched CI check. OMP 18 is manual only: `bash scripts/test-omp.sh v18.22.2`
+(or `v18.20.3`) verifies the release binary and runs the same suite locally.
 The separate weekly/manual **OMP upstream compatibility** workflow tests the latest
 published CLI without falling back to the baseline or blocking releases.
 
@@ -157,7 +157,7 @@ To install OMP separately, see the
 [upstream instructions](https://github.com/can1357/oh-my-pi#install).
 
 ```sh
-bun add --global --trust omp-superagent@0.1.7
+bun add --global --trust omp-superagent@0.1.8
 omp-sa --help
 ```
 
@@ -170,7 +170,7 @@ Ensure `bun pm bin --global` is on `PATH`.
 Alternatively, with Bun on `PATH`:
 
 ```sh
-npm install --global omp-superagent@0.1.7
+npm install --global omp-superagent@0.1.8
 ```
 
 Keep lifecycle scripts enabled for the managed omp-superkit integration.
@@ -347,6 +347,7 @@ worker. That is not a stop command for an already running lane.
 
 ## Working from chat
 
+- Ask “keep the Discord bot online”, “watch `owner/repo#35` and tell me when CI passes”, or “let me know when this lane stalls or finishes”. Ask for status or stop the watch in the same conversation. A watch does not authorize a merge or stop the work. Discord presence controls only the bot's indicator, not its ability to receive messages.
 - Send follow-ups in the existing work thread or topic to continue its task. No repository
   name or command is needed.
 - Elsewhere, send the request itself, even if it names a repository. HEAD answers questions
@@ -440,7 +441,7 @@ recorded versions and scenarios. Offline CI does not verify live accounts or pro
 | [Execution and coordination](docs/design/execution.md) | lanes, native Host lifecycle, models, workflows, managed integration, monitoring, and the board. |
 | [Operations guide](docs/OPERATIONS.md) | platform setup, commands, and recovery. |
 | [Voice configuration guide](docs/discord-voice.md) | Codex subscription voice or the separately billed API. |
-| Releases | [Release notes](docs/releases/0.1.7.md) and [historical verification records](docs/releases/0.1.0.md#verification-records). |
+| Releases | [Release notes](docs/releases/0.1.8.md) and [historical verification records](docs/releases/0.1.0.md#verification-records). |
 
 Built on [oh-my-pi](https://github.com/can1357/oh-my-pi), with
 [omp-superkit](https://github.com/dbc-hbin/omp-superkit) workflow integration.

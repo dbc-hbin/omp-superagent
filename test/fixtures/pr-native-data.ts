@@ -27,11 +27,12 @@ export default async function nativeDataValidation(_pi: ExtensionAPI): Promise<v
     store.settle("native-source", "done");
     const watcher = new PrWatcher(store, config, async () => ({
       head: "a".repeat(40), state: "open", self: "owner", mergedSha: null,
-      feedback: [], failures: [], headChange: "unknown",
+      feedback: [], failures: [], headChange: "unknown", ci: { outcome: "passed", key: "fixture-ci-pass", skipped: 0 },
     }));
     watcher.change({ action: "track", sourceId: "native-source", ref: "example/repo#1", intervalSeconds: 300 });
     await watcher.poll(0, new AbortController().signal);
-    assert.equal(watcher.list()[0]?.baseline?.state, "open");
+    assert.equal(watcher.list({ sourceId: "native-source" })[0]?.baseline?.state, "open");
+    assert.equal(watcher.list({ sourceId: "native-source" })[0]?.baseline?.ci, "passed");
     assert.equal(store.inputs("main").length, 0);
     changeDiscordPurpose(store, { action: "set", sourceId: "native-source", route, purpose: "Project context" });
     assert.deepEqual(changeDiscordPurpose(store, { action: "list", sourceId: "native-source", route }),

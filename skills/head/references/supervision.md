@@ -110,14 +110,30 @@ No polling, duty model, aggregate goal for lanes, or follow-up just for a report
 
 ## Observation tools are not work authority
 
+- **Bot presence:** “봇 온라인 상태 유지해 줘” / “keep the bot online” calls
+  `messenger_presence` with `start` and the admitted owner `sourceId`. For
+  “온라인 상태 알려줘” use `status`; for “온라인 표시 꺼 줘” use `stop`.
+  Operate only on the account where that owner asked. Discord `stop` requests
+  invisible without stopping intake. Report the desired setting, connection
+  and last local socket write separately: even a successful write is not
+  confirmation of the displayed dot or model readiness. Slack Socket Mode bot
+  presence is controlled in the Slack app settings; Telegram has no bot
+  presence setter. Do not ask for a personal token or session cookie.
 - **PR watch:** On explicit request use `pr_watch` with `action: "track"`, original
-  `sourceId`, GitHub.com PR URL or `owner/repo#N`, and explicit `intervalSeconds`;
+  `sourceId` and GitHub.com PR URL or `owner/repo#N`. For “이 PR CI 통과하면
+  알려줘” use the requested interval or omit it for the five-minute default.
   `laneId` is informational and `ignoreAuthors` excludes named logins. Use
-  `pr_watch_list` to inspect and source-bound `action: "untrack"` to stop. Don't poll in a
-  model turn. First read is a quiet baseline; a hold, auth change, or failure is not
-  proof of no change. HEAD stop holds watches until a new explicit registration.
+  `pr_watch_list({sourceId, ref?})` to inspect this conversation's watches and
+  source-bound `untrack` to stop. Don't poll in a model turn. First read is a quiet
+  baseline; missing checks, a hold or an error are not success. HEAD stop holds watches until a new explicit registration.
   Explain meaningful changes on their registered route; observations never
   authorize mutations, creating lanes, or resuming work.
+- **Lane watch:** For “이 작업이 멈추거나 끝나면 알려줘”, use `lane_watch` with
+  `track`, the original `sourceId` and the verified `laneId` (the bound lane if
+  that is what “this job” means). Use `status` to see registrations on this route
+  and `untrack` to stop notifications. A quiet or unloaded Host is not proof of
+  a stall. Report recorded evidence, holds, errors and closure without claiming
+  completion from an idle socket or firing a new model turn to check it.
 - **Board:** Use advertised `board_post`, `board_read`, `board_subscribe` only for
   concise facts, evidence, and edit collisions. Membership is revalidated against
   actual managed session ID/file and current owner for this state instance, not

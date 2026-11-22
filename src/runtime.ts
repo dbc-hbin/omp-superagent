@@ -6,8 +6,10 @@ import { isDeepStrictEqual } from "node:util";
 import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
 import type { MemoryRuntimeContext } from "@oh-my-pi/pi-coding-agent/memory-backend";
 import { getAgentDbPath } from "@oh-my-pi/pi-utils/dirs";
-import type { Approval, ApprovalResolution, DialogResponse, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, InputRecord, Lane, LaneModel, LaneModelChoice, LanePresetSnapshot, ResolvedLanePreset, ModelPreset, Messenger, Route, StorePort, ThreadInfo, ThreadUpdate, WorkflowChoice } from "./contracts";
+import type { Approval, ApprovalResolution, DialogResponse, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, InputRecord, Lane, LaneModel, LaneModelChoice, LanePresetSnapshot, ResolvedLanePreset, ModelPreset, Messenger, OutputRecord, Route, StorePort, ThreadInfo, ThreadUpdate, WorkflowChoice } from "./contracts";
 import { authorizeDiscordPurpose, discordPurposeRequest } from "./discord-context";
+import { isObservationRequest } from "./observation-request";
+import type { PresenceAction } from "./contracts";
 import { HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type HeadModelChange, type HeadPicker } from "./contracts";
 import { authorizeRoute, credentialEnvNames, type Config, hostPaths, privateDirectory } from "./config";
 import { DeliveryError } from "./delivery";
@@ -25,9 +27,10 @@ import { repositoryRoot } from "./repository";
 import { discordThreadSplit, editsTopicPlacement, existingWorkspace, inferredWorkspace, namedWorkspaces, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
 import { findPastTopic, findRoutingTopics, pastTopicQuery, readPastTopic, routingExcerpt, routingSubject, transportRoutingProse } from "./topic-history";
 import { parseLaneReportResult } from "./lane-report";
+import { isLaneWatchNotice, LaneWatcher, type LaneWatchCommand } from "./lane-watch";
 import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
 import { headRecoveryEvidence } from "./head-recovery";
-import { PrWatcher, type PrWatchCommand } from "./pr-watch";
+import { isPrObservation, PrWatcher, type PrWatchCommand } from "./pr-watch";
 import { CRON_RUN_PREFIX, CronJobs, type CronCreate } from "./cron-jobs";
 import { readOmpUsage } from "./omp-usage";
 import type { readPrSnapshot } from "./pr-github";
@@ -385,6 +388,9 @@ export class Superagent {
   private readonly intakeReady = Promise.withResolvers<void>();
   private timer?: NodeJS.Timeout;
   private readonly prWatcher: PrWatcher;
+  private readonly laneWatcher: LaneWatcher;
+  private laneWatchObservation?: Promise<void>;
+  private watchDeliveryReady = false;
   private readonly cronJobs: CronJobs;
   private groups?: GroupAccess;
   private readonly stopSignal = new AbortController();
@@ -405,6 +411,7 @@ export class Superagent {
     this.adapters = { connect: HostConnection.connectForActivity, startHost, readOmpUsage,
       selectWorkerPlacement, workerPlacementReady, lookupWorker, workerProbe, workerOpen, workerConnect, ...adapters };
     this.prWatcher = new PrWatcher(store, config, adapters.readPrSnapshot);
+    this.laneWatcher = new LaneWatcher(store, config);
     this.cronJobs = new CronJobs(store, config);
     // Adapters that do not consume the optional gate must not cause an unhandled
     // rejection when startup fails before there is any queued intake.
@@ -1249,6 +1256,7 @@ export class Superagent {
   async changeModel(input: LaneModelChoice & { id: string; sourceId: string; modelReason: string }) {
     this.assertRestartOpen();
     if (this.stopped) throw new Error("Controller is stopped");
+    this.assertWorkSourceNotPrObservation(input.sourceId);
     if (typeof input.modelReason !== "string" || !input.modelReason.trim()) throw new Error("A nonempty modelReason is required");
     if ((input.model !== undefined) === (input.preset !== undefined)
       || (input.model !== undefined && !isLaneModel(input.model))
@@ -1971,7 +1979,12 @@ export class Superagent {
     }
     const eventId = selection ? null : this.eventOrderId(input);
     const placement = placementText(input);
-    const headAddressed = /^\/head(?:\s|$)/.test(input.text.trimStart());
+    const editEvent = messengerEdit(input);
+    // An edit cannot acquire new manager routing. A watch hint only chooses
+    // which native session receives an original message; HEAD interprets it.
+    const observation = !editEvent && !selection && !input.text.trimStart().startsWith("/")
+      && isObservationRequest(transportRoutingProse(input));
+    const headAddressed = observation || /^\/head(?:\s|$)/.test(input.text.trimStart());
     const request = topicRequest(placement);
     let history: PastTopicRef[] | null = null;
     let historyUnavailable = false;
@@ -1980,7 +1993,6 @@ export class Superagent {
     const slackRoot = !input.reply && input.route.platform === "slack" ? input.route.threadId : null;
     const replyRoute = slackRoot ? { ...physicalRoute(input.route), threadId: null } : input.route;
     const replyId = input.reply?.messageId ?? slackRoot;
-    const editEvent = messengerEdit(input);
     const discordEdit = input.route.platform === "discord" && editEvent;
     if (!selection && !discordEdit && !headAddressed && !codeHandledControl(input.text)
       && query && !this.store.input(input.id)
@@ -2733,6 +2745,8 @@ export class Superagent {
   }
 
   private requireManagerSource(sourceId: string, destination?: Route): void {
+    if (isLaneWatchNotice(sourceId)) throw new Error("Lane watch notices cannot authorize lane work");
+    this.assertWorkSourceNotPrObservation(sourceId);
     const original = this.store.ownerSource(sourceId);
     if (this.store.getMeta(`topic-owner:${original?.id ?? sourceId}`)) throw new Error("Topic-owned intake cannot authorize a manager handoff; use an explicit HEAD request");
     if (original) this.assertFirstDmHandoffSource(original, sourceId);
@@ -2741,6 +2755,20 @@ export class Superagent {
       throw new Error("Work from this Discord thread stays in the original thread unless the owner explicitly requests a split");
     }
     this.assertCronDelegationOpen(sourceId);
+  }
+
+  private assertWorkSourceNotPrObservation(sourceId: string): void {
+    // The activity link identifies the original recipient, not work authority.
+    // Reject an observation even if an older handoff aliased it to another ID.
+    const seen = new Set<string>();
+    let id: string | null = sourceId;
+    while (id !== null) {
+      if (isPrObservation(id)) throw new Error("PR observations cannot authorize lane work");
+      if (this.store.getMeta(`user-source:${id}`) === "true") return;
+      if (seen.has(id)) throw new Error("Cannot establish the source of lane work");
+      seen.add(id);
+      id = this.store.getMeta(`handoff-source:${id}`) ?? this.store.getMeta(`activity-source:${id}`);
+    }
   }
 
   private requireRemoteCommandPolicy(): void {
@@ -3095,17 +3123,67 @@ export class Superagent {
     return lane;
   }
 
+  async watchLane(command: LaneWatchCommand) {
+    const { route } = this.observationSource(command.sourceId, "Lane watch");
+    const checked = new Map<string, boolean>();
+    if (command.action === "track" && command.laneId) {
+      const lane = this.requireLane(command.laneId);
+      const allowed = await this.historicalRoute(route, lane.route, checked);
+      this.observationSource(command.sourceId, "Lane watch");
+      if (!allowed || routeKey(this.requireLane(lane.id).route) !== routeKey(lane.route))
+        throw new Error("Lane watch requires a verified authorized target route");
+    }
+    if (command.action === "status") {
+      const status = this.laneWatcher.change(command);
+      const views = status === null ? [] : "tracking" in status ? [status] : status;
+      for (const view of views) {
+        if (view.workState === null) continue; // Already redacted; no target data can be returned.
+        const lane = this.requireLane(view.laneId);
+        const allowed = await this.historicalRoute(route, lane.route, checked);
+        this.observationSource(command.sourceId, "Lane watch");
+        if (!allowed) this.laneWatcher.holdRejectedTarget(view.sourceId, lane.id);
+      }
+    }
+    return this.laneWatcher.change(command);
+  }
+
+  private observeLaneWatches(): void {
+    const now = Date.now();
+    try { this.laneWatcher.poll(now); }
+    catch (error) { this.report(error); }
+    if (this.laneWatchObservation) return;
+    const open = () => this.ready && !this.stopped && !this.restartFence() && !this.headRotationHeld()
+      && !this.headStopping && !this.initializationHoldsHead();
+    // Slow adapter proof must not hold the existing native dispatch pump.
+    this.laneWatchObservation = this.laneWatcher.pollCrossPlatform(now, {
+      open, check: (source, target) => this.historicalRoute(source, target, new Map<string, boolean>()),
+    }).then(notified => {
+      if (notified && open()) this.background(this.kick());
+    }).catch(this.report).finally(() => { this.laneWatchObservation = undefined; });
+  }
+
+  private observationSource(sourceId: string, purpose: string): InputRecord {
+    const { source } = this.currentOwnerSource(sourceId, purpose);
+    if (messengerEdit(source) || source.pickerSelection)
+      throw new Error(`${purpose} requires an original owner message, not an edit or card`);
+    return source;
+  }
+
   watchPr(command: PrWatchCommand) {
-    this.assertRestartOpen();
-    if (this.stopped) throw new Error("Controller is stopped");
+    this.observationSource(command.sourceId, "PR tracking");
     const result = this.prWatcher.change(command);
-    this.observePrs();
+    if (command.action === "track") this.observePrs();
     return result;
   }
 
-  listPrWatches() {
-    if (this.stopped) throw new Error("Controller is stopped");
-    return this.prWatcher.list();
+  listPrWatches(request: Parameters<PrWatcher["list"]>[0]) {
+    this.observationSource(request.sourceId, "PR tracking");
+    return this.prWatcher.list(request);
+  }
+
+  prObservationActive(): boolean {
+    const input = this.live.get("main")?.input;
+    return !!input && isPrObservation(input.id);
   }
 
   listDecisions(state: "open" | "all" = "open", laneId?: string): DecisionView[] {
@@ -3226,6 +3304,21 @@ export class Superagent {
     if (source.route.platform !== "discord" || !this.messenger.inspectDiscordContext)
       throw new Error("Discord context inspection requires a supported Discord source");
     return this.messenger.inspectDiscordContext(physicalRoute(source.route));
+  }
+
+  async messengerPresence(sourceId: string, action: PresenceAction, platform?: Route["platform"]) {
+    const source = this.observationSource(sourceId, "Messenger presence");
+    if (platform !== undefined && platform !== source.route.platform)
+      throw new Error("Request presence from an authorized conversation on the target messenger account");
+    switch (source.route.platform) {
+      case "slack":
+        return { platform: "slack", supported: false, reason: "Socket Mode bots cannot set their online dot via the Slack Events API. Configure bot presence in the Slack app settings." };
+      case "telegram":
+        return { platform: "telegram", supported: false, reason: "The Telegram Bot API does not expose bot online presence." };
+      case "discord":
+        if (!this.messenger.messengerPresence) throw new Error("This Gateway does not support Discord presence");
+        return this.messenger.messengerPresence({ sourceId, action, route: source.route });
+    }
   }
 
   async discordPurpose(input: { sourceId: string; scope?: "channel" | "thread" } & (
@@ -3406,6 +3499,10 @@ export class Superagent {
 
   async resume(id: string, sourceId?: string): Promise<void> {
     this.assertRestartOpen();
+    if (sourceId !== undefined) {
+      if (isLaneWatchNotice(sourceId)) throw new Error("Lane watch notices cannot authorize lane resume");
+      this.assertWorkSourceNotPrObservation(sourceId);
+    }
     const pauseRevision = this.pauseRevisions.get(id) ?? 0;
     this.laneMutations++;
     try {
@@ -5377,6 +5474,10 @@ export class Superagent {
         if (!this.stopped && !this.restartFence() && this.headStopping === 0 && !this.initializationHoldsHead()) {
           try { this.cronJobs.poll(Date.now()); }
           catch (error) { this.report(error); }
+          // Startup's first outbox flush must leave these notifications for
+          // the pump, where recovered owner stop controls are processed first.
+          this.watchDeliveryReady = true;
+          this.observeLaneWatches();
         }
         const heldTargets = new Set<string>();
         const earlierMain = new Set<string>();
@@ -5394,6 +5495,16 @@ export class Superagent {
         // settlement appended the row. Its uncertainty must also fence later work.
         const ordered = deferred ? [deferred, ...inputs.filter(input => input !== deferred)] : inputs;
         for (const input of ordered) {
+          if (isLaneWatchNotice(input.id)) {
+            // Controller informational receipt: never share the native prompt,
+            // steer or work queue, even across restart or an uncertain HEAD turn.
+            if (!this.stopped && !this.restartFence() && !this.headStopping && !this.initializationHoldsHead()
+              && input.target === "main" && input.state === "pending") {
+              try { this.laneWatcher.consume(input); }
+              catch (error) { this.report(error); }
+            }
+            continue;
+          }
           if (input.target && (input.state === "submitted" || input.state === "uncertain")) heldTargets.add(input.target);
           if (input.target === "main" && input.state !== "pending") earlierMain.add(input.id);
           if (this.stopped || input.state !== "pending") continue;
@@ -5703,6 +5814,10 @@ export class Superagent {
         || confirmed.pendingUiRequests?.length || this.store.approvals("main").length
         || this.restartFence() || this.headRecoveryActive() || this.headStopping || this.headCompaction || this.pendingHeadModel()
         || confirmedInput?.state !== "pending" || confirmedInput.target !== live.id || this.kickoffHeld(live.id)) return;
+      if (!this.prWatcher.canConsume(confirmedInput)) {
+        this.store.settle(confirmedInput.id, "cancelled");
+        return;
+      }
       this.store.setMeta(`head-native-owner:${input.id}`, JSON.stringify({
         requestId, generation: live.generation, sessionId: live.sessionId,
         sessionFile: confirmed.sessionFile, cursor,
@@ -5916,7 +6031,7 @@ export class Superagent {
       }
       this.observeAssistant(live, frame.message);
       const progress = assistantProgress(frame.message);
-      if (progress && !live.input.id.startsWith(laneDecisionReview) && !this.stopped && !this.restartFence()
+      if (progress && !isPrObservation(live.input.id) && !live.input.id.startsWith(laneDecisionReview) && !this.stopped && !this.restartFence()
         && (live.id !== "main" || this.headStopping === 0)) {
         const eventId = key(JSON.stringify([live.sessionId, live.generation, progress.identity]));
         try {
@@ -6031,6 +6146,10 @@ export class Superagent {
         this.activity(admitted.input, false);
         if (admitted.input.id === input.id || this.store.input(admitted.input.id)?.state === "cancelled") continue;
         const status = admitted.result!.status;
+        if (live.id !== "main" && status === "error") {
+          try { this.laneWatcher.recordFailure(admitted.input); }
+          catch (error) { this.report(error); }
+        }
         this.store.settle(admitted.input.id, status === "completed" ? "done" : status === "aborted" ? "cancelled" : "uncertain");
       }
       let headModel: HeadModelChange | undefined;
@@ -6044,6 +6163,12 @@ export class Superagent {
       }
       // Joined receipts are durable, not separate answers or duplicate lane reports.
       const reviewingLaneDecision = live.id === "main" && input.id.startsWith(laneDecisionReview);
+      // A goal-resume fallback without an observed assistant error is not
+      // evidence of a native failure. Its durable uncertainty is observed separately.
+      if (live.id !== "main" && outcome === "error" && (!result?.goalResume || live.assistantOutcome?.status === "error")) {
+        try { this.laneWatcher.recordFailure(input); }
+        catch (error) { this.report(error); }
+      }
       this.store.settle(input.id, state, !reviewingLaneDecision && (text || live.id !== "main")
         ? { id: `${input.id}:answer`, text } : undefined, headModel);
       if (live.input === input) {
@@ -6271,19 +6396,66 @@ export class Superagent {
     } finally { this.callbacks.delete(id); }
   }
 
+  private async verifyLaneWatchDelivery(output: OutputRecord): Promise<"ready" | "held" | "deferred"> {
+    const scope = this.laneWatcher.deliveryScope(output);
+    if (!scope) return "held";
+    if (this.restartFence() || this.headRotationHeld() || this.headStopping) return "deferred";
+    let allowed: boolean;
+    try { allowed = await this.historicalRoute(scope.source.route, scope.target.route, new Map()); }
+    catch (error) {
+      if (error instanceof Error) return "deferred"; // No external send was attempted.
+      throw error;
+    }
+    if (this.stopped || this.restartFence() || this.headRotationHeld() || this.headStopping) return "deferred";
+    if (!allowed) {
+      this.laneWatcher.holdRejectedTarget(scope.source.id, scope.target.id);
+      return "held";
+    }
+    return "ready";
+  }
+
   private async flushOutputs(): Promise<void> {
     if (this.outbound) return this.outbound;
     if (this.stopped) return;
     let delivered = false;
     this.outbound = Promise.resolve().then(async () => {
+      const deferredLaneNotices = new Set<string>();
       try {
         while (!this.stopped) {
-          const outputs = this.store.outputs();
-          if (!outputs.length) break;
+          const outputs = this.store.outputs().filter(output => this.watchDeliveryReady
+            || !(isLaneWatchNotice(output.id) || isPrObservation(output.sourceId)));
+          if (outputs.every(output => deferredLaneNotices.has(output.id))) break;
           for (const output of outputs) {
+            if (isLaneWatchNotice(output.id)) {
+              if (deferredLaneNotices.has(output.id)) continue;
+              let verification: "ready" | "held" | "deferred";
+              try { verification = await this.verifyLaneWatchDelivery(output); }
+              catch (error) {
+                this.report(new Error("Lane watch notice cannot be verified", { cause: error }));
+                verification = "held";
+              }
+              if (verification === "deferred") { deferredLaneNotices.add(output.id); continue; }
+              if (verification === "held") {
+                if (!this.stopped && this.store.claimOutput(output.id))
+                  this.store.finishOutput(output.id, "failed", undefined, "Lane watch notice is held or no longer tracked");
+                continue;
+              }
+            }
             if (this.stopped || !this.store.claimOutput(output.id)) continue;
             let remoteId: string;
             try {
+              if (isLaneWatchNotice(output.id)) {
+                let scope: ReturnType<LaneWatcher["deliveryScope"]>;
+                try { scope = this.laneWatcher.deliveryScope(output); }
+                catch (error) { throw new DeliveryError("Lane watch notice cannot be verified", "rejected", undefined, { cause: error }); }
+                if (!scope) throw new DeliveryError("Lane watch notice is held or no longer tracked", "rejected");
+              }
+              if (isPrObservation(output.sourceId)) {
+                let deliverable: boolean;
+                try { deliverable = this.prWatcher.deliverable(output); }
+                catch (error) { throw new DeliveryError("PR observation cannot be verified", "rejected", undefined, { cause: error }); }
+                if (!deliverable) throw new DeliveryError("PR observation is held or no longer tracked", "rejected");
+              }
               if (groupRoom(this.config, output.route)) {
                 throw new DeliveryError("Owner output is not authorized in a restricted group room", "rejected");
               }
@@ -6328,7 +6500,7 @@ export class Superagent {
     for (const live of this.live.values()) {
       for (const { input } of live.admitted.values()) this.activity(input, false);
     }
-    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values()]);
+    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values()]);
     await this.messenger.stop();
     await Promise.allSettled([...this.live.values()].map(async live => { live.unsubscribe(); await live.connection.close(); }));
     this.live.clear();

@@ -26,6 +26,7 @@ mod outputs;
 mod pending;
 mod permissions;
 mod picker;
+mod presence;
 mod purposes;
 mod responses;
 mod rest;
@@ -39,6 +40,7 @@ mod voice;
 
 use approvals::Cards;
 use model::{Channel, Route, read, snowflake};
+use presence::Presence;
 use rest::{Rest, broken};
 use supervisor::Task;
 use voice::Voice;
@@ -75,6 +77,7 @@ struct State {
     voice: Option<Voice>,
     cards: Cards,
     purpose_lock: Mutex<()>,
+    presence: Presence,
     stopping: AtomicBool,
 }
 
@@ -110,6 +113,7 @@ impl Discord {
                 voice,
                 cards: Cards::default(),
                 purpose_lock: Mutex::new(()),
+                presence: Presence::default(),
                 stopping: AtomicBool::new(false),
             }),
             task: Mutex::new(None),
@@ -201,6 +205,10 @@ impl Adapter for Discord {
 
     async fn attachment(&self, route: &Value, file: &Value) -> Effect<Response> {
         self.state.download(&read(route)?, &read(file)?).await
+    }
+
+    async fn messenger_presence(&self, id: &str, request: &Value) -> Effect<Value> {
+        self.state.set_presence(id, request).await
     }
 }
 

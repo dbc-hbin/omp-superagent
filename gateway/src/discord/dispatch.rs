@@ -28,9 +28,12 @@ struct Application {
 }
 
 impl Ready {
-    pub fn authenticate(&self, state: &State) -> Result<()> {
+    pub fn authenticate(&self, state: &State, expected_account: Option<&str>) -> Result<()> {
         ensure!(
-            self.user.bot && snowflake(&self.user.id) && snowflake(&self.application.id),
+            self.user.bot
+                && snowflake(&self.user.id)
+                && snowflake(&self.application.id)
+                && expected_account.is_none_or(|account| account == self.user.id),
             "Discord Gateway did not identify an authenticated bot and application"
         );
         let identity = Identity {

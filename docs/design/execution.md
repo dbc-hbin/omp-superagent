@@ -367,6 +367,16 @@ discarding custom commands or enabling disabled extensions.
   between reads. A head stop holds old watches; a merged PR ends observation,
   while a non-merged closure can later reopen. GitHub content is untrusted, not
   a new owner source or authority to dispatch, resume, or perform effects.
+  The same PR may be watched by different conversations without transferring
+  registration or notifications. The original operator can inspect and remove
+  their conversation's watch. A pass means the observed checks on the current
+  head succeeded, not that branch policy permits merging.
+- Lane watches observe the controller's existing records, not a second Host
+  session. Status, stop, and notifications are scoped to the registration's
+  original route; stopping observation does not pause or cancel the lane.
+  An unloaded Host, an empty socket, and an `agent_end` event are not proof
+  that the work stalled or finished. Clear observation requests may route to
+  HEAD from a bound thread. Routing text alone changes no subscription.
 
 ## Shared information board
 

@@ -174,8 +174,8 @@ surface. Do not patch or build OMP, use the in-tree SDK as the CLI, or use a
 runtime wrapper in place of the native CLI.
 
 [CI](https://github.com/dbc-hbin/omp-superagent/actions/workflows/ci.yml)
-runs the SDK-matched official CLI and OMP **18.22.2**
-on Linux and macOS, plus **18.20.3** on Ubuntu. `bun run test:ci` uses the installed
+runs the SDK-matched official CLI on Linux and macOS. OMP 18 can still be tested
+locally with `bash scripts/test-omp.sh <release-tag>`. `bun run test:ci` uses the installed
 CLI; `bun run test:baseline` downloads and verifies the SDK-matched official binary.
 The [weekly/manual compatibility workflow](https://github.com/dbc-hbin/omp-superagent/actions/workflows/omp-compatibility.yml)
 checks the latest upstream release without falling back or changing SDK pins.

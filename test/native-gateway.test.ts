@@ -14,8 +14,12 @@ async function within<T>(work: Promise<T>, ms: number, label: string): Promise<T
   finally { clearTimeout(timer); }
 }
 
-for (const presetScenario of ["create", "valid", "failed", "skipped", "interrupted", "recovery"]) {
-nativeTest(`production Gateway native preset startup (${presetScenario}) preserves setup state, queued input and actual head ownership`, async () => {
+const scenarios = ["create", "valid", "failed", "skipped", "interrupted", "recovery", "chat-observations"] as const;
+for (const scenario of scenarios) {
+const chatObservations = scenario === "chat-observations";
+nativeTest(chatObservations
+  ? "ordinary owner chat runs native presence, PR/CI and lane observation tools on the original routes"
+  : `production Gateway native preset startup (${scenario}) preserves setup state, queued input and actual head ownership`, async () => {
   // Native imports and subprocesses begin only after HOME/settings isolation.
   const root = await fs.mkdtemp(path.join(await fs.realpath("/tmp"), "osg-"));
   await fs.chmod(root, 0o700);
@@ -25,7 +29,8 @@ nativeTest(`production Gateway native preset startup (${presetScenario}) preserv
     const home = path.join(root, "home");
     await fs.mkdir(home, { mode: 0o700 });
     const child = Bun.spawn({
-      cmd: [process.execPath, path.resolve(import.meta.dir, "fixtures/native-gateway.ts")],
+      cmd: [process.execPath, path.resolve(import.meta.dir, chatObservations
+        ? "fixtures/native-chat-observation.ts" : "fixtures/native-gateway.ts")],
       cwd: root,
       env: {
         OMP_TEST_HOST_FIXTURE_ROOT: root,
@@ -35,9 +40,11 @@ nativeTest(`production Gateway native preset startup (${presetScenario}) preserv
         XDG_CACHE_HOME: path.join(root, "cache"), XDG_STATE_HOME: path.join(root, "state"),
         CODEX_HOME: path.join(root, "codex"), CLAUDE_CONFIG_DIR: path.join(root, "claude"), COPILOT_HOME: path.join(root, "copilot"),
         TMPDIR: root, TMP: root, TEMP: root, OMP_NATIVE_GATEWAY_ROOT: root,
-        OMP_NATIVE_GATEWAY_PRESETS: presetScenario,
+        ...(chatObservations ? {} : { OMP_NATIVE_GATEWAY_PRESETS: scenario }),
         ...(process.env.OMP_TEST_COMMAND === undefined ? {} : { OMP_TEST_COMMAND: process.env.OMP_TEST_COMMAND }),
         ...(process.env.OMP_TEST_NATIVES_DIR ? { PI_NATIVES_DIR: process.env.OMP_TEST_NATIVES_DIR } : {}),
+        ...(chatObservations && process.env.OMP_TEST_NATIVES_DIR ? { OMP_TEST_NATIVES_DIR: process.env.OMP_TEST_NATIVES_DIR } : {}),
+        ...(chatObservations && process.env.CARGO_TARGET_DIR ? { CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR } : {}),
       },
       stdout: "pipe", stderr: "pipe",
     });

@@ -29,6 +29,7 @@ impl Drop for Task {
 impl Task {
     pub async fn start(state: Arc<State>) -> Result<Self> {
         let login = Login::discover(&state).await?;
+        let presence_account = state.restore_presence().await?;
         let backlog = state.ctx.discord_intake().last()?;
         let (started, startup) = oneshot::channel();
         let cancel = CancellationToken::new();
@@ -49,7 +50,8 @@ impl Task {
                 }
             });
             let dispatcher = Dispatcher::new(state, incoming, interactions.clone(), child.clone());
-            supervise(dispatcher, login, Some(started), admission, &child).await;
+            let session = Session::new(presence_account);
+            supervise(dispatcher, (login, session), Some(started), admission, &child).await;
             child.cancel();
             if intake.await.is_err() {
                 eprintln!("Discord ordered intake stopped unexpectedly");
@@ -85,12 +87,11 @@ impl Task {
 
 async fn supervise(
     dispatcher: Dispatcher,
-    mut login: Login,
+    (mut login, mut session): (Login, Session),
     mut startup: Option<oneshot::Sender<Result<()>>>,
     mut admission: oneshot::Receiver<()>,
     cancel: &CancellationToken,
 ) {
-    let mut session = Session::default();
     let mut admitted = false;
     let mut delay = Duration::from_secs(1);
     loop {

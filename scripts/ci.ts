@@ -31,7 +31,7 @@ const commands = [
   [...bun, "run", "build:native"],
   ["cargo", "build", "--locked", "--manifest-path", "gateway/Cargo.toml",
     "--example", "gateway-differential", "--example", "gateway-lifecycle-fixture"],
-  [...bun, "test", "test"],
+  [...bun, "test", "--parallel=2", "test"],
 ];
 for (const command of commands) {
   const child = Bun.spawn(command, {

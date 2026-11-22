@@ -105,8 +105,10 @@ Owner controls in chat (not shell commands):
 Capabilities to request from HEAD in chat (not CLI subcommands):
   Lanes and threads: ask HEAD to start, inspect, steer, pause, resume or close an independent lane,
     select its model/preset, or inspect and update its Discord thread or forum tags.
-  PR monitoring: give HEAD a GitHub PR URL and check interval to watch reviews and CI; ask to list or stop watches.
-    Requires gh with read access. A change notification does not authorize a merge or a new task.
+  Monitoring: ask HEAD to watch a GitHub PR's reviews/CI, or a managed lane's progress, stalls and closure.
+    PRs require gh read access. Ask for status or stop the watch in the same conversation; a watch never merges or resumes work.
+  Bot presence: ask Discord HEAD to keep the bot online, show its presence or turn the indicator off without stopping intake.
+    Slack Socket Mode bot presence is set in Slack app settings; Telegram Bot API does not expose online presence.
   Scheduled jobs: explicitly ask HEAD in plain language to schedule a task; manage it with /cron in the same chat.
   Decisions: ask HEAD to request an owner decision, list pending decisions, inspect one or withdraw it.
   Discord channel context: ask HEAD to inspect channel/thread context or set, list or clear a local purpose

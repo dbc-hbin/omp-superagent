@@ -83,6 +83,21 @@ export type DiscordPurposeRequest = {
 );
 export interface DiscordPurposeNote { readonly route: Route; readonly purpose: string }
 
+export type PresenceAction = "start" | "status" | "stop";
+export interface MessengerPresenceRequest {
+  readonly action: PresenceAction;
+  readonly sourceId: string;
+  readonly route: Route;
+}
+export interface DiscordPresenceStatus {
+  readonly platform: "discord";
+  readonly desired: "default" | "online" | "invisible";
+  readonly connection: "connected" | "disconnected";
+  /** Last presence written on this authenticated socket, not a Discord UI acknowledgement. */
+  readonly lastSent: "online" | "invisible" | null;
+  readonly replayed: boolean;
+}
+
 export interface Inbound {
   id: string;
   route: Route;
@@ -444,6 +459,7 @@ export interface Messenger {
   updateThread?(route: Route, update: ThreadUpdate): Promise<ThreadInfo>;
   inspectDiscordContext?(route: Route): Promise<DiscordContext>;
   discordPurpose?(request: DiscordPurposeRequest): Promise<readonly DiscordPurposeNote[]>;
+  messengerPresence?(request: MessengerPresenceRequest): Promise<DiscordPresenceStatus>;
   /** null explicitly means no history API; intake recovery belongs to the adapter. */
   fetchAfter(route: Route, messageId: string): Promise<Inbound[] | null>;
   /** Validate platform/auth destination before fetching. Never follow redirects with credentials. */

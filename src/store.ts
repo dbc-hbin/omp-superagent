@@ -34,6 +34,7 @@ import { isLaneModel, laneModelArgument, sameLaneModel } from "./lane-models";
 import { laneData, readLaneRows, toLane, type LaneRow } from "./lane-rows";
 import { storedWorkflowName, workflowChoice } from "./workflow";
 import { laneWaitKey, type LaneReport } from "./lane-report";
+import { laneWatchReplySource } from "./lane-watch";
 import { existingWorkspace, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
 import type { CronUpdate } from "./cron-jobs";
 
@@ -986,9 +987,10 @@ export class Store implements StorePort {
           throw new Error(`Result attachment does not match its original native request: ${output.id}`);
         }
       }
-      const replyTo = original?.route.platform === "discord" && original.messageId
-        && physicalRouteKey(original.route) === physicalRouteKey(output.route)
-        ? { route: physicalRoute(original.route), messageId: original.messageId } : undefined;
+      const replyOrigin = original ?? laneWatchReplySource(this, source, output.id);
+      const replyTo = replyOrigin?.route.platform === "discord" && replyOrigin.messageId
+        && physicalRouteKey(replyOrigin.route) === physicalRouteKey(output.route)
+        ? { route: physicalRoute(replyOrigin.route), messageId: replyOrigin.messageId } : undefined;
       if (output.replyTo !== undefined && (!replyTo || output.replyTo.messageId !== replyTo.messageId
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(replyTo.route))) {
         throw new Error(`Output reply differs from its source: ${output.id}`);

@@ -23,6 +23,8 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../src/contracts
 import { headRecoveryEvidence } from "../src/head-recovery";
 import { decisionId } from "../src/decisions";
 import { CronJobs } from "../src/cron-jobs";
+import { PrWatcher } from "../src/pr-watch";
+import type { PrSnapshot } from "../src/pr-github";
 import { remoteLanePaths } from "../src/worker-wire";
 import type { RemotePlacement, WorkerLaneRef, WorkerRegistration } from "../src/worker-wire";
 
@@ -290,6 +292,7 @@ class MessengerTransport implements Messenger {
   canCreateThread?: Messenger["canCreateThread"];
   inspectThread?: Messenger["inspectThread"];
   updateThread?: Messenger["updateThread"];
+  messengerPresence?: Messenger["messengerPresence"];
   private sendWaiters: Array<{ count: number; resolve: () => void }> = [];
   private approvalWaiters: Array<() => void> = [];
   threadFails = false;
@@ -1189,6 +1192,54 @@ test("natural-language cron registration is active-owner-bound and cannot recrea
   expect(() => runtime.createCronJob(request)).toThrow("current HEAD turn");
 });
 
+test.each(["디스코드 봇 온라인 상태 유지해 줘", "이 PR CI가 통과하면 알려줘", "이 작업이 멈추거나 끝나면 알려줘",
+  "Stop watching this lane", "Watch https://github.com/example/project/pull/17"])(
+  "an original bound-topic observation request reaches HEAD without dispatching work: %s", async text => {
+    const { runtime, config, store, main, launched } = fixture();
+    const lane = savedLane(store, config, "watched-work", route("44"));
+    await runtime.start();
+    const input = message("245", lane.route, text);
+    await admit(runtime, input);
+    expect(store.input(input.id)).toMatchObject({ route: lane.route, target: "main", text });
+    expect(main.prompts[0]?.command.message).toContain(text);
+    expect(main.prompts[0]?.command.message).toContain(lane.id);
+    expect(launched).toEqual([]);
+  });
+
+test("bot presence accepts only the active owner and the account where the request was admitted", async () => {
+  const { runtime, messenger, main } = fixture();
+  const requests: Array<Parameters<NonNullable<Messenger["messengerPresence"]>>[0]> = [];
+  messenger.messengerPresence = async request => {
+    requests.push(request);
+    return { platform: "discord", desired: "online", connection: "disconnected", lastSent: null, replayed: false };
+  };
+  await runtime.start();
+  const input = message("246", route("44"), "Keep the bot online");
+  await expect(runtime.messengerPresence(input.id, "start")).rejects.toThrow("current HEAD turn");
+  await admit(runtime, input);
+  await expect(runtime.messengerPresence(input.id, "start", "slack")).rejects.toThrow("target messenger account");
+  expect(await runtime.messengerPresence(input.id, "start")).toMatchObject({ desired: "online", connection: "disconnected", lastSent: null });
+  expect(requests).toEqual([{ action: "start", sourceId: input.id, route: input.route }]);
+  main.complete("Online requested; currently disconnected.");
+  await messenger.whenSent(1);
+  await expect(runtime.messengerPresence(input.id, "stop")).rejects.toThrow("current HEAD turn");
+  expect(requests).toHaveLength(1);
+});
+
+test.each(["slack", "telegram"] as const)("%s bot presence reports a limitation without invoking a transport", async platform => {
+  const { runtime, config, messenger } = fixture();
+  config.telegram = { tokenEnv: "TEST_TG", ownerId: "1", allowedChatIds: ["-100"] };
+  config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+  const origin = platform === "slack"
+    ? route(null, { platform, accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" })
+    : route(null, { platform, accountId: "2", guildId: "-100", channelId: "-100" });
+  messenger.messengerPresence = async () => { throw new Error("Unsupported presence must not call the transport"); };
+  await runtime.start();
+  const source = headMessage(platform === "slack" ? "100.000001" : "301", origin, "Keep the bot online");
+  await admit(runtime, source);
+  expect(await runtime.messengerPresence(source.id, "start", platform)).toMatchObject({ platform, supported: false });
+});
+
 test.each(["stop", "pause", "remove"] as const)("recovered %s control takes effect before the scheduler can submit a run", async action => {
   const { runtime, store, config, messenger, main } = fixture();
   const origin = route("11");
@@ -1216,12 +1267,13 @@ test.each(["stop", "pause", "remove"] as const)("recovered %s control takes effe
   expect(main.prompts).toEqual([]);
 });
 
-test("PR feedback after lane closure reaches only HEAD and its registered conversation", async () => {
+test("PR feedback and a CI pass after lane closure reach only HEAD and the registration conversation", async () => {
   let reads = 0;
   const { runtime, store, main, messenger, launched, directory, hosts } = fixture(3, undefined, {
     readPrSnapshot: async () => {
       reads++;
       return { head: "a".repeat(40), state: "open", mergedSha: null, self: "owner", headChange: "unknown", failures: [],
+        ci: reads === 1 ? { outcome: "pending" } : { outcome: "passed", key: "pass", skipped: 0 },
         feedback: reads === 1 ? [] : [{ key: "review:1", actor: "reviewer", kind: "review",
           url: "https://github.com/example/project/pull/7#review", text: "Please correct the parsing boundary." }] };
     },
@@ -1247,26 +1299,138 @@ test("PR feedback after lane closure reaches only HEAD and its registered conver
   await runtime.kick();
   const initialPrompts = main.prompts.length;
   const initialLaunches = launched.length;
+  const request = headMessage("pr-track", route("11"), "Track example/project#7 every second");
+  await admit(runtime, request);
+  await main.whenPrompts(initialPrompts + 1);
+  const command = { action: "track", ref: "example/project#7", sourceId: request.id, laneId: lane.id, intervalSeconds: 1 } as const;
+  expect(() => runtime.watchPr({ ...command, sourceId: original.id })).toThrow("current HEAD turn");
+  runtime.watchPr(command);
+  const registrationReply = messenger.whenSent(messenger.sent.length + 1);
+  main.complete("Tracking registered.");
+  await registrationReply;
   const initialMessages = messenger.sent.length;
-  const delivered = main.whenPrompts(initialPrompts + 1);
-  runtime.watchPr({ action: "track", ref: "example/project#7", sourceId: original.id, laneId: lane.id, intervalSeconds: 1 });
+  const delivered = main.whenPrompts(initialPrompts + 2);
   await delivered;
   const prompt = main.prompts.at(-1)?.command;
   expect(String(prompt?.message)).toContain("PR_FEEDBACK");
+  expect(String(prompt?.message)).toContain("PR_CI_PASS");
   expect(String(prompt?.message)).toContain("Please correct the parsing boundary.");
+  expect(runtime.prObservationActive()).toBe(true);
+  expect(() => runtime.listPrWatches({ sourceId: request.id })).toThrow("current HEAD turn");
+  expect(() => runtime.watchPr({ action: "untrack", ref: command.ref, sourceId: request.id })).toThrow("current HEAD turn");
   expect(prompt?.streamingBehavior).toBeUndefined();
   expect(launched).toHaveLength(initialLaunches);
   expect(store.lane(lane.id)?.workState).toBe("completed");
   expect(messenger.sent).toHaveLength(initialMessages);
-  main.complete("A reviewer requested a parsing correction.");
+  main.complete("CI passed and a reviewer requested a parsing correction.");
   await messenger.whenSent(initialMessages + 1);
-  expect(messenger.sent.at(-1)?.route).toEqual(original.route);
+  expect(messenger.sent.at(-1)?.route).toEqual(request.route);
 }, 10_000);
+
+async function queuePrObservation({ config, store }: Pick<ReturnType<typeof fixture>, "config" | "store">) {
+  const original = message("removed-pr");
+  store.receive(original, "main", { "user-source:removed-pr": "true" });
+  store.settle(original.id, "done");
+  let snapshot: PrSnapshot = { head: "a".repeat(40), state: "open", mergedSha: null, self: "owner",
+    headChange: "unknown", feedback: [], failures: [], ci: { outcome: "pending" } };
+  const previous = new PrWatcher(store, config, async () => snapshot);
+  const ref = "example/project#7";
+  const intervalSeconds = 300;
+  previous.change({ action: "track", sourceId: original.id, ref, intervalSeconds });
+  const signal = new AbortController().signal;
+  const now = Date.now();
+  await previous.poll(now, signal);
+  snapshot = { ...snapshot, ci: { outcome: "passed", key: "completed-pass", skipped: 0 } };
+  await previous.poll(now + intervalSeconds * 1000, signal);
+  const [notice] = store.inputs("main", "pending");
+  if (!notice) throw new Error("Expected enrolled PR notification");
+  return { previous, original, ref, notice };
+}
+
+test("settled PR notices and derived IDs cannot authorize lane work for their original recipient", async () => {
+  const { runtime, config, store, main } = fixture();
+  const lane = savedLane(store, config, "pr-authority", route("80"));
+  const { original, notice } = await queuePrObservation({ config, store });
+  expect(store.settle(notice.id, "done")).toBe(true);
+  const derived = { ...original, id: `legacy-handoff:${notice.id}`, text: "Earlier report data" };
+  store.receive(derived, "main", { [`handoff-source:${derived.id}`]: notice.id });
+  expect(store.settle(derived.id, "done")).toBe(true);
+  await runtime.start();
+
+  for (const id of [notice.id, derived.id]) {
+    expect(store.ownerSource(id)?.id).toBe(original.id); // Delivery provenance remains intact.
+    await expect(runtime.startLane({ ...selection, sourceId: id, title: "Unauthorized work",
+      kickoff: "Do not admit this work.", cwd: config.headCwd })).rejects.toThrow("PR observations cannot authorize lane work");
+    await expect(runtime.messageLane(lane.id, "Do not dispatch", id)).rejects.toThrow("PR observations cannot authorize lane work");
+    await expect(runtime.changeModel({ id: lane.id, sourceId: id, model: otherModel, modelReason: "No owner intent" }))
+      .rejects.toThrow("PR observations cannot authorize lane work");
+    expect(store.input(`handoff:${id}:${lane.id}`)).toBeNull();
+  }
+  await runtime.pause(lane.id);
+  for (const id of [notice.id, derived.id])
+    await expect(runtime.resume(lane.id, id)).rejects.toThrow("PR observations cannot authorize lane work");
+  expect(store.lane(lane.id)?.workState).toBe("paused");
+
+  const owner = headMessage("authorized-pr-follow-up", route("81"), "Resume the lane and address the review.");
+  await admit(runtime, owner);
+  await main.whenPrompts(1);
+  expect(store.input(owner.id)?.state).toBe("submitted");
+  await runtime.resume(lane.id, owner.id);
+  const work = await runtime.messageLane(lane.id, "Address the review.", owner.id);
+  expect(work.inputId).toBe(`handoff:${owner.id}:${lane.id}`);
+  expect(store.lane(lane.id)?.workState).toBe("open");
+});
+
+test("an active PR observation queues only its settled final summary, not native commentary", async () => {
+  const { runtime, config, store, main, messenger } = fixture();
+  const { original, notice } = await queuePrObservation({ config, store });
+  await runtime.start();
+  await main.whenPrompts(1);
+  expect(store.input(notice.id)?.state).toBe("submitted");
+  main.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{
+    type: "text", text: "Unsettled PR commentary.",
+    textSignature: JSON.stringify({ v: 1, id: "pr-comment", phase: "commentary" }),
+  }] } });
+  expect(store.outputs().filter(output => output.sourceId === notice.id)).toEqual([]);
+  main.complete("Final PR summary.");
+  await messenger.whenSent(1);
+  expect(messenger.attempted.map(output => output.text)).toEqual(["Final PR summary."]);
+  expect(messenger.sent[0]?.route).toEqual(original.route);
+}, 10_000);
+
+test("recovery does not consume a queued PR observation after the original watch is removed", async () => {
+  const { runtime, config, store, main, messenger } = fixture();
+  const { previous, original, ref, notice } = await queuePrObservation({ config, store });
+  previous.change({ action: "untrack", sourceId: original.id, ref });
+  await runtime.start();
+  expect(store.input(notice.id)?.state).toBe("cancelled");
+  expect(main.prompts).toEqual([]);
+  expect(messenger.sent).toEqual([]);
+});
+
+test.each(["active", "untracked", "recovered-stop"] as const)(
+  "startup rechecks a settled PR notice at the outbox boundary (%s)", async scenario => {
+    const { runtime, config, store, main, messenger } = fixture();
+    const { previous, original, ref, notice } = await queuePrObservation({ config, store });
+    const outputId = `${notice.id}:result`;
+    expect(store.settle(notice.id, "done", { id: outputId, text: "Observed CI pass on the original PR." })).toBe(true);
+    if (scenario === "untracked") previous.change({ action: "untrack", sourceId: original.id, ref });
+    if (scenario === "recovered-stop") {
+      const stop = message("recovered-pr-stop", original.route, "/stop head");
+      store.receive(stop, "main", { "user-source:recovered-pr-stop": "true" });
+    }
+
+    await runtime.start();
+    expect(store.output(outputId)?.state).toBe(scenario === "active" ? "sent" : "failed");
+    expect(messenger.sent.filter(output => output.id === outputId).map(output => output.route))
+      .toEqual(scenario === "active" ? [original.route] : []);
+    expect(main.prompts).toEqual([]);
+  });
 
 test("runtime shutdown aborts and joins an in-flight PR read without a late observation", async () => {
   const started = Promise.withResolvers<void>();
   let aborted = false;
-  const { runtime, store, main } = fixture(3, undefined, {
+  const { runtime, main, directory } = fixture(3, undefined, {
     readPrSnapshot: async (_ref, { signal }) => {
       started.resolve();
       return new Promise((_resolve, reject) => {
@@ -1275,13 +1439,17 @@ test("runtime shutdown aborts and joins an in-flight PR read without a late obse
     },
   });
   await runtime.start();
-  store.receive(message("pr-stop"), "main", { "user-source:pr-stop": "true" });
-  store.settle("pr-stop", "done");
+  await admit(runtime, headMessage("pr-stop", route(), "Track example/project#7"));
+  await main.whenPrompts(1);
   runtime.watchPr({ action: "track", ref: "example/project#7", sourceId: "pr-stop", intervalSeconds: 1 });
   await started.promise;
   await runtime.stop();
   expect(aborted).toBe(true);
-  expect(main.prompts).toHaveLength(0);
+  expect(main.prompts).toHaveLength(1);
+  const reopened = new Store(join(directory, "coordination.sqlite"));
+  try {
+    expect(reopened.inputs("main").some(input => input.id.startsWith("pr-observation:"))).toBe(false);
+  } finally { reopened.close(); }
 }, 10_000);
 
 describe("source-bound Discord topic management", () => {
@@ -10335,6 +10503,11 @@ describe("ordinary placement in owner parents without native threads", () => {
     expect(store.input("9123")).toMatchObject({ state: "done", route: lane.route });
     expect(store.lane(lane.id)?.workState).toBe("open");
     expect(main.prompts).toEqual([]);
+
+    const watch = message("9124", parent, "Keep an eye on it");
+    await admit(runtime, { ...watch, routingText: watch.text, reply });
+    expect(store.input("9124")).toMatchObject({ target: "main", route: lane.route });
+    expect(main.prompts[0]?.command.message).toContain(lane.id);
   });
 
   test.each(["probe-failed", "mutation-uncertain"] as const)("never makes a logical topic after %s", async failure => {

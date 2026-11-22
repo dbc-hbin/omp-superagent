@@ -23,7 +23,7 @@ Gateway가 메신저 연결과 헤드 수명을 맡고, 모든 요청·후속 �
 
 헤드만 `lane_models`, `lane_init_presets`, `lane_start`, `lane_set_model`,
 `lane_inspect`, `lane_message`, `lane_pause`, `lane_resume`, `lane_close`,
-`thread_inspect`, `lane_thread_update`, `pr_watch`, `pr_watch_list`,
+`thread_inspect`, `lane_thread_update`, `messenger_presence`, `lane_watch`, `pr_watch`, `pr_watch_list`,
 `discord_context`, `discord_purpose_list`, `discord_purpose_set`, `discord_purpose_clear`,
 `decision_list`, `decision_inspect`, `decision_withdraw`를 사용한다.
 `decision_ask`는 HEAD와 레인 root에서 사용하며 native 자식에는 제공하지 않는다.
@@ -37,22 +37,44 @@ Gateway가 메신저 연결과 헤드 수명을 맡고, 모든 요청·후속 �
 - native discovery를 사용하므로 현재 cwd와 무관하게 위 URI를 읽을 수 있다. 사용자·프로젝트
   스킬을 덮어쓰지 않는다. `--no-skills`는 이 URI 기반 운영 흐름에서 사용하지 않는다.
 
+### 온라인 표시와 작업 감시
+
+| 운영자가 보내는 요청 예시 | 동작 |
+| --- | --- |
+| `디스코드 봇 온라인 상태 유지해 줘` / `온라인 상태 알려줘` / `온라인 표시 꺼 줘` | 현재 Discord 봇의 온라인 표시를 유지·조회하거나 `invisible`로 바꾼다. 다른 사용자나 계정을 추적하지 않는다. |
+| `이 레인 감시해 줘` / `감시 목록 보여줘` / `이 레인 감시 중지해 줘` | 원래 대화에서 선택한 레인의 기록된 진행·중단 사유·종료를 관찰한다. 알림 중지는 레인 일시정지나 작업 취소가 아니다. |
+| `owner/repo#35 CI가 통과하면 알려줘` | 아래 PR 관찰을 등록한다. HEAD는 등록 결과를 확인한 뒤 답한다. |
+
+대상이 불분명하면 레인 이름이나 PR URL을 알려준다. 바인딩된 대화에서도 명확한 감시 요청은
+HEAD가 처리하며, 일반 작업과 인용문은 기존처럼 취급한다. 필요하면 `/head`로 명시한다.
+다른 대화로 등록이 자동 이전되지 않는다. 기존 Gateway와 HEAD가 실행 중이어야 하며
+봇을 하나 더 띄우거나 추가 토큰을 발급할 필요는 없다.
+실제 연결이 없는 상태를 “메신저에서 온라인으로 보인다”로 해석하면 안 된다.
+
+Discord의 온라인·숨김 설정은 같은 Gateway가 재접속할 때 적용한다. 상태 조회는 **설정값,
+현재 연결, 현재 소켓에 마지막으로 쓴 값**을 구분한다. 사용자의 화면 표시, HEAD 준비 여부,
+레인 실행 상태를 증명하지 않는다. 시작 전 기본 동작은 그대로이고 숨김도 메시지 수신을 끄지 않는다.
+Slack Socket Mode 앱의 봇 온라인 표시는 [Slack 앱 설정](https://docs.slack.dev/apis/web-api/user-presence-and-status/#events-api-bots)에서
+관리한다. Telegram Bot API는 온라인 표시를 지원하지 않는다. 둘 다 사용자 토큰이나 쿠키로 우회하지 않는다.
+
 ### PR 후속 추적
 
-헤드에 PR URL과 관찰 주기를 알려 추적을 요청한다. `pr_watch`는 `action: "track"`,
+헤드에 PR URL을 알려 추적을 요청한다. `pr_watch`는 `action: "track"`,
 `ref`(GitHub PR URL 또는 `owner/repo#번호`), 실제 원본 `sourceId`,
-`intervalSeconds`를 받는다. 선택적인 `laneId`는 기존 레인과의 정보상 연결이며,
+선택적인 `intervalSeconds`를 받는다(생략하면 5분). `laneId`는 기존 레인과의 정보상 연결이며,
 `ignoreAuthors`는 알림에서 제외할 GitHub login 목록이다. 예를 들어 300초마다
-리뷰·CI 변경을 확인하도록 요청할 수 있다. 자동 등록이나 기본 관찰 주기는 없다.
+리뷰·CI 변경을 확인하도록 요청할 수 있다. 자동 등록은 하지 않는다.
 
-`pr_watch_list({})`로 등록·기준 head/state·다음 확인 시각·오류·보류를 조회하고,
+`pr_watch_list({sourceId, ref?})`로 이 대화의 등록·기준점·최근 관찰·다음 확인 시각·오류·보류를 조회하고,
 `pr_watch({action: "untrack", ref, sourceId})`로 추적을 끝낸다. 이들은 HEAD의 native
 도구이지 메신저 slash command나 셸 명령이 아니다.
 
 - 별도 설치된 `gh`가 HEAD 환경의 PATH에 있어야 하고 `github.com` 읽기 인증이 필요하다.
   기존 `gh` 인증을 쓰며 자체 토큰 저장이나 로그인은 하지 않는다. Enterprise 호스트는 지원하지 않는다.
-- 첫 성공 조회는 기준점만 저장한다. 이후 새 리뷰·댓글, 리뷰 상태 변경, 현재 head의 CI 실패·재실패,
+- 첫 성공 조회는 기준점만 저장한다. 이후 새 리뷰·댓글, 리뷰 상태 변경, 현재 head의 CI 통과·실패·재실패,
   외부/불명 head 변경, PR 종료·재개·병합을 원래 등록 대화의 HEAD 입력으로 전달한다.
+  실제 성공한 검사가 있고 나머지 일부가 skip/neutral이면 이를 구분해서 보고한다.
+  전부 skip이거나 검사가 없으면 통과가 아니다. CI 통과가 병합 가능 여부의 보증은 아니다.
   본인 댓글·본인만의 push와 이미 관측한 항목은 반복 알리지 않는다.
 - 레인이 완료·비상주가 되어도 HEAD runtime의 일반 코드가 조회한다. 변화가 없으면 모델 턴을
   만들지 않는다. HEAD/Gateway가 꺼져 있는 동안에는 조회하지 않으며 다시 시작하면 저장한
@@ -168,7 +190,7 @@ board_subscribe({channels: ["general", "repo:/absolute/repository"]})
 현재 소스는 Git, **Bun >= 1.4.4**(`packageManager: bun@1.4.4`)와 로컬 Unix socket을
 사용한다. OMP 없이 패키지를 설치할 수 있다. Host 실행에는 별도로 설치한 stock OMP가
 필요하며, 버전 번호로 차단하지 않고 `rpc-ui`, 세션 재개, 확장, 모델 선택과 프로세스 관측
-인터페이스를 확인한다. 검증 대상은 OMP 18.20.3, 18.22.2, 19.0.0이다. SDK 기준선은
+인터페이스를 확인한다. OMP 18은 수동 호환성 검사 대상이며 자동 CI의 SDK 기준선은
 OMP 19.0.0이며 upstream `v19.0.0` 커밋은
 [`57771ae562b9345e0579bceb2d68d585e3e6927e`](https://github.com/can1357/oh-my-pi/commit/57771ae562b9345e0579bceb2d68d585e3e6927e)이다.
 `doctor`는 `command`가 고른 실행 파일 경로, 버전, 서비스 백엔드를 보여주며 로그인이나
@@ -181,13 +203,13 @@ OMP 19.0.0이며 upstream `v19.0.0` 커밋은
 사용한다. 이 저장소는 OMP를 다운로드하거나 소스에서 빌드하지 않는다.
 
 ```sh
-bun add --global --trust omp-superagent@0.1.7
+bun add --global --trust omp-superagent@0.1.8
 omp-sa --help
 ```
 
 `--trust`는 관리형 omp-superkit 준비 등 패키지 설치 스크립트를 허용한다.
 `bun pm bin --global`의 출력 경로를 PATH에 포함한다. Bun이 PATH에 있으면
-`npm install --global omp-superagent@0.1.7`도 사용할 수 있다.
+`npm install --global omp-superagent@0.1.8`도 사용할 수 있다.
 설정은 설치 디렉터리가 아닌 사용자 작업 디렉터리에
 `omp-sa setup --config ./config.local.json`으로 만든다. 설치만으로 봇을 활성화하지 않는다.
 
@@ -1362,7 +1384,8 @@ OpenSSH 클라이언트·서버와 stock OMP가 설치되어 있으면 아래 �
 OMP_SUPERAGENT_WORKER_SSH_TEST=1 bun test test/native-worker-ssh.test.ts
 ```
 
-일반 회귀는 `bun run check`와 `bun test test`(`bun run test`와 같음)로 실행한다.
+일반 회귀는 `bun run check`와 `bun run test`로 실행한다. 테스트 스크립트는 네이티브 바이너리를
+빌드한 뒤 격리된 워커 두 개로 테스트 파일을 실행한다. 순서 의존성을 확인할 때는 같은 범위를 `bun test test`로 직렬 실행할 수 있다.
 기본 테스트는 opt-in native/PTY 시나리오를 제외한다. `.upstream`까지 탐색하는 인수 없는
 `bun test`로 대체하지 않는다. OMP와 관리형 omp-superkit이 준비된 checkout의 `bun run test:ci`는
 타입 검사와 모든 로컬 project/native/PTY·omp-superkit 통합 회귀를 실행한다. `scripts/ci.ts`는 활성
@@ -1374,13 +1397,15 @@ standalone CLI를 찾는다. Bun이 앞에 넣은 `node_modules/.bin`은 건너�
 `OMP_TEST_NATIVES_DIR`에 신뢰하는 절대 경로를 직접 지정하면 임시 캐시 대신 사용하며, 이 경로는 실행 후 삭제하지 않는다.
 
 PR, `main`, 수동 실행과 `v*` 릴리즈 태그의 GitHub Actions는 Ubuntu 24.04와 macOS 15 ARM64에서
-실행한다. macOS Intel은 CI에서 검사하지 않으며, 릴리즈 게시는 두 러너가 모두 통과해야 진행된다.
-각 러너는 `bun run test:baseline`으로 SDK와 같은 공식 CLI를, `bash scripts/test-omp.sh v18.22.2`로
-공식 OMP 18을 임시 디렉터리에 받아 각각 SHA-256과 `omp --version`을 확인한다.
+실행한다. 두 러너는 SDK 기준판만 검사하며, 원본 oracle 재생은 macOS에서 실행한다.
+릴리즈 게시는 양쪽의 테스트와 macOS Intel을 포함한 네 플랫폼의 패키지 설치 검증이 모두 통과해야 진행된다.
+각 러너는 `bun run test:baseline`으로 SDK와 같은 공식 CLI를 임시 디렉터리에 받아
+SHA-256과 `omp --version`을 확인한다.
 `bun install --frozen-lockfile`로 패키지를 먼저 설치한 뒤 `bun run test:ci`에만 그 CLI를
 `PATH` 앞에 넣는다. 같은 명령을 로컬에서
 실행해도 PATH의 기존 OMP를 교체하지 않는다. 다운로드에는 인터넷·curl·shasum이 필요하다.
-Ubuntu CI는 이전 비동기 작업 API를 쓰는 `v18.20.3`도 같은 방식으로 검증한다.
+OMP 18은 CI에서 실행하지 않는다. 필요할 때만 `bash scripts/test-omp.sh v18.22.2` 또는 이전
+비동기 작업 API를 쓰는 `v18.20.3`을 지정해 같은 검사를 수동으로 실행한다.
 
 **OMP upstream compatibility**는 매주 월요일 04:17 UTC 또는 Actions에서 수동으로 실행한다.
 upstream의 최신 정식 릴리스 태그를 한 번 조회한 뒤 Ubuntu·macOS ARM64에서 그 태그로 같은 검사를 수행한다.

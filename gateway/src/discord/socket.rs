@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::dispatch::{Connection, Dispatcher, Ready};
 use super::login::{IdentifyLimiter, gateway_url};
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Deserialize)]
 struct Frame {
@@ -36,6 +36,17 @@ struct Frame {
 #[derive(Default)]
 pub(super) struct Session {
     pub resume: Option<Resume>,
+    presence_account: Option<String>,
+    presence_allowed: Option<time::Instant>,
+}
+
+impl Session {
+    pub fn new(presence_account: Option<String>) -> Self {
+        Self {
+            presence_account,
+            ..Self::default()
+        }
+    }
 }
 
 pub(super) struct Resume {
@@ -67,7 +78,7 @@ pub(super) fn jitter(bound: u64) -> Duration {
     Duration::from_millis(nanos % bound.max(1))
 }
 
-async fn text(socket: &mut Socket, value: Value) -> Result<()> {
+pub(super) async fn text(socket: &mut Socket, value: Value) -> Result<()> {
     time::timeout(
         Duration::from_secs(5),
         socket.send(Message::Text(value.to_string().into())),
@@ -137,9 +148,13 @@ impl Link<'_> {
         );
         heartbeats.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let state = self.dispatcher.state();
-        let login = match &self.session.resume {
-            Some(resume) => json!({ "op": 6, "d": { "token": state.rest.token(),
-                "session_id": resume.id, "seq": resume.sequence } }),
+        let mut connection = state.presence.link();
+        let mut identified_presence = match &self.session.resume {
+            Some(resume) => {
+                text(&mut self.socket, json!({ "op": 6, "d": { "token": state.rest.token(),
+                    "session_id": resume.id, "seq": resume.sequence } })).await?;
+                None
+            }
             None => {
                 self.limiter.attempted();
                 let intents = 1
@@ -147,16 +162,18 @@ impl Link<'_> {
                     | (1 << 12)
                     | (1 << 15)
                     | if state.voice.is_some() { 1 << 7 } else { 0 };
-                json!({ "op": 2, "d": { "token": state.rest.token(), "intents": intents,
-                    "properties": { "os": std::env::consts::OS, "browser": "omp-superagent", "device": "omp-superagent" } } })
+                let identify = json!({ "op": 2, "d": { "token": state.rest.token(), "intents": intents,
+                    "properties": { "os": std::env::consts::OS, "browser": "omp-superagent", "device": "omp-superagent" } } });
+                connection.identify(&mut self.socket, identify).await?
             }
         };
-        text(&mut self.socket, login).await?;
         let mut heartbeat_ack = true;
         let (outbound, mut packets) = mpsc::channel::<Value>(32);
         let authentication = time::sleep(Duration::from_secs(30));
         tokio::pin!(authentication);
         loop {
+            let presence_pending = connection.pending().is_some();
+            let presence_allowed = self.session.presence_allowed.unwrap_or_else(time::Instant::now);
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
@@ -191,6 +208,10 @@ impl Link<'_> {
                 outgoing = packets.recv() => {
                     if let Some(value) = outgoing { text(&mut self.socket, value).await?; }
                 }
+                () = time::sleep_until(presence_allowed), if self.authenticated && presence_pending => {
+                    connection.update(&mut self.socket, &mut self.session.presence_allowed).await?;
+                }
+                changed = connection.changed() => { changed?; }
                 received = next(&mut self.socket) => {
                     let frame = match received? { Ok(frame) => frame, Err(end) => return Ok(end) };
                     match frame.op {
@@ -204,8 +225,13 @@ impl Link<'_> {
                                 let ready = Ready::deserialize(&frame.d)
                                     .map_err(|_| anyhow::anyhow!("Discord Gateway READY is invalid"))?;
                                 let url = gateway_url(&ready.resume_gateway_url)?;
-                                if ready.authenticate(state).is_err() || ready.session_id.is_empty() {
+                                if ready.authenticate(state, self.session.presence_account.as_deref()).is_err()
+                                    || ready.session_id.is_empty()
+                                {
                                     return Ok(End::Fatal(4004));
+                                }
+                                if self.session.presence_account.is_none() {
+                                    state.restore_ready_presence().await?;
                                 }
                                 self.session.resume = Some(Resume { url, id: ready.session_id, sequence });
                             }
@@ -215,6 +241,7 @@ impl Link<'_> {
                             if let Some(resume) = &mut self.session.resume { resume.sequence = resume.sequence.max(sequence); }
                             if matches!(event, "READY" | "RESUMED") {
                                 self.authenticated = true;
+                                connection.connected(identified_presence.take());
                                 if let Some(startup) = self.startup.take() {
                                     if startup.send(Ok(())).is_err() { return Ok(End::Identify); }
                                 } else {

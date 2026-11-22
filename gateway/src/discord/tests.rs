@@ -31,6 +31,8 @@ mod addressing_tests;
 mod addressing_authority_tests;
 #[path = "tests/addressing_recovery.rs"]
 mod addressing_recovery_tests;
+#[path = "tests/presence.rs"]
+mod presence_tests;
 
 struct Temp(PathBuf);
 impl Temp {
@@ -90,6 +92,7 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
     let result = match (method.as_str(), path.as_str()) {
         ("GET", "/gateway/bot") => json!({"url": fixture.socket, "shards": 1,
             "session_start_limit":{"total":1000,"remaining":1000,"reset_after":86_400_000_u64,"max_concurrency":1}}),
+        ("GET", "/users/@me") => json!({"id":"71","bot":true}),
         ("GET", "/channels/90") => {
             json!({"id":"90", "guild_id":"77", "type":11, "parent_id":"88", "name":"task thread"})
         }
@@ -297,6 +300,7 @@ async fn discord_fixture_with_store(mut config: Value, store: &Arc<Store>) -> (
                 voice,
                 cards: Cards::default(),
                 purpose_lock: Mutex::new(()),
+                presence: Presence::default(),
             }),
             task: Mutex::new(None),
         };

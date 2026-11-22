@@ -22,10 +22,10 @@ use crate::{
 mod group;
 mod restart;
 
-struct SocketDir(PathBuf);
+pub(crate) struct SocketDir(pub(crate) PathBuf);
 
 impl SocketDir {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         // macOS temporary directories may exceed the Unix socket address cap.
         let path = PathBuf::from("/tmp").join(format!("ogw-{}", Uuid::new_v4()));
         fs::DirBuilder::new().mode(0o700).create(&path)?;
@@ -66,7 +66,7 @@ impl Adapter for LocalAttachment {
     }
 }
 
-struct LifecycleFixture;
+pub(crate) struct LifecycleFixture;
 
 #[async_trait]
 impl Service for LifecycleFixture {
@@ -89,8 +89,8 @@ impl Service for LifecycleFixture {
     }
 }
 
-struct GatewayClient {
-    server: Server,
+pub(crate) struct GatewayClient {
+    pub(crate) server: Server,
     client: reqwest::Client,
     headers: reqwest::header::HeaderMap,
 }
@@ -122,7 +122,7 @@ impl GatewayClient {
         Self::with_adapters(root, store, service, adapters).await
     }
 
-    async fn with_adapters(
+    pub(crate) async fn with_adapters(
         root: &SocketDir,
         store: Arc<Store>,
         service: Arc<dyn Service>,
@@ -157,7 +157,7 @@ impl GatewayClient {
         })
     }
 
-    async fn call(&self, endpoint: &str, body: &Value) -> Result<Value> {
+    pub(crate) async fn call(&self, endpoint: &str, body: &Value) -> Result<Value> {
         Ok(self
             .client
             .post(format!("http://localhost{endpoint}"))
@@ -167,6 +167,17 @@ impl GatewayClient {
             .await?
             .json()
             .await?)
+    }
+
+    pub(crate) async fn events(&self, root: &SocketDir) -> Result<Response> {
+        // The event stream has no total lifetime deadline; its consumer
+        // bounds each read rather than expiring the active controller.
+        let request = reqwest::Client::builder()
+            .unix_socket(root.0.join("g.sock"))
+            .build()?
+            .get("http://localhost/events")
+            .headers(self.headers.clone());
+        Ok(timeout(Duration::from_secs(3), request.send()).await??.error_for_status()?)
     }
 
     async fn download(&self) -> Result<Response> {

@@ -103,7 +103,7 @@ OS 샌드박스가 아닙니다. 자세한 내용은 [설계(영문)](DESIGN.md)
 ## 배포 형태
 
 [npm 패키지](https://www.npmjs.com/package/omp-superagent)를 Bun 또는 npm으로 설치하거나
-[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.7)의 소스·npm tarball을 받으세요.
+[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.8)의 소스·npm tarball을 받으세요.
 실행에는 Bun이 필요하며 독립 실행 바이너리는 아닙니다. 설치 시 관리형 의존성을 준비합니다.
 Host를 실행하려면 별도로 설치한 OMP가 필요하며, 이 프로젝트가 패치하거나 빌드하지 않습니다.
 
@@ -111,7 +111,7 @@ Host를 실행하려면 별도로 설치한 OMP가 필요하며, 이 프로젝�
 
 현재 소스는 Git, **Bun >= 1.4.4**, 로컬 Unix socket을 사용합니다. 패키지 설치에는 OMP가
 필요 없습니다. Host를 실행할 때는 별도로 설치한 OMP의 기능을 검사하며, 버전 범위로 제한하지
-않습니다. 검증한 공식 버전은 **OMP 18.20.3, 18.22.2, 19.0.0**입니다.
+않습니다. CI 기준판은 **OMP 19.0.0**이며, **18.20.3과 18.22.2**는 이전 릴리스에서 검증했습니다.
 Windows는 지원하지 않습니다.
 
 <details>
@@ -119,9 +119,9 @@ Windows는 지원하지 않습니다.
 
 SDK는 **19.0.0**으로 유지하며 upstream 커밋은
 [`57771ae562b9345e0579bceb2d68d585e3e6927e`](https://github.com/can1357/oh-my-pi/commit/57771ae562b9345e0579bceb2d68d585e3e6927e)입니다.
-`bun run test:ci`는 현재 설치된 OMP를 검사합니다. CI를 재현하려면 SDK 기준판은
-`bun run test:baseline`, OMP 18은 `bash scripts/test-omp.sh v18.22.2` 또는 `v18.20.3`을 사용하세요.
-두 명령 모두 공식 바이너리를 검증한 뒤 같은 회귀를 실행합니다.
+`bun run test:ci`는 현재 설치된 OMP를 검사합니다. CI 기준판을 재현하려면 `bun run test:baseline`을
+사용하세요. OMP 18은 수동 검사만 제공합니다. `bash scripts/test-omp.sh v18.22.2` 또는 `v18.20.3`을
+지정하면 해당 공식 바이너리를 검증한 뒤 같은 회귀를 로컬에서 실행합니다.
 별도의 주간·수동 **OMP upstream compatibility** 검사는 최신판이 깨지면 그대로 실패하며 릴리스를 막지 않습니다.
 
 </details>
@@ -140,7 +140,7 @@ OMP 19 데몬은 이전 브로커의 서비스를 인수하지 않습니다.
 OMP 자체를 설치하려면 [공식 설치 안내](https://github.com/can1357/oh-my-pi#install)를 참고하세요.
 
 ```sh
-bun add --global --trust omp-superagent@0.1.7
+bun add --global --trust omp-superagent@0.1.8
 omp-sa --help
 ```
 
@@ -153,7 +153,7 @@ omp-sa --help
 Bun이 `PATH`에 있다면 npm으로도 설치할 수 있습니다.
 
 ```sh
-npm install --global omp-superagent@0.1.7
+npm install --global omp-superagent@0.1.8
 ```
 
 postinstall이 필수 관리형 omp-superkit 통합을 준비하므로 설치 스크립트를 생략하지 마세요.
@@ -317,6 +317,7 @@ SSH가 끊겨도 Host 자체는 종료되지 않습니다. Host가 종료된 뒤
 
 ## 사용 방법
 
+- `디스코드 봇 온라인 상태 유지해 줘`, `owner/repo#35 CI가 통과하면 알려줘`, `이 작업이 멈추거나 끝나면 알려줘`처럼 요청하세요. 같은 대화에서 상태를 묻거나 감시만 중지할 수 있습니다. 감시가 PR 병합이나 작업 중지를 허가하지는 않습니다. Discord 온라인 표시를 꺼도 메시지는 계속 받습니다.
 - 이미 연결된 작업 스레드나 주제에서는 저장소 이름이나 명령 없이 후속 메시지를 보내면 그 작업을 이어갑니다.
 - 그 밖에서는 요청을 그대로 보내세요. 저장소 이름을 안다면 `client-ui에서 로그인 오류 봐줘`처럼 적어도 됩니다.
   HEAD는 저장소가 필요 없는 질문에는 직접 답하고, 작업에는 요청과 해당 대화의 문맥을 바탕으로 실제
@@ -399,7 +400,7 @@ bun run test:ci
 | [실행과 조율(영문)](docs/design/execution.md) | 레인·native Host 수명·모델·workflow·관리형 통합·모니터링·게시판. |
 | [운영 가이드](docs/OPERATIONS.md) | 설치·설정·명령·복구 절차. |
 | [Discord 음성채팅](docs/discord-voice.md) | Codex 구독 음성 또는 별도 과금되는 API 음성 선택. |
-| 릴리즈 | [릴리즈 노트](docs/releases/0.1.7.md) 및 [과거 검증 기록](docs/releases/0.1.0.md#verification-records). |
+| 릴리즈 | [릴리즈 노트](docs/releases/0.1.8.md) 및 [과거 검증 기록](docs/releases/0.1.0.md#verification-records). |
 
 [oh-my-pi](https://github.com/can1357/oh-my-pi)를 기반으로 하며, workflow에는 [omp-superkit](https://github.com/dbc-hbin/omp-superkit)을 사용합니다.
 

@@ -19,16 +19,19 @@ const metadata = { head: { sha: head }, state: "open", merged: false, merge_comm
 const roots: string[] = [];
 afterEach(async () => { for (const path of roots.splice(0)) await rm(path, { recursive: true, force: true }); });
 
-type Reply = { readonly body?: unknown; readonly raw?: string; readonly exit?: number; readonly stall?: boolean };
+type Reply = { readonly body?: unknown; readonly raw?: string; readonly exit?: number; readonly stall?: boolean; readonly after?: string };
 async function fixture(overrides: Readonly<Record<string, readonly Reply[]>> = {}) {
   const directory = await mkdtemp(join(tmpdir(), "superagent-pr-"));
   roots.push(directory);
+  const checkReplies = overrides[checkEndpoint] ?? [{ body: [{ total_count: 0, check_runs: [] }] }];
+  const [firstCheck] = checkReplies;
   const plan = {
     [pr]: [{ body: [metadata] }, { body: [metadata] }], user: [{ body: [{ login: "Me" }] }],
     [issueComments]: [{ body: [[]] }], [reviewComments]: [{ body: [[]] }],
     [reviewEndpoint]: [{ body: [[]] }], [timelineEndpoint]: [{ body: [[]] }],
-    [checkEndpoint]: [{ body: [{ total_count: 0, check_runs: [] }] }], [statusEndpoint]: [{ body: [[]] }],
+    [statusEndpoint]: [{ body: [[]] }],
     ...overrides,
+    [checkEndpoint]: firstCheck && checkReplies.length === 1 ? [firstCheck, firstCheck] : checkReplies,
   };
   await writeFile(join(directory, "plan.json"), JSON.stringify(plan));
   const executable = join(directory, "gh");
@@ -47,6 +50,7 @@ const index = calls.filter(call => call === endpoint).length;
 appendFileSync(directory + "/calls", endpoint + "\\n");
 const reply = plan[endpoint]?.[index];
 if (!reply) { console.error("Unexpected API request"); process.exit(92); }
+if (reply.after && !calls.includes(reply.after)) process.exit(93);
 if (reply.exit) { console.error("ghp_private_token private@example.invalid private response body"); process.exit(reply.exit); }
 if (reply.stall) { writeFileSync(directory + "/ready", ""); setInterval(() => {}, 1000); }
 else process.stdout.write(reply.raw ?? JSON.stringify(reply.body));
@@ -160,7 +164,8 @@ test.each([
   { label: "missing slurp page", endpoint: reviewEndpoint, reply: { body: [] } },
   { label: "malformed dismissal", endpoint: timelineEndpoint, reply: { body: [[{ event: "review_dismissed" }]] } },
   { label: "incomplete checks", endpoint: checkEndpoint, reply: { body: [{ total_count: 2, check_runs: [check(1)] }] } },
-  { label: "checks for another head", endpoint: checkEndpoint, reply: { body: [{ total_count: 1, check_runs: [{ ...check(1), head_sha: old }] }] } },
+  { label: "a successful check for another head", endpoint: checkEndpoint,
+    reply: { body: [{ total_count: 1, check_runs: [{ ...check(1, "success"), head_sha: old }] }] } },
   { label: "unavailable endpoint", endpoint: statusEndpoint, reply: { exit: 1 } },
 ])("rejects $label instead of committing an empty observation", async ({ endpoint, reply }) => {
   const result = await (await fixture({ [endpoint]: [reply] }))();
@@ -220,11 +225,76 @@ test("projects current CI failures with distinct rerun identities and drops supe
     [statusEndpoint]: [{ body: [[status(21), status(22, "success")], [status(23, "failure", "lint")]] }],
   };
   const result = await (await fixture(responses))();
-  expect(result).toMatchObject({ snapshot: { failures: [
+  expect(result).toMatchObject({ snapshot: { ci: { outcome: "failed" }, failures: [
     expect.objectContaining({ key: expect.stringMatching(/^check:11:/), conclusion: "failure" }),
     expect.objectContaining({ key: expect.stringMatching(/^check:12:/), conclusion: "cancelled" }),
     { key: "status:23", name: "lint", url: "https://ci.example.invalid/result", conclusion: "failure" },
   ] } });
+});
+
+test.each([
+  { label: "no checks or statuses", runs: [], statuses: [], outcome: "missing" },
+  { label: "only skipped checks", runs: [check(11, "skipped")], statuses: [], outcome: "skipped" },
+  { label: "only neutral checks", runs: [check(11, "neutral")], statuses: [], outcome: "skipped" },
+  { label: "substantive success alongside optional skips", runs: [check(11, "neutral"), check(12, "success"), check(13, "skipped")],
+    statuses: [], outcome: "passed_with_skips", skipped: 2 },
+  { label: "a new pending status that superseded a success", runs: [check(11, "success")],
+    statuses: [status(21, "success"), status(22, "pending")], outcome: "pending" },
+  { label: "checks still running", runs: [{ ...check(11, "success"), status: "in_progress", conclusion: null, completed_at: null }],
+    statuses: [status(21, "success")], outcome: "pending" },
+  { label: "a purported success without a completion time", runs: [{ ...check(11, "success"), completed_at: null }],
+    statuses: [], outcome: "pending" },
+  { label: "a completed check and status rerun replacing an old failure", runs: [check(11, "success")],
+    statuses: [status(22, "success"), status(21, "failure")], outcome: "passed", skipped: 0 },
+])("classifies current-head CI with $label as $outcome", async ({ runs, statuses, outcome, skipped }) => {
+  const run = await fixture({
+    [checkEndpoint]: [{ body: [{ total_count: runs.length, check_runs: runs }] }],
+    [statusEndpoint]: [{ body: [statuses] }],
+  });
+  const ci = outcome === "passed" || outcome === "passed_with_skips"
+    ? { outcome, skipped, key: expect.stringMatching(new RegExp(`^ci-pass:${head}:[0-9a-f]{24}$`)) }
+    : { outcome };
+  expect(await run()).toMatchObject({ snapshot: { head, ci, failures: [] } });
+});
+
+test("pass identity ignores API row order but changes for a distinct successful attempt", async () => {
+  async function observe(runs: readonly unknown[], statuses: readonly unknown[]) {
+    const result = await (await fixture({
+      [checkEndpoint]: [{ body: [{ total_count: runs.length, check_runs: runs }] }],
+      [statusEndpoint]: [{ body: [statuses] }],
+    }))();
+    if (!result || typeof result !== "object" || !("snapshot" in result)
+      || !result.snapshot || typeof result.snapshot !== "object" || !("ci" in result.snapshot))
+      throw new Error(`Expected snapshot CI evidence: ${JSON.stringify(result)}`);
+    const ci = result.snapshot.ci;
+    if (!ci || typeof ci !== "object" || !("outcome" in ci) || ci.outcome !== "passed" || !("key" in ci) || typeof ci.key !== "string")
+      throw new Error(`Expected a completed CI identity: ${JSON.stringify(ci)}`);
+    return ci.key;
+  }
+  const checks = [check(11, "success"), check(12, "success")];
+  const statuses = [status(21, "success"), status(22, "success", "docs")];
+  const result = await observe(checks, statuses);
+  expect(await observe(checks.toReversed(), statuses.toReversed())).toEqual(result);
+  expect(await observe(checks, [status(23, "success"), status(22, "success", "docs")])).not.toEqual(result);
+  expect(await observe([{ ...check(11, "success"), completed_at: "2026-11-17T01:00:11Z" }, check(12, "success")],
+    statuses)).not.toEqual(result);
+});
+
+test.each([
+  { label: "the same check moves to pending", before: [check(11, "success")],
+    after: [{ ...check(11, "success"), status: "in_progress", conclusion: null, completed_at: null }] },
+  { label: "a new check appears after a status-only success", before: [],
+    after: [{ ...check(12, "success"), status: "queued", conclusion: null, started_at: null, completed_at: null }] },
+  { label: "a replacement attempt has already completed", before: [check(11, "success")], after: [check(12, "success")] },
+])("withholds a CI pass on the same PR head if $label across the status read", async ({ before, after }) => {
+  const run = await fixture({
+    [checkEndpoint]: [
+      { body: [{ total_count: before.length, check_runs: before }] },
+      { body: [{ total_count: after.length, check_runs: after }], after: statusEndpoint },
+    ],
+    [statusEndpoint]: [{ body: [[status(21, "success")]] }],
+  });
+  expect(await run()).toMatchObject({ error: { message: "GitHub PR check attempts changed during observation" } });
 });
 
 test.each(["cancel", "preabort"])("cancels %s reads without leaking subprocess diagnostics", async cancellation => {

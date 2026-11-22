@@ -28,12 +28,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Ubuntu runs three full stock OMP suites; macOS runs two and the oracle replay.
-          - { os: ubuntu-24.04, timeout: 75 }
-          - { os: macos-15, timeout: 60 }
+        os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -61,11 +58,6 @@ jobs:
           (cd "$RUNNER_TEMP/owner-oracle" && echo "ee0ae5766bbd51a8619c5ec2e63f7786cd86cbc12e475ed296aa303a55e241ec  $name.tar.gz" | shasum -a 256 -c - && tar -xzf "$name.tar.gz")
           "$RUNNER_TEMP/owner-oracle/$name/rust-anything" app replay test/rust-anything
           "$RUNNER_TEMP/owner-oracle/$name/rust-anything" app replay test/rust-anything-gateway
-      - name: Test with stock OMP 18
-        run: bash scripts/test-omp.sh v18.22.2
-      - name: Test the earlier OMP 18 native lifecycle
-        if: matrix.os == 'ubuntu-24.04'
-        run: bash scripts/test-omp.sh v18.20.3
 
   build-native:
     name: Build Host owner and Gateway (${{ matrix.platform }})

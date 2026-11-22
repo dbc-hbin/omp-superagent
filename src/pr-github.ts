@@ -2,11 +2,15 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { Type, type Static, type TSchema } from "@sinclair/typebox/type";
 import {
-  PrReadError, checkPageSchema, commentSchema, comparePageSchema, loginSchema, metadataSchema,
+  PrReadError, checkPageSchema, type ciOutcomeSchema, commentSchema, comparePageSchema, loginSchema, metadataSchema,
   pages, parseWire, reviewSchema, safeText, safeUrl, sha, statusSchema, timelineSchema,
 } from "./pr-github-schema";
 
 export type PrRef = { readonly owner: string; readonly repo: string; readonly number: number };
+type CiPass = "passed" | "passed_with_skips";
+type PrCi =
+  | { readonly outcome: Exclude<Static<typeof ciOutcomeSchema>, CiPass> }
+  | { readonly outcome: CiPass; readonly key: string; readonly skipped: number };
 export type PrSnapshot = {
   readonly head: string;
   readonly state: "open" | "closed" | "merged";
@@ -18,6 +22,7 @@ export type PrSnapshot = {
   readonly failures: readonly {
     readonly key: string; readonly name: string; readonly url: string; readonly conclusion: string;
   }[];
+  readonly ci: PrCi;
   readonly headChange: "self" | "external" | "rewritten" | "unknown";
 };
 
@@ -61,6 +66,20 @@ function unique<T extends { readonly key: string }>(rows: readonly T[]): T[] {
     .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
 }
 
+async function readCheckRuns(root: string, head: string, signal: AbortSignal) {
+  const checks = await api(`${root}/commits/${head}/check-runs?per_page=100&filter=latest`, pages(checkPageSchema), signal);
+  const runs = checks.flatMap(page => page.check_runs);
+  const checkCount = checks[0]?.total_count;
+  if (checks.some(page => page.total_count !== checkCount) || runs.length !== checkCount
+    || new Set(runs.map(run => run.id)).size !== checkCount
+    || runs.some(run => run.head_sha !== head)) throw new PrReadError("response");
+  return runs.sort((left, right) => left.id - right.id);
+}
+
+function checkAttempt(run: Static<typeof checkPageSchema>["check_runs"][number]): string {
+  return `check:${run.id}:${fingerprint([run.started_at, run.completed_at, run.conclusion])}`;
+}
+
 export async function readPrSnapshot(
   ref: PrRef, options: { readonly previousHead?: string; readonly signal: AbortSignal },
 ): Promise<PrSnapshot> {
@@ -80,12 +99,8 @@ export async function readPrSnapshot(
   const reviewComments = (await api(`${endpoint}/comments?per_page=100`, pages(Type.Array(commentSchema)), signal)).flat();
   const reviews = (await api(`${endpoint}/reviews?per_page=100`, pages(Type.Array(reviewSchema)), signal)).flat();
   const timeline = (await api(`${root}/issues/${parsed.number}/timeline?per_page=100`, pages(Type.Array(timelineSchema)), signal)).flat();
-  const checks = await api(`${root}/commits/${head}/check-runs?per_page=100&filter=latest`, pages(checkPageSchema), signal);
+  const runs = await readCheckRuns(root, head, signal);
   const statuses = (await api(`${root}/commits/${head}/statuses?per_page=100`, pages(Type.Array(statusSchema)), signal)).flat();
-  const runs = checks.flatMap(page => page.check_runs);
-  const checkCount = checks[0]?.total_count;
-  if (checks.some(page => page.total_count !== checkCount) || new Set(runs.map(run => run.id)).size !== checkCount
-    || runs.some(run => run.head_sha !== head)) throw new PrReadError("response");
 
   const feedback: PrSnapshot["feedback"][number][] = [];
   for (const [kind, rows] of [["issue_comment", comments], ["review_comment", reviewComments]] as const) {
@@ -113,12 +128,22 @@ export async function readPrSnapshot(
     }
   }
   const failures: PrSnapshot["failures"][number][] = [];
+  const successes: string[] = [];
+  const skips: string[] = [];
+  let ciPending = false;
   for (const run of runs) {
-    if (run.status !== "completed" || run.conclusion === null || ["success", "neutral", "skipped"].includes(run.conclusion)) continue;
-    failures.push({
-      key: `check:${run.id}:${fingerprint([run.started_at, run.completed_at, run.conclusion])}`,
-      name: safeText(run.name, 256), url: safeUrl(run.html_url), conclusion: run.conclusion,
-    });
+    const key = checkAttempt(run);
+    if (run.status !== "completed" || run.conclusion === null) { ciPending = true; continue; }
+    switch (run.conclusion) {
+      case "success":
+        if (run.completed_at) successes.push(key);
+        else ciPending = true;
+        break;
+      case "neutral": case "skipped": skips.push(key); break;
+      default:
+        failures.push({ key, name: safeText(run.name, 256), url: safeUrl(run.html_url), conclusion: run.conclusion });
+        break;
+    }
   }
   // Status history includes old failures superseded by a pending/success rerun.
   const latestStatuses = new Map<string, Static<typeof statusSchema>>();
@@ -127,11 +152,33 @@ export async function readPrSnapshot(
     if (!previous || status.id > previous.id) latestStatuses.set(status.context, status);
   }
   for (const status of latestStatuses.values()) {
-    if (status.state !== "error" && status.state !== "failure") continue;
-    failures.push({
-      key: `status:${status.id}`, name: safeText(status.context, 256),
-      url: safeUrl(status.target_url), conclusion: status.state,
-    });
+    const key = `status:${status.id}`;
+    switch (status.state) {
+      case "success": successes.push(key); break;
+      case "pending": ciPending = true; break;
+      case "error": case "failure":
+        failures.push({ key, name: safeText(status.context, 256), url: safeUrl(status.target_url), conclusion: status.state });
+        break;
+    }
+  }
+  // This is observed commit CI, not GitHub's required-check or mergeability decision.
+  const ci: PrCi = failures.length ? { outcome: "failed" }
+    : ciPending ? { outcome: "pending" }
+    : successes.length ? {
+      outcome: skips.length ? "passed_with_skips" : "passed",
+      key: `ci-pass:${head}:${fingerprint([successes.sort(), skips.sort()])}`,
+      skipped: skips.length,
+    }
+    : { outcome: skips.length ? "skipped" : "missing" };
+
+  if ("key" in ci) {
+    // A rerun can change checks without moving the PR head. Bracket the
+    // status sample with complete check-run reads before claiming a pass.
+    const confirmed = await readCheckRuns(root, head, signal);
+    if (confirmed.length !== runs.length || confirmed.some((run, index) => {
+      const previous = runs[index];
+      return !previous || previous.status !== run.status || checkAttempt(previous) !== checkAttempt(run);
+    })) throw new PrReadError("ci-changed");
   }
 
   let headChange: PrSnapshot["headChange"] = "unknown";
@@ -165,6 +212,6 @@ export async function readPrSnapshot(
     || end.merge_commit_sha !== start.merge_commit_sha) throw new PrReadError("changed");
   return {
     head, state: start.merged ? "merged" : start.state, mergedSha: start.merged ? start.merge_commit_sha : null,
-    self, feedback: unique(feedback), failures: unique(failures), headChange,
+    self, feedback: unique(feedback), failures: unique(failures), ci, headChange,
   };
 }

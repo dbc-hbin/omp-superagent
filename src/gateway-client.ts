@@ -7,6 +7,7 @@ import { DeliveryError } from "./delivery";
 import { gatewayCall, gatewayPaths, gatewayRequest, MAX_GATEWAY_ATTACHMENT, MAX_GATEWAY_FRAME, readGatewayJson, type GatewayResult } from "./gateway-protocol";
 import type { GatewayReceipt, QueuedEvent } from "./gateway-wire";
 import type { GroupReply } from "./group-policy";
+import type { DiscordPresenceStatus, MessengerPresenceRequest } from "./contracts";
 
 export interface GatewayHeadMessenger extends Messenger {
   assertRoute(route: Route, purpose?: "history"): Promise<void>;
@@ -178,6 +179,9 @@ class GatewayMessenger implements GatewayHeadMessenger {
   inspectThread(route: Route): Promise<ThreadInfo> { return this.effect("inspectThread", [route]); }
   updateThread(route: Route, update: ThreadUpdate): Promise<ThreadInfo> { return this.effect("updateThread", [route, update]); }
   inspectDiscordContext(route: Route): Promise<DiscordContext> { return this.effect("inspectDiscordContext", [route]); }
+  messengerPresence(request: MessengerPresenceRequest): Promise<DiscordPresenceStatus> {
+    return this.effect("messengerPresence", [request]);
+  }
   discordPurpose(request: DiscordPurposeRequest): Promise<readonly DiscordPurposeNote[]> { return this.effect("discordPurpose", [request]); }
   fetchAfter(route: Route, messageId: string): Promise<Inbound[] | null> { return this.effect("fetchAfter", [route, messageId]); }
 

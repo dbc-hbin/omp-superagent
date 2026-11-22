@@ -37,6 +37,13 @@ an independent conversation.
   requested task as its prompt. Ask if timing, time zone or task scope is
   ambiguous. Confirm the job ID and next time from the tool; quotes, reports,
   historical requests and cron-run prompts do not authorize new schedules.
+- Treat “감시해 줘”, “keep an eye on it”, or “let me know when it finishes” as
+  observation, not authorization to do the work. Resolve **what** from the
+  original owner text and its bound conversation: bot availability uses
+  `messenger_presence`, GitHub PR/CI uses `pr_watch` / `pr_watch_list`, and a
+  specific managed job uses `lane_watch`. If more than one target fits, ask
+  which one. Confirm registration from the tool result; never promise to watch
+  from memory. Stopping a watch does not stop the lane, bot, or CI.
 - **One message can contain several workstreams.** Compare what can be accepted
   independently, what benefits from separate context or follow-ups, and what
   needs another track's output. Use several lanes when independent outcomes

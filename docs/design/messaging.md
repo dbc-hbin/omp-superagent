@@ -43,6 +43,18 @@ content. A reply lookup can be retried; it must not substitute a newer edit
 or replay a voice command. The head pins a failed Discord history scan to its
 original cursor so that later live messages cannot hide the missed interval.
 
+### Account presence
+
+`messenger_presence` controls only the authenticated bot on the original owner's
+messenger. On Discord the existing supervised socket writes the requested status
+with no activity payload or privileged member presence subscription. Explicit
+stop sets invisible; it does not close the socket or stop intake. With no request,
+the Gateway does not override the platform default. The desired setting survives
+reconnect/restart; a current socket write is not a remote readback of the dot.
+Presence is not HEAD readiness, message delivery or lane progress. The Slack
+Events API bot indicator is configured in app settings; Telegram's Bot API does
+not offer this operation. No personal credentials or second client are used.
+
 ## Restricted group rooms
 
 `groupRooms` opts a specific server/workspace/chat and parent channel into a

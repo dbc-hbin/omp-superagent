@@ -29,6 +29,12 @@ struct OfflineMessenger {
     stop: CancellationToken,
     task: Mutex<Option<JoinHandle<Result<()>>>>,
     journal: Mutex<()>,
+    observations: Option<Mutex<ChatObservations>>,
+}
+
+struct ChatObservations {
+    desired_presence: &'static str,
+    work_thread_title: String,
 }
 
 fn authorized(route: &Value) -> bool {
@@ -101,6 +107,7 @@ impl Adapter for OfflineMessenger {
             "assertRoute" | "fetchAfter" | "inspectThread" | "canCreateThread" | "createThread" => {
                 argument
             }
+            "updateThread" if self.observations.is_some() => argument,
             "send" | "setActivity" => &argument["route"],
             _ => {
                 return Err(EffectError::rejected(
@@ -135,11 +142,22 @@ impl Adapter for OfflineMessenger {
                 let id = route["threadId"]
                     .as_str()
                     .ok_or_else(|| EffectError::rejected("Fixture route is not a thread"))?;
-                // Fixture work threads already have an open-state title.
-                Ok(json!({
-                    "route": route, "title": format!("⏳ Fixture topic {id}"),
-                    "archived": false, "requiresTag": false, "availableTags": [], "appliedTags": []
-                }))
+                let title = match (&self.observations, id) {
+                    (Some(observations), "50") => observations.lock().await.work_thread_title.clone(),
+                    _ => format!("⏳ Fixture topic {id}"),
+                };
+                Ok(thread_info(route, &title))
+            }
+            ("updateThread", [_, changes]) if route["threadId"] == "50" => {
+                let observations = self
+                    .observations
+                    .as_ref()
+                    .ok_or_else(|| EffectError::rejected("Unexpected fixture messenger operation"))?;
+                let title = changes["title"]
+                    .as_str()
+                    .ok_or_else(|| EffectError::rejected("Expected fixture work-thread title update"))?;
+                observations.lock().await.work_thread_title = title.to_owned();
+                Ok(thread_info(route, title))
             }
             ("send", _) => {
                 let id = argument["id"]
@@ -172,6 +190,28 @@ impl Adapter for OfflineMessenger {
         }
     }
 
+    async fn messenger_presence(&self, _id: &str, request: &Value) -> Result<Value, EffectError> {
+        let observations = self
+            .observations
+            .as_ref()
+            .ok_or_else(|| EffectError::rejected("Unexpected fixture messenger operation"))?;
+        if !authorized(&request["route"]) || request["sourceId"].as_str().is_none_or(str::is_empty) {
+            return Err(EffectError::rejected("Fixture presence source did not match"));
+        }
+        let mut observations = observations.lock().await;
+        match request["action"].as_str() {
+            Some("start") => observations.desired_presence = "online",
+            Some("status") => {}
+            Some("stop") => observations.desired_presence = "invisible",
+            _ => return Err(EffectError::rejected("Unexpected fixture presence action")),
+        }
+        // No remote connection or UI acknowledgement exists in this example.
+        Ok(json!({
+            "platform": "discord", "desired": observations.desired_presence,
+            "connection": "disconnected", "lastSent": null, "replayed": false
+        }))
+    }
+
     async fn attachment(
         &self,
         _route: &Value,
@@ -181,6 +221,13 @@ impl Adapter for OfflineMessenger {
             "Fixture messenger has no attachments",
         ))
     }
+}
+
+fn thread_info(route: &Value, title: &str) -> Value {
+    json!({
+        "route": route, "title": title,
+        "archived": false, "requiresTag": false, "availableTags": [], "appliedTags": []
+    })
 }
 
 enum Invocation {
@@ -334,6 +381,12 @@ async fn serve(config: &Value, lifecycle: LifecycleConfig, request: Option<&str>
                 stop: CancellationToken::new(),
                 task: Mutex::new(None),
                 journal: Mutex::new(()),
+                observations: root.join(".native-chat-observation").is_file().then(|| {
+                    Mutex::new(ChatObservations {
+                        desired_presence: "default",
+                        work_thread_title: "⏳ Fixture topic 50".to_owned(),
+                    })
+                }),
             }))
         })
     })

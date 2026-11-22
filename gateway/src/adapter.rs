@@ -19,7 +19,10 @@ use crate::{
     group::{Candidate, Request as GroupRequest, Room, Rooms},
     picker::{Pickers, Selection},
     slack::Slack,
-    store::{DiscordIntake, DiscordSourceReceipt, Store},
+    store::{
+        DiscordIntake, DiscordSourceReceipt, Store,
+        discord_presence::{OPERATION as PRESENCE, PresenceStore},
+    },
     telegram::Telegram,
 };
 
@@ -59,6 +62,11 @@ pub trait Adapter: Send + Sync {
     async fn start(&self) -> Result<()>;
     async fn stop(&self) -> Result<()>;
     async fn effect(&self, operation: &str, args: &[Value]) -> Result<Value, EffectError>;
+    async fn messenger_presence(&self, _: &str, _: &Value) -> Result<Value, EffectError> {
+        Err(EffectError::rejected(
+            "Configured adapter does not support messenger presence",
+        ))
+    }
     async fn attachment(
         &self,
         route: &Value,
@@ -143,6 +151,9 @@ impl Context {
     }
     pub(crate) fn discord_intake(&self) -> DiscordIntake<'_> {
         DiscordIntake(&self.store)
+    }
+    pub(crate) fn discord_presence(&self) -> PresenceStore<'_> {
+        PresenceStore(&self.store)
     }
     pub(crate) fn discord_admitted_input(&self, input: &Value, confirmation: bool) -> Result<DiscordSourceReceipt> {
         let route = &input["route"];
@@ -408,7 +419,8 @@ impl Hub {
             .first()
             .ok_or_else(|| EffectError::rejected("Missing messenger arguments"))?;
         let route = match op {
-            "send" | "showApproval" | "dismissApproval" | "discordPurpose" | "setActivity" => &arg["route"],
+            "send" | "showApproval" | "dismissApproval" | "discordPurpose" | "setActivity"
+            | PRESENCE => &arg["route"],
             "assertRoute" | "canCreateThread" | "createThread" | "inspectThread" | "updateThread"
             | "inspectDiscordContext" | "fetchAfter" => arg,
             _ => return Err(EffectError::rejected("Unknown messenger operation")),
@@ -420,6 +432,23 @@ impl Hub {
     pub(crate) async fn send_group(&self, output: Value) -> Result<Value, EffectError> {
         let adapter = self.for_route(&output["route"])?;
         adapter.effect("sendGroup", &[output]).await
+    }
+
+    pub(crate) async fn messenger_presence(
+        &self,
+        id: &str,
+        request: &Value,
+    ) -> Result<Value, EffectError> {
+        let route = self.authorize_effect(PRESENCE, std::slice::from_ref(request))?;
+        if route["platform"].as_str().is_none() {
+            return Err(EffectError::rejected("Invalid messenger presence request"));
+        }
+        if route["platform"] != "discord" {
+            return Err(EffectError::rejected(
+                "Messenger presence is only supported on Discord",
+            ));
+        }
+        self.for_route(route)?.messenger_presence(id, request).await
     }
 
     pub async fn effect(&self, op: &str, args: &[Value]) -> Result<Value, EffectError> {

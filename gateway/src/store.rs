@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod discord_intake;
+pub(crate) mod discord_presence;
 mod ingress;
 mod restart;
 mod rotation;
@@ -83,6 +84,7 @@ impl Store {
         )?;
         tx.commit()?;
         discord_intake::create(&db)?;
+        discord_presence::create(&db)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600))?;
         Ok(Self {

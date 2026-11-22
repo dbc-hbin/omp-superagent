@@ -2,12 +2,13 @@ import { Type, type Static, type TSchema } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 
 export class PrReadError extends Error {
-  constructor(readonly reason: "reference" | "request" | "response" | "changed" | "aborted") {
+  constructor(readonly reason: "reference" | "request" | "response" | "changed" | "ci-changed" | "aborted") {
     super({
       reference: "Invalid GitHub PR reference",
       request: "GitHub PR observation request failed",
       response: "GitHub PR observation response was invalid or incomplete",
       changed: "GitHub PR changed during observation",
+      "ci-changed": "GitHub PR check attempts changed during observation",
       aborted: "GitHub PR observation was cancelled",
     }[reason]);
     this.name = "PrReadError";
@@ -62,6 +63,9 @@ export const statusSchema = Type.Object({
   id, context: Type.String(), target_url: nullableText, created_at: Type.String(),
   state: Type.Union((["error", "failure", "pending", "success"] as const).map(value => Type.Literal(value))),
 });
+export const ciOutcomeSchema = Type.Union(
+  (["missing", "pending", "skipped", "failed", "passed", "passed_with_skips"] as const).map(value => Type.Literal(value)),
+);
 export const comparePageSchema = Type.Object({
   status: Type.Union((["ahead", "behind", "diverged", "identical"] as const).map(value => Type.Literal(value))),
   total_commits: Type.Integer({ minimum: 0 }),

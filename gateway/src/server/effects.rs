@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     group::Reply as GroupReply,
-    store::{EffectStart, PHYSICAL_ROUTE_FIELDS, js_trim},
+    store::{EffectStart, PHYSICAL_ROUTE_FIELDS, discord_presence::OPERATION as PRESENCE, js_trim},
 };
 
 impl Hub {
@@ -38,7 +38,8 @@ impl Hub {
             | "dismissApproval"
             | "inspectThread"
             | "inspectDiscordContext"
-            | "discordPurpose" => args.len() == 1,
+            | "discordPurpose"
+            | PRESENCE => args.len() == 1,
             "setActivity" | "updateThread" | "fetchAfter" => args.len() == 2,
             "canCreateThread" => (1..=2).contains(&args.len()),
             "createThread" => (2..=4).contains(&args.len()),
@@ -46,6 +47,10 @@ impl Hub {
         };
         if !allowed {
             return Err(rejected("Unknown Gateway effect"));
+        }
+        let presence = operation == PRESENCE;
+        if presence && !data.is_empty() {
+            return Err(rejected("Invalid messenger presence effect"));
         }
         let group_output = if operation == "sendGroup" {
             let reply = GroupReply::deserialize(&args[0]).map_err(|_| rejected("Invalid group reply"))?;
@@ -75,7 +80,9 @@ impl Hub {
             None
         };
         let ledger_args = digest.as_ref().map_or(args.as_slice(), |value| value.as_slice());
-        if let EffectStart::Previous(result) = self.store.begin_effect(&id, &operation, ledger_args)? {
+        if !presence
+            && let EffectStart::Previous(result) = self.store.begin_effect(&id, &operation, ledger_args)?
+        {
             return Ok(result);
         }
         let (send, result) = oneshot::channel();
@@ -85,6 +92,11 @@ impl Hub {
         drop(self.effects.spawn(async move {
             let dispatched = match group_output {
                 Some(output) => hub.adapters.send_group(output).await.map_err(Fault::from),
+                None if presence => hub
+                    .adapters
+                    .messenger_presence(&id, &args[0])
+                    .await
+                    .map_err(Fault::from),
                 None => hub.dispatch_effect(&operation, &args).await,
             };
             let result = match dispatched {
@@ -97,7 +109,11 @@ impl Hub {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(fault) => fault.into_json(),
             };
-            let receipt = hub.store.finish_effect(&id, &result).map(|()| result);
+            let receipt = if presence {
+                Ok(result)
+            } else {
+                hub.store.finish_effect(&id, &result).map(|()| result)
+            };
             drop(send.send(receipt));
         }));
         Ok(result.await.map_err(anyhow::Error::from)??)
