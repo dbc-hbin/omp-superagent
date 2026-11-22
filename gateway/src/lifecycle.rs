@@ -82,6 +82,9 @@ struct State {
 
 impl Lifecycle {
     pub async fn open(config: LifecycleConfig, request: Option<&str>) -> Result<Self> {
+        config.validate_spawned_config()?;
+        config.preflight_memory().await?;
+        config.require_credentials()?;
         let store = if let Some(id) = request {
             handoff::wait_launch_receipt(&config, id).await?
         } else {
@@ -165,6 +168,11 @@ impl Lifecycle {
         let ulw = Ulw::load(config)?;
         ulw.package()?;
         let status = ulw.status()?;
+        stock_ops::inspect_omp(config, &config.head_environment()).await?;
+        ensure!(
+            config.matches_config_hash(&config.source_hash),
+            "Gateway configuration changed during startup"
+        );
         ensure!(
             self.0.ulw.set(ulw).is_ok()
                 && self.0.config_hash.set(config.source_hash.clone()).is_ok(),
@@ -177,6 +185,7 @@ impl Lifecycle {
             .status = Some(status);
         let old: Option<Endpoint> = restart_record::meta(store.get_meta(SOCKET)?)?;
         remove_dead_socket(&config.gateway_socket, old, None).await?;
+        config.ensure_memory().await?;
         self.schedule_maintenance()?;
         Ok(())
     }

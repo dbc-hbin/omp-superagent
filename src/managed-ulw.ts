@@ -194,25 +194,26 @@ export async function managedUlwLaunchExtensions(options: {
   managedUlwPath: string;
   extensionPaths: string[];
   configPath: string;
+  parentConfigPath?: string;
   /** Native argv prefix retained verbatim by the caller when it replaces the generated Host args. */
   commandArgs: string[];
   /** Exact native OMP argv, including the original command's flags and generated Host args; no executable prefix. */
   launchArgs: string[];
   env: Record<string, string | undefined>;
   bunCommand: string[];
-}): Promise<{ extensionPaths: string[]; noExtensions: boolean }> {
+}): Promise<{ extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null }> {
   if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
   const { env, bunCommand, ...input } = options;
   const output = await run([...bunCommand, fileURLToPath(import.meta.url), "--launch-extensions", JSON.stringify(input)],
     options.cwd, 30_000, Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)));
   const result = output.split("\n").findLast(line => line.startsWith("MANAGED_ULW_LAUNCH "));
   if (!result) throw new Error("Stock OMP discovery did not return a launch composition");
-  return JSON.parse(result.slice("MANAGED_ULW_LAUNCH ".length)) as { extensionPaths: string[]; noExtensions: boolean };
+  return JSON.parse(result.slice("MANAGED_ULW_LAUNCH ".length));
 }
 
 if (import.meta.main && process.argv[2] === "--launch-extensions") {
   const input = JSON.parse(process.argv[3]!) as {
-    cwd: string; managedUlwPath: string; extensionPaths: string[]; configPath: string;
+    cwd: string; managedUlwPath: string; extensionPaths: string[]; configPath: string; parentConfigPath?: string;
     commandArgs: string[]; launchArgs: string[];
   };
   const { parseNativeLaunch } = await import("./native-launch-profile");
@@ -240,10 +241,18 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
   const { homedir } = await import("node:os");
   if (parsed.pluginDirs?.length) await injectPluginDirRoots(homedir(), parsed.pluginDirs, cwd);
   else await preloadPluginRoots(homedir(), cwd);
-  const { effectiveMnemopi, memoryBlockReason } = await import("./managed-memory");
+  const { ensureManagedMemory, memoryBlockReason } = await import("./managed-memory");
   const settings = await Settings.loadReadOnly({ cwd, agentDir: getAgentDir(), configFiles: parsed.config })
     .catch(() => { throw new Error(memoryBlockReason({ status: "unknown" })); });
-  const memory = await effectiveMnemopi(settings).catch(() => ({ status: "unknown" } as const));
+  let memoryWriteDir: string | null = parsed.launchAgentDir;
+  if (input.parentConfigPath) {
+    // A lane inherits its head's post-dotenv environment. It cannot use that
+    // environment to enlarge the write authority recorded by the head's launcher.
+    const parent: unknown = await Bun.file(join(dirname(input.parentConfigPath), "owner.json")).json().catch(() => null);
+    if (!parent || typeof parent !== "object" || !("configPath" in parent) || parent.configPath !== input.parentConfigPath ||
+        !("memoryWriteDir" in parent) || parent.memoryWriteDir !== memoryWriteDir) memoryWriteDir = null;
+  }
+  const { memory } = await ensureManagedMemory(settings, memoryWriteDir);
   if (memory.status !== "enabled") throw new Error(memoryBlockReason(memory));
   const restore = initializeWithSettings(settings);
   try {
@@ -322,7 +331,7 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
       // Ordinary native discovery preserves every native surface, including
       // TypeScript commands, when no other ULW copy needs exclusion.
       console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({
-        extensionPaths: [...new Set([...input.extensionPaths, managed])], noExtensions: !!parsed.noExtensions,
+        extensionPaths: [...new Set([...input.extensionPaths, managed])], noExtensions: !!parsed.noExtensions, memoryWriteDir,
       })}`);
     } else {
       const commands = parsed.noExtensions ? [] : (await discoverCustomCommands({ cwd, agentDir: getAgentDir() })).paths;
@@ -357,7 +366,7 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
           throw new Error(`Stock OMP explicit -e would change ${root.level} resource scope to ${actualLevel} scope: ${root.path}`);
         }
       }
-      console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ extensionPaths: explicit, noExtensions: true })}`);
+      console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ extensionPaths: explicit, noExtensions: true, memoryWriteDir })}`);
     }
   } finally { restore(); }
 }

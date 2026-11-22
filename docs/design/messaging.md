@@ -151,8 +151,10 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   operator's text, not reply bodies or attachments. Restricted group rooms, HEAD,
   other bot accounts and unrelated local OMP sessions are not candidates. Natural
   language dates refer to the original request timestamp, using UTC calendar boundaries.
-  The controller first calls the live head extension's public `ctx.memory.search`:
-  with Mnemopi this runs the same scoped lookup (`recallResultsScoped`) as OMP's
+  This path requires active, searchable Mnemopi on the live head; another
+  enabled backend can satisfy managed startup but is not a substitute for this
+  search. The controller calls the head extension's public `ctx.memory.search`,
+  which runs the same scoped lookup (`recallResultsScoped`) as OMP's Mnemopi
   `recall` tool. The head does not run a model turn or save a memory. A memory
   hit is a search hint, never a routing decision. Combine corroborated memory
   hits with direct matches on active branches of eligible journals. A successful

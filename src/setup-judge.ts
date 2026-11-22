@@ -7,7 +7,7 @@ type JudgeConfiguration =
 /** Read configuration only, after a new setup has successfully published. */
 export async function inspectNativeJudge(cwd: string): Promise<JudgeConfiguration> {
   try {
-    // Like setup-memory, keep even native dotenv/config imports behind setup's
+    // Keep even native dotenv/config imports behind setup's
     // credential acquisition and publication. Never resolve a model or open auth.
     const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
     const settings = await Settings.loadReadOnly({ cwd });

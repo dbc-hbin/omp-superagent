@@ -17,7 +17,7 @@ const defaultNames = ["DISCORD_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "SLACK_BOT_TOKE
 const customName = "SETUP_PTY_TELEGRAM_TOKEN";
 const unrelatedName = "SETUP_PTY_UNRELATED";
 const trackedNames = [...defaultNames, customName, unrelatedName];
-const memoryPrompt = "Enable native Mnemopi memory after saving setup? [y/N]: ";
+const mnemopiSavePrompt = "Write configuration/credentials and enable native Mnemopi memory? [y/N]: ";
 const judgeRecommendation = "Recommended: configure a native judge model for OMP's judge role";
 const judgeUnknown = "native OMP judge configuration could not be verified";
 // Runner preflight is shared; every setup/doctor invocation still probes the real CLI itself.
@@ -546,8 +546,14 @@ ptyTest("actual traced setup wrapper prepares all messengers privately; explicit
     await terminal.answer("maxSubagents [", "");
     await terminal.answer("idleMs [", "");
     for (const [name, value] of Object.entries(secrets)) await terminal.secret(name, value, false);
-    await terminal.answer(memoryPrompt, "yes");
-    await terminal.prompt("Write configuration/credentials? [y/N]: ");
+    await terminal.prompt(mnemopiSavePrompt);
+    const review = terminal.transcript();
+    expect(review).toContain(`selected OMP profile: ${path.dirname(context.nativeConfig)}`);
+    expect(review).toContain("memory.backend=mnemopi");
+    expect(review).toContain("persists across conversations");
+    expect(review).toContain("later OMP startup");
+    expect(review).toContain("may process conversations with models and download models");
+    expect(review).toContain("bot profile pictures with the repository mascot");
     expect(await Bun.file(context.config).exists()).toBe(false);
     expect(await Bun.file(`${context.config}.env`).exists()).toBe(false);
     expect(await fs.readFile(context.nativeConfig, "utf8")).toBe(context.nativeOriginal);
@@ -556,12 +562,8 @@ ptyTest("actual traced setup wrapper prepares all messengers privately; explicit
     await terminal.input("y\n");
     await terminal.finished(true);
     expect(terminal.transcript()).toContain("+ set +x");
-    expect(terminal.transcript()).toContain("persists across conversations");
-    expect(terminal.transcript()).toContain("OMP's global memory.backend preference");
-    expect(terminal.transcript()).toContain("later OMP startup");
-    expect(terminal.transcript()).toContain("may process conversations with models and download models");
     expect(terminal.transcript()).toContain("Saved native memory.backend=mnemopi");
-    expect(terminal.transcript()).toContain("bot profile pictures with the repository mascot");
+    expect(terminal.transcript()).toContain("Native OMP memory.backend=mnemopi is configured");
     expect(terminal.transcript()).toContain("discord: Mascot profile picture applied");
     expect(terminal.transcript()).toContain("telegram: Mascot upload accepted");
     expect(terminal.transcript()).toContain("slack: Bot/app tokens cannot upload the app icon automatically");
@@ -613,53 +615,22 @@ ptyTest("actual traced setup wrapper prepares all messengers privately; explicit
   } finally { await context.cleanup(); }
 }, 120_000);
 
-ptyTest("new setup declining Mnemopi saves credentials but does not complete setup", async () => {
-  for (const answer of ["n", "", "yeah"]) {
-    const context = await fixture({ memory: { backend: "off" } });
-    try {
-      const terminal = context.terminal();
-      await newTelegram(context, terminal);
-      await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-declined-memory-secret", false);
-      await terminal.answer(memoryPrompt, answer);
-      await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(false);
-      expect(terminal.transcript()).toContain("Native memory settings will not be changed.");
-      expect(terminal.transcript()).toContain("Setup saved but is incomplete");
-      expect(terminal.transcript()).not.toContain("Start explicitly:");
-      expect(terminal.transcript()).toContain(judgeRecommendation);
-      expect(terminal.transcript().indexOf(judgeRecommendation)).toBeGreaterThan(terminal.transcript().indexOf("Saved configuration:"));
-      expect(terminal.transcript()).toContain("/models, choose Roles -> Judge");
-      expect(terminal.transcript()).toContain("ordinary native OMP terminal opened in the head workspace");
-      expect(terminal.transcript()).toContain("selector presence does not prove model or authentication availability");
-      expect(await context.nativeSetupImports()).toBe(1);
-      expect(terminal.transcript()).not.toContain("Saved native memory.backend");
-      expect(terminal.transcript()).not.toContain("pty-declined-memory-secret");
-      expect(await exists(context.config)).toBe(true);
-      expect(parseEnv(await fs.readFile(`${context.config}.env`, "utf8"))).toEqual({ TELEGRAM_BOT_TOKEN: "pty-declined-memory-secret" });
-      expect(await exists(context.nativeDb)).toBe(false);
-      if (answer === "n") {
-        const proof = await doctor(context, {}, 1);
-        expect(proof.result.memory).toMatchObject({ status: "missing", backend: "off", source: "global" });
-        expect(proof.result.memoryBlock).toContain("require effective native OMP Mnemopi");
-      }
-      await context.inert();
-    } finally { await context.cleanup(); }
-  }
-}, 120_000);
-
 ptyTest("missing judge advice follows publication even when native Mnemopi is enabled", async () => {
   const context = await fixture({ memory: { backend: "off" }, modelRoles: { default: "pty-private-chat-selector" } });
   try {
     const terminal = context.terminal();
     await newTelegram(context, terminal);
     await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-memory-and-judge-secret", false);
-    await terminal.answer(memoryPrompt, "yes");
-    await terminal.answer("Write configuration/credentials? [y/N]: ", "yes");
+    await terminal.answer(mnemopiSavePrompt, "yes");
     await terminal.finished(true);
     const transcript = terminal.transcript();
     expect(transcript).toContain("Saved native memory.backend=mnemopi");
     expect(transcript).toContain(judgeRecommendation);
     expect(transcript.indexOf(judgeRecommendation)).toBeGreaterThan(transcript.indexOf("Saved configuration:"));
+    expect(transcript).toContain("/models, choose Roles -> Judge");
+    expect(transcript).toContain("ordinary native OMP terminal opened in the head workspace");
+    expect(transcript).toContain("selector presence does not prove model or authentication availability");
+    expect(await context.nativeSetupImports()).toBe(1);
     expect(transcript).not.toContain("pty-private-chat-selector");
     expect(transcript).not.toContain("pty-memory-and-judge-secret");
     expect(YAML.parse(await fs.readFile(context.nativeConfig, "utf8"))).toEqual({
@@ -677,7 +648,7 @@ ptyTest("fresh installs recommend a judge, unresolved legacy state is unknown, a
     const context = await fixture(null);
     const legacy = path.join(path.dirname(context.nativeConfig), "settings.json");
     const legacyBytes = "pty-private-opaque-legacy-settings-must-not-be-parsed\n";
-    const fallbackBytes = '{"modelRoles":{"default":"pty-private-default-only"}}\n';
+    const fallbackBytes = '{"memory":{"backend":"local"},"modelRoles":{"default":"pty-private-default-only"}}\n';
     try {
       if (mode !== "fresh") {
         await fs.writeFile(legacy, legacyBytes, { mode: 0o600 });
@@ -688,14 +659,13 @@ ptyTest("fresh installs recommend a judge, unresolved legacy state is unknown, a
       const terminal = context.terminal();
       await newTelegram(context, terminal);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-native-presence-judge-secret", false);
-      if (mode !== "legacy") await terminal.answer(memoryPrompt, "n");
-      await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(false);
+      await terminal.answer(mode === "fresh" ? mnemopiSavePrompt : "Write configuration/credentials? [y/N]: ", "y");
+      await terminal.finished(mode !== "legacy");
       const transcript = terminal.transcript();
       expect(transcript).toContain("Saved configuration:");
       if (mode === "legacy") {
         expect(transcript).toContain("Unmigrated native settings could not be verified");
-        expect(transcript).not.toContain(memoryPrompt);
+        expect(transcript).not.toContain(mnemopiSavePrompt);
         expect(transcript).toContain(judgeUnknown);
         expect(transcript).toContain("unknown, not confirmed missing");
         expect(transcript).not.toContain(judgeRecommendation);
@@ -713,7 +683,9 @@ ptyTest("fresh installs recommend a judge, unresolved legacy state is unknown, a
       else expect(await exists(legacy)).toBe(false);
       if (mode === "modern-yaml") expect(await fs.readFile(context.nativeFallbackConfig, "utf8")).toBe(fallbackBytes);
       else expect(await exists(context.nativeFallbackConfig)).toBe(false);
-      await context.inert();
+      if (mode === "fresh")
+        expect(YAML.parse(await fs.readFile(context.nativeConfig, "utf8"))).toEqual({ memory: { backend: "mnemopi" } });
+      await context.inert(false, mode === "fresh");
     } finally { await context.cleanup(); }
   }
 }, 180_000);
@@ -764,7 +736,7 @@ ptyTest("effective global, project and overlay judge selectors suppress advice w
     ["overlay", ["@pty-private-role", "pty-private-unavailable/judge"]],
     ["project", "@pty-private-head-role"],
   ] as const) {
-    const context = await fixture(layer === "global" ? { modelRoles: { judge: selector } } : null);
+    const context = await fixture(layer === "global" ? { memory: { backend: "mnemopi" }, modelRoles: { judge: selector } } : null);
     const legacy = path.join(path.dirname(context.nativeConfig), "settings.json");
     const legacyBytes = "pty-private-unresolved-global-judge\n";
     const projectNull = '{"modelRoles":{"judge":null}}\n';
@@ -792,9 +764,8 @@ ptyTest("effective global, project and overlay judge selectors suppress advice w
       const terminal = context.terminal();
       await newTelegram(context, terminal, headCwd);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-configured-judge-secret", false);
-      if (layer === "global") await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(false);
+      await terminal.finished(layer === "global");
       expect(terminal.transcript()).toContain("Saved configuration:");
       expect(terminal.transcript()).not.toContain(judgeRecommendation);
       expect(terminal.transcript()).not.toContain(judgeUnknown);
@@ -812,7 +783,7 @@ ptyTest("effective global, project and overlay judge selectors suppress advice w
 
 ptyTest("empty or null overlay judge roles recommend effective configuration without exposing hidden assignments", async () => {
   for (const selector of [null, [",", " , "]]) {
-    const context = await fixture({ modelRoles: { judge: "pty-private-global/judge" } });
+    const context = await fixture({ memory: { backend: "mnemopi" }, modelRoles: { judge: "pty-private-global/judge" } });
     const overlay = path.join(context.root, "judge-overlay.yml");
     const bytes = `${JSON.stringify({ modelRoles: { judge: selector } })}\n`;
     const project = '{"modelRoles":{"judge":"@pty-private-project"}}\n';
@@ -824,9 +795,8 @@ ptyTest("empty or null overlay judge roles recommend effective configuration wit
       const terminal = context.terminal();
       await newTelegram(context, terminal);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-shadowed-judge-secret", false);
-      await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(false);
+      await terminal.finished(true);
       expect(terminal.transcript()).toContain(judgeRecommendation);
       expect(terminal.transcript()).toContain("empty or unset in overlay settings");
       expect(terminal.transcript()).toContain("a hidden lower-layer assignment does not make it effective");
@@ -843,7 +813,9 @@ ptyTest("empty or null overlay judge roles recommend effective configuration wit
 
 ptyTest("delimiter-only global and project judge settings recommend configuration without native writes", async () => {
   for (const [layer, selector] of [["global", " , , \t"], ["project", [",", " , "]]] as const) {
-    const context = await fixture(layer === "global" ? { modelRoles: { judge: selector } } : {});
+    const context = await fixture({
+      memory: { backend: "mnemopi" }, ...(layer === "global" ? { modelRoles: { judge: selector } } : {}),
+    });
     const bytes = `${JSON.stringify({ modelRoles: { judge: selector } })}\n`;
     try {
       if (layer === "project") {
@@ -853,9 +825,8 @@ ptyTest("delimiter-only global and project judge settings recommend configuratio
       const terminal = context.terminal();
       await newTelegram(context, terminal);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-delimiter-only-judge-secret", false);
-      await terminal.answer(memoryPrompt, "n");
       await terminal.answer("Write configuration/credentials? [y/N]: ", "y");
-      await terminal.finished(false);
+      await terminal.finished(true);
       expect(terminal.transcript()).toContain(judgeRecommendation);
       expect(terminal.transcript()).toContain(`empty or unset in ${layer} settings`);
       expect(terminal.transcript()).not.toContain(judgeUnknown);
@@ -907,9 +878,12 @@ ptyTest("existing setup saves only the explicitly consented native profile's bac
     const terminal = context.terminal();
     await terminal.secret(customName, "pty-refreshed-without-judge-inspection", true);
     await terminal.answer("Replace existing credential values? [y/N]: ", "yes");
-    await terminal.prompt(`This would change OMP's global memory.backend preference for ${profile}`);
-    await terminal.answer(memoryPrompt, "yes");
-    await terminal.answer("Write configuration/credentials? [y/N]: ", "yes");
+    await terminal.prompt(mnemopiSavePrompt);
+    expect(terminal.transcript()).toContain(`selected OMP profile: ${profile}`);
+    expect(YAML.parse(await fs.readFile(profileConfig, "utf8"))).toEqual({
+      memory: { backend: "off" }, mnemopi: { bank: "preserve-bank" },
+    });
+    await terminal.input("yes\n");
     await terminal.finished(true);
     expect(terminal.transcript()).toContain("Saved configuration:");
     expect(terminal.transcript()).not.toContain(judgeRecommendation);
@@ -928,26 +902,25 @@ ptyTest("existing setup saves only the explicitly consented native profile's bac
   } finally { await context.cleanup(); }
 }, 90_000);
 
-ptyTest("new setup cancellation, final refusal and pre-publication conflicts never commit opted-in memory", async () => {
-  for (const action of ["cancel-memory", "eof-memory", "decline-final", "enter-final", "cancel-final", "config-race", "credential-lock"]) {
+ptyTest("new setup cancellation, final refusal and pre-publication conflicts never commit planned memory", async () => {
+  for (const [action, answer] of [
+    ["eof", "\x04"], ["decline", "n\n"], ["enter", "\n"], ["ambiguous", "yeah\n"],
+    ["interrupt", "\x03"], ["config-race", "y\n"], ["credential-lock", "y\n"],
+  ] as const) {
     const context = await fixture();
     try {
       const terminal = context.terminal();
       await newTelegram(context, terminal);
       await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-unpublished-memory-secret", false);
-      await terminal.prompt(memoryPrompt);
-      if (action === "cancel-memory" || action === "eof-memory") {
-        await terminal.input(action === "cancel-memory" ? "\x03" : "\x04");
-      } else {
-        await terminal.input("y\n");
-        await terminal.prompt("Write configuration/credentials? [y/N]: ");
-        expect(await fs.readFile(context.nativeConfig, "utf8")).toBe(context.nativeOriginal);
-        if (action === "config-race") await fs.writeFile(context.config, "external-publication\n");
-        if (action === "credential-lock") await fs.writeFile(`${context.config}.env.lock`, "other-publisher\n", { mode: 0o600 });
-        await terminal.input(action === "cancel-final" ? "\x03" : action === "decline-final" ? "n\n" : action === "enter-final" ? "\n" : "y\n");
-      }
+      await terminal.prompt(mnemopiSavePrompt);
+      expect(await fs.readFile(context.nativeConfig, "utf8")).toBe(context.nativeOriginal);
+      if (action === "config-race") await fs.writeFile(context.config, "external-publication\n");
+      if (action === "credential-lock") await fs.writeFile(`${context.config}.env.lock`, "other-publisher\n", { mode: 0o600 });
+      await terminal.input(answer);
       await terminal.finished(false);
+      expect(terminal.transcript()).not.toContain("Saved configuration:");
       expect(terminal.transcript()).not.toContain("Saved native memory.backend");
+      expect(terminal.transcript()).not.toContain("Start explicitly:");
       expect(terminal.transcript()).not.toContain(judgeRecommendation);
       expect(terminal.transcript()).not.toContain(judgeUnknown);
       expect(await context.nativeSetupImports()).toBe(0);
@@ -958,6 +931,40 @@ ptyTest("new setup cancellation, final refusal and pre-publication conflicts nev
       expect(await exists(`${context.config}.env`)).toBe(false);
       expect(await exists(context.nativeDb)).toBe(false);
       await context.inert();
+    } finally { await context.cleanup(); }
+  }
+}, 180_000);
+
+ptyTest("final save preserves concurrent native changes and reports the now-effective backend", async () => {
+  const privateValue = "pty-private-concurrent-native-failure";
+  for (const [layer, bytes, success, outcome] of [
+    ["global", '{"mnemopi":{"bank":"external-bank"}}\n', false, "Effective backend is off (default settings)"],
+    ["global", '{"memory":{"backend":"local"},"mnemopi":{"bank":"external-bank"}}\n', true, "Native OMP memory.backend=local is configured"],
+    ["project", '{"memory":{"backend":"off"}}\n', false, "Effective backend is off (project settings)"],
+    ["global", `memory: [\nprivate: ${privateValue}\n`, false, "Native memory settings could not be verified"],
+  ] as const) {
+    const context = await fixture();
+    try {
+      const terminal = context.terminal();
+      await newTelegram(context, terminal);
+      const credential = "pty-saved-despite-concurrent-native-edit";
+      await terminal.secret("TELEGRAM_BOT_TOKEN", credential, false);
+      await terminal.prompt(mnemopiSavePrompt);
+      const nativePath = layer === "global" ? context.nativeConfig : context.nativeProjectConfig;
+      await fs.mkdir(path.dirname(nativePath), { recursive: true });
+      await fs.writeFile(nativePath, bytes, { mode: 0o600 });
+      await terminal.input("yes\n");
+      await terminal.finished(success);
+      const transcript = terminal.transcript();
+      expect(transcript).toContain("Saved configuration:");
+      expect(transcript).toContain(outcome);
+      expect(transcript.includes("Start explicitly:")).toBe(success);
+      expect(transcript).not.toContain("Saved native memory.backend");
+      expect(transcript).not.toContain(privateValue);
+      expect(transcript).not.toContain(credential);
+      expect(await fs.readFile(nativePath, "utf8")).toBe(bytes);
+      expect(parseEnv(await fs.readFile(`${context.config}.env`, "utf8"))).toEqual({ TELEGRAM_BOT_TOKEN: credential });
+      await context.inert(false, layer === "global");
     } finally { await context.cleanup(); }
   }
 }, 180_000);
@@ -973,7 +980,7 @@ ptyTest("new setup rejects a missing credential before ambient dotenv or native 
     await terminal.finished(false);
     expect(terminal.transcript()).toContain("A credential is required for TELEGRAM_BOT_TOKEN");
     expect(terminal.transcript()).not.toContain("pty-ambient-new-setup-must-not-count");
-    expect(terminal.transcript()).not.toContain(memoryPrompt);
+    expect(terminal.transcript()).not.toContain(mnemopiSavePrompt);
     expect(terminal.transcript()).not.toContain(judgeRecommendation);
     expect(terminal.transcript()).not.toContain(judgeUnknown);
     expect(await context.nativeSetupImports()).toBe(0);
@@ -984,28 +991,37 @@ ptyTest("new setup rejects a missing credential before ambient dotenv or native 
   } finally { await context.cleanup(); }
 }, 90_000);
 
-ptyTest("setup blocked by project memory does not offer or write an ineffectual global override", async () => {
-  const context = await fixture();
-  const project = '{"memory":{"backend":"off"},"mnemopi":{"bank":"project-kept"}}\n';
-  try {
-    await fs.mkdir(path.dirname(context.nativeProjectConfig), { recursive: true });
-    await fs.writeFile(context.nativeProjectConfig, project, { mode: 0o600 });
-    const terminal = context.terminal();
-    await newTelegram(context, terminal);
-    await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-shadowed-memory-secret", false);
-    await terminal.answer("Write configuration/credentials? [y/N]: ", "yes");
-    await terminal.finished(false);
-    expect(terminal.transcript()).toContain("Saved configuration:");
-    expect(terminal.transcript()).not.toContain(memoryPrompt);
-    expect(terminal.transcript()).not.toContain("Saved native memory.backend=mnemopi");
-    expect(terminal.transcript()).toContain("Effective backend is off (project settings)");
-    expect(terminal.transcript()).not.toContain("Mnemopi is configured for the head workspace");
-    expect(await fs.readFile(context.nativeProjectConfig, "utf8")).toBe(project);
-    expect(await exists(context.config)).toBe(true);
-    expect(await exists(`${context.config}.env`)).toBe(true);
-    await context.inert();
-  } finally { await context.cleanup(); }
-}, 90_000);
+ptyTest("setup blocked by a project or overlay opt-out does not offer a global memory edit", async () => {
+  for (const layer of ["project", "overlay"] as const) {
+    const context = await fixture({ memory: { backend: "mnemopi" } });
+    const bytes = '{"memory":{"backend":"off"},"mnemopi":{"bank":"override-kept"}}\n';
+    const override = layer === "project" ? context.nativeProjectConfig : path.join(context.root, "memory-overlay.yml");
+    try {
+      await fs.mkdir(path.dirname(override), { recursive: true });
+      await fs.writeFile(override, bytes, { mode: 0o600 });
+      if (layer === "overlay") context.env.PI_CONFIG_FILES = override;
+      const terminal = context.terminal();
+      await newTelegram(context, terminal);
+      await terminal.secret("TELEGRAM_BOT_TOKEN", "pty-shadowed-memory-secret", false);
+      await terminal.answer("Write configuration/credentials? [y/N]: ", "yes");
+      await terminal.finished(false);
+      const transcript = terminal.transcript();
+      expect(transcript).toContain("Saved configuration:");
+      expect(transcript).toContain("Setup saved but is incomplete");
+      expect(transcript).not.toContain(mnemopiSavePrompt);
+      expect(transcript).not.toContain("Saved native memory.backend");
+      expect(transcript).toContain(`Effective backend is off (${layer} settings)`);
+      expect(transcript).not.toContain("Start explicitly:");
+      expect(await fs.readFile(override, "utf8")).toBe(bytes);
+      expect(await exists(context.config)).toBe(true);
+      expect(await exists(`${context.config}.env`)).toBe(true);
+      const proof = await doctor(context, {}, 1);
+      expect(proof.result.memory).toMatchObject({ status: "missing", backend: "off", source: layer });
+      expect(proof.result.memoryBlock).toContain("require an enabled native OMP memory backend");
+      await context.inert();
+    } finally { await context.cleanup(); }
+  }
+}, 120_000);
 
 ptyTest("native configuration failure leaves setup saved and reports no unverified memory success or secret", async () => {
   const context = await fixture();
@@ -1023,6 +1039,7 @@ ptyTest("native configuration failure leaves setup saved and reports no unverifi
     expect(terminal.transcript()).toContain(judgeUnknown);
     expect(terminal.transcript()).toContain("unknown, not confirmed missing");
     expect(terminal.transcript()).not.toContain(judgeRecommendation);
+    expect(terminal.transcript()).not.toContain(mnemopiSavePrompt);
     expect(terminal.transcript()).not.toContain("Saved native memory.backend");
     expect(terminal.transcript()).not.toContain(nativeSecret);
     expect(await fs.readFile(context.nativeConfig, "utf8")).toBe(invalidNative);
@@ -1034,8 +1051,8 @@ ptyTest("native configuration failure leaves setup saved and reports no unverifi
   } finally { await context.cleanup(); }
 }, 90_000);
 
-ptyTest("existing config and blank retention ignore ambient dotenv; only named credentials load", async () => {
-  const context = await fixture({ memory: { backend: "mnemopi" } });
+ptyTest("existing setup keeps an alternate backend byte-for-byte and blank credentials ignore ambient dotenv", async () => {
+  const context = await fixture({ memory: { backend: "local" }, mnemopi: { bank: "keep-even-when-unused" } });
   try {
     const original = await existingConfig(context);
     context.ambientEnv = `${customName}=pty-ambient-phantom\n${unrelatedName}=pty-ambient-unrelated\n`;
@@ -1051,7 +1068,11 @@ ptyTest("existing config and blank retention ignore ambient dotenv; only named c
     expect(await fs.readFile(`${context.config}.env`, "utf8")).toBe(original.env);
     expect((await fs.stat(`${context.config}.env`)).mode & 0o777).toBe(0o600);
     expect(terminal.transcript()).not.toContain("Messengers (");
-    expect(terminal.transcript()).not.toContain(memoryPrompt);
+    expect(terminal.transcript()).not.toContain(mnemopiSavePrompt);
+    expect(terminal.transcript()).not.toContain("Saved native memory.backend");
+    expect(terminal.transcript()).toContain("Native OMP memory.backend=local is configured");
+    expect(terminal.transcript()).toContain("Start explicitly:");
+    expect(await fs.readFile(context.nativeConfig, "utf8")).toBe(context.nativeOriginal);
     expect(terminal.transcript()).not.toContain("Recommended: native OMP Mnemopi");
     expect(terminal.transcript()).not.toContain(judgeRecommendation);
     expect(terminal.transcript()).not.toContain(judgeUnknown);
@@ -1059,6 +1080,7 @@ ptyTest("existing config and blank retention ignore ambient dotenv; only named c
     expect(terminal.transcript()).not.toContain("Replace existing credential values?");
     for (const name of defaultNames) expect(terminal.transcript()).not.toContain(`${name} (`);
     const proof = await doctor(context);
+    expect(proof.result.memory).toMatchObject({ status: "enabled", backend: "local", source: "global" });
     expect(proof.result.credentials).toEqual({ [customName]: true });
     expect(proof.observed.hashes[customName]).toBe(hash("pty-original-telegram"));
     expect(proof.observed.hashes[unrelatedName]).toBeNull();
@@ -1192,10 +1214,7 @@ ptyTest("terminal and parent-only signals, EOF and declined confirmations preser
       } else {
         await terminal.secret(customName, replacement, true);
         await terminal.answer("Replace existing credential values? [y/N]: ", action === "decline-replacement" ? "n" : "y");
-        if (action === "decline-final") {
-          await terminal.answer(memoryPrompt, "n");
-          await terminal.answer("Write configuration/credentials? [y/N]: ", "n");
-        }
+        if (action === "decline-final") await terminal.answer(mnemopiSavePrompt, "n");
       }
       await terminal.finished(false);
       expect(terminal.transcript()).not.toContain(replacement);

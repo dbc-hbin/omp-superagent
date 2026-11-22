@@ -82,15 +82,6 @@ async fn run(args: Args) -> Result<()> {
                 "Restart state directory changed"
             );
         }
-        if !matches!(args.kind, CommandKind::ValidatedRunner)
-            && let Err(error) = lifecycle.require_mnemopi().await
-        {
-            eprintln!(
-                "Managed sessions require effective native OMP Mnemopi (memory.backend=mnemopi). \
-                 Run omp-sa doctor with the same configuration and native profile."
-            );
-            return Err(error);
-        }
         match args.kind {
             CommandKind::Serve => {
                 daemon::serve(

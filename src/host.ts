@@ -370,12 +370,12 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
       fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
       fileURLToPath(new URL("./host-extension.ts", import.meta.url))];
     const composition = await managedUlwLaunchExtensions({ cwd: options.cwd, managedUlwPath,
-      extensionPaths, configPath, commandArgs: options.command.slice(1),
+      extensionPaths, configPath, parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
       launchArgs: [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
       env: options.env, bunCommand: [bun, "--no-env-file"] });
     const { env: _inheritedEnvironment, ...launchOptions } = options;
     const helperPath = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
-    const manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath,
+    const manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath, memoryWriteDir: composition.memoryWriteDir,
       processBackend, helperPath, nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
     // Preparation used to run inside the owner; it shares the same startup budget.
     const deadline = Date.now() + START_TIMEOUT_MS;

@@ -109,8 +109,8 @@ async function launchFixture(packageName = "omp-superkit", alternateName = "omp-
   await writeFile(join(oldUlw, "index.ts"), "throw new Error('unmanaged ULW must not load');\n");
   const configPath = join(f.root, "launch.json");
   await writeFile(configPath, JSON.stringify({ extensions: [unrelated, oldUlw] }));
-  const launch = (commandArgs: string[] = [], env: Record<string, string | undefined> = {}) => managedUlwLaunchExtensions({
-    cwd: f.root, managedUlwPath: f.remote, extensionPaths: [], configPath,
+  const launch = (commandArgs: string[] = [], env: Record<string, string | undefined> = {}, parentConfigPath?: string) => managedUlwLaunchExtensions({
+    cwd: f.root, managedUlwPath: f.remote, extensionPaths: [], configPath, parentConfigPath,
     commandArgs,
     launchArgs: [...commandArgs, "--mode", "rpc-ui", "--cwd", f.root, "-e", f.remote, "--config", configPath],
     env: { PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: agentDir,
@@ -188,7 +188,7 @@ test("stock launch honors original --no-extensions without resurrecting ambient 
   await mkdir(join(f.agentDir, "commands/operator"), { recursive: true });
   await writeFile(join(f.agentDir, "commands/operator/index.ts"), "throw new Error('disabled command must not load');\n");
   const launch = await f.launch(["--no-extensions", "-e", f.unrelated]);
-  expect(launch).toEqual({ extensionPaths: [f.remote], noExtensions: true });
+  expect(launch).toEqual({ extensionPaths: [f.remote], noExtensions: true, memoryWriteDir: f.agentDir });
   expect(launch.extensionPaths).not.toContain(join(f.agentDir, "extensions/ambient.ts"));
   expect(launch.extensionPaths).not.toContain(f.oldUlw);
 }, 60_000);
@@ -236,9 +236,9 @@ test("stock launch uses original --config overlays and the generated config in n
   expect(excluded.extensionPaths).toContain(f.unrelated);
   expect(excluded.extensionPaths).not.toContain(f.oldUlw);
   const replaced = await f.launch(["--config", originalConfig, `--config=${replacementConfig}`]);
-  expect(replaced).toEqual({ extensionPaths: [f.remote], noExtensions: false });
+  expect(replaced).toEqual({ extensionPaths: [f.remote], noExtensions: false, memoryWriteDir: f.agentDir });
   await writeFile(f.configPath, JSON.stringify({ extensions: [f.unrelated] }));
-  expect(await f.launch(["--config", originalConfig])).toEqual({ extensionPaths: [f.remote], noExtensions: false });
+  expect(await f.launch(["--config", originalConfig])).toEqual({ extensionPaths: [f.remote], noExtensions: false, memoryWriteDir: f.agentDir });
 }, 60_000);
 
 test("stock launch preserves PI_CONFIG_FILES precedence beneath original CLI configs", async () => {
@@ -249,7 +249,7 @@ test("stock launch preserves PI_CONFIG_FILES precedence beneath original CLI con
   await writeFile(originalConfig, JSON.stringify({ extensions: [f.unrelated] }));
   await writeFile(f.configPath, "{}");
   const launch = await f.launch(["--config", originalConfig], { PI_CONFIG_FILES: environmentConfig });
-  expect(launch).toEqual({ extensionPaths: [f.remote], noExtensions: false });
+  expect(launch).toEqual({ extensionPaths: [f.remote], noExtensions: false, memoryWriteDir: f.agentDir });
 }, 60_000);
 
 test("stock launch bootstraps the explicit profile before its .env and native discovery", async () => {
@@ -257,12 +257,12 @@ test("stock launch bootstraps the explicit profile before its .env and native di
   const profileAgent = join(f.home, ".omp/profiles/work/agent");
   const profileConfig = join(f.root, "profile.json");
   await mkdir(join(profileAgent, "extensions"), { recursive: true });
-  await writeFile(join(profileAgent, "config.yml"), JSON.stringify(offlineMnemopi), { mode: 0o600 });
   await writeFile(join(profileAgent, "extensions/profile.ts"), "throw new Error('profile discovery must not execute factories');\n");
   await writeFile(profileConfig, JSON.stringify({ extensions: [f.unrelated, f.oldUlw] }));
   await writeFile(join(profileAgent, ".env"), `PI_CONFIG_FILES=${profileConfig}\n`);
   await writeFile(f.configPath, "{}");
   const launch = await f.launch(["--profile=work"]);
+  expect(Bun.YAML.parse(await readFile(join(profileAgent, "config.yml"), "utf8"))).toEqual({ memory: { backend: "mnemopi" } });
   expect(launch.noExtensions).toBe(true);
   expect(launch.extensionPaths).toContain(join(profileAgent, "extensions/profile.ts"));
   expect(launch.extensionPaths).not.toContain(join(f.agentDir, "extensions/ambient.ts"));
@@ -275,6 +275,28 @@ test("stock launch follows native profile value consumption instead of scanning 
   const launch = await f.launch(["--system-prompt", "--profile", "work"]);
   expect(launch.noExtensions).toBe(true);
   expect(launch.extensionPaths).toContain(join(f.agentDir, "extensions/ambient.ts"));
+}, 60_000);
+
+test("Host memory writes stay within the original launch profile across dotenv and lane inheritance", async () => {
+  const f = await launchFixture();
+  const profile = join(f.root, "alternate");
+  const config = join(profile, "config.yml");
+  const bytes = "memory: {backend: off}\n";
+  await mkdir(profile);
+  await writeFile(config, bytes);
+  await writeFile(join(f.root, ".env"), `PI_CODING_AGENT_DIR=${profile}\n`);
+  await expect(f.launch([], { PI_CODING_AGENT_DIR: undefined })).rejects.toThrow("operator's launch profile");
+  expect(await readFile(config, "utf8")).toBe(bytes);
+
+  const parentConfig = join(f.root, "parent/config.json");
+  await mkdir(join(f.root, "parent"));
+  await writeFile(join(f.root, "parent/owner.json"), JSON.stringify({ configPath: parentConfig, memoryWriteDir: f.agentDir }));
+  await expect(f.launch([], { PI_CODING_AGENT_DIR: profile }, parentConfig)).rejects.toThrow("operator's launch profile");
+  expect(await readFile(config, "utf8")).toBe(bytes);
+  const enabled = "memory: {backend: local}\n";
+  await writeFile(config, enabled);
+  expect((await f.launch([], { PI_CODING_AGENT_DIR: profile }, parentConfig)).memoryWriteDir).toBeNull();
+  expect(await readFile(config, "utf8")).toBe(enabled);
 }, 60_000);
 
 test("stock launch includes original plugin-dir hooks in native exclusion snapshots", async () => {

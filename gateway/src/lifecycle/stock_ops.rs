@@ -19,16 +19,17 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 impl LifecycleConfig {
-    /// Verify the head's native profile before the native entry point can activate adapters.
-    pub async fn require_mnemopi(&self) -> Result<()> {
-        #[derive(serde::Deserialize)]
-        struct Status {
-            status: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct Report {
-            memory: Status,
-        }
+    /// Refuse unsupported profiles without changing native settings or creating state.
+    pub(super) async fn preflight_memory(&self) -> Result<()> {
+        self.check_memory("preflight").await
+    }
+
+    /// An owned startup can apply the fallback, but must observe enabled memory after the edit.
+    pub(super) async fn ensure_memory(&self) -> Result<()> {
+        self.check_memory("ensure").await
+    }
+
+    async fn check_memory(&self, operation: &str) -> Result<()> {
         let (_, args) = self
             .command
             .split_first()
@@ -36,17 +37,24 @@ impl LifecycleConfig {
         let mut check = bun(self, &self.head_environment());
         check
             .arg(self.root.join("src/managed-memory-helper.ts"))
-            .arg("inspect")
+            .arg(operation)
             .args(args);
-        let report: Report = tagged_output(
-            &capture(check, None, OPERATION_TIMEOUT).await?,
-            "MANAGED_MEMORY ",
-        )?;
-        ensure!(
-            report.memory.status == "enabled",
-            "Effective Mnemopi is not configured"
-        );
-        Ok(())
+        let result = async {
+            let allowed: bool = tagged_output(
+                &capture(check, None, OPERATION_TIMEOUT).await?,
+                "MANAGED_MEMORY ",
+            )?;
+            ensure!(allowed, "Native OMP memory profile cannot be prepared");
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            eprintln!(
+                "Managed sessions require an enabled native OMP memory backend. \
+                 Run omp-sa doctor with the same configuration and native profile."
+            );
+        }
+        result
     }
 }
 

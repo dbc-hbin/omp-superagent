@@ -1,22 +1,26 @@
 // Configuration only. Never import the SDK entry point, account storage, or a backend.
-import { effectiveMnemopi, parseMemoryConsent, type MnemopiReport } from "./managed-memory";
+import { canEnableGlobalMemory, effectiveManagedMemory, ensureManagedMemory, parseMemoryConsent, type ManagedMemoryReport } from "./managed-memory";
 import { parseNativeLaunch } from "./native-launch-profile";
 
-const unavailable: MnemopiReport = { memory: { status: "unknown" }, updated: false };
-async function check(): Promise<MnemopiReport> {
+const unavailable: ManagedMemoryReport = { memory: { status: "unknown" }, updated: false };
+const [operation, ...args] = process.argv.slice(2);
+async function check(): Promise<ManagedMemoryReport> {
   const cwd = process.cwd();
-  const [operation, ...args] = process.argv.slice(2);
-  if (operation !== "inspect" && operation !== "apply-consented") return unavailable;
+  if (operation !== "inspect" && operation !== "preflight" && operation !== "ensure" && operation !== "apply-consented") return unavailable;
   const parsed = await parseNativeLaunch([...args, "--mode", "rpc-ui", "--cwd", cwd]);
   if (parsed.mode !== "rpc-ui" || parsed.cwd !== cwd) return unavailable;
   const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
   const settings = await Settings.loadReadOnly({ cwd, configFiles: parsed.config });
-  if (operation === "inspect") return { memory: await effectiveMnemopi(settings), updated: false };
-  const expected = parseMemoryConsent(await Bun.stdin.text());
-  const { saveMnemopiPreference } = await import("./setup-memory");
-  return saveMnemopiPreference(settings, expected);
+  if (operation === "inspect" || operation === "preflight") {
+    return { memory: await effectiveManagedMemory(settings, parsed.launchAgentDir), updated: false };
+  }
+  return ensureManagedMemory(settings, parsed.launchAgentDir,
+    operation === "apply-consented" ? parseMemoryConsent(await Bun.stdin.text()) : undefined);
 }
 
 // Native parse/read diagnostics may include private settings. Emit only known fields.
 const report = await check().catch(() => unavailable);
-process.stdout.write(`MANAGED_MEMORY ${JSON.stringify(report)}\n`);
+const output = operation === "preflight" || operation === "ensure"
+  ? report.memory.status === "enabled" || (operation === "preflight" && canEnableGlobalMemory(report.memory))
+  : report;
+process.stdout.write(`MANAGED_MEMORY ${JSON.stringify(output)}\n`);

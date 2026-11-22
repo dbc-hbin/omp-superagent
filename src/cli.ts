@@ -30,10 +30,11 @@ Usage:
 Setup and service lifecycle:
   setup creates FILE interactively, or preserves an existing FILE and prompts for its configured credentials.
   It saves a private FILE.env and sets configured Discord/Telegram bot profile pictures through REST; it does not start bots.
-  Managed sessions require effective native Mnemopi. Setup asks separately before changing native global settings.
+  Managed sessions keep any enabled native OMP memory backend. If the profile has memory off or unset,
+  saving setup or starting a managed session sets memory.backend=mnemopi; project and launch overrides are preserved.
   On first setup, if no native Judge model is configured, setup explains how to select one in ordinary OMP
   (/models > Roles > Judge); it does not choose a model for you.
-  doctor checks native prerequisites, effective Mnemopi and credential presence, not successful login.
+  doctor checks native prerequisites, the effective memory backend and credential presence without changing settings or logging in.
   start launches a detached Gateway and one HEAD, activating ALL configured messengers. No autostart is installed.
   start can return before HEAD can accept work. Check head.ready and head.initialization in the start response
   (gateway.head in status); initial high/middle/low model presets must be verified before queued work runs.
@@ -207,10 +208,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   const paths = hostPaths(config, target);
   if (command === "doctor") {
     const { requireGateway } = await import("./gateway-native");
-    const { inspectManagedMnemopi, memoryBlockReason } = await import("./managed-memory");
+    const { inspectManagedMemory, memoryBlockReason } = await import("./managed-memory");
     loadCredentials(config);
     const omp = await inspectInstalledOmp(config.command, credentialEnvNames(config));
-    const memory = await inspectManagedMnemopi(config);
+    const memory = await inspectManagedMemory(config);
     console.log(JSON.stringify({
       config: config.path, command: config.command, headCwd: config.headCwd,
       omp, hostOwnerExecutable: await requireHostOwner(), gatewayExecutable: await requireGateway(), nativeTuiAttach: false,

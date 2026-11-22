@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
@@ -17,6 +17,7 @@ use super::{fs::private_directory, stock_ops::capture};
 
 pub(super) const RESTART_CONFIG_ENV: &str = "OMP_SUPERAGENT_RESTART_CONFIG_SHA256";
 pub(super) const RUNNER_CONFIG_ENV: &str = "OMP_SUPERAGENT_RUNNER_CONFIG_SHA256";
+pub(super) const GATEWAY_START_CONFIG_ENV: &str = "OMP_SUPERAGENT_GATEWAY_START_CONFIG_SHA256";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,6 +146,13 @@ impl LifecycleConfig {
         if let Some(slack) = raw.slack {
             credentials.extend([slack.bot_token_env, slack.app_token_env]);
         }
+        ensure!(
+            credentials
+                .iter()
+                .chain(voice_credential.iter())
+                .all(|name| name != GATEWAY_START_CONFIG_ENV),
+            "Gateway startup config marker cannot be used as a credential"
+        );
         let mut restart_context = config.clone();
         restart_context.sort_all_objects();
         let normalized_hash = hex::encode(Sha256::digest(serde_json::to_vec(&restart_context)?));
@@ -183,6 +191,18 @@ impl LifecycleConfig {
         self.restart_context == candidate.restart_context
     }
 
+    /// Reject a detached child's changed config before running any helper with inherited credentials.
+    pub(super) fn validate_spawned_config(&self) -> Result<()> {
+        if let Some(expected) = env::var_os(GATEWAY_START_CONFIG_ENV) {
+            ensure!(
+                expected.as_os_str() == OsStr::new(&self.source_hash)
+                    && self.matches_config_hash(&self.source_hash),
+                "Gateway configuration changed between launch and serve"
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_directories(&self) -> Result<()> {
         private_directory(&self.state_dir)?;
         for directory in ["run", "logs", "sessions"] {
@@ -194,8 +214,8 @@ impl LifecycleConfig {
     pub(super) fn require_credentials(&self) -> Result<()> {
         for name in &self.messenger_credentials {
             ensure!(
-                env::var_os(name).is_some_and(|value| !value.is_empty()),
-                "Missing messenger credential environment variable {name}"
+                env::var(name).is_ok_and(|value| !value.is_empty() && !value.contains(['\r', '\n'])),
+                "Missing or invalid messenger credential environment variable {name}"
             );
         }
         Ok(())
@@ -218,6 +238,7 @@ impl LifecycleConfig {
             "OMP_SUPERAGENT_GATEWAY_TOKEN",
             RESTART_CONFIG_ENV,
             RUNNER_CONFIG_ENV,
+            GATEWAY_START_CONFIG_ENV,
         ] {
             environment.remove(&OsString::from(name));
         }

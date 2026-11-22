@@ -127,12 +127,21 @@ async function verifyTranscript(fixture: NativeRustGateway, heads: readonly Head
 
 nativeTest("native Gateway stops only settled work and resumes the original stock OMP session", () =>
   withNativeRustGateway(async fixture => {
+    const nativeConfig = join(fixture.root, "agent", "config.yml");
+    const enabledSettings = JSON.parse(await readFile(nativeConfig, "utf8"));
+    const globallyOff = JSON.stringify({ ...enabledSettings, memory: { backend: "off" } });
+    await writeFile(nativeConfig, globallyOff);
     const first = await fixture.start();
+    assert.deepEqual(Bun.YAML.parse(await readFile(nativeConfig, "utf8")), enabledSettings,
+      "An owned startup repairs only the globally disabled memory setting");
     sampleIdleMemory(first.gatewayPid, first.head);
     // Omit the bot credential: a mistaken new launch cannot reach the network.
+    await writeFile(nativeConfig, globallyOff);
     const reused = JSON.parse((await fixture.run([await requireGateway(), "launch", "--config", fixture.config])).stdout) as GatewayStatus;
     assert.equal(reused.gateway.pid, first.gatewayPid);
     assert.equal(reused.head.pid, first.head.pid);
+    assert.equal(await readFile(nativeConfig, "utf8"), globallyOff, "A redundant launch must not write memory settings");
+    await writeFile(nativeConfig, JSON.stringify(enabledSettings));
     await fixture.deliver(headInput("201"));
     assert.equal(await verifyDelivery(fixture, "201"), "HEAD:201");
     assert.deepEqual(await fixture.snapshot("settled"), first.head);
@@ -176,6 +185,9 @@ nativeTest("authorized messenger /restart accepts compatible config drift and ha
     const nextConfig = JSON.stringify({ ...JSON.parse(originalConfig), maxSubagents: 4 });
     assert.notEqual(nextConfig, originalConfig);
     await writeFile(fixture.config, nextConfig);
+    const nativeConfig = join(fixture.root, "agent", "config.yml");
+    const enabledSettings = JSON.parse(await readFile(nativeConfig, "utf8"));
+    await writeFile(nativeConfig, JSON.stringify({ ...enabledSettings, memory: { backend: "off" } }));
     const acceptedHash = createHash("sha256").update(nextConfig).digest("hex");
     const restart = input("211", "/restart");
     await fixture.deliver(restart);
@@ -211,6 +223,8 @@ nativeTest("authorized messenger /restart accepts compatible config drift and ha
     await fixture.headExit(first.head);
     await waitForFixtureProcessExit([runner]);
     const successor = await fixture.ready(handoff.successorPid);
+    assert.deepEqual(Bun.YAML.parse(await readFile(nativeConfig, "utf8")), enabledSettings,
+      "The authenticated restart leaves the native profile with enabled memory");
     assert.equal(successor.head.pid, handoff.replacementPid);
     assert.notEqual(successor.head.ownerPid, first.head.ownerPid);
     assert.equal(successor.head.sessionId, first.head.sessionId);

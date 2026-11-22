@@ -1,5 +1,6 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { authorizeRoute, configuredPlatforms, credentialEnvNames, loadConfig, requireMessengerCredentials } from "../src/config";
@@ -168,6 +169,18 @@ describe("operator execution limits", () => {
 });
 
 describe("installed OMP prerequisite", () => {
+  async function runGateway(directory: string, args: readonly string[], env: Readonly<Record<string, string>> = {}) {
+    const child = Bun.spawn([await requireGateway(), ...args], {
+      env: { PATH: process.env.PATH, HOME: directory, PI_CODING_AGENT_DIR: join(directory, "agent"),
+        OMP_SUPERAGENT_ROOT: realpathSync(join(import.meta.dir, "..")), OMP_SUPERAGENT_BUN: process.execPath, ...env },
+      stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 30_000, killSignal: "SIGKILL",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    return { stdout, stderr, code };
+  }
+
   async function executable(version = testedVersion, help = "--mode rpc, rpc-ui --resume PATH --extension FILE --model MODEL",
     processHelp = "--signal SIGNAL") {
     const directory = mkdtempSync(join(tmpdir(), "superagent-installed-"));
@@ -265,7 +278,7 @@ else process.exit(8);
     const profileOverlay = join(f.directory, "profile.yml");
     const launchOverlay = join(f.directory, "launch.yml");
     await Bun.write(join(profile, ".env"), `PI_CONFIG_FILES=${profileOverlay}\n`);
-    await Bun.write(profileOverlay, JSON.stringify(offlineMnemopi));
+    await Bun.write(profileOverlay, '{"memory":{"backend":"sharpshooter"}}\n');
     await Bun.write(launchOverlay, '{"memory":{"backend":"off"}}\n');
     for (const overrides of [[], ["--config", launchOverlay]]) {
       const path = await config({ command: [f.command, "--profile=isolated", ...overrides] });
@@ -280,7 +293,7 @@ else process.exit(8);
       expect({ code, stderr }).toEqual({ code: shadowed ? 1 : 0, stderr: "" });
       expect(JSON.parse(stdout)).toMatchObject({
         memory: { status: shadowed ? "missing" : "enabled", source: "overlay",
-          backend: shadowed ? "off" : "mnemopi", agentDir: profile },
+          backend: shadowed ? "off" : "sharpshooter", agentDir: profile },
         messengersActivated: false,
       });
     }
@@ -288,28 +301,96 @@ else process.exit(8);
     expect(await Bun.file(join(profile, "config.yml")).exists()).toBe(false);
   }, 30_000);
 
-  test.each(["launch", "serve"])("direct native Gateway %s refuses ineffective memory before creating state", async mode => {
+  test.each([
+    ["launch", "off"], ["serve", "off"], ["launch", "future-backend"], ["serve", "future-backend"],
+  ])("direct native Gateway %s rejects a %s overlay before creating state", async (mode, backend) => {
     const f = await executable(testedVersion);
     const denied = join(f.directory, "deny.yml");
-    const bytes = '{"memory":{"backend":"off"}}\n';
+    const bytes = JSON.stringify({ memory: { backend } }) + "\n";
     const agent = join(f.directory, "agent");
     mkdirSync(agent, { mode: 0o700 });
     await Bun.write(join(agent, "config.yml"), JSON.stringify(offlineMnemopi));
     await Bun.write(denied, bytes);
     const file = await config({ command: [f.command, "--config", denied] });
-    const child = Bun.spawn([await requireGateway(), mode, "--config", file], {
-      env: { PATH: process.env.PATH, HOME: f.directory, PI_CODING_AGENT_DIR: agent,
-        OMP_SUPERAGENT_ROOT: realpathSync(join(import.meta.dir, "..")), OMP_SUPERAGENT_BUN: process.execPath },
-      stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 30_000, killSignal: "SIGKILL",
-    });
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-    ]);
+    const { stdout, stderr, code } = await runGateway(f.directory, [mode, "--config", file]);
     expect(code).toBe(1);
     expect(stdout).toBe("");
-    expect(stderr).toContain("Managed sessions require effective native OMP Mnemopi");
-    expect(await Bun.file(join(dirname(file), "state/coordination.sqlite")).exists()).toBe(false);
+    expect(stderr).toContain("Managed sessions require an enabled native OMP memory backend");
+    expect(existsSync(join(dirname(file), "state"))).toBe(false);
     expect(await Bun.file(join(agent, "agent.db")).exists()).toBe(false);
     expect(await Bun.file(denied).text()).toBe(bytes);
+  }, 40_000);
+
+  test.each(["launch", "serve", "replacement serve"] as const)(
+    "direct native Gateway %s leaves global memory off without credentials or a replacement receipt", async mode => {
+      const f = await executable();
+      const agent = join(f.directory, "agent");
+      mkdirSync(agent, { mode: 0o700 });
+      const settings = Bun.file(join(agent, "config.yml"));
+      const bytes = '{"memory":{"backend":"off"}}\n';
+      await Bun.write(settings, bytes);
+      const file = await config({ command: [f.command] });
+      const replacement = mode === "replacement serve";
+      const args = [
+        replacement ? "serve" : mode, "--config", file,
+        ...(replacement ? ["--restart-request", crypto.randomUUID()] : []),
+      ];
+      const { code, stdout } = await runGateway(f.directory, args,
+        replacement ? { DISCORD_BOT_TOKEN: "fixture-only" } : {});
+      expect({ code, stdout }).toEqual({ code: 1, stdout: "" });
+      expect(await settings.text()).toBe(bytes);
+      expect(existsSync(join(dirname(file), "state"))).toBe(false);
+    }, 40_000);
+
+  test("direct native Gateway serve cannot repair memory while another owner holds the lifetime lock", async () => {
+    const f = await executable();
+    const agent = join(f.directory, "agent");
+    mkdirSync(agent, { mode: 0o700 });
+    const settings = Bun.file(join(agent, "config.yml"));
+    const bytes = '{"memory":{"backend":"off"}}\n';
+    await Bun.write(settings, bytes);
+    const file = await config({ command: [f.command] });
+    const state = join(dirname(file), "state");
+    mkdirSync(state, { mode: 0o700 });
+    const lock = new Database(join(state, "coordination.sqlite.gateway-lock"));
+    try {
+      lock.exec("BEGIN EXCLUSIVE");
+      const { code, stdout } = await runGateway(f.directory, ["serve", "--config", file], {
+        DISCORD_BOT_TOKEN: "offline-fixture-only\u0007",
+      });
+      expect({ code, stdout }).toEqual({ code: 1, stdout: "" });
+      expect(await settings.text()).toBe(bytes);
+      expect(existsSync(join(state, "coordination.sqlite"))).toBe(false);
+    } finally {
+      lock.close();
+    }
+  }, 40_000);
+
+  test("owned native Gateway refuses an incompatible OMP before repairing memory or exposing messenger credentials", async () => {
+    const f = await executable(testedVersion, "--mode rpc --resume PATH --extension FILE --model MODEL");
+    const agent = join(f.directory, "agent");
+    mkdirSync(agent, { mode: 0o700 });
+    const settings = Bun.file(join(agent, "config.yml"));
+    const bytes = '{"memory":{"backend":"off"}}\n';
+    await Bun.write(settings, bytes);
+    const tokenEnv = "INSTALLED_OMP_TEST_TOKEN";
+    const file = await config({
+      command: [f.command],
+      discord: { tokenEnv, ownerId: "123", allowedGuildIds: [], allowedChannelIds: [] },
+    });
+    const { code, stdout, stderr } = await runGateway(f.directory, ["serve", "--config", file], {
+      // An invalid header prevents any real transport request even if ordering regresses.
+      [tokenEnv]: "private-messenger-token\u0007",
+      OMP_SUPERAGENT_TEST_MANAGED_ULW_PATH: join(import.meta.dir, "fixtures/managed-ulw"),
+    });
+    expect({ code, stdout }).toEqual({ code: 1, stdout: "" });
+    expect(stderr).not.toContain("private-messenger-token");
+    const rows = (await Bun.file(f.audit).text()).trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.map(({ args, credential }) => ({ args, credential }))).toEqual([
+      { args: ["--version"], credential: null },
+      { args: ["--help"], credential: null },
+    ]);
+    expect(await settings.text()).toBe(bytes);
+    expect(existsSync(join(dirname(file), "state/run/gateway.sock"))).toBe(false);
   }, 40_000);
 });

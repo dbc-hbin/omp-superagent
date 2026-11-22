@@ -104,9 +104,9 @@ service or an OS sandbox; see [Design](DESIGN.md).
 | Step | What it changes |
 | --- | --- |
 | [Install](#1-install) | Prepares dependencies and the managed ULW integration. Does not start a bot or replace OMP. |
-| [`setup`](#2-configure) | Writes `config.local.json` and the owner-only, plaintext `config.local.json.env` (`0600`). Bot avatars change only on the confirmed final save. Changing OMP's global memory backend needs a separate `yes`. Starts no bot or model session. |
-| [`doctor`](#3-start) | Checks local configuration and effective Mnemopi without logging into the messengers. |
-| [`start`](#3-start) | Starts the detached Gateway and head and connects all configured messengers. |
+| [`setup`](#2-configure) | Writes `config.local.json` and the owner-only, plaintext `config.local.json.env` (`0600`). The final save discloses any needed OMP global memory change and bot avatar updates. Starts no bot or model session. |
+| [`doctor`](#3-start) | Checks local configuration and whether the effective OMP memory backend is enabled, without writing settings or logging into the messengers. |
+| [`start`](#3-start) | Applies the native memory fallback if needed, then starts the detached Gateway and head and connects all configured messengers. |
 | [Discord voice](docs/discord-voice.md) | Off by default. A rejected subscription call never switches to API billing. |
 | [`/stop`](#working-from-chat) | Pauses the bound lane. Approvals, cancellations, tool exclusions, and uncertain-effect holds remain binding. |
 
@@ -218,12 +218,15 @@ credentials take precedence. Configure model authentication through OMP.
 </td></tr></table>
 
 Setup does not start a bot or model session. Its final save confirmation includes
-replacing configured Discord/Telegram bot avatars with the mascot. Head and lane
-workspaces require effective native Mnemopi (`memory.backend: mnemopi`), even for
-existing configurations. Setup asks for a separate explicit `yes` before changing
-OMP's global memory backend. It does not override project or launch settings. If
-Mnemopi is still unavailable, setup keeps the saved files but reports incomplete.
-Setup recommends configuring a missing native judge role but does not choose or call a model.
+replacing configured Discord/Telegram bot avatars with the mascot and discloses a
+native memory change when needed. Managed head and lane workspaces accept any
+supported effective OMP memory backend other than `off`. If the selected profile
+is unconfigured or memory is off at the global layer, setup sets only that
+profile's global `memory.backend` to `mnemopi` after the confirmed save. There is no
+separate memory prompt. Project and launch overrides are not rewritten. If memory
+is still disabled or cannot be verified, setup keeps the saved files and reports
+incomplete. Setup recommends configuring a missing native judge role but does not
+choose or call a model.
 
 See [configuration and setup effects](docs/OPERATIONS.md#3-설정) for permissions,
 memory behavior, alternative config paths, and manual configuration.
@@ -236,9 +239,11 @@ Check local configuration without logging into the messengers:
 omp-sa doctor --config ./config.local.json
 ```
 
-Startup refuses if the head's native profile and workspace do not resolve to Mnemopi.
-Each lane launch also checks its own workspace. Start the detached Gateway and head,
-connecting **all configured messengers**:
+`doctor` reports a disabled or unverifiable backend without changing it. Gateway
+start/restart and each managed Host launch apply the same default/global fallback
+as setup, including for existing configurations. Each Host checks its own
+workspace. Explicit disabled project or launch overrides still block startup.
+Start the detached Gateway and head, connecting **all configured messengers**:
 
 ```sh
 omp-sa start --config ./config.local.json
@@ -271,9 +276,11 @@ crash supervisor; Linux service installation is not provided.
 - Start with the request itself. For example, “check login in client-ui” selects a uniquely named
   workspace previously used in this conversation. Reply to a placed task or its delivered
   message to reuse its workspace in a new topic without copying its history.
-- From any allowed owner channel, describe the earlier work, e.g. “continue the login bug
-  investigation from last week.” The controller uses OMP's Mnemopi recall and verifies
-  candidates against this instance's eligible session journals.
+- With active, searchable Mnemopi on the head, describe earlier work from any allowed
+  owner channel, e.g. “continue the login bug investigation from last week.” The
+  controller uses Mnemopi recall and verifies candidates against this instance's
+  eligible session journals. Other enabled memory backends can run managed sessions
+  but do not support this historical topic search.
   A cross-channel continuation uses the matched workspace and relevant task evidence, not
   the original channel binding, transcript or approvals. Choose by number if multiple tasks match.
 - If the workspace is unclear, reply to the question with a known repository name or absolute

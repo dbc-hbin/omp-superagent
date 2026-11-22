@@ -245,7 +245,6 @@ async function nativeMemoryCase(before: string, after = "") {
   const directory = setupDirectory();
   const home = join(directory, "home");
   mkdirSync(home);
-  const helper = new URL("../src/setup-memory.ts", import.meta.url).href;
   const policy = new URL("../src/managed-memory.ts", import.meta.url).href;
   const nativeSettings = import.meta.resolve("@oh-my-pi/pi-coding-agent/config/settings");
   const nativeBackend = import.meta.resolve("@oh-my-pi/pi-coding-agent/memory-backend/settings");
@@ -259,8 +258,7 @@ async function nativeMemoryCase(before: string, after = "") {
     import net from "node:net";
     import tls from "node:tls";
     import dgram from "node:dgram";
-    import { saveMnemopiPreference } from ${JSON.stringify(helper)};
-    import { effectiveMnemopi } from ${JSON.stringify(policy)};
+    import { ensureManagedMemory } from ${JSON.stringify(policy)};
     const deny = () => { throw new Error("Native setup must stay offline"); };
     net.Socket.prototype.connect = net.Server.prototype.listen = tls.connect = deny;
     for (const name of ["bind", "connect", "send"]) dgram.Socket.prototype[name] = deny;
@@ -280,7 +278,7 @@ async function nativeMemoryCase(before: string, after = "") {
     const writeConfig = value => Bun.write(configPath, JSON.stringify(value));
     ${before}
     const settings = await Settings.loadReadOnly({ cwd });
-    const result = await saveMnemopiPreference(settings, await effectiveMnemopi(settings));
+    const result = await ensureManagedMemory(settings, agentDir);
     ${after}
     const actual = await Settings.loadReadOnly({ cwd });
     const effective = cfgMemoryBackend.get(actual);
@@ -316,7 +314,7 @@ async function nativeMemoryCase(before: string, after = "") {
   }
 }
 
-describe("consented effective native Mnemopi preference", () => {
+describe("effective native memory configuration", () => {
   test("fresh read-only setup writes config without creating account storage", async () => {
     const result = await nativeMemoryCase("");
     expect(result.result).toMatchObject({ memory: { status: "enabled" }, updated: true });
@@ -346,18 +344,63 @@ describe("consented effective native Mnemopi preference", () => {
     }
   }, 90_000);
 
-  test("sets only the native backend and survives RPC defaults without starting memory", async () => {
+  test("malformed native project settings refuse the global memory fallback", async () => {
+    const result = await nativeMemoryCase(`
+      const globalBytes = 'memory:\\n  backend: off\\n';
+      await Bun.write(configPath, globalBytes);
+      const project = getProjectAgentDir(cwd);
+      await mkdir(project, { recursive: true });
+      const projectPath = join(project, "settings.json");
+      const projectBytes = '{"memory":{"backend":"off"';
+      await Bun.write(projectPath, projectBytes);
+    `, `
+      if (await Bun.file(configPath).text() !== globalBytes)
+        throw new Error("Global config changed despite unreadable project settings");
+      if (await Bun.file(projectPath).text() !== projectBytes)
+        throw new Error("Malformed project settings changed");
+    `);
+    expect(result.result).toEqual({ memory: { status: "unknown" }, updated: false });
+  }, 30_000);
+
+  test.each(["hindsight", "local", "mnemopi", "sharpshooter"])("keeps configured %s memory through RPC defaults without starting it", async backend => {
     const original = {
-      memory: { backend: "local" }, modelRoles: { default: "vendor/model", judge: "vendor/judge" },
+      memory: { backend }, modelRoles: { default: "vendor/model", judge: "vendor/judge" },
       mnemopi: { autoRecall: false, autoRetain: false, scoping: "global", bank: "keep-bank", dbPath: "keep.db" },
     };
     const result = await nativeMemoryCase(`await writeConfig(${JSON.stringify(original)});`);
-    expect(result.result).toMatchObject({ memory: { status: "enabled" }, updated: true });
-    expect(result.effective).toBe("mnemopi");
-    expect(result.rpcEffective).toBe("mnemopi");
-    expect(result.disk).toEqual({ ...original, memory: { backend: "mnemopi" } });
+    expect(result.result).toMatchObject({ memory: { status: "enabled", backend }, updated: false });
+    expect(result.effective).toBe(backend);
+    expect(result.rpcEffective).toBe(backend);
+    expect(result.disk).toEqual(original);
     expect(result.memoryFiles).toEqual([]);
     expect(result.agentDbExists).toBe(false);
+  }, 30_000);
+
+  test("does not replace an unrecognized configured backend with the SDK default", async () => {
+    const original = { memory: { backend: "newer-native-backend" } };
+    const result = await nativeMemoryCase(`await writeConfig(${JSON.stringify(original)});`);
+    expect(result.result).toEqual({ memory: { status: "unknown" }, updated: false });
+    expect(result.disk).toEqual(original);
+  }, 30_000);
+
+  test("does not replace a non-mapping memory section with a fallback", async () => {
+    const bytes = "memory: [kept-setting]\n";
+    const result = await nativeMemoryCase(`await Bun.write(configPath, ${JSON.stringify(bytes)});`, `
+      if (await Bun.file(configPath).text() !== ${JSON.stringify(bytes)}) throw new Error("Memory section was overwritten");
+    `);
+    expect(result.result).toEqual({ memory: { status: "unknown" }, updated: false });
+  }, 30_000);
+
+  test("a project backend unset does not replace enabled memory in the global profile", async () => {
+    const result = await nativeMemoryCase(`
+      await writeConfig({ memory: { backend: "local" } });
+      const project = getProjectAgentDir(cwd);
+      await mkdir(project, { recursive: true });
+      await Bun.write(join(project, MAIN_CONFIG_FILENAMES[0]), "memory:\\n  backend: null\\n");
+    `);
+    expect(result.result).toMatchObject({ memory: { status: "missing", source: "project", backend: "off" }, updated: false });
+    expect(result.disk).toEqual({ memory: { backend: "local" } });
+    expect(result.project.memory.backend).toBeNull();
   }, 30_000);
 
   test("config-only persistence never opens or changes native account/token storage", async () => {
@@ -374,27 +417,29 @@ describe("consented effective native Mnemopi preference", () => {
     expect(result.memoryFiles).toEqual([]);
   }, 30_000);
 
-  test("native persistence preserves a disjoint edit made after staging", async () => {
+  test.each(["explicit", "legacy"])("native persistence preserves a disjoint edit made after staging (%s)", async format => {
+    const selector = format === "legacy" ? { memories: { enabled: false } } : { memory: { backend: "off" } };
     const result = await nativeMemoryCase(`
-      await writeConfig({ memory: { backend: "off" }, modelRoles: { default: "vendor/old" } });
+      const selector = ${JSON.stringify(selector)};
+      await writeConfig({ ...selector, modelRoles: { default: "vendor/old" } });
       const withFileLock = nativeLocks.withFileLock;
       let edited = false;
       spyOn(nativeLocks, "withFileLock").mockImplementation(async (file, callback, options) => {
         if (!edited) {
           edited = true;
-          await writeConfig({ memory: { backend: "off" }, modelRoles: { default: "vendor/new" },
+          await writeConfig({ ...selector, modelRoles: { default: "vendor/new" },
             mnemopi: { bank: "concurrent-bank", autoRetain: false } });
         }
         return withFileLock(file, callback, options);
       });
     `);
     expect(result.result).toMatchObject({ memory: { status: "enabled" }, updated: true });
-    expect(result.disk).toEqual({ memory: { backend: "mnemopi" }, modelRoles: { default: "vendor/new" },
+    expect(result.disk).toEqual({ ...selector, memory: { backend: "mnemopi" }, modelRoles: { default: "vendor/new" },
       mnemopi: { bank: "concurrent-bank", autoRetain: false } });
     expect(result.memoryFiles).toEqual([]);
   }, 30_000);
 
-  test("a same-setting external edit wins and authoritative readback refuses success", async () => {
+  test("a concurrently enabled backend wins and readback accepts it", async () => {
     const result = await nativeMemoryCase(`
       await writeConfig({ memory: { backend: "off" } });
       const withFileLock = nativeLocks.withFileLock;
@@ -407,9 +452,32 @@ describe("consented effective native Mnemopi preference", () => {
         return withFileLock(file, callback, options);
       });
     `);
-    expect(result.result).toMatchObject({ memory: { status: "missing", backend: "local" }, updated: false });
+    expect(result.result).toMatchObject({ memory: { status: "enabled", backend: "local" }, updated: false });
     expect(result.effective).toBe("local");
     expect(result.disk).toEqual({ memory: { backend: "local" }, mnemopi: { bank: "external" } });
+  }, 30_000);
+
+  test.each(["explicit", "legacy"])("preserves a backend enabled after the locked native read (%s)", async format => {
+    const staged = format === "legacy" ? {} : { memory: { backend: "off" } };
+    const external = format === "legacy" ? { memories: { enabled: true } }
+      : { memory: { backend: "local" }, memories: { enabled: false } };
+    const result = await nativeMemoryCase(`
+      await writeConfig(${JSON.stringify(staged)});
+      const loadReadOnly = Settings.loadReadOnly;
+      const load = spyOn(Settings, "loadReadOnly").mockImplementation(async options => {
+        const snapshot = await loadReadOnly(options);
+        // The initial staging read has no explicit agentDir. Save without
+        // taking the lock once the writer has obtained its native snapshot.
+        if (options.agentDir === agentDir) {
+          load.mockRestore();
+          await writeConfig(${JSON.stringify(external)});
+        }
+        return snapshot;
+      });
+    `);
+    expect(result.result).toMatchObject({ memory: { status: "enabled", backend: "local" }, updated: false });
+    expect(result.effective).toBe("local");
+    expect(result.disk).toEqual(external);
   }, 30_000);
 
   test("a project denial introduced after consent prevents the global edit", async () => {
@@ -452,7 +520,7 @@ describe("consented effective native Mnemopi preference", () => {
       if (await Bun.file(overlayPath).text() !== overlayBytes)
         throw new Error("Native config overlay changed during setup");
     `);
-    expect(result.result).toMatchObject({ memory: { status: "missing", source: "overlay" }, updated: false });
+    expect(result.result).toMatchObject({ memory: { status: backend ? "enabled" : "missing", source: "overlay" }, updated: false });
     expect(result.effective).toBe(backend ?? "off");
     expect(result.disk).toEqual({ memory: { backend: "mnemopi" }, mnemopi: { bank: "global-kept" } });
     expect(result.memoryFiles).toEqual([]);
@@ -478,10 +546,10 @@ describe("consented effective native Mnemopi preference", () => {
     expect(result.memoryFiles).toEqual([]);
   }, 30_000);
 
-  test("can update a backend inherited from a legacy key in modern native YAML", async () => {
+  test("keeps local memory enabled by a legacy key in modern native YAML", async () => {
     const result = await nativeMemoryCase(`await writeConfig({ memories: { enabled: true } });`);
-    expect(result.result).toMatchObject({ memory: { status: "enabled" }, updated: true });
-    expect(result.disk).toEqual({ memory: { backend: "mnemopi" }, memories: { enabled: true } });
+    expect(result.result).toMatchObject({ memory: { status: "enabled", backend: "local" }, updated: false });
+    expect(result.disk).toEqual({ memories: { enabled: true } });
   }, 30_000);
 });
 

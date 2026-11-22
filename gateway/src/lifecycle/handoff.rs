@@ -11,10 +11,14 @@ use crate::store::Store;
 
 use super::{
     LifecycleConfig,
-    config::RUNNER_CONFIG_ENV,
+    config::{GATEWAY_START_CONFIG_ENV, RUNNER_CONFIG_ENV},
     fs::{EXIT_TIMEOUT, Endpoint, WAIT_SLICE, alive, log, metadata, socket_stat},
     process::{ChildKind, detached},
-    restart_record::{self as restart, ACTIVE, HEAD, Plan, Record, SOCKET, Stage, plan_key},
+    restart_record::{
+        self as restart, ACTIVE, FENCE, Fence, HEAD, Plan, Record, SOCKET, STOP, Stage, plan_key,
+    },
+    stock_ops::inspect_omp,
+    ulw::Ulw,
 };
 
 const RUNNER_TIMEOUT: Duration = Duration::from_secs(90);
@@ -124,17 +128,43 @@ pub fn record_runner_failure(dir: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn mark_ready(db: &mut Connection, config: &LifecycleConfig, id: &str, expected: &Plan) -> Result<()> {
-    let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (record, mut plan) = read_pair(&transaction, id)?;
+fn validate_preparation(
+    db: &Connection,
+    config: &LifecycleConfig,
+    id: &str,
+    expected: &Plan,
+) -> Result<Plan> {
+    let (record, plan) = read_pair(db, id)?;
     ensure!(
-        record.state.pending()
-            && get_meta(&transaction, ACTIVE)?.as_deref() == Some(id)
+        record.state == Stage::Accepted
+            && get_meta(db, ACTIVE)?.as_deref() == Some(id)
             && plan.runner_pid == Some(std::process::id())
+            && plan.runner_ready != Some(true)
+            && plan.launch_pid.is_none()
+            && record.successor_pid.is_none()
             && expected.matches_preparation(&plan),
         "Successor preparation lost request ownership"
     );
     restart::validate_config(config, &plan)?;
+    let fence: Fence = restart::meta(get_meta(db, FENCE)?)?.context("Missing restart fence")?;
+    ensure!(
+        fence.matches(&record.request, &plan.head) && get_meta(db, STOP)? == fence.stop_boundary,
+        "Successor preparation lost the original restart fence"
+    );
+    let predecessor: Option<Endpoint> = restart::meta(get_meta(db, SOCKET)?)?;
+    let socket = socket_stat(&config.gateway_socket, false)?;
+    ensure!(
+        predecessor == Some(plan.socket)
+            && plan.socket.matches(&socket)
+            && alive(record.gateway_pid)?,
+        "Predecessor Gateway endpoint changed during successor preparation"
+    );
+    Ok(plan)
+}
+
+fn mark_ready(db: &mut Connection, config: &LifecycleConfig, id: &str, expected: &Plan) -> Result<()> {
+    let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut plan = validate_preparation(&transaction, config, id, expected)?;
     plan.runner_ready = Some(true);
     transaction.execute(
         "UPDATE metadata SET value=?1 WHERE key=?2",
@@ -169,12 +199,12 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
         );
         if plan.runner_pid == Some(std::process::id()) && plan.runner_ready != Some(true) {
             restart::validate_plan(config, &record, &plan, &session_file).await?;
-            config.require_mnemopi().await?;
-            let socket = socket_stat(&config.gateway_socket, false)?;
-            ensure!(
-                plan.socket.matches(&socket),
-                "Predecessor Gateway endpoint changed before successor preparation"
-            );
+            Ulw::load(config)?.package()?;
+            inspect_omp(config, &config.head_environment()).await?;
+            // The predecessor cannot shut down until this exact runner has enabled memory.
+            // Recheck its authority on both sides of the native settings operation.
+            validate_preparation(&db, config, id, &plan)?;
+            config.ensure_memory().await?;
             mark_ready(&mut db, config, id, &plan)?;
         }
         if record.state == Stage::HeadStopped {
@@ -260,6 +290,7 @@ async fn spawn_successor(
 }
 
 pub async fn launch(config: &LifecycleConfig) -> Result<Value> {
+    config.preflight_memory().await?;
     if let Some(status) = status_or_recorded_stale(config).await? {
         return Ok(status);
     }
@@ -274,6 +305,7 @@ fn spawn_gateway(config: &LifecycleConfig, request: Option<&str>) -> Result<Chil
     command
         .arg("--config")
         .arg(&config.path)
+        .env(GATEWAY_START_CONFIG_ENV, &config.source_hash)
         .current_dir(&config.cwd);
     if let Some(id) = request {
         command.arg("--restart-request").arg(id);

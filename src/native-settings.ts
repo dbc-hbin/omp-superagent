@@ -1,8 +1,12 @@
 import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { settingsCapability } from "@oh-my-pi/pi-coding-agent/capability/settings";
+import { cfgDisabledProviders } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { writeFileAtomically } from "@oh-my-pi/pi-coding-agent/utils/atomic-file";
-import { getAgentDbPath, MAIN_CONFIG_FILENAMES } from "@oh-my-pi/pi-utils/dirs";
+import { getAgentDbPath, getProjectAgentDir, MAIN_CONFIG_FILENAMES, normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { expandTilde } from "@oh-my-pi/pi-utils/path";
 import { stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
@@ -24,6 +28,25 @@ export async function hasUnresolvedNativeLegacy(agentDir: string): Promise<boole
   return (await Promise.all([
     isPresent(join(agentDir, "settings.json")), isPresent(getAgentDbPath(agentDir)),
   ])).some(Boolean);
+}
+
+/**
+ * Before a global fallback, check a fresh read-only snapshot for a native project
+ * settings.json that discovery rejected. Other providers, paths and warnings are
+ * not evidence about this file; strict YAML failures are handled by Settings.
+ */
+export async function hasUnresolvedNativeProjectSettings(settings: Settings): Promise<boolean> {
+  const provider = "native";
+  if (cfgDisabledProviders.get(settings).includes(provider)) return false;
+  const cwd = resolve(settings.getCwd());
+  // Native discovery treats the home directory as user scope only.
+  if (normalizePathForComparison(cwd) === normalizePathForComparison(homedir())) return false;
+  const file = join(getProjectAgentDir(cwd), "settings.json");
+  const { warnings } = await loadCapability(settingsCapability.id, {
+    cwd, agentDir: settings.getAgentDir(), providers: [provider], includeDisabledProviders: true,
+  });
+  return warnings.includes(`[OMP] Failed to parse ${file}`) ||
+    warnings.includes(`[OMP] Invalid item at ${file}: Missing or invalid data`);
 }
 
 export function readNativeSettings(settings: Settings): Promise<Settings> {
@@ -57,9 +80,10 @@ function valueAt(record: unknown, path: readonly string[]): unknown {
 }
 
 /**
- * Application-owned edits only. Native read-only loading validates all inputs;
- * the native lock and atomic publisher serialize with stock Settings writers.
- * A stale key is preserved while disjoint keys are merged from the locked file.
+ * Application-owned edits only. Recheck the effective scope with native
+ * read-only loading and use the lock shared by stock Settings writers.
+ * Compare staged keys against the YAML being edited. A writer that ignores
+ * the lock can still change the file after that comparison.
  */
 export async function editNativeGlobalConfig(settings: Settings, edits: readonly GlobalEdit[],
   accept?: (actual: Settings) => boolean | Promise<boolean>): Promise<boolean[]> {
@@ -105,7 +129,6 @@ export async function editNativeGlobalConfig(settings: Settings, edits: readonly
     if (raw === null || raw === undefined) raw = {};
     if (!isRecord(raw)) throw new Error("Native global config must be a mapping");
     const global = raw;
-    const actualGlobal = actual.getGlobalSettings();
     const updated = structuredClone(global);
     const applied = edits.map(edit => {
       const path = edit.path.split(".");
@@ -116,10 +139,19 @@ export async function editNativeGlobalConfig(settings: Settings, edits: readonly
             [actual.mirrorState().overrides, actual.mirrorState().configOverlay].some(layer =>
               isRecord(layer.modelPresets) && Object.hasOwn(layer.modelPresets, name))) return false;
       } else {
-        // Native Settings interprets legacy `memories.enabled` in modern YAML
-        // as a backend. Compare that effective global value while editing raw YAML.
-        const latest = edit.path === "memory.backend" ? actualGlobal : global;
-        if (!Bun.deepEquals(valueAt(latest, path), valueAt(baseline, path))) return false;
+        let latest = valueAt(global, path);
+        if (edit.path === "memory.backend") {
+          if (global.memory !== undefined && global.memory !== null && !isRecord(global.memory)) return false;
+          // The staged value has already been migrated by native Settings.
+          // Apply the same selector rules to the exact YAML we will edit.
+          const legacyEnabled = valueAt(global, ["memories", "enabled"]);
+          if (typeof latest !== "string" && typeof legacyEnabled === "boolean") {
+            latest = legacyEnabled ? "local" : "off";
+          } else if (latest === "mnemosyne") {
+            latest = "mnemopi";
+          }
+        }
+        if (!Bun.deepEquals(latest, valueAt(baseline, path))) return false;
       }
       let target = updated;
       for (const segment of path.slice(0, -1)) {

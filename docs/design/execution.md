@@ -113,6 +113,29 @@ delivered. Reconcile exact ownership and matching completion journal evidence
 with the yield queue. Name collision checks do not make service launch atomic
 against another process using the same name.
 
+### Native memory preflight
+
+Resolve the effective OMP memory backend for the selected native profile,
+workspace, and launch settings. Any supported backend other than `off`
+satisfies the managed configuration requirement; retain it unchanged. If the
+effective setting is unconfigured or globally `off`, the fallback persists
+only the selected profile's global `memory.backend: mnemopi`. Setup discloses
+this before final save and applies it only after successful publication.
+Gateway start/restart check the head profile before activating adapters; a
+new head or lane Host checks its own workspace before launching stock OMP.
+`doctor` only inspects the effective configuration. A workspace dotenv file can
+select a different profile for native reads, but cannot authorize a global
+write there. Lanes also honor the profile bound in the head's private launch
+manifest, rather than treating its post-dotenv environment as operator input.
+
+The [guarded native writer](../../src/native-settings.ts) rechecks the expected
+configuration under the native lock, preserves unrelated settings, and reads
+back the effective value. It does not overwrite stale values, higher-priority
+disables or unsets, or unverified legacy/unknown settings. If enabled memory
+cannot be verified, launch stays blocked. This preflight does not initialize
+memory or verify live search. [Historical topic search](messaging.md#topic-routing-and-controls)
+still specifically requires an active, searchable Mnemopi backend on the head.
+
 ### Native discovery and resume
 
 [Native discovery](../../src/native-sessions.ts) publishes symlinks to the

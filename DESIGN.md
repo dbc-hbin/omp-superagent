@@ -59,15 +59,20 @@ part of the native build.
 1. Package installation prepares dependencies and the managed integration without
    needing OMP. To run, configure the executable of a separately installed, unmodified
    OMP. `doctor` checks local prerequisites and reports credential presence without
-   authenticating bots or starting models. Interactive `setup` does not start bots or
-   models; its confirmed final save can update Discord/Telegram avatars, and changing
-   the global memory backend requires its own explicit consent.
+   authenticating bots or starting models; it never changes memory settings.
+   Interactive `setup` does not start bots or models; its confirmed final save can
+   update Discord/Telegram avatars and includes disclosure of any eligible global
+   memory fallback, with no separate memory prompt.
 2. `start` requires a valid active managed integration and starts or reuses one
    detached Gateway. A lifetime lock establishes single ownership. The Gateway starts
    or reconnects to the designated head through private local transport; the root
    head loads the manager and board extensions, a root lane loads the lane and board
    extensions. The Gateway owns configured messenger secrets and removes their
    environment variables from the managed Hosts; this is not isolation from the OS user.
+   Gateway start/restart and new Host launches enforce the
+   [native memory preflight](docs/design/execution.md#native-memory-preflight):
+   any supported effective backend other than `off` is sufficient; only missing
+   or globally disabled memory can trigger the `mnemopi` default.
 3. Adapter authentication, initial native approval reconciliation, controller
    connection, head initialization, and eligibility to dispatch work are separate
    facts. `gateway.ready` describes transport readiness; `gateway.admissionReady`
@@ -139,8 +144,8 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
   The Gateway's one-shot successor waits for the old lifetime lock to release.
   A later operator stop invalidates the restart and prevents successor revival.
 - Restore the exact head native session and saved model/effort and reconcile approvals.
-  The replacement uses the same native profile and workspace to reopen the
-  existing Mnemopi memory, not a copy of memory in the Gateway database.
+  The replacement uses the same native profile and workspace and applies the
+  usual memory preflight. Memory stays with OMP, not in the Gateway database.
   If the checkpoint recorded `auto`, verify the restored configured selector
   rather than requiring OMP to choose the same effective level again.
   For the same model identified as non-reasoning by both Hosts, stock OMP can

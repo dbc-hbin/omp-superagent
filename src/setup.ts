@@ -12,7 +12,7 @@ import {
   assertCredentialsUnchanged, readCredentialFile, serializeCredentials, stagePrivateFile,
   validateCredential, writeCredentials,
 } from "./credentials";
-import { applyConsentedMnemopi, canEnableGlobalMemory, inspectManagedMnemopi, memoryBlockReason } from "./managed-memory";
+import { applyConsentedMnemopi, canEnableGlobalMemory, inspectManagedMemory, memoryBlockReason } from "./managed-memory";
 import { inspectNativeJudge } from "./setup-judge";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -206,26 +206,22 @@ export async function setup(configPath: string): Promise<void> {
     }
     serializeCredentials(values); // Prove lossless encoding before any persistent write.
     if (replacing) await terminal.confirm("Replace existing credential values?");
-    const initialMemory = await inspectManagedMnemopi(config);
-    let memoryConsent: Parameters<typeof applyConsentedMnemopi>[1] | undefined;
-    if (canEnableGlobalMemory(initialMemory)) {
-      console.log("Managed sessions require native OMP Mnemopi memory, which persists across conversations (project-scoped by default).");
-      console.log(`This would change OMP's global memory.backend preference for ${initialMemory.agentDir}; existing memory options stay unchanged.`);
+    const initialMemory = await inspectManagedMemory(config);
+    const memoryPlan = canEnableGlobalMemory(initialMemory) ? initialMemory : undefined;
+    console.log(`Configuration: ${path}\nPrivate credentials: ${path}.env`);
+    if (memoryPlan) {
+      console.log(`After saving, set memory.backend=mnemopi in the global settings for the selected OMP profile: ${memoryPlan.agentDir}`);
+      console.log("Mnemopi persists across conversations (project-scoped by default). Existing memory options and model settings stay unchanged.");
       console.log("Depending on existing native settings, later memory use may process conversations with models and download models.");
       console.log("Setup does not start memory or OMP; it activates on later OMP startup. Running OMP instances may apply native settings reloads.");
-      if (/^y(es)?$/i.test((await terminal.ask("Enable native Mnemopi memory after saving setup? [y/N]: ")).trim())) {
-        memoryConsent = initialMemory;
-      } else {
-        console.log("Native memory settings will not be changed.");
-      }
     }
-    console.log(`Configuration: ${path}\nPrivate credentials: ${path}.env`);
     const profilePlatforms = (["discord", "telegram"] as const).filter(platform => config[platform]);
     if (profilePlatforms.length) {
       console.log(`After saving, replace the configured ${profilePlatforms.join("/")} bot profile pictures with the repository mascot: ${join(root, "assets", "superagent-avatar.jpg")}`);
       console.log("This uses profile REST APIs only; no Gateway, polling, messages, or native model session is started.");
     }
-    await terminal.confirm("Write configuration/credentials?");
+    await terminal.confirm(memoryPlan ? "Write configuration/credentials and enable native Mnemopi memory?"
+      : "Write configuration/credentials?");
     // Snapshot the same environment-over-file precedence used by start before
     // native settings imports can populate unrelated dotenv values.
     const profileCredentials = Object.fromEntries(credentialEnvNames(config).map(name => [name, process.env[name] || values[name]!]));
@@ -253,12 +249,12 @@ export async function setup(configPath: string): Promise<void> {
     terminal.saved = true;
     console.log(`Saved configuration: ${path}\nPrivate credentials: ${path}.env (0600)`);
     terminal.check();
-    const { memory, updated } = memoryConsent ? await applyConsentedMnemopi(config, memoryConsent)
-      : { memory: await inspectManagedMnemopi(config), updated: false };
+    const { memory, updated } = memoryPlan ? await applyConsentedMnemopi(config, memoryPlan)
+      : { memory: await inspectManagedMemory(config), updated: false };
     terminal.check();
     if (updated) console.log("Saved native memory.backend=mnemopi in OMP agent settings.");
     if (memory.status === "enabled") {
-      console.log(`Mnemopi is configured for the head workspace (${memory.source} settings); no service was started by setup.`);
+      console.log(`Native OMP memory.backend=${memory.backend} is configured for the head workspace (${memory.source} settings); no service was started by setup.`);
     } else {
       console.log(`Setup saved but is incomplete. ${memoryBlockReason(memory)} No service was started by setup.`);
       process.exitCode = 1;

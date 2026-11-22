@@ -82,6 +82,7 @@ struct SavedSettings {
 struct Discovery {
     extension_paths: Vec<PathBuf>,
     no_extensions: bool,
+    memory_write_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -202,7 +203,7 @@ impl PreparedHost {
         let mut manifest = json!({
             "options": { "command": command, "cwd": config.cwd, "sessionFile": session_file, "managedUlwPath": package,
                 "socketPath": config.head_socket, "modelSettings": settings.as_ref().map(|saved| &saved.settings) },
-            "args": args, "configPath": config_path, "processBackend": backend,
+            "args": args, "configPath": config_path, "memoryWriteDir": discovery.memory_write_dir, "processBackend": backend,
             "helperPath": helper, "nativeSocket": native_socket,
         });
         if let Some(plan) = rotation {
