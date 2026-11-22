@@ -407,6 +407,8 @@ export function releaseId(pkg: { version: string; digest: string }): string {
 /** HEAD's package: exactly what workerPackage() digests, plus what the worker needs to run it. */
 export function releaseFiles(root: string, ownerBinary: string): { files: ReleaseFile[]; lockfile: boolean } {
   const paths = ["package.json", "bin/omp-sa-worker", "upstream/ulw.json", `host-owner/bin/${ownerBinary}`];
+  // macOS workers compile the fixed launcher once from this source.
+  if (existsSync(join(root, "worker-launcher/omp-sa-worker-launcher.c"))) paths.push("worker-launcher/omp-sa-worker-launcher.c");
   const lockfile = existsSync(join(root, "bun.lock"));
   if (lockfile) paths.push("bun.lock");
   const walk = (directory: string): void => {

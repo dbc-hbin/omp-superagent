@@ -328,6 +328,16 @@ await loopbackWorkerExec(${JSON.stringify(exec)});
         for (const dir of ${JSON.stringify(dirs)}) await stopHostFixtures(dir); console.log("null");`);
     },
     workerProcess: async ownerPid => await run(`const fs = require("node:fs"); const os = require("node:os");
+      if (process.platform === "darwin") {
+        // macOS: launched from the GUI session's launchd domain through the fixed launcher, not the SSH session.
+        const ps = (args) => Bun.spawnSync(["/bin/ps", ...args], { stdin: "ignore", stderr: "ignore" }).stdout.toString();
+        const env = ps(["-E", "-ww", "-o", "command=", "-p", "${ownerPid}"]);
+        const launchers = Bun.spawnSync(["/usr/bin/pgrep", "-f", "omp-sa-worker-launcher"], { stderr: "ignore" }).stdout.toString().trim();
+        console.log(JSON.stringify({ context: "launchd", ownerParent: Number(ps(["-o", "ppid=", "-p", "${ownerPid}"]).trim()),
+          launcherAlive: launchers.length > 0, sshConnectionPresent: /(^| )SSH_CONNECTION=/.test(env),
+          role: /(^| )OMP_SUPERAGENT_ROLE=lane( |$)/.test(env) ? "lane" : null }));
+        process.exit(0);
+      }
       const env = Object.fromEntries(fs.readFileSync("/proc/${ownerPid}/environ", "utf8").split("\\0").filter(Boolean)
         .map(entry => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
       const shell = os.userInfo().shell;

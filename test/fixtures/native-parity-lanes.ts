@@ -231,6 +231,14 @@ export async function sshLaneParityFixture(root: string, value: string): Promise
     workerIdentity: async () => await run(`const os = require("node:os");
       console.log(JSON.stringify({ hostname: os.hostname(), platform: process.platform, arch: process.arch, user: os.userInfo().username }));`) as Record<string, unknown>,
     workerProcess: async ownerPid => await run(`const fs = require("node:fs"); const os = require("node:os");
+      if (process.platform === "darwin") {
+        const ps = (args) => Bun.spawnSync(["/bin/ps", ...args], { stdin: "ignore", stderr: "ignore" }).stdout.toString();
+        const env = ps(["-E", "-ww", "-o", "command=", "-p", "${ownerPid}"]);
+        console.log(JSON.stringify({ context: "launchd", ownerParent: Number(ps(["-o", "ppid=", "-p", "${ownerPid}"]).trim()),
+          sshConnectionPresent: /(^| )SSH_CONNECTION=/.test(env), role: /(^| )OMP_SUPERAGENT_ROLE=lane( |$)/.test(env) ? "lane" : null,
+          superagentEnvironment: [...new Set(env.match(/(?<=(^| ))OMP_SUPERAGENT_[A-Z_]+(?==)/g) ?? [])].sort() }));
+        process.exit(0);
+      }
       const env = Object.fromEntries(fs.readFileSync("/proc/${ownerPid}/environ", "utf8").split("\\0").filter(Boolean)
         .map(entry => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
       console.log(JSON.stringify({ cgroup: fs.readFileSync("/proc/${ownerPid}/cgroup", "utf8").trim(), hostPath: env.PATH,

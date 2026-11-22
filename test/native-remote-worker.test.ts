@@ -184,8 +184,12 @@ async function proveRemoteWorker(provision: (root: string) => Promise<RemoteWork
     const workerProcess = await f.workerProcess?.(identity.ownerPid);
     if (workerProcess) {
       // Outside the SSH session, in the account's user manager, with its login-shell PATH.
-      expect(workerProcess).toMatchObject({ pathResolvesLikeLoginShell: true, sshConnectionPresent: false, role: "lane" });
-      expect(String(workerProcess.cgroup)).toMatch(/\/user@\d+\.service\/.*omp-sa-.*\.service$/);
+      if (workerProcess.context === "launchd") {
+        expect(workerProcess).toMatchObject({ ownerParent: 1, launcherAlive: true, sshConnectionPresent: false, role: "lane" });
+      } else {
+        expect(workerProcess).toMatchObject({ pathResolvesLikeLoginShell: true, sshConnectionPresent: false, role: "lane" });
+        expect(String(workerProcess.cgroup)).toMatch(/\/user@\d+\.service\/.*omp-sa-.*\.service$/);
+      }
     }
     expect(new Set([identity.pid, identity.ownerPid, headIdentity.pid, headIdentity.ownerPid]).size).toBe(4);
     await f.assertWorkerOwner(dirname(resident.sessionFile), { nativePid: identity.pid, ownerPid: identity.ownerPid });
