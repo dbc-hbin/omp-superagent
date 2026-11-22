@@ -48,6 +48,8 @@ jobs:
       - name: Test the Rust Gateway
         run: cargo test --locked --manifest-path gateway/Cargo.toml
       - name: Install and test with the SDK-matched OMP release
+        env:
+          OMP_SUPERAGENT_WORKER_SSH_TEST: "1"
         run: bun run test:baseline
       - name: Replay the original Host owner and Gateway oracles
         if: matrix.os == 'macos-15'
