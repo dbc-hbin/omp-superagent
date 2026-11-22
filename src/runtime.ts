@@ -1757,7 +1757,7 @@ export class Superagent {
     const allowed: Lane[] = [];
     const checked = new Map<string, boolean>();
     for (const lane of lanes) {
-      if (!lane.sessionId || lane.sessionFile !== hostPaths(this.config, lane.id).sessionFile) continue;
+      if (lane.remote || !lane.sessionId || lane.sessionFile !== hostPaths(this.config, lane.id).sessionFile) continue;
       if (await this.historicalRoute(source, lane.route, checked)) allowed.push(lane);
     }
     return allowed;
@@ -2657,6 +2657,28 @@ export class Superagent {
     this.assertCronDelegationOpen(sourceId);
   }
 
+  private requireRemoteCommandPolicy(): void {
+    // Never strip head-side --tools/--no-tools, approval, profile or config
+    // flags when crossing machines. Raw launch argv isn't a worker capability.
+    if (this.config.command.length !== 1)
+      throw new Error("Remote lanes cannot inherit custom head OMP command flags safely; use local placement");
+  }
+
+  private async assertLanePlacement(receipt: LanePlacementReceipt, selector?: WorkerSelector): Promise<void> {
+    if (receipt.remote) this.requireRemoteCommandPolicy();
+    if (!selector) return;
+    const { remote, platform } = receipt;
+    if (selector.target === "local" && (remote || selector.worker !== undefined || selector.platform !== undefined)
+      || (selector.target === "remote" || selector.worker !== undefined || selector.platform !== undefined) && !remote
+      || selector.worker !== undefined && selector.worker !== remote?.workerId) {
+      throw new Error("Worker selector conflicts with the lane's durable placement");
+    }
+    if (remote && selector.platform !== undefined) {
+      const actual = platform ?? (await this.adapters.lookupWorker(this.config.stateDir, remote)).description.platform;
+      if (selector.platform !== actual) throw new Error("Worker platform conflicts with the lane's durable placement");
+    }
+  }
+
   private assertFirstDmHandoffSource(source: InputRecord, sourceId = source.id): void {
     if (!this.isDm(source.route)) return;
     const first = source.messageId === null ? null : this.store.firstAdmittedMessage(source.route, source.messageId);
@@ -2708,6 +2730,9 @@ export class Superagent {
         if (!isDeepStrictEqual(intent.destination, input.destination ?? null)) throw new Error("Concurrent lane handoff destination intent conflict");
         if (!isDeepStrictEqual(intent.appliedTags, input.appliedTags)) throw new Error("Concurrent forum tag selection conflicts with the source's existing handoff");
       }
+      const savedPlacement = this.store.getMeta(`handoff-placement:${input.sourceId}`);
+      const receipt: LanePlacementReceipt = savedPlacement ? JSON.parse(savedPlacement) : { cwd: lane.cwd, remote: lane.remote ?? null };
+      await this.assertLanePlacement(receipt, selected.placement);
       return lane;
     }
     const operation = this.createLane(selected);
