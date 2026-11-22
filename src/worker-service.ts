@@ -79,13 +79,13 @@ class WorkerService {
   async probe(ref: WorkerLaneRef): Promise<WorkerProbe> {
     const lane = this.#lane(ref);
     const observed = this.#receipt(lane);
-    const probe = await inspectWorkerHost(this.#ledger, lane.paths, observed);
+    const { exitGeneration, ...probe } = await inspectWorkerHost(this.#ledger, lane.paths, observed);
     // Do not claim ownership or absence for a newer generation unless the current
     // resident was positively released and no different attempt raced this probe.
     if (this.#receipt(lane)?.attempt !== observed?.attempt ||
       (observed && observed.generation < ref.generation && (probe.socket || probe.pidAlive || probe.ownerAlive)))
       return { ...probe, uncertain: true, pid: null, sessionId: null };
-    return probe;
+    return exitGeneration === ref.generation ? { ...probe, exitGeneration } : probe;
   }
 
   async open(ref: WorkerLaneRef, launch: WorkerLaunch): Promise<{ pid: number }> {
@@ -131,13 +131,11 @@ class WorkerService {
       privateWorkerDirectory(dirname(dirname(lane.paths.sessionFile)), true);
       privateWorkerDirectory(dirname(lane.paths.sessionFile), true);
     } catch (error) {
-      this.#ledger.retire(reservation, reservation.sessionId);
+      this.#ledger.retire(reservation);
       throw error;
     }
     const launching = { ...reservation, phase: "launching" } as const;
-    if (!this.#ledger.transition(reservation, launching)) throw new WorkerRefusal("Worker launch reservation is no longer current");
-    // After crossing this fence a disconnect or failure does not authorize a
-    // retry. Probes reconcile the attempt from the live owner or its exact exit receipt.
+    let preparingSession = false;
     try {
       const { pid } = await startHost({
         ...launch, cwd, command: [target.executable], socketPath: lane.paths.socketPath,
@@ -146,6 +144,9 @@ class WorkerService {
         worker: { ...target.profile, managedUlwPath },
         env: { ...target.env, OMP_SUPERAGENT_ROLE: "lane", OMP_SUPERAGENT_LANE: launching.laneId,
           [WORKER_ATTEMPT_ENV]: launching.attempt, [WORKER_SESSION_ENV]: launching.sessionId ?? "" },
+      }, () => {
+        if (!this.#ledger.transition(reservation, launching)) throw new WorkerRefusal("Worker launch reservation is no longer current");
+        preparingSession = true;
       });
       const probe = await inspectWorkerHost(this.#ledger, lane.paths, launching);
       const actual = this.#ledger.get(ref.laneId);
@@ -154,6 +155,10 @@ class WorkerService {
         throw new WorkerRefusal("Stock worker Host did not confirm the reserved launch identity");
       return { pid };
     } catch (error) {
+      if (!preparingSession) {
+        this.#ledger.retire(reservation);
+        throw new WorkerRefusal("Worker Host preflight failed before session preparation; no Host was launched", { cause: error });
+      }
       if (error instanceof WorkerRefusal) throw error;
       throw new WorkerRefusal("Stock worker Host launch is unresolved; inspect the private worker log and probe the same generation", { cause: error });
     }

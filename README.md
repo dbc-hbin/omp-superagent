@@ -282,7 +282,10 @@ credentials. Use a build with `omp-sa worker` on **both** machines (for an unrel
 checkout, use the source installation above, not an older npm release).
 
 1. **On the worker:** install Git, Bun, stock OMP and `omp-superagent` as above.
-   Configure the worker account's own OMP provider access and enable its native
+   Install the executables and `omp-superagent` outside the checkout you want to
+   enroll, in paths that other users cannot replace.
+   Configure the worker account's own OMP provider access (not a shell-command
+   API key or remote auth broker) and enable its native
    memory backend (for example `omp config set memory.backend mnemopi` if none
    is enabled). Prepare a dedicated clean clone of the same Git repository
    **at the requested commit**. Enable **OpenSSH

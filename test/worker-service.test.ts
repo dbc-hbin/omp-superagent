@@ -3,6 +3,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Readable, Writable } from "node:stream";
+import { reserveCheckout } from "../src/worker-checkout";
+import { WorkerLedger } from "../src/worker-ledger";
 import { workerLaunchProfile } from "../src/worker-profile";
 import { serveWorker } from "../src/worker-service";
 import { workerRepositoryIdentity } from "../src/worker-repository";
@@ -87,6 +89,48 @@ test("a dirty checkout refuses open, releases its unused slot and never reopens 
     expect(await request(policy, { op: "probe", workerId: policy.workerId, ref: { ...ref, generation: 2 } }))
       .toMatchObject({ ok: true, value: { socket: false, sessionFile: false, pidAlive: false, ownerAlive: false, uncertain: false } });
     expect(await request(policy, open)).toMatchObject({ ok: false, error: expect.stringContaining("cannot reopen") });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test.each([0, 1])("the persisted first native exit proves its matching generation only when clean (exit code %s)", async code => {
+  const { root, cwd, policy, ref } = await fixture();
+  try {
+    const ledger = new WorkerLedger(policy);
+    const attempt = (() => {
+      try {
+        const reserved = ledger.reserve(ref, { repoRoot: cwd, gitDir: join(cwd, ".git"), launchDigest: "a".repeat(64) }, null);
+        reserveCheckout(reserved);
+        expect(ledger.transition(reserved, { ...reserved, phase: "launching" })).toBe(true);
+        return reserved.attempt;
+      } finally { ledger.close(); }
+    })();
+
+    const { socketPath, sessionFile } = remoteLanePaths(policy, ref.laneId);
+    mkdirSync(dirname(socketPath), { mode: 0o700 });
+    mkdirSync(dirname(sessionFile), { mode: 0o700, recursive: true });
+    const sessionId = "first-worker-session";
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", version: 3, id: sessionId, cwd }) + "\n", { mode: 0o600 });
+    const native = Bun.spawn([code === 0 ? "/usr/bin/true" : "/usr/bin/false"]);
+    const owner = Bun.spawn(["/usr/bin/true"]);
+    const [exitCode] = await Promise.all([native.exited, owner.exited]);
+    const exit = { sessionId, sessionFile, pid: native.pid, ownerPid: owner.pid, code: exitCode, signal: null,
+      persisted: true, observationsFlushed: true };
+    const exitPath = `${socketPath}.exit.json`;
+    const probe = { op: "probe", workerId: policy.workerId, ref };
+    writeFileSync(exitPath, JSON.stringify({ ...exit, workerAttempt: crypto.randomUUID() }), { mode: 0o600 });
+    expect(await request(policy, probe)).toEqual({ ok: true, value: {
+      socket: false, sessionFile: true, sessionId: null, pid: null, pidAlive: false, ownerAlive: false, uncertain: true,
+    } });
+    expect(WorkerLedger.count(policy)).toBe(1);
+
+    writeFileSync(exitPath, JSON.stringify({ ...exit, workerAttempt: attempt }));
+    const absent = { socket: false, sessionFile: true, sessionId, pid: null, pidAlive: false, ownerAlive: false, uncertain: false };
+    const proved = { ok: true, value: code === 0 ? { ...absent, exitGeneration: ref.generation } : absent };
+    expect(await request(policy, probe)).toEqual(proved);
+    expect(WorkerLedger.count(policy)).toBe(0);
+    expect(await request(policy, probe)).toEqual(proved);
+    expect(await request(policy, { ...probe, ref: { ...ref, generation: ref.generation + 1 } }))
+      .toEqual({ ok: true, value: absent });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

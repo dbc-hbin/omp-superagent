@@ -23,6 +23,8 @@ const identity = Type.Object({
 export const workerExit = Type.Object({
   ...identityFields,
   workerAttempt: Type.String(),
+  code: Type.Union([Type.Integer(), Type.Null()]),
+  signal: Type.Union([Type.String(), Type.Null()]),
   persisted: Type.Literal(true),
   observationsFlushed: Type.Literal(true),
 });
@@ -43,7 +45,7 @@ const receipt = Type.Union([
   Type.Object({ ...receiptFields, phase: Type.Literal("reserved") }),
   Type.Object({ ...receiptFields, phase: Type.Literal("launching") }),
   Type.Object({ ...receiptFields, phase: Type.Literal("live"), identity }),
-  Type.Object({ ...receiptFields, phase: Type.Literal("released") }),
+  Type.Object({ ...receiptFields, phase: Type.Literal("released"), exitVerified: Type.Optional(Type.Literal(true)) }),
 ]);
 export type WorkerReceipt = Readonly<Static<typeof receipt>>;
 export type WorkerIdentity = Readonly<Static<typeof identity>>;
@@ -135,15 +137,15 @@ export class WorkerLedger {
     }).immediate();
   }
 
-  retire(current: WorkerReceipt, id: string | null, cleanup?: () => void): boolean {
+  retire(current: WorkerReceipt, exit?: { readonly sessionId: string; readonly clean: boolean; readonly cleanup: () => void }): boolean {
     return this.#db.transaction(() => {
       const actual = this.get(current.laneId);
       if (actual?.attempt !== current.attempt || actual.phase !== current.phase) return false;
-      cleanup?.();
+      exit?.cleanup();
       releaseCheckout(current);
       const { laneId, generation, repoId, revision, subdir, repoRoot, gitDir, attempt, launcherPid, launchDigest } = current;
       this.#write({ laneId, generation, repoId, revision, subdir, repoRoot, gitDir, attempt, launcherPid, launchDigest,
-        phase: "released", sessionId: id });
+        phase: "released", sessionId: exit?.sessionId ?? current.sessionId, ...(exit?.clean && { exitVerified: true }) });
       return true;
     }).immediate();
   }

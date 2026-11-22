@@ -466,9 +466,34 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], ada
 }
 
 describe("remote lane ownership", () => {
+  test("pending worker assignments remain visible to the next admission when all head slots are occupied", async () => {
+    const queues: Record<string, number>[] = [];
+    const f = fixture(1, undefined, {
+      selectWorkerPlacement: async ({ stateDir }, _cwd, _selector, admission) => {
+        if (!admission) throw new Error("Expected head admission accounting");
+        const queued = admission.queued();
+        queues.push(Object.fromEntries(queued));
+        const workerId = queued.has("lab-a") ? "lab-b" : "lab-a";
+        admission.reserve(workerId);
+        return { workerId, stateDir: join(stateDir, workerId), repoId: "b".repeat(64), revision: "a".repeat(40), subdir: "" };
+      },
+    });
+    await f.runtime.start();
+    for (const id of ["401", "402"]) {
+      const source = headMessage(id, route(id));
+      await admit(f.runtime, source);
+      await f.runtime.startLane({ ...selection, sourceId: id, title: "Queued remote work", cwd: f.directory, kickoff: "Waiting for a slot." });
+      await f.runtime.kick();
+    }
+    expect(queues).toEqual([{}, { "lab-a": 1 }]);
+    expect(f.store.lanes().map(lane => lane.remote?.workerId).sort()).toEqual(["lab-a", "lab-b"]);
+    expect(f.store.lanes().every(lane => lane.generation === 0)).toBe(true);
+  });
+
   function remoteFixture(options: { loseOpenAcknowledgement?: boolean; busy?: boolean; stream?: boolean; verifyExit?: boolean } = {}) {
     let placement: RemotePlacement | undefined;
     let resident: { ref: WorkerLaneRef; host: HostTransport } | undefined;
+    let firstExit: "exact" | "other-generation" | "unverified" | "uncertain" | undefined;
     let availableForPlacement = true;
     let online = true;
     let workspaceReady = !options.busy;
@@ -495,24 +520,34 @@ describe("remote lane ownership", () => {
           socket: false, sessionFile: false, pidAlive: false, ownerAlive: false, uncertain: false, pid: null, sessionId: null,
         };
         if (ref.generation !== resident.ref.generation) throw new Error("Unverified worker generation");
+        if (firstExit) return {
+          socket: false, sessionFile: true, pidAlive: false, ownerAlive: false, uncertain: firstExit === "uncertain",
+          pid: null, sessionId: resident.host.state.sessionId,
+          ...(firstExit === "unverified" ? {} : { exitGeneration: firstExit === "other-generation" ? ref.generation + 1 : ref.generation }),
+        };
         const teardown = options.verifyExit && resident.host.commands.some(command => command.type === "shutdown_host");
         return { socket: !teardown, sessionFile: true, pidAlive: !teardown, ownerAlive: !teardown, uncertain: false,
-          pid: process.pid, sessionId: resident.host.state.sessionId };
+          pid: teardown ? null : process.pid, sessionId: resident.host.state.sessionId,
+          ...(teardown ? { exitGeneration: ref.generation } : {}) };
       },
       workerOpen: async (worker, ref) => {
-        if (resident) throw new Error("Refusing a second worker owner");
-        const host = new HostTransport(remoteLanePaths(worker.description, ref.laneId).sessionFile, "worker-native-session");
-        host.local = !options.loseOpenAcknowledgement && !options.stream;
+        const first = !resident;
+        if (resident && (firstExit !== "exact" || ref.laneId !== resident.ref.laneId || ref.generation !== resident.ref.generation + 1))
+          throw new Error("Refusing a second worker owner");
+        const host = new HostTransport(remoteLanePaths(worker.description, ref.laneId).sessionFile,
+          resident?.host.state.sessionId ?? "worker-native-session");
+        host.local = !(first && options.loseOpenAcknowledgement) && !options.stream;
         host.shutdownDisconnect = true;
         resident = { ref, host };
-        if (options.loseOpenAcknowledgement) {
+        firstExit = undefined;
+        if (first && options.loseOpenAcknowledgement) {
           online = false;
           throw new Error("Lost worker open acknowledgement");
         }
         return { pid: process.pid }; // Deliberately also alive on the head.
       },
       workerConnect: async (_worker, ref) => {
-        if (!resident || ref.laneId !== resident.ref.laneId || ref.generation !== resident.ref.generation)
+        if (!resident || firstExit || ref.laneId !== resident.ref.laneId || ref.generation !== resident.ref.generation)
           throw new Error("Worker Host is not the requested owner");
         return resident.host;
       },
@@ -521,6 +556,11 @@ describe("remote lane ownership", () => {
       ...f,
       withdrawPlacement: () => { availableForPlacement = false; },
       restoreConnection: () => { online = true; },
+      exitFirstHost: async (proof: "exact" | "other-generation" | "unverified" | "uncertain") => {
+        if (!resident || firstExit) throw new Error("Expected a live first Host");
+        firstExit = proof;
+        await resident.host.close();
+      },
       confirmWorkspace: () => { workspaceReady = true; },
       replaceConnection: async () => {
         if (!resident) throw new Error("Expected an attached worker Host");
@@ -605,6 +645,93 @@ describe("remote lane ownership", () => {
     expect(approval.route).toEqual(lane.route);
     await f.messenger.handlers?.answer(approval.id, { confirmed: true }, lane.route);
     expect(host.responses).toEqual([{ id: "worker-confirm", response: { confirmed: true } }]);
+  });
+
+  test("cancelling an offline remote lane fences its queue before contact and closes only after native work stops", async () => {
+    const f = remoteFixture({ loseOpenAcknowledgement: true, verifyExit: true });
+    await f.runtime.start();
+    const source = headMessage("worker-offline-cancel", route("36"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Cancel remote work", cwd: f.directory,
+      kickoff: "Check the worker checkout.", placement: { target: "remote" } });
+    await f.runtime.kick();
+    const handoffId = `handoff:${source.id}:lane`;
+    await expect(f.runtime.closeLane(lane.id, "cancelled", "No longer needed.")).rejects.toThrow("Worker is unreachable");
+    expect(f.store.lane(lane.id)).toMatchObject({ workState: "paused", generation: 1 });
+    expect(f.store.input(handoffId)?.state).toBe("pending");
+
+    const host = f.workerHost();
+    host.state.isSettled = false;
+    host.state.isStreaming = true;
+    const aborting = Promise.withResolvers<void>();
+    const releaseAbort = Promise.withResolvers<void>();
+    host.beforeAbort = () => { aborting.resolve(); return releaseAbort.promise; };
+    f.restoreConnection();
+    const closing = f.runtime.closeLane(lane.id, "cancelled", "No longer needed.");
+    try {
+      await Promise.race([aborting.promise, closing.then(() => { throw new Error("Closed before native abort"); })]);
+      await f.runtime.kick();
+      expect(f.store.lane(lane.id)?.workState).toBe("paused");
+      expect(host.prompts).toEqual([]);
+      expect(f.store.input(handoffId)?.state).toBe("pending");
+    } finally { releaseAbort.resolve(); }
+    await closing;
+    expect(f.store.lane(lane.id)).toMatchObject({ workState: "cancelled", runtimeState: "unloaded", pid: null });
+    expect(f.store.input(handoffId)?.state).toBe("cancelled");
+    expect(host.prompts).toEqual([]);
+  });
+
+  test.each(["exact", "other-generation", "unverified", "uncertain"] as const)(
+    "closing after a lost first open ACK requires exact worker exit proof (%s)",
+    async proof => {
+      const f = remoteFixture({ loseOpenAcknowledgement: true });
+      await f.runtime.start();
+      const source = headMessage(`worker-closed-before-attach-${proof}`, route("37"));
+      await admit(f.runtime, source);
+      const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Unattached remote work", cwd: f.directory,
+        kickoff: "Check the worker checkout.", placement: { target: "remote" } });
+      await f.runtime.kick();
+      const handoffId = `handoff:${source.id}:lane`;
+      expect(f.store.lane(lane.id)).toMatchObject({ sessionId: null, generation: 1 });
+      await f.exitFirstHost(proof);
+      f.restoreConnection();
+      const closing = f.runtime.closeLane(lane.id, "cancelled", "No longer needed.");
+      if (proof === "exact") {
+        await closing;
+        expect(f.store.lane(lane.id)).toMatchObject({ workState: "cancelled", runtimeState: "unloaded",
+          sessionId: "worker-native-session", generation: 1, pid: null });
+        expect(f.store.input(handoffId)?.state).toBe("cancelled");
+      } else {
+        await expect(closing).rejects.toThrow("unresolved");
+        expect(f.store.lane(lane.id)).toMatchObject({ workState: "paused", runtimeState: "interrupted", sessionId: null, generation: 1 });
+        expect(f.store.input(handoffId)?.state).toBe("pending");
+      }
+      expect(f.workerHost().prompts).toEqual([]);
+    },
+  );
+
+  test("explicit resume restores the verified first journal after an open ACK was lost without replaying a prompt", async () => {
+    const f = remoteFixture({ loseOpenAcknowledgement: true });
+    await f.runtime.start();
+    const source = headMessage("worker-restore-first-journal", route("38"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Resume remote work", cwd: f.directory,
+      kickoff: "Check the worker checkout.", placement: { target: "remote" } });
+    await f.runtime.kick();
+    const handoffId = `handoff:${source.id}:lane`;
+    const first = f.workerHost();
+    await f.exitFirstHost("exact");
+    f.restoreConnection();
+    await f.runtime.kick();
+    expect(f.store.input(handoffId)?.state).toBe("pending");
+    expect(first.prompts).toEqual([]);
+
+    await f.runtime.resume(lane.id, source.id);
+    await f.runtime.kick();
+    expect(first.prompts).toEqual([]);
+    expect(f.workerHost().prompts).toHaveLength(1);
+    expect(f.store.input(handoffId)?.state).toBe("done");
+    expect(f.store.lane(lane.id)).toMatchObject({ sessionId: first.state.sessionId, generation: 2 });
   });
 
   test.each([false, true])("remote shutdown uses worker exit proof (verified=%s) to release head capacity", async verifyExit => {

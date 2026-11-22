@@ -330,15 +330,15 @@ function selectManagedUlw(options: HostOptions): string {
 }
 
 /** Launch only a new host. Existing endpoints require the caller's explicit adoption decision. */
-export async function startHost(options: HostOptions): Promise<{ pid: number }> {
-  try { return await launchHost(options); }
+export async function startHost(options: HostOptions, beforeSessionPrepare?: () => void): Promise<{ pid: number }> {
+  try { return await launchHost(options, beforeSessionPrepare); }
   catch (cause) {
     // Never read child output into errors: logs can contain credentials or prompt content.
     throw new HostStartError(cause instanceof Error ? cause.message : "OMP host startup failed", { cause });
   }
 }
 
-async function launchHost(options: HostOptions): Promise<{ pid: number }> {
+async function launchHost(options: HostOptions, beforeSessionPrepare?: () => void): Promise<{ pid: number }> {
   // Snapshot once before any awaits; an updater may activate a newer revision
   // during startup, but this Host must load one exact immutable package.
   const managedUlwPath = selectManagedUlw(options);
@@ -412,6 +412,9 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
       processBackend, helperPath, nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
     // Preparation used to run inside the owner; it shares the same startup budget.
     const deadline = Date.now() + START_TIMEOUT_MS;
+    // The SDK helper is the first operation that can create or publish this
+    // session. A worker must persist its launch fence before spawning it.
+    beforeSessionPrepare?.();
     const prepare = Bun.spawn([bun, "--no-env-file", helperPath, "prepare"], {
       cwd: options.worker ? launchDirectory : options.cwd, env: options.env, stdin: new Blob([JSON.stringify(manifest)]), stdout: "pipe", stderr: log.fd,
       timeout: START_TIMEOUT_MS, killSignal: "SIGKILL",

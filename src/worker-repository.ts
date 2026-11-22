@@ -6,8 +6,9 @@ import type { WorkerLaneRef } from "./worker-wire";
 
 const gitOid = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const controls = /[\u0000-\u001f\u007f]/;
+const gitTimeoutMs = 10_000;
 
-function gitProcess(cwd: string, args: readonly string[]) {
+function gitProcess(cwd: string, args: readonly string[], timeout?: number) {
   return Bun.spawn(["/usr/bin/git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
     "-c", "core.untrackedCache=false", "-c", "core.excludesFile=/dev/null", ...args], {
     cwd, env: {
@@ -15,13 +16,13 @@ function gitProcess(cwd: string, args: readonly string[]) {
       GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1",
       GIT_NO_REPLACE_OBJECTS: "1", GIT_ALLOW_PROTOCOL: "",
     },
-    stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 10_000, killSignal: "SIGKILL",
+    stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout, killSignal: "SIGKILL",
   });
 }
 
 /** Read the local Git repository without ambient Git configuration, hooks, or network access. */
 export async function gitWorkerRepository(cwd: string, args: readonly string[]): Promise<string | null> {
-  const git = gitProcess(cwd, args);
+  const git = gitProcess(cwd, args, gitTimeoutMs);
   const reader = git.stdout.getReader();
   const decoder = new TextDecoder();
   let size = 0;
@@ -151,9 +152,22 @@ async function matchesBlob(root: string, indexed: Buffer, committed: Buffer): Pr
 
 async function* gitRecords(root: string, args: readonly string[]): AsyncGenerator<Buffer, boolean> {
   const git = gitProcess(root, args);
+  const kill = () => {
+    if (git.exitCode === null && git.signalCode === null) git.kill("SIGKILL");
+  };
+  let timedOut = false;
+  const expire = () => {
+    timedOut = true;
+    kill();
+  };
+  let deadline = setTimeout(expire, gitTimeoutMs);
   let pending = Buffer.alloc(0);
   try {
     for await (const bytes of git.stdout) {
+      // While we yield records, Git may be blocked on its pipe while the caller
+      // hashes files. Only time waits for a new chunk or for Git to exit.
+      clearTimeout(deadline);
+      if (timedOut) return false;
       const chunk = Buffer.from(bytes);
       const records = pending.length ? Buffer.concat([pending, chunk]) : chunk;
       let offset = 0;
@@ -163,10 +177,12 @@ async function* gitRecords(root: string, args: readonly string[]): AsyncGenerato
       }
       pending = records.subarray(offset);
       if (pending.length > 256 * 1024) return false;
+      deadline = setTimeout(expire, gitTimeoutMs);
     }
-    return pending.length === 0 && await git.exited === 0;
+    return pending.length === 0 && await git.exited === 0 && !timedOut;
   } finally {
-    if (git.exitCode === null && git.signalCode === null) git.kill("SIGKILL");
+    clearTimeout(deadline);
+    kill();
     await git.exited;
   }
 }

@@ -26,6 +26,12 @@ the first input. A pending or ambiguous launch must be reconciled on that
 worker, never retried on another machine. Remote PIDs and session paths are not
 local filesystem or board identities. See [worker enrollment](../../README.md#add-a-remote-worker).
 
+When several workers qualify, placement accounts for both reported free slots
+and head assignments waiting to start. Concurrent admissions reserve their
+selection before the next admission decides, without serializing SSH probes.
+On the target, a failure before native session preparation releases the slot;
+after preparation begins, an uncertain attempt keeps its reservation.
+
 Only an operator-approved head checkout may use a default worker implicitly;
 Git origin and commit identify compatible contents, not permission to send a
 task. Worker verification must not execute checkout-configured Git filters.

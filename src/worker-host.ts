@@ -88,7 +88,8 @@ export function absentWorkerHost(files: WorkerFiles, receipt: WorkerReceipt | nu
   const uncertain = !!files.socket || files.sessionId !== expected || !!files.session !== (expected !== null)
     || (!!files.exit && expected === null);
   return { socket: !!files.socket, sessionFile: !!files.session, sessionId: uncertain ? null : files.sessionId,
-    pid: null, pidAlive: false, ownerAlive: false, uncertain };
+    pid: null, pidAlive: false, ownerAlive: false, uncertain,
+    ...(!uncertain && receipt?.phase === "released" && receipt.exitVerified && { exitGeneration: receipt.generation }) };
 }
 
 export async function attestWorkerHost(paths: WorkerPaths, files: WorkerFiles, receipt: WorkerReceipt): Promise<WorkerIdentity> {
@@ -112,7 +113,7 @@ export async function inspectWorkerHost(ledger: WorkerLedger, paths: WorkerPaths
   if (!receipt || receipt.phase === "released") return absentWorkerHost(files, receipt);
   if (receipt.phase === "reserved") {
     const untouched = absentWorkerHost(files, receipt);
-    if (!pidAlive(receipt.launcherPid) && !untouched.uncertain && ledger.retire(receipt, files.sessionId))
+    if (!pidAlive(receipt.launcherPid) && !untouched.uncertain && ledger.retire(receipt))
       return untouched;
     return { ...untouched, uncertain: true };
   }
@@ -131,8 +132,10 @@ export async function inspectWorkerHost(ledger: WorkerLedger, paths: WorkerPaths
       if (!files.socket || !sameFile(files.socket, socket)) throw new WorkerRefusal("Worker socket changed before exit cleanup");
       unlinkSync(paths.socketPath);
     };
-    if (ledger.retire(receipt, exit.sessionId, cleanup))
-      return { socket: false, sessionFile: true, sessionId: exit.sessionId, pid: null, pidAlive: false, ownerAlive: false, uncertain: false };
+    const clean = exit.code === 0 && exit.signal === null;
+    if (ledger.retire(receipt, { sessionId: exit.sessionId, clean, cleanup }))
+      return { socket: false, sessionFile: true, sessionId: exit.sessionId, pid: null, pidAlive: false, ownerAlive: false,
+        uncertain: false, ...(clean ? { exitGeneration: receipt.generation } : {}) };
   }
   if (attest && files.socket && !exit) {
     try {

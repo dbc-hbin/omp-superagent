@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -12,6 +12,9 @@ import { workerRepositoryIdentity } from "../src/worker-repository";
 import type { WorkerDescription, WorkerLaneRef } from "../src/worker-wire";
 
 const roots: string[] = [];
+const fixturePublicKey = `ssh-ed25519 ${Buffer.concat([
+  Buffer.from("\0\0\0\x0bssh-ed25519\0\0\0\x20"), Buffer.alloc(32),
+]).toString("base64")}`;
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 function fixture() {
@@ -189,6 +192,74 @@ test("target init refuses nested paths and leaves SSH untouched", async () => {
   await expect(enrollWorker({ home, headKey: publicKey, executable: process.execPath, repositories: [nested] }))
     .rejects.toThrow(/root of an existing non-bare Git checkout/);
   expect(existsSync(join(home, ".ssh"))).toBe(false);
+});
+
+test.each(["enrolled checkout", "writable ancestor"] as const)(
+  "target init leaves authorization and policy untouched for an executable under a %s", async location => {
+    const { home, root } = fixture();
+    const repo = targetRepo(root, "checkout");
+    const bin = join(location === "enrolled checkout" ? repo : root, "bin");
+    mkdirSync(bin, { mode: 0o700 });
+    if (location === "writable ancestor") chmodSync(bin, 0o772);
+    writeFileSync(join(bin, "omp"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const alternate = join(root, "CHECKOUT", "bin", "omp");
+    const executable = location === "enrolled checkout" && existsSync(alternate) ? alternate : join(bin, "omp");
+    const auth = join(home, ".ssh", "authorized_keys");
+    mkdirSync(join(home, ".ssh"), { mode: 0o700 });
+    writeFileSync(auth, "# existing authorization\n", { mode: 0o600 });
+
+    await expect(enrollWorker({ home, headKey: fixturePublicKey, executable, repositories: [repo] }))
+      .rejects.toThrow(/owned canonical path outside enrolled checkouts/);
+
+    expect(readFileSync(auth, "utf8")).toBe("# existing authorization\n");
+    expect(existsSync(join(home, ".omp-sa-worker"))).toBe(false);
+  },
+);
+
+test.each(["installed inside checkout", "symlinked CLI"] as const)(
+  "target init writes neither policy nor SSH authorization when the worker is %s", async location => {
+    const { home, root } = fixture();
+    const repo = targetRepo(root, "checkout");
+    const install = location === "installed inside checkout" ? repo : join(root, "install");
+    if (install !== repo) mkdirSync(install);
+    const source = join(import.meta.dir, "../src");
+    cpSync(source, join(install, "src"), { recursive: true });
+    symlinkSync(join(import.meta.dir, "../node_modules"), join(install, "node_modules"));
+    if (location === "symlinked CLI") {
+      const cli = join(install, "src", "cli.ts");
+      rmSync(cli);
+      writeFileSync(join(repo, "cli.ts"), "export {};\n");
+      symlinkSync(join(repo, "cli.ts"), cli);
+    }
+    const target = { home, headKey: fixturePublicKey, executable: process.execPath, repositories: [repo] };
+
+    const child = Bun.spawn([process.execPath, "--no-env-file", "--eval", `
+      import { enrollWorker } from "./src/worker-enrollment.ts";
+      await enrollWorker(${JSON.stringify(target)}).catch(error => {
+        if (!(error instanceof Error)) throw error;
+        console.error(error.message);
+        process.exitCode = 1;
+      });
+    `], { cwd: install, env: { HOME: home, PATH: "/usr/bin:/bin" }, stdout: "ignore", stderr: "pipe", timeout: 10_000 });
+    const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+
+    expect(code).toBe(1);
+    expect(error).toMatch(/owned canonical path outside enrolled checkouts/);
+    expect(existsSync(join(home, ".ssh"))).toBe(false);
+    expect(existsSync(join(home, ".omp-sa-worker"))).toBe(false);
+  },
+);
+
+test("target init rejects an unsafe home ancestor before creating worker state", async () => {
+  const { home, root } = fixture();
+  const repo = targetRepo(root, "checkout");
+  chmodSync(root, 0o772);
+
+  await expect(enrollWorker({ home, headKey: fixturePublicKey, executable: process.execPath, repositories: [repo] }))
+    .rejects.toThrow(/owned canonical path outside enrolled checkouts/);
+
+  expect(existsSync(join(home, ".ssh"))).toBe(false);
+  expect(existsSync(join(home, ".omp-sa-worker"))).toBe(false);
 });
 
 test("worker CLI rejects extra options before consulting account or configuration state", async () => {

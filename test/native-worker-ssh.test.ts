@@ -174,6 +174,15 @@ sshTest("enroll via the CLI, launch once over SSH, reconnect to the same stock O
     const reg = await lookupWorker(config.stateDir, placement);
     const ref: WorkerLaneRef = { laneId: "lane-ssh-qa", generation: 1, revision: placement.revision, repoId: placement.repoId, subdir: placement.subdir };
     const launch = { model: "socket-host-smoke/local", subagentConcurrency: 1 };
+    // A failure in native launch composition must not consume the sole slot
+    // or leave a checkout claim when no session/owner has been started yet.
+    const bad = { ...ref, laneId: "lane-preflight" };
+    const settings = join(agent, "config.yml");
+    const before = await readFile(settings);
+    await writeFile(settings, JSON.stringify({ memory: { backend: "off" }, disabledProviders: nativeDisabledProviders }));
+    await expect(workerOpen(reg, bad, launch)).rejects.toThrow("no Host was launched");
+    expect(await workerProbe(reg, bad)).toMatchObject({ socket: false, sessionFile: false, uncertain: false });
+    await writeFile(settings, before);
     const { pid } = await workerOpen(reg, ref, launch);
     owned = { ...remoteLanePaths(placement, ref.laneId), pid };
     expect(await workerOpen(reg, ref, launch)).toMatchObject({ pid });

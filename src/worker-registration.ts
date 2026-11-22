@@ -1,16 +1,17 @@
+import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
   closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync,
   renameSync, rmSync, unlinkSync, type Stats,
 } from "node:fs";
-import { isAbsolute, join, normalize } from "node:path";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { privateDirectory } from "./config";
 import { stagePrivateFile } from "./credentials";
 import { workerRepositoryHead } from "./worker-repository";
-import { WorkerDescriptionSchema } from "./worker-wire";
-import type { WorkerDescription, WorkerLaneRef, WorkerRegistration } from "./worker-wire";
+import { trustedWorkerPath } from "./worker-trust";
+import { WorkerDescriptionSchema, type WorkerDescription, type WorkerLaneRef, type WorkerRegistration } from "./worker-wire";
 
 export class WorkerRegistrationError extends Error {
   override readonly name = "WorkerRegistrationError";
@@ -83,18 +84,40 @@ export function workerDirectory(path: string, allowedMode: number, create = fals
 }
 
 export async function withWorkerWriteLock<T>(path: string, action: () => T | Promise<T>): Promise<T> {
-  let fd: number;
-  try { fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
-  catch (cause) { throw new WorkerRegistrationError(`Worker write lock unavailable: ${path}`, { cause }); }
-  try { return await action(); }
-  finally {
+  let lock: Database | undefined;
+  try {
     try {
-      const held = fstatSync(fd);
-      const current = lstatSync(path);
-      if (held.dev === current.dev && held.ino === current.ino) unlinkSync(path);
-    } catch (error) { if (!isMissing(error)) throw error; }
+      trustedWorkerPath(dirname(path), [], "directory");
+      // Create the private sidecar if needed. Never reopen/close its inode here:
+      // closing an unrelated fd can release this process's SQLite file locks.
+      try { closeSync(openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)); }
+      catch (error) { if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error; }
+      checkWorkerFile(lstatSync(path), 0o600);
+      lock = new Database(path, { readwrite: true, strict: true });
+      lock.run("PRAGMA busy_timeout = 0");
+      lock.run("BEGIN EXCLUSIVE");
+    } catch (cause) { throw new WorkerRegistrationError(`Worker write lock unavailable: ${path}`, { cause }); }
+    // As with Store's writer lock, the OS releases ownership on process exit.
+    // Keep the inode: unlinking would let contenders take independent locks.
+    return await action();
+  } finally { lock?.close(true); }
+}
+
+function checkWorkerDirectories(directory: string): void {
+  workerDirectory(directory, 0o700);
+  workerDirectory(dirname(directory), 0o700);
+  trustedWorkerPath(directory, [], "directory");
+}
+
+/** Verify the selected key immediately before handing its path to an external process. */
+export function checkWorkerIdentity(path: string): void {
+  try {
+    if (!canonicalPath(path)) throw new WorkerRegistrationError("Worker key path must be canonical");
+    checkWorkerDirectories(dirname(path));
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try { checkWorkerFile(fstatSync(fd), 0o600); }
     finally { closeSync(fd); }
-  }
+  } catch (cause) { throw new WorkerRegistrationError(`Dedicated worker SSH identity is unavailable or unsafe: ${path}`, { cause }); }
 }
 
 function endpointFor(stateDir: string, destination: string) {
@@ -118,10 +141,10 @@ function canonicalPath(path: string): boolean {
   return isAbsolute(path) && normalize(path) === path && !controls.test(path);
 }
 
-/** Pending enrollments have only a key and never appear in this inventory. */
+/** Last verified inventory, not endpoint readiness. Pending keys are not listed. */
 export function listWorkers(stateDir: string): WorkerRegistration[] {
   const directory = join(stateDir, "workers");
-  try { workerDirectory(directory, 0o700); workerDirectory(stateDir, 0o700); }
+  try { checkWorkerDirectories(directory); }
   catch (error) { if (isMissing(error)) return []; throw error; }
   const bytes = readWorkerFile(join(directory, "verified.json"));
   if (bytes === undefined) return [];
@@ -137,7 +160,6 @@ export function listWorkers(stateDir: string): WorkerRegistration[] {
         (defaultRepository && (!preferred || defaultSeen || !canonicalPath(defaultRepository.root)
           || !verified.repos.some(repo => repo.id === defaultRepository.repoId))))
       throw new WorkerRegistrationError("Conflicting verified worker inventory");
-    checkWorkerFile(lstatSync(identityFile), 0o600);
     ids.add(verified.workerId);
     destinations.add(destination);
     // Legacy boolean-only entries never authorized disclosure from any local checkout.
@@ -177,6 +199,7 @@ export async function addWorker(
   const source = defaultRepositoryRoot === undefined ? null : await workerRepositoryHead(defaultRepositoryRoot);
   if (defaultRepositoryRoot !== undefined && (!source || source.subdir !== ""))
     throw new WorkerRegistrationError("A default worker requires the root of a clean head-side Git checkout with a verifiable network origin");
+  trustedWorkerPath(stateDir, [], "profile");
   privateDirectory(stateDir);
   const directory = join(stateDir, "workers");
   workerDirectory(directory, 0o700, true);
@@ -186,11 +209,9 @@ export async function addWorker(
     if (source && registrations.some(worker => worker.defaultRepository && worker !== previous))
       throw new WorkerRegistrationError("A different verified worker is already the default");
     const endpoint = endpointFor(stateDir, destination);
-    try { checkWorkerFile(lstatSync(endpoint.identityFile), 0o600); }
-    catch (error) {
-      if (!isMissing(error)) throw error;
+    if (!previous && !lstatSync(endpoint.identityFile, { throwIfNoEntry: false }))
       return pendingEnrollment(destination, await createIdentity(endpoint.identityFile, directory));
-    }
+    checkWorkerIdentity(endpoint.identityFile);
 
     let observed: WorkerDescription;
     try { observed = await describe(endpoint); }
@@ -213,6 +234,7 @@ export async function addWorker(
         throw new WorkerRegistrationError("Worker is not approved for the default repository identity");
       // Do not send the head-side path (or a revision for an unapproved repo).
       let scoped: WorkerDescription;
+      checkWorkerIdentity(endpoint.identityFile);
       try { scoped = validateDescription(await describe(endpoint, workspace)); }
       catch (cause) {
         throw new WorkerRegistrationError("Worker could not verify the default repository at the requested Git revision", { cause });
@@ -238,6 +260,7 @@ export async function addWorker(
 }
 
 async function identityPublicKey(path: string): Promise<string> {
+  checkWorkerIdentity(path);
   const keygen = Bun.spawn(["ssh-keygen", "-y", "-f", path],
     { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 10_000 });
   const [key, code] = await Promise.all([new Response(keygen.stdout).text(), keygen.exited]);

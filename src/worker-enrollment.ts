@@ -13,6 +13,7 @@ import {
   workerHash, workerPublicKey, WorkerRegistrationError,
 } from "./worker-registration";
 import { gitWorkerRepository, workerRepositoryIdentity } from "./worker-repository";
+import { trustedWorkerPath, workerInstallRoot } from "./worker-trust";
 import type { WorkerPolicy, WorkerRepo } from "./worker-wire";
 
 const policyRoot = ".omp-sa-worker";
@@ -44,9 +45,10 @@ function policyAt(path: string) {
   return stored;
 }
 
-function forcedKeyLine(path: string, key: string): string {
-  const bun = realpathSync(process.execPath);
-  const cli = realpathSync(fileURLToPath(new URL("./cli.ts", import.meta.url)));
+function enrollmentAuthorization(path: string, key: string, repos: WorkerPolicy["repos"]): string {
+  trustedWorkerPath(workerInstallRoot, repos, "directory");
+  const cli = trustedWorkerPath(fileURLToPath(new URL("./cli.ts", import.meta.url)), repos, "file");
+  const bun = trustedWorkerPath(realpathSync(process.execPath), repos, "file");
   const argv = [bun, "--no-env-file", cli, "worker", "serve", "--policy", path].map(shellWord);
   const command = `exec ${argv.join(" ")}`.replaceAll('"', '\\"');
   return `restrict,command="${command}" ${key} omp-sa-worker`;
@@ -121,10 +123,12 @@ export async function enrollWorker(options: {
   if (!options.repositories.length || options.repositories.length > maxRepositories)
     throw new WorkerRegistrationError(`Target enrollment requires 1–${maxRepositories} Git checkouts`);
   const repos = await targetRepositories(options.repositories, stateDir);
-  const executable = realpathSync(options.executable);
-  if (controls.test(executable)) throw new WorkerRegistrationError("Invalid installed OMP executable path");
+  const executable = trustedWorkerPath(realpathSync(options.executable), repos, "file");
   const command = [executable];
-  const line = forcedKeyLine(path, key);
+  const line = enrollmentAuthorization(path, key, repos);
+  // Run every trust check before making policy, lock, or SSH directories.
+  trustedWorkerPath(stateDir, repos, "profile");
+  trustedWorkerPath(ssh, repos, "profile");
   workerDirectory(root, 0o700, true);
   return await withWorkerWriteLock(join(root, "init.lock"), () => {
     workerDirectory(stateDir, 0o700, true);

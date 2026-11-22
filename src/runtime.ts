@@ -315,6 +315,7 @@ export class Superagent {
   private readonly callbacks = new Set<string>();
   private readonly controls = new Set<string>();
   private readonly operations = new Map<string, Promise<Lane>>();
+  private readonly placingWorkers = new Map<string, string>();
   private readonly pauseRevisions = new Map<string, number>();
   private readonly modelChanges = new Map<string, Promise<unknown>>();
   private readonly tasks = new Set<Promise<unknown>>();
@@ -429,7 +430,13 @@ export class Superagent {
           continue;
         }
         try {
-          const live = await this.attachLane(lane);
+          const inspection = lane.remote ? await this.inspectRemote(lane) : undefined;
+          if (inspection && !inspection.probe.socket) {
+            if (!this.recordRemoteExit(lane, inspection.probe)) throw new Error(`Lane ${lane.id} remote ownership is unresolved`);
+            if (this.remoteOpenPending(lane)) this.blocked.add(lane.id);
+            continue;
+          }
+          const live = await this.attachLane(lane, inspection);
           if (!this.remoteShutdownPending(lane)) await this.checkLaneModel(live);
         }
         catch (error) {
@@ -1263,7 +1270,7 @@ export class Superagent {
     if (!live && lane.remote && this.mayOwnHost(lane)) {
       const inspection = await this.inspectRemote(lane);
       if (inspection.probe.socket) live = await this.attachLane(lane, inspection);
-      else if (!this.remoteUnloaded(lane, inspection.probe)) throw new Error(`Lane ${id} remote ownership is unresolved`);
+      else if (!this.recordRemoteExit(lane, inspection.probe)) throw new Error(`Lane ${id} remote ownership is unresolved`);
     } else if (!live && !lane.remote && (existsSync(lane.socketPath) || lane.pid !== null && this.pidAlive(lane.pid))) {
       live = await this.attachLane(lane);
     }
@@ -1412,11 +1419,6 @@ export class Superagent {
     return { registration, probe };
   }
 
-  private remoteUnloaded(lane: Lane, probe: WorkerProbe): boolean {
-    return !probe.socket && !probe.pidAlive && !probe.ownerAlive
-      && probe.sessionFile === (lane.sessionId !== null) && probe.sessionId === lane.sessionId;
-  }
-
   private remoteShutdownKey(lane: Lane): string {
     return `worker-shutdown:${lane.id}:${lane.generation}`;
   }
@@ -1433,9 +1435,22 @@ export class Superagent {
     return !!lane.remote && this.store.getMeta(this.remoteOpenKey(lane)) === "pending";
   }
 
-  private recordRemoteExit(lane: Lane): boolean {
-    if (!this.store.updateLane(lane.id, lane.generation, { runtimeState: "unloaded", pid: null })) return false;
-    if (this.remoteShutdownPending(lane)) this.store.setMeta(this.remoteShutdownKey(lane), "exited");
+  private recordRemoteExit(lane: Lane, probe: WorkerProbe): boolean {
+    if (probe.uncertain || probe.socket || probe.pidAlive || probe.ownerAlive || probe.pid !== null
+      || probe.sessionFile !== (probe.sessionId !== null)
+      || probe.exitGeneration !== undefined && (probe.exitGeneration !== lane.generation || !probe.sessionId)) return false;
+    const current = this.requireLane(lane.id);
+    const live = this.live.get(lane.id);
+    if (current.generation !== lane.generation || current.pid !== null && probe.sessionId === null
+      || this.remoteAttaching.has(lane.id) || live && (!live.releasing || !live.lostDuringRelease)) return false;
+    // An ordinary no-owner probe cannot introduce a journal. Only the worker's
+    // exact persisted exit for this pending first launch can supply its ID.
+    if (current.sessionId !== probe.sessionId &&
+      (current.sessionId !== null || !probe.sessionId || probe.exitGeneration !== current.generation || !this.remoteOpenPending(current)))
+      return false;
+    if (!this.store.updateLane(current.id, current.generation, { sessionId: probe.sessionId, runtimeState: "unloaded", pid: null }))
+      return false;
+    if (this.remoteShutdownPending(current)) this.store.setMeta(this.remoteShutdownKey(current), "exited");
     return true;
   }
 
@@ -1625,7 +1640,8 @@ export class Superagent {
           const inspection = await this.inspectRemote(lane);
           if (this.stopped || this.restartFence() || this.live.has(id)) return;
           if (!inspection.probe.socket) {
-            if (this.remoteUnloaded(lane, inspection.probe)) {
+            const shutdownPending = this.remoteShutdownPending(lane);
+            if (this.recordRemoteExit(lane, inspection.probe)) {
               if (retry.preflight) {
                 if (!await this.adapters.workerPlacementReady(inspection.registration, workerRef(lane))) return;
                 if (this.stopped || this.restartFence() || this.live.has(id)
@@ -1635,8 +1651,6 @@ export class Superagent {
                 this.modelHolds.delete(id);
                 this.blocked.delete(id);
               }
-              const shutdownPending = this.remoteShutdownPending(lane);
-              if (!this.recordRemoteExit(lane)) return;
               this.remoteReconnect.delete(id);
               if (shutdownPending) this.blocked.delete(id);
               wake = true; // Other lanes can use the newly confirmed capacity.
@@ -1648,8 +1662,8 @@ export class Superagent {
           try { await this.reconcileUi(replacement); }
           catch (error) { await this.holdLostRemote(replacement, error); return; }
           if (this.remoteShutdownPending(lane)) return;
-          await this.checkLaneModel(replacement);
           if (!this.restartFence() && this.requireLane(id).workState !== "open") await this.pause(id);
+          await this.checkLaneModel(replacement);
           this.blocked.delete(id);
           wake = true;
         } finally {
@@ -2486,7 +2500,21 @@ export class Superagent {
     }
     const operation = this.createLane(selected);
     this.operations.set(input.sourceId, operation);
-    try { return await operation; } finally { this.operations.delete(input.sourceId); }
+    try { return await operation; } finally {
+      this.operations.delete(input.sourceId);
+      this.placingWorkers.delete(input.sourceId);
+    }
+  }
+
+  private queuedWorkerAssignments(): Map<string, number> {
+    const queued = new Map<string, number>();
+    const count = (id: string) => queued.set(id, (queued.get(id) ?? 0) + 1);
+    for (const id of this.placingWorkers.values()) count(id);
+    for (const lane of this.store.lanes()) {
+      if (lane.remote && lane.workState === "open" && lane.runtimeState === "unloaded" && lane.pid === null
+        && this.store.hasInput(lane.id, "pending")) count(lane.remote.workerId);
+    }
+    return queued;
   }
 
   private async createLane(input: ResolvedLaneStart): Promise<Lane> {
@@ -2548,10 +2576,13 @@ export class Superagent {
     // retargeting retries after a native topic creation or a lost kickoff.
     const receipt: LanePlacementReceipt = savedPlacement ? JSON.parse(savedPlacement)
       : { cwd, remote: existingBinding ? existingBinding.remote ?? null
-        : await this.adapters.selectWorkerPlacement(this.config, cwd, input.placement),
+        : await this.adapters.selectWorkerPlacement(this.config, cwd, input.placement, {
+          queued: () => this.queuedWorkerAssignments(), reserve: id => this.placingWorkers.set(original.id, id),
+        }),
       ...(input.placement?.platform !== undefined && !existingBinding ? { platform: input.placement.platform } : {}) };
     if (receipt.cwd !== cwd || existingBinding && !isDeepStrictEqual(existingBinding.remote ?? null, receipt.remote))
       throw new Error("Lane placement conflicts with the original source workspace or binding");
+    if (savedPlacement && receipt.remote && !existingBinding) this.placingWorkers.set(original.id, receipt.remote.workerId);
     await this.assertLanePlacement(receipt, input.placement);
     this.assertRestartOpen();
     if (this.stopped || this.store.input(original.id)?.state === "cancelled") throw new Error("Source is no longer available for delegated work");
@@ -2653,6 +2684,7 @@ export class Superagent {
       workState: "open", runtimeState: "unloaded", sessionFile: paths.sessionFile, sessionId: null,
       socketPath: paths.socketPath, generation: 0, pid: null, createdAt: now, lastActivityAt: now, result: null,
     }, source.id);
+    this.placingWorkers.delete(original.id);
     if (this.store.getMeta(nativeKey) === "true") {
       const decision = { source: original.route, destination: lane.route, laneId: lane.id };
       const deliveryKey = `head-delivery:${original.id}`;
@@ -2972,14 +3004,23 @@ export class Superagent {
     });
   }
 
+  private holdLanePause(lane: Lane): void {
+    this.pauseRevisions.set(lane.id, (this.pauseRevisions.get(lane.id) ?? 0) + 1);
+    if (lane.workState === "open" && this.store.updateLane(lane.id, lane.generation, { workState: "paused" }))
+      this.background(this.syncLaneThreadTitle(lane, "paused"));
+  }
+
   async pause(id: string): Promise<void> {
     this.assertRestartOpen();
-    this.pauseRevisions.set(id, (this.pauseRevisions.get(id) ?? 0) + 1);
+    this.holdLanePause(this.requireLane(id));
+    await this.stopPausedLane(id);
+  }
+
+  private async stopPausedLane(id: string): Promise<void> {
+    this.assertRestartOpen();
     this.laneMutations++;
     try {
       const lane = this.requireLane(id);
-      if (lane.workState === "open" && this.store.updateLane(id, lane.generation, { workState: "paused" }))
-        this.background(this.syncLaneThreadTitle(lane, "paused"));
       const live = this.live.get(id);
       const failures: unknown[] = [];
       if (live) {
@@ -3024,7 +3065,10 @@ export class Superagent {
       const paused = await this.state(live);
       live.busy = !paused.isSettled;
       this.store.updateLane(id, live.generation, { runtimeState: paused.isSettled ? "idle" : "running", lastActivityAt: Date.now() });
-      if (paused.isStreaming || !paused.isSettled || paused.hasOwnedRunningWork) throw new Error("Lane is paused durably, but native work has not fully stopped");
+      if (paused.isStreaming || !paused.isSettled || paused.hasOwnedRunningWork
+        || lane.remote && (paused.isCompacting || paused.queuedMessageCount || paused.hasPendingAsyncWork
+          || paused.goal?.enabled || paused.pendingUiRequests?.length))
+        throw new Error("Lane is paused durably, but native work has not fully stopped");
       if (failures.length) throw new AggregateError(failures, "Pause cleanup incomplete; lane remains paused");
     } finally { this.laneMutations--; }
   }
@@ -3034,7 +3078,7 @@ export class Superagent {
     const pauseRevision = this.pauseRevisions.get(id) ?? 0;
     this.laneMutations++;
     try {
-      const lane = this.requireLane(id);
+      let lane = this.requireLane(id);
       if (lane.workState === "cancelled") throw new Error("Cancelled work requires an explicit new/reopened request");
       this.authorized(lane.route);
       const source = sourceId ? this.store.input(sourceId) : null;
@@ -3046,12 +3090,13 @@ export class Superagent {
       let remoteOwnerAbsent = false;
       if (this.blocked.has(id) && this.residentHosts().size > this.config.maxHosts)
         throw new Error("Existing native ownership exceeds the host budget; reconcile it before resuming");
-      if (!live && lane.remote && (this.mayOwnHost(lane) || this.blocked.has(id) || source && lane.sessionId !== null)) {
+      if (!live && lane.remote && (this.mayOwnHost(lane) || this.remoteOpenPending(lane)
+        || this.blocked.has(id) || source && lane.sessionId !== null)) {
         const inspection = await this.inspectRemote(lane);
         if (inspection.probe.socket) live = await this.attachLane(lane, inspection);
-        else if (!this.remoteUnloaded(lane, inspection.probe)) throw new Error(`Lane ${id} remote ownership or transcript is unresolved`);
+        else if (!this.recordRemoteExit(lane, inspection.probe)) throw new Error(`Lane ${id} remote ownership or transcript is unresolved`);
         else {
-          if (this.remoteShutdownPending(lane)) this.recordRemoteExit(lane);
+          lane = this.requireLane(id);
           remoteOwnerAbsent = true;
           remoteTranscript = inspection.probe.sessionFile;
         }
@@ -3146,28 +3191,44 @@ export class Superagent {
     try {
       const lane = this.requireLane(id);
       if (!evidence.trim()) throw new Error("Observed completion evidence or a cancellation reason is required");
+      // Reconnect can run independently of this call. Fence the queue before
+      // any worker I/O, but don't publish cancellation before native stop.
+      if (outcome === "cancelled") this.holdLanePause(lane);
       let live = this.live.get(id);
-      if (!live && lane.remote && this.mayOwnHost(lane)) {
+      if (!live && lane.remote && (this.mayOwnHost(lane) || this.remoteOpenPending(lane))) {
         if (this.connecting.has(id) && lane.runtimeState === "starting")
           throw new Error("Cannot close a lane while its remote Host launch is in progress");
         const inspection = await this.inspectRemote(lane);
-        if (inspection.probe.socket) live = await this.attachLane(lane, inspection);
-        else if (!this.remoteUnloaded(lane, inspection.probe) || this.live.has(id))
+        if (inspection.probe.socket) {
+          live = await this.attachLane(lane, inspection);
+          if (outcome === "cancelled") await this.reconcileUi(live);
+        } else if (!this.recordRemoteExit(lane, inspection.probe))
           throw new Error("Cannot close a lane whose native ownership/state is unresolved");
-        else this.recordRemoteExit(lane);
       }
-      if (outcome === "cancelled") await this.pause(id);
+      if (outcome === "cancelled") await this.stopPausedLane(id);
       if (!lane.remote || !live) live = this.live.get(id);
       if (!live && !lane.remote && this.mayOwnHost(lane))
         throw new Error("Cannot close a lane whose native ownership/state is unresolved");
       if (live && (!(await this.state(live)).isSettled || live.input)) throw new Error("Lane still owns unresolved native work");
       this.assertRestartOpen();
       if (this.store.approvals(id).length) throw new Error("Lane has unresolved approvals");
+      const current = this.requireLane(id);
+      if (current.generation !== lane.generation || outcome === "cancelled" && current.workState === "open")
+        throw new Error("Lane was resumed or changed generation before closure");
       if (outcome === "cancelled") for (const input of this.store.inputs(id)) this.store.settle(input.id, "cancelled");
       if (this.store.inputs(id).length) throw new Error("Resolve queued or uncertain lane inputs before completing work");
-      const previous = this.requireLane(id).workState;
-      if (this.store.updateLane(id, lane.generation, { workState: outcome, result: evidence }) && previous !== outcome)
-        this.background(this.syncLaneThreadTitle(lane, outcome));
+      if (!this.store.updateLane(id, lane.generation, { workState: outcome, result: evidence }))
+        throw new Error("Lane generation changed before closure");
+      if (this.remoteOpenPending(lane)) this.store.setMeta(this.remoteOpenKey(lane), "reconciled");
+      if (lane.remote) {
+        this.remoteReconnect.delete(id);
+        if (!live || outcome === "cancelled") {
+          // A verified stop or exit makes model/readback holds irrelevant to cancellation.
+          this.blocked.delete(id);
+          this.modelHolds.delete(id);
+        }
+      }
+      if (current.workState !== outcome) this.background(this.syncLaneThreadTitle(lane, outcome));
       if (live) await this.release(live, true);
     } finally { this.laneMutations--; }
   }
@@ -3260,18 +3321,17 @@ export class Superagent {
         preflight = false;
         if (this.remoteShutdownPending(lane)) return null;
         const live = await this.attachLane(lane, remote);
-        if (!lane.remote || !explicitRetry) await this.checkLaneModel(live);
         if (lane.remote) {
           await this.reconcileUi(live);
           const workState = this.requireLane(lane.id).workState;
           if (workState !== "open" && !restoringResumed(workState)) { await this.pause(lane.id); return null; }
         }
+        if (!lane.remote || !explicitRetry) await this.checkLaneModel(live);
         return live;
       }
-      if (remote ? !this.remoteUnloaded(lane, remote.probe) : lane.pid !== null && this.pidAlive(lane.pid))
+      if (remote ? !this.recordRemoteExit(lane, remote.probe) : lane.pid !== null && this.pidAlive(lane.pid))
         throw new Error(`Lane ${lane.id} process is alive or ownership/transcript is unknown; refusing duplicate launch`);
       if (this.remoteOpenPending(lane) && authorizedResume === undefined) return null;
-      if (this.remoteShutdownPending(lane)) this.recordRemoteExit(lane);
       if (remote && !await this.adapters.workerPlacementReady(remote.registration, workerRef(lane)))
         throw new Error(`Lane ${lane.id} remains queued: worker workspace or free capacity is not verified`);
       const hasTranscript = remote ? remote.probe.sessionFile : existsSync(lane.sessionFile);
@@ -3333,13 +3393,13 @@ export class Superagent {
         });
       if (!this.store.updateLane(lane.id, lane.generation, { pid })) throw new Error(`Lane ${lane.id} generation changed during launch`);
       const live = await this.attachLane({ ...lane, pid });
-      if (explicitRetry) { await this.reconcileUi(live); return live; }
-      await this.checkLaneModel(live);
-      await this.reconcileUi(live);
       if (remote) {
+        await this.reconcileUi(live);
         const workState = this.requireLane(lane.id).workState;
         if (workState !== "open" && !restoringResumed(workState)) { await this.pause(lane.id); return null; }
       }
+      if (!explicitRetry) await this.checkLaneModel(live);
+      if (!remote) await this.reconcileUi(live);
       return live;
     } catch (error) {
       this.blocked.add(lane.id);
@@ -3387,10 +3447,10 @@ export class Superagent {
         if ((live.nextReleaseProbe ?? 0) > Date.now()) return false;
         live.nextReleaseProbe = Date.now() + remoteReconnectIntervalMs;
         try {
-          if (!this.remoteUnloaded(lane, (await this.inspectRemote(lane)).probe)) return false;
+          const { probe } = await this.inspectRemote(lane);
+          if (!this.current(live) || !this.recordRemoteExit(lane, probe)) return false;
         } catch (error) { this.report(error); return false; }
       } else if (this.pidAlive(lane.pid) || existsSync(lane.socketPath)) return false;
-      if (lane.remote && (!this.current(live) || !this.recordRemoteExit(lane))) return false;
       this.live.delete(live.id);
       live.unsubscribe();
       await live.connection.close();

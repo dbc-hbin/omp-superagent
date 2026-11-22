@@ -34,6 +34,8 @@ export interface WorkerLaneRef {
 export interface WorkerProbe {
   readonly socket: boolean; readonly sessionFile: boolean; readonly pidAlive: boolean; readonly ownerAlive: boolean;
   readonly uncertain: boolean; readonly pid: number | null; readonly sessionId: string | null;
+  /** Exact generation whose persisted native exit the worker verified. */
+  readonly exitGeneration?: number;
 }
 export type WorkerLaunch = Pick<HostOptions, "model" | "modelPreset" | "subagentConcurrency">;
 export const WORKER_HEADER_BYTES = 64 * 1024;
@@ -51,6 +53,7 @@ export const WorkerDescriptionSchema = Type.Object({
 const probe = Type.Object({
   socket: Type.Boolean(), sessionFile: Type.Boolean(), pidAlive: Type.Boolean(), ownerAlive: Type.Boolean(),
   uncertain: Type.Boolean(), pid: Type.Union([positive, Type.Null()]), sessionId: Type.Union([text, Type.Null()]),
+  exitGeneration: Type.Optional(positive),
 });
 const opened = Type.Object({ pid: positive });
 const attached = Type.Object({ pid: positive, sessionId: text, sessionFile: absolute });
@@ -123,6 +126,8 @@ function readHeader(child: ChildProcessWithoutNullStreams): Promise<Buffer> {
 async function exchange<S extends TSchema>(endpoint: Endpoint, request: object, schema: S, attach: boolean) {
   const payload = Buffer.from(`${JSON.stringify({ version: 1, ...request })}\n`);
   if (payload.length > WORKER_HEADER_BYTES) throw new Error("Worker request exceeds header limit");
+  const { checkWorkerIdentity } = await import("./worker-registration");
+  checkWorkerIdentity(endpoint.identityFile);
   const child = startSSH(endpoint);
   const exited = new Promise<number | null>((resolve, reject) => {
     child.once("error", reject);

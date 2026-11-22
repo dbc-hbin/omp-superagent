@@ -1,11 +1,12 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, jest, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { addWorker, listWorkers } from "../src/worker-registration";
-import { workerRepositoryIdentity } from "../src/worker-repository";
+import { workerRepositoryHead, workerRepositoryIdentity } from "../src/worker-repository";
 import type { WorkerDescription, WorkerSelector } from "../src/worker-wire";
 
 const placementModule = fileURLToPath(new URL("../src/worker-placement.ts", import.meta.url));
@@ -83,13 +84,16 @@ async function pair(f: Fixture, worker: {
   return { destination, description };
 }
 
-async function place(f: Fixture, cwd: string, selector?: WorkerSelector): Promise<unknown> {
+async function place(f: Fixture, cwd: string, selector?: WorkerSelector, count = 1): Promise<unknown> {
   // Isolate PATH in a child instead of modifying the test runner's environment.
   const child = Bun.spawn([process.execPath, "--no-env-file", "-e", `
     import { selectWorkerPlacement } from ${JSON.stringify(placementModule)};
-    const { stateDir, cwd, selector } = JSON.parse(process.env.PLACEMENT_ARGS);
+    const { stateDir, cwd, selector, count } = JSON.parse(process.env.PLACEMENT_ARGS);
+    const waiting = new Map();
+    const admission = { queued: () => waiting, reserve: id => waiting.set(id, (waiting.get(id) ?? 0) + 1) };
     try {
-      console.log(JSON.stringify({ value: await selectWorkerPlacement({ stateDir }, cwd, selector) }));
+      const placements = await Promise.all(Array.from({ length: count }, () => selectWorkerPlacement({ stateDir }, cwd, selector, admission)));
+      console.log(JSON.stringify({ value: count === 1 ? placements[0] : placements.map(p => p.workerId).sort() }));
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       console.log(JSON.stringify({ error: error.message }));
@@ -98,7 +102,7 @@ async function place(f: Fixture, cwd: string, selector?: WorkerSelector): Promis
     cwd: f.root,
     env: {
       PATH: f.bin, HOME: f.root, DESCRIBE_CALLS: f.calls, DESCRIBE_REPLIES: f.replies,
-      PLACEMENT_ARGS: JSON.stringify({ stateDir: f.stateDir, cwd, selector }),
+      PLACEMENT_ARGS: JSON.stringify({ stateDir: f.stateDir, cwd, selector, count }),
     },
     stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000, killSignal: "SIGKILL",
   });
@@ -214,6 +218,13 @@ test("an exact unavailable worker remains pinned instead of substituting another
   expect(await readFile(f.calls, "utf8")).toBe(`${destination}\n`);
 });
 
+test("concurrent remote admissions reserve distinct one-slot workers before either starts", async () => {
+  const f = await setup();
+  await pair(f, { id: "worker-a" });
+  await pair(f, { id: "worker-b" });
+  expect(await place(f, f.cwd, { target: "remote" }, 2)).toEqual({ value: ["worker-a", "worker-b"] });
+});
+
 test("remote placement refuses identical repository basenames under different owners before SSH", async () => {
   const f = await setup();
   await pair(f, { id: "worker-a", preferred: true });
@@ -274,6 +285,61 @@ test.each(["clean", "process"])("read-only preflight accepts identical tracked b
   expect(await place(f, f.cwd, { target: "remote" })).toEqual({ value: {
     workerId: description.workerId, stateDir: description.stateDir, repoId: f.repoId, revision, subdir: "",
   } });
+});
+
+test.serial.each(["hashing", "stdout"] as const)("Git inventory deadline distinguishes file hashing from a producer stall (%s)", async phase => {
+  const f = await setup();
+  const workspace = { root: f.cwd, repoId: f.repoId, revision: git(f.cwd, "rev-parse", "HEAD"), subdir: "" };
+  const spawned = Promise.withResolvers<void>();
+  let producer: Bun.Subprocess<"pipe", "pipe", "ignore"> | undefined;
+  const spawnProcess = Bun.spawn;
+  const spawn = spyOn(Bun, "spawn").mockImplementation(new Proxy(spawnProcess, {
+    apply(target, receiver, args: readonly unknown[]) {
+      const [command, options] = args;
+      if (!Array.isArray(command) || !command.includes("ls-tree") || !options || typeof options !== "object")
+        return Reflect.apply(target, receiver, args);
+      // Run real Git for inventory bytes, but keep the producing command alive
+      // until hashing starts, or leave it waiting before it emits any output.
+      const script = phase === "hashing" ? '"$@" || exit "$?"; IFS= read -r gate; exit 0' : "IFS= read -r gate";
+      const child = target(["/bin/sh", "-c", script, "inventory-fixture", ...command], {
+        ...options, timeout: undefined, stdin: "pipe", stdout: "pipe", stderr: "ignore",
+      });
+      producer = child;
+      // Model a native spawn-time deadline on the same clock as read deadlines.
+      if ("timeout" in options && typeof options.timeout === "number" && options.timeout > 0)
+        setTimeout(() => child.kill("SIGKILL"), options.timeout);
+      spawned.resolve();
+      return child;
+    },
+  }));
+  const open = fs.open;
+  const hashing = spyOn(fs, "open").mockImplementation((...args) => {
+    if (phase === "hashing" && args[0] === join(f.cwd, ".gitignore")) {
+      if (!producer) throw new Error("Tree producer did not enter the fixture");
+      jest.advanceTimersByTime(10_001);
+      producer.stdin.end();
+    }
+    return open(...args);
+  });
+
+  try {
+    const watchdog = new Promise<never>((_, reject) => {
+      AbortSignal.timeout(4_000).addEventListener("abort", () => reject(new Error("Git inventory did not settle")), { once: true });
+    });
+    jest.useFakeTimers();
+    const inspected = Promise.race([workerRepositoryHead(f.cwd), watchdog]);
+    if (phase === "stdout") {
+      await Promise.race([spawned.promise, inspected.then(() => { throw new Error("Tree producer did not enter the fixture"); })]);
+      jest.advanceTimersByTime(10_001);
+    }
+    expect(await inspected).toEqual(phase === "hashing" ? workspace : null);
+  } finally {
+    jest.useRealTimers();
+    spawn.mockRestore();
+    hashing.mockRestore();
+    if (producer?.exitCode === null && producer.signalCode === null) producer.kill("SIGKILL");
+    await producer?.exited;
+  }
 });
 
 test("a checkout with a separate Git directory is refused before contacting the worker", async () => {

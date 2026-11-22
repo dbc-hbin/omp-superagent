@@ -1,9 +1,10 @@
+import { Database } from "bun:sqlite";
 import { lstatSync, realpathSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { readWorkerFile } from "./worker-registration";
 import { gitWorkerRepository } from "./worker-repository";
 import { WorkerRefusal } from "./worker-request";
+import { trustedWorkerPath, workerInstallRoot } from "./worker-trust";
 import type { WorkerPolicy, WorkerRepo } from "./worker-wire";
 
 export interface WorkerHostProfile {
@@ -13,7 +14,6 @@ export interface WorkerHostProfile {
   readonly managedUlwPath: string;
 }
 
-const installRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const flags = ["--no-extensions", "--no-lsp"] as const;
 // --no-extensions is necessary but does not suppress all stock custom tool and
 // MCP discovery. Keep only the explicitly composed OMP extension roots and
@@ -51,28 +51,6 @@ const gitSettings = [
   /^user\.(name|email|useconfigonly)$/,
 ];
 
-function within(root: string, candidate: string): boolean {
-  const suffix = relative(root, candidate);
-  return !isAbsolute(suffix) && suffix !== ".." && !suffix.startsWith(`..${sep}`);
-}
-
-/** A trusted input is a local account/system path that no enrolled tree or other user can replace. */
-function trustedPath(path: string, repos: WorkerPolicy["repos"], kind: "file" | "directory" | "profile"): string {
-  const fail = () => new WorkerRefusal(`Worker ${kind} input must be an owned canonical path outside enrolled checkouts`);
-  if (!isAbsolute(path) || resolve(path) !== path || controls.test(path) || repos.some(repo => within(repo.cwd, path)))
-    throw fail();
-  for (let dir = path; ; dir = dirname(dir)) {
-    const stat = lstatSync(dir, { throwIfNoEntry: false });
-    if (stat) {
-      const stickyRoot = dir !== path && stat.uid === 0 && stat.isDirectory() && (stat.mode & 0o1000) !== 0;
-      if ((stat.uid !== 0 && stat.uid !== process.getuid?.()) || ((stat.mode & 0o022) !== 0 && !stickyRoot) ||
-          (dir === path && kind === "file" ? !stat.isFile() : !stat.isDirectory())) throw fail();
-    } else if (dir === path && kind !== "profile") throw fail();
-    if (dirname(dir) === dir) break;
-  }
-  return path;
-}
-
 /** Stock sources read cwd, its Git root and, for plugin registries, ancestors above the root. */
 export function assertWorkerWorkspaceStartup(cwd: string, home: string): void {
   for (let dir = cwd; ; dir = dirname(dir)) {
@@ -103,22 +81,64 @@ function containsCommand(doc: unknown): boolean {
   return false;
 }
 
+function assertWorkerAuthDatabase(path: string): void {
+  if (!lstatSync(path, { throwIfNoEntry: false })) return;
+  let commandBacked: boolean;
+  try {
+    using db = new Database(path, { readonly: true });
+    db.run("PRAGMA trusted_schema = OFF");
+    // Stock OMP 19.0.0 stores enabled API keys as JSON { key, source? }.
+    // Query just the presence flag: do not load the stock store or return any credential fields.
+    const table = db.query<{ type: string }, []>("PRAGMA main.table_list('auth_credentials')").get();
+    if (!table) return;
+    if (table.type !== "table") throw new WorkerRefusal("Worker auth credentials must be stored in a regular SQLite table");
+    const columns = db.query<{ name: string }, []>("PRAGMA main.table_info(auth_credentials)").all();
+    const active = columns.some(column => column.name === "disabled_cause") ? "c.disabled_cause IS NULL"
+      : columns.some(column => column.name === "disabled") ? "c.disabled IS NOT 1" : "1";
+    // The stock OAuth deserializer spreads persisted fields over its type marker.
+    commandBacked = db.query<{ blocked: number }, []>(`
+      SELECT EXISTS (
+        SELECT 1 FROM main.auth_credentials AS c CROSS JOIN json_each(c.data) AS entry
+        WHERE ${active} AND entry.key = 'key' AND entry.type = 'text' AND substr(entry.value, 1, 1) = '!'
+          AND (c.credential_type = 'api_key' OR (c.credential_type = 'oauth' AND EXISTS (
+            SELECT 1 FROM json_each(c.data) WHERE key = 'type' AND value = 'api_key'
+          )))
+      ) AS blocked
+    `).get()?.blocked === 1;
+  } catch (error) {
+    if (error instanceof WorkerRefusal) throw error;
+    throw new WorkerRefusal("Worker profile auth database could not be verified");
+  }
+  if (commandBacked) throw new WorkerRefusal("Worker profile does not allow command-backed auth credentials");
+}
+
 function workerProfileInputs(agent: string, repos: WorkerPolicy["repos"]) {
   const disabledProviders = new Set(config.disabledProviders);
   for (const name of ["config.yml", "config.yaml", "models.yml", "models.yaml", "models.json", "settings.json", "auth.json"]) {
     const data = readProfileFile(join(agent, name), 0o644);
-    if (!data || name === "auth.json") continue;
+    if (!data) continue;
     let parsed: unknown;
     try { parsed = name.endsWith(".json") ? JSON.parse(data.toString("utf8")) : Bun.YAML.parse(data.toString("utf8")); }
-    catch (cause) { throw new WorkerRefusal("Worker profile settings or model configuration could not be verified", { cause }); }
+    catch { throw new WorkerRefusal("Worker profile settings, models or legacy auth could not be verified"); }
     // Model and auth config's !command form runs in the selected project cwd.
-    if (containsCommand(parsed)) throw new WorkerRefusal("Worker profile does not allow command-backed settings or model credentials");
-    if ((name.startsWith("config.") || name === "settings.json") && parsed && typeof parsed === "object" && "disabledProviders" in parsed) {
-      const configured = parsed.disabledProviders;
-      if (Array.isArray(configured) && configured.every(provider => typeof provider === "string")) {
-        for (const provider of configured) disabledProviders.add(provider);
-      } else if (configured !== undefined && configured !== null) {
-        throw new WorkerRefusal("Worker profile does not allow path-specific discovery provider settings");
+    if (containsCommand(parsed)) {
+      if (name === "auth.json") throw new WorkerRefusal("Worker profile does not allow command-backed auth credentials");
+      throw new WorkerRefusal("Worker profile does not allow command-backed settings or model credentials");
+    }
+    if ((name.startsWith("config.") || name === "settings.json") && parsed && typeof parsed === "object") {
+      // The stock broker may supply or refresh API-key records that local preflight cannot verify.
+      const auth = "auth" in parsed ? parsed.auth : undefined;
+      const broker = auth && typeof auth === "object" && "broker" in auth ? auth.broker : undefined;
+      if (("auth.broker.url" in parsed && typeof parsed["auth.broker.url"] === "string" && parsed["auth.broker.url"]) ||
+          (broker && typeof broker === "object" && "url" in broker && typeof broker.url === "string" && broker.url))
+        throw new WorkerRefusal("Worker profile does not allow auth brokers; use locally stored credentials");
+      if ("disabledProviders" in parsed) {
+        const configured = parsed.disabledProviders;
+        if (Array.isArray(configured) && configured.every(provider => typeof provider === "string")) {
+          for (const provider of configured) disabledProviders.add(provider);
+        } else if (configured !== undefined && configured !== null) {
+          throw new WorkerRefusal("Worker profile does not allow path-specific discovery provider settings");
+        }
       }
     }
   }
@@ -132,7 +152,7 @@ function workerProfileInputs(agent: string, repos: WorkerPolicy["repos"]) {
   const extensionPaths = [...new Set(value.map((entry: unknown) => {
     if (typeof entry !== "string" || !/\.(ts|[mc]?js)$/.test(entry) || entry.endsWith(".d.ts"))
       throw new WorkerRefusal("worker-extensions.json requires absolute extension module files, not packages or directories");
-    return trustedPath(entry, repos, "file");
+    return trustedWorkerPath(entry, repos, "file");
   }))];
   return { disabledProviders: [...disabledProviders], extensionPaths };
 }
@@ -141,7 +161,7 @@ function pathEnvironment(source: NodeJS.ProcessEnv, repos: WorkerPolicy["repos"]
   const dirs = new Set<string>();
   for (const raw of (source.PATH ?? "").split(delimiter)) {
     if (!isAbsolute(raw) || controls.test(raw)) continue;
-    try { dirs.add(trustedPath(realpathSync(raw), repos, "directory")); }
+    try { dirs.add(trustedWorkerPath(realpathSync(raw), repos, "directory")); }
     catch (error) {
       if (!(error instanceof WorkerRefusal) && !(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
@@ -157,12 +177,12 @@ export function workerLaunchProfile(policy: WorkerPolicy, cwd: string, source: N
   const executable = command[0];
   if (command.length !== 1 || executable === undefined)
     throw new WorkerRefusal("Worker startup requires one enrolled stock OMP executable, with no extra arguments");
-  const home = trustedPath(source.HOME ?? "", repos, "directory");
+  const home = trustedWorkerPath(source.HOME ?? "", repos, "directory");
   assertWorkerWorkspaceStartup(cwd, home);
   assertWorkerWorkspaceStartup(stateDir, home);
-  trustedPath(executable, repos, "file");
-  trustedPath(installRoot, repos, "directory");
-  trustedPath(realpathSync(process.execPath), repos, "file");
+  trustedWorkerPath(executable, repos, "file");
+  trustedWorkerPath(workerInstallRoot, repos, "directory");
+  trustedWorkerPath(realpathSync(process.execPath), repos, "file");
 
   const named = (source.OMP_PROFILE ?? source.PI_PROFILE)?.trim();
   const profileName = named && named !== "default" ? named : undefined;
@@ -170,9 +190,9 @@ export function workerLaunchProfile(policy: WorkerPolicy, cwd: string, source: N
       /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)/i.test(profileName)))
     throw new WorkerRefusal("Invalid target OMP profile name");
   const base = join(home, ".omp");
-  const root = trustedPath(profileName ? join(base, "profiles", profileName) : base, repos, "profile");
+  const root = trustedWorkerPath(profileName ? join(base, "profiles", profileName) : base, repos, "profile");
   const defaultAgent = join(root, "agent");
-  const agent = trustedPath((profileName ? undefined : source.PI_CODING_AGENT_DIR) || defaultAgent, repos, "profile");
+  const agent = trustedWorkerPath((profileName ? undefined : source.PI_CODING_AGENT_DIR) || defaultAgent, repos, "profile");
   const env: Record<string, string> = {
     HOME: home, PATH: pathEnvironment(source, repos), PI_CODING_AGENT_DIR: agent,
     ...(profileName ? { OMP_PROFILE: profileName } : {}),
@@ -187,15 +207,19 @@ export function workerLaunchProfile(policy: WorkerPolicy, cwd: string, source: N
   }
   const dataRoots = new Set([agent]);
   const pluginRoots = new Set([root]);
+  let authDbRoot = agent;
   for (const name of appData) {
     const value = source[name];
     if (!value) continue;
-    env[name] = trustedPath(value, repos, "profile");
-    const xdgBase = trustedPath(join(value, "omp"), repos, "profile");
-    const xdgProfile = trustedPath(profileName ? join(xdgBase, "profiles", profileName) : xdgBase, repos, "profile");
+    env[name] = trustedWorkerPath(value, repos, "profile");
+    const xdgBase = trustedWorkerPath(join(value, "omp"), repos, "profile");
+    const xdgProfile = trustedWorkerPath(profileName ? join(xdgBase, "profiles", profileName) : xdgBase, repos, "profile");
     if (name === "XDG_DATA_HOME") {
       dataRoots.add(xdgProfile);
       pluginRoots.add(xdgProfile);
+      // Stock DirResolver uses XDG data only for the standard agent directory
+      // and only when the applicable app/profile directory already exists.
+      if (agent === defaultAgent && lstatSync(xdgProfile, { throwIfNoEntry: false })) authDbRoot = xdgProfile;
     }
   }
   for (const dir of new Set([home, base, root, agent])) {
@@ -203,23 +227,24 @@ export function workerLaunchProfile(policy: WorkerPolicy, cwd: string, source: N
       throw new WorkerRefusal("Worker startup does not read target dotenv or Bun preload configuration; use the target profile's stored auth");
   }
   for (const dir of pluginRoots) {
-    const plugins = trustedPath(join(dir, "plugins"), repos, "profile");
+    const plugins = trustedWorkerPath(join(dir, "plugins"), repos, "profile");
     if (lstatSync(join(plugins, "node_modules"), { throwIfNoEntry: false }))
       throw new WorkerRefusal("Worker OMP profile has ambient plugin code; select a dedicated profile and explicitly allow worker extensions");
   }
   for (const dir of dataRoots) {
     for (const name of ["agent.db", "agent.db-wal", "agent.db-shm", "models.db", "models.db-wal", "models.db-shm"]) {
       const path = join(dir, name);
-      if (lstatSync(path, { throwIfNoEntry: false })) trustedPath(path, repos, "file");
+      if (lstatSync(path, { throwIfNoEntry: false })) trustedWorkerPath(path, repos, "file");
     }
   }
   const { disabledProviders, extensionPaths } = workerProfileInputs(agent, repos);
+  assertWorkerAuthDatabase(join(authDbRoot, "agent.db"));
   return { env, profile: { config: { ...config, disabledProviders }, flags, extensionPaths }, executable };
 }
 
 export async function workerManagedUlwPath(repos: WorkerPolicy["repos"]): Promise<string> {
   const { activeManagedUlw } = await import("./managed-ulw");
-  try { return trustedPath(activeManagedUlw(), repos, "directory"); }
+  try { return trustedWorkerPath(activeManagedUlw(), repos, "directory"); }
   catch (cause) { throw new WorkerRefusal("Worker requires an active operator-installed managed superkit outside enrolled checkouts", { cause }); }
 }
 
