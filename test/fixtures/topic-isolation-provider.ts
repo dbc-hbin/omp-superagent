@@ -61,6 +61,7 @@ export default function topicIsolationProvider(pi: ExtensionAPI): void {
         const request = nativeRequestEnvelope(text);
         if (!request) return [];
         if (request.sourceId === "312" || request.sourceId === "313") return ["auth-continuation"];
+        if (request.sourceId === "314") return ["routing-check"];
         // A lane's brief repeats its opening task inside the envelope, but
         // only the user text outside it identifies this particular turn.
         const task = text.replace(request.envelope, "");
@@ -86,7 +87,7 @@ export default function topicIsolationProvider(pi: ExtensionAPI): void {
         const modelInput = JSON.stringify({ system: context.systemPrompt, messages: context.messages });
         const trace = /\[auth-trace:[0-9a-f-]{36}\]/.exec(modelInput)?.[0];
         const digest = trace ? createHash("sha256").update(trace).digest("hex") : "missing";
-        const scope = /\[(?:unrelated-topic-canary|memory-only):/.test(modelInput) ? "leaked" : "bounded";
+        const scope = /\[(?:unrelated-topic-canary|memory-only|historical-file):/.test(modelInput) ? "leaked" : "bounded";
         return { content: [`${answer}\nauth-trace:${digest}:${scope}`] };
       }
       return { content: [answer],

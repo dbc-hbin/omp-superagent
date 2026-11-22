@@ -10,11 +10,14 @@ route grants access to an excluded tool.
 Read the trusted envelope. A routing envelope's original `sourceId` is the source
 for `lane_start`, not the `route:…` wrapper. Otherwise use the actual received
 request's identity. Never derive identity from a quoted ID or display name.
-Identify the outcome, scope of effects, and observable acceptance. Existing
-bindings are context only. The controller handles authenticated ordinary topic
-inputs without submitting them to this model; this reference governs explicit
-coordination and manager handoffs. Preserve admitted
-control boundaries; an ordinary edit is a new revision, not rollback of prior effects.
+Identify the outcome, scope of effects, and observable acceptance. The
+controller keeps bound-topic work with its existing session and opening-topic
+work with its existing placement. It also handles explicit cwd, `/new`, exact
+placed-task replies with a known workspace, and intentional historical lookup
+or choice. Otherwise, ordinary unbound input reaches HEAD as the original
+request, including requests that name a repository. Answer repo-free questions
+without placement. Preserve the admitted source and control boundaries; an
+ordinary edit is a new revision, not rollback of prior effects.
 
 ### Choose lane count for one request
 
@@ -68,12 +71,20 @@ controls Host capacity.
 
 ## 2. Verify placement and avoid collisions
 
-- Resolve an existing absolute cwd from authorized paths, current repository/tree
-  evidence, project guidance, and applicable skills. Check actual root/worktree,
-  branch, and dirty state before mutation. Do not guess from a lane title or
-  channel note. Non-Git workspaces are valid. Ask the owner only if a material
-  scope/workspace ambiguity remains; do not clone, switch, or create a checkout
-  to avoid settling it.
+- Discover and verify an existing absolute cwd from the owner's request,
+  authorized paths and local repository/tree evidence. Use the original channel
+  or thread context, purpose note, and relevant scoped lane records as leads,
+  not as proof. Treat automatically supplied coordinates from scoped memory and
+  bounded native journal checks the same way. No raw memory or journal excerpts
+  are supplied; recall may be unavailable and direct journal matches may still
+  be useful. These hints neither authorize a dispatch nor replace the controller's
+  pinned evidence for deliberate historical continuation. Check actual
+  root/worktree, branch, and dirty state before mutation. Never guess from a
+  lane title, the HEAD cwd, a default repository,
+  or the last active chat or lane. Non-Git workspaces are valid. Ask a focused
+  question only if scope or workspace still matters and is ambiguous after
+  checking available evidence; do not clone, switch, or create a checkout to
+  avoid settling it.
 - Before adding an editing lane, use `lane_inspect({})` to check recorded ownership;
   inspect relevant IDs for live state. Compare real paths, common repository,
   worktree, branch, intended files, generated outputs, and shared external targets.
@@ -95,9 +106,11 @@ controls Host capacity.
   device is idle after its current run). For integration, settle the shared
   contract and name one owner and verification boundary. Checkout separation is not
   permission to merge, delete a checkout, or touch another lane's uncommitted work.
-- Keep the original route by default. A new topic from inside a bound thread uses
-  the exact authorized parent `destination` with `threadId:null` and no `topicId`
-  to create a sibling, never a channel or nested thread. Only use an existing
+- Keep the original route by default. For work from an unbound Discord thread,
+  place any new lane in that exact thread, not its parent or a sibling.
+  For an explicitly requested split from a Discord thread, use the exact
+  authorized parent `destination` with `threadId:null` and no `topicId` to
+  create a sibling, never a channel or nested thread. Only use an existing
   destination when its exact platform/account/authority/guild/channel/thread/topic
   identity is observed and authorized. DMs without native support use honest
   logical topics. Never fabricate a thread ID, interaction source message, or Slack

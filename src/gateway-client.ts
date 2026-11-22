@@ -9,7 +9,7 @@ import type { GatewayReceipt, QueuedEvent } from "./gateway-wire";
 import type { GroupReply } from "./group-policy";
 
 export interface GatewayHeadMessenger extends Messenger {
-  assertRoute(route: Route): Promise<void>;
+  assertRoute(route: Route, purpose?: "history"): Promise<void>;
   requestRestart(request: GatewayRestartRequest): Promise<GatewayRestartRecord>;
 }
 
@@ -160,7 +160,9 @@ class GatewayMessenger implements GatewayHeadMessenger {
       id: output.id, route: output.route, text: output.text, replyTo: output.replyTo, resultAttachment: resultAttachment.payload,
     }] });
   }
-  assertRoute(route: Route): Promise<void> { return this.call("/route", { route }, AbortSignal.timeout(1000)); }
+  assertRoute(route: Route, purpose?: "history"): Promise<void> {
+    return this.call(purpose === "history" ? "/history/route" : "/route", { route }, AbortSignal.timeout(1000));
+  }
   setActivity(message: MessageReference, activity: MessageActivity): Promise<void> {
     return this.effect("setActivity", [{ route: message.route, messageId: message.messageId }, activity]);
   }

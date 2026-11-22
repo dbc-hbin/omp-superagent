@@ -136,7 +136,11 @@ nativeTest("stock topics stay isolated across HEAD rotation and recall-assisted 
     const trace = `[auth-trace:${crypto.randomUUID()}]`;
     const canary = `[unrelated-topic-canary:${crypto.randomUUID()}]`;
     const privateMemory = `[memory-only:${crypto.randomUUID()}]`;
-    const originalTask = `Investigate the login authentication bug. QA reproduction trace: ${trace}.`;
+    // A reference in past work must never read the same name in a later
+    // destination. It exists only in B, not in the original workspace.
+    const referenceWitness = `[historical-file:${crypto.randomUUID()}]`;
+    await writeFile(join(workB, "auth-notes.txt"), referenceWitness);
+    const originalTask = `Investigate the login authentication bug. Inspect @auth-notes.txt for the QA reproduction trace: ${trace}.`;
     const a1 = { input: inbound("301", topicA,
       `cwd: ${workA}\n${originalTask}\n[topic-isolation:a1]`),
       answer: `topic-proof:lane:${workA}:a1` };
@@ -155,9 +159,9 @@ nativeTest("stock topics stay isolated across HEAD rotation and recall-assisted 
       answer: `topic-proof:head:${config.headCwd}:head-before` };
     const a4 = { input: inbound("308", topicA, "Continue A after the global HEAD changes.\n[topic-isolation:a4]"),
       answer: `topic-proof:lane:${workA}:a1,a2,a3,a4` };
-    const headAfter = { input: inbound("309", topicB, "/head Coordinate from B.\n[topic-isolation:head-after]"),
+    const headAfter = { input: inbound("309", { ...channel, threadId: null }, `Explain the ${repoA} change.\n[topic-isolation:head-after]`),
       answer: `topic-proof:head:${config.headCwd}:head-after` };
-    const c1 = { input: inbound("310", topicC, `Check the ${repoA} repository.\n[topic-isolation:c1]`),
+    const c1 = { input: inbound("310", topicC, `cwd: ${workA}\nCheck the ${repoA} repository.\n[topic-isolation:c1]`),
       answer: `topic-proof:lane:${workA}:c1` };
 
     const first = await fixture.start();
@@ -346,6 +350,8 @@ nativeTest("stock topics stay isolated across HEAD rotation and recall-assisted 
       [intact.id, intact.sessionId, intact.sessionFile, workB]);
     const boundJournal = await verifyJournal(fixture, boundLane, { cwd: workB, turns: [b1, b2, b3, bound] });
     assert.deepEqual(boundJournal.prompts.at(-1)?.previous, evidence);
+    assert(!(await readFile(boundLane.sessionFile, "utf8")).includes(referenceWitness),
+      "A file reference in historical data expanded against the current lane's workspace");
     assert.equal((await nativeRead(fixture, "recall-witness", witnessPath)).recallCount, 2);
     for (const { sessionFile, before } of journals) {
       if (sessionFile === boundLane.sessionFile) continue;
@@ -358,6 +364,17 @@ nativeTest("stock topics stay isolated across HEAD rotation and recall-assisted 
     assert.deepEqual(ledger(fixture, db => db.query(
       "SELECT arguments,state,result FROM gateway_effects WHERE operation='createThread'",
     ).all()), effects, "Bound continuation must not create another thread");
+
+    const ordinary = { input: inbound("314", continuationParent, `Inspect the ${alias}.`),
+      answer: `topic-proof:head:${config.headCwd}:head-after,routing-check` };
+    await sendTurn(fixture, ordinary);
+    assert.equal((await nativeRead(fixture, "recall-witness", witnessPath)).recallCount, 3);
+    const added = (await readFile(newHead.sessionFile)).subarray(headAfterSeed.length).toString();
+    assert(added.includes(resumed.id) && added.includes(resumed.sessionId) && added.includes(originalEntry.entryId),
+      "Ordinary HEAD routing must receive the prior managed session corroborating the recalled nickname");
+    assert(![privateMemory, memoryBridge, canary, trace].some(text => added.includes(text)),
+      "Routing hints must not copy raw recall, the prior task, or unrelated context into HEAD");
+    assert.equal(ledger(fixture, db => db.query("SELECT id FROM lanes").all()).length, 4);
 
     await fixture.cli("stop");
     await fixture.initialExit();

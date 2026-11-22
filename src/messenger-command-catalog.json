@@ -12,6 +12,6 @@
   { "name": "model", "description": "Choose a Superagent HEAD model, or inspect or apply a named preset.", "text": "Omit for the menu, or enter list, an exact provider/model, or a preset command." },
   { "name": "effort", "description": "Choose the Superagent HEAD thinking effort.", "text": "Omit for the menu, or enter an exact advertised effort level." },
   { "name": "compact", "description": "Compact Superagent HEAD context when idle.", "text": "Optional compaction instructions, including multiple lines." },
-  { "name": "stop", "description": "Stop Superagent HEAD work or pause a bound or explicitly named lane.", "text": "head or an actual lane ID; omit to use this conversation's lane, otherwise HEAD." },
+  { "name": "stop", "description": "Stop Superagent work in this conversation, the shared HEAD, or a named lane.", "text": "Omit for this conversation, or specify head or an exact lane ID." },
   { "name": "new", "description": "Start a Superagent work topic; use a sibling for a new request in an existing thread.", "text": "An optional first request for the new topic." }
 ]

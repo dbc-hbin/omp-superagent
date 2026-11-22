@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -11,6 +13,7 @@ use crate::{
 
 use super::{
     Core,
+    entities::{Entity, routing_text},
     files::{Attachment, Media, MediaKind},
     model::{Chat, Identity, Policy, Route, SAFE_INTEGER, Sender},
 };
@@ -92,14 +95,6 @@ struct Quote {
     text: String,
 }
 
-#[derive(Deserialize)]
-struct Entity {
-    #[serde(rename = "type")]
-    kind: String,
-    offset: u64,
-    length: usize,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Inbound {
@@ -107,6 +102,7 @@ pub(super) struct Inbound {
     pub route: Route,
     message_id: String,
     text: String,
+    routing_text: String,
     received_at: u64,
     attachments: Vec<Attachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,7 +151,8 @@ pub(super) fn normalize(policy: &Policy, me: &Identity, message: &Message) -> Op
     } else {
         &message.caption_entities
     };
-    let text = command(original, entities, me.username.as_deref())?;
+    let (text, command_suffix) = command(original, entities, me.username.as_deref())?;
+    let routing_text = routing_text(original, &text, entities, command_suffix).unwrap_or_default();
     let photo = message.photo.iter().reduce(|largest, candidate| {
         let area = |media: &Media| u128::from(media.width) * u128::from(media.height);
         if area(candidate) > area(largest) {
@@ -221,28 +218,32 @@ pub(super) fn normalize(policy: &Policy, me: &Identity, message: &Message) -> Op
         route,
         message_id: message.message_id.to_string(),
         text,
+        routing_text,
         received_at,
         attachments,
         reply,
     })
 }
 
-fn command(text: &str, entities: &[Entity], bot: Option<&str>) -> Option<String> {
+// Return the original byte range removed by normalization so entity positions
+// can be validated against the input before being projected onto the result.
+fn command(text: &str, entities: &[Entity], bot: Option<&str>) -> Option<(String, Range<usize>)> {
+    let unchanged = || Some((text.to_owned(), 0..0));
     let Some(entity) = entities
         .iter()
-        .find(|entity| entity.kind == "bot_command" && entity.offset == 0)
+        .find(|entity| entity.kind == "bot_command" && entity.offset == Some(0))
     else {
-        return Some(text.to_owned());
+        return unchanged();
     };
     // A qualified command is ASCII. The UTF-16 offset is therefore also its
     // byte offset; if it splits multibyte content it cannot be a command.
-    let Some(head) = text.get(..entity.length) else {
-        return Some(text.to_owned());
+    let Some(head) = entity.length.and_then(|length| text.get(..length)) else {
+        return unchanged();
     };
     let rest = &text[head.len()..];
     let Some((name, username)) = head.strip_prefix('/').and_then(|head| head.split_once('@'))
     else {
-        return Some(text.to_owned());
+        return unchanged();
     };
     let word = |value: &str| {
         !value.is_empty()
@@ -258,15 +259,15 @@ fn command(text: &str, entities: &[Entity], bot: Option<&str>) -> Option<String>
             .next()
             .is_some_and(|ch| !js_trim(&rest[..ch.len_utf8()]).is_empty())
     {
-        return Some(text.to_owned());
+        return unchanged();
     }
     if !bot.is_some_and(|bot| username.eq_ignore_ascii_case(bot)) {
         return None;
     }
     if accepts_text(name).is_some() {
-        return Some(format!("/{name}{rest}"));
+        return Some((format!("/{name}{rest}"), (name.len() + 1)..head.len()));
     }
-    Some(text.to_owned())
+    unchanged()
 }
 
 impl Core {
@@ -335,14 +336,15 @@ impl Core {
             return Ok(());
         }
         let qualified_command = message.entities.iter().find_map(|entity| {
-            if entity.kind != "bot_command" || entity.offset != 0 {
+            if entity.kind != "bot_command" || entity.offset != Some(0) {
                 return None;
             }
-            let token = text.get(..entity.length)?.strip_prefix('/')?;
+            let head = text.get(..entity.length?)?;
+            let token = head.strip_prefix('/')?;
             let (name, username) = token.split_once('@')?;
             (name == room.mode.command() && me.username.as_deref().is_some_and(|own| {
                 username.eq_ignore_ascii_case(own)
-            })).then(|| &text[..entity.length])
+            })).then_some(head)
         });
         let Some(sent_ms) = i64::try_from(message.date).ok().and_then(|date| date.checked_mul(1000)) else {
             return Ok(());

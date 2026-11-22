@@ -273,9 +273,17 @@ crash supervisor; Linux service installation is not provided.
 
 ## Working from chat
 
-- Start with the request itself. For example, “check login in client-ui” selects a uniquely named
-  workspace previously used in this conversation. Reply to a placed task or its delivered
-  message to reuse its workspace in a new topic without copying its history.
+- Send follow-ups in the existing work thread or topic to continue its task. No repository
+  name or command is needed.
+- Elsewhere, send the request itself, even if it names a repository. HEAD answers questions
+  that need no workspace directly. For “check login in client-ui,” it uses your request and
+  its conversation context to find and verify the workspace before assigning work. It asks a
+  focused question only if a material ambiguity remains; it does not use a default repository
+  or the last active chat. If you asked from an unbound Discord thread, HEAD keeps any
+  resulting work there unless you explicitly ask for a split.
+- Use `cwd: /absolute/workspace` on the first line to specify a workspace, `/new <request>`
+  to start a separate topic, or reply directly to a placed task or its delivered message to reuse
+  its known workspace without copying its history.
 - With active, searchable Mnemopi on the head, describe earlier work from any allowed
   owner channel, e.g. “continue the login bug investigation from last week.” The
   controller uses Mnemopi recall and verifies candidates against this instance's
@@ -283,8 +291,6 @@ crash supervisor; Linux service installation is not provided.
   but do not support this historical topic search.
   A cross-channel continuation uses the matched workspace and relevant task evidence, not
   the original channel binding, transcript or approvals. Choose by number if multiple tasks match.
-- If the workspace is unclear, reply to the question with a known repository name or absolute
-  directory. An explicit `cwd: /absolute/workspace` on the first line still overrides inference.
 - Use `/head <request>` for coordination or direct global work. Repositories and
   topics keep independent lane context; voice metadata does not imply transcription.
 - Use `/help` and `/status` for controls and state. `/model` and `/effort` manage the

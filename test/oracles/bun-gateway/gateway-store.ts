@@ -11,7 +11,7 @@ import type { GatewayEvent, GatewayReceipt, QueuedEvent } from "../../../src/gat
 
 function identity(event: GatewayEvent): unknown {
   if (event.kind !== "message") return event;
-  const { receivedAt: _, reply: _reply, discordContext: _context, ...input } = event.input;
+  const { receivedAt: _, reply: _reply, discordContext: _context, routingText: _routingText, ...input } = event.input;
   return { ...event, input: { ...input, attachments: input.attachments.map(file => {
     let location = file.url;
     try {

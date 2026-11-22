@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { Api, InputFile } from "grammy";
-import type { CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, UserFromGetMe } from "grammy/types";
+import type { CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update, UserFromGetMe } from "grammy/types";
 import { physicalRouteKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type ReplyContext, type Route, type StorePort } from "../../../src/contracts.ts";
 import { parseDialog, type Dialog } from "../../../src/dialog.ts";
 import { validateDecisionAnswer, validateDecisionResponse } from "../../../src/decisions";
@@ -21,6 +21,36 @@ const DOWNLOAD_LIMIT = 20 * 1024 * 1024;
 // documented random update_id reset after at least a week without updates.
 const CURSOR_IDLE_MS = 24 * 60 * 60 * 1000;
 const COMMAND_NAMES = new Set<string>(MESSENGER_COMMANDS.map(command => command.name));
+const hiddenEntityTypes = new Set<string>(["blockquote", "expandable_blockquote", "pre", "code"]);
+
+function routingView(original: string, entities: readonly MessageEntity[], suffix: { readonly start: number; readonly end: number }): string {
+  const afterCommand = (index: number) => index - Math.min(Math.max(index - suffix.start, 0), suffix.end - suffix.start);
+  const scalarBoundary = (index: number) => !(/[\uD800-\uDBFF]/.test(original.charAt(index - 1))
+    && /[\uDC00-\uDFFF]/.test(original.charAt(index)));
+  const normalized = original.slice(0, suffix.start) + original.slice(suffix.end);
+  const spans: Array<{ readonly start: number; readonly end: number }> = [];
+  for (const { type, offset, length } of entities) {
+    if (!hiddenEntityTypes.has(type)) continue;
+    const end = offset + length;
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length <= 0
+      || end > original.length || !scalarBoundary(offset) || !scalarBoundary(end)) return "";
+    const start = afterCommand(offset), stop = afterCommand(end);
+    if (start < stop) spans.push({ start, end: stop });
+  }
+  if (!spans.length) return normalized;
+  let view = "", cursor = 0;
+  for (const { start, end } of spans.sort((a, b) => a.start - b.start)) {
+    if (end <= cursor) continue;
+    if (start > cursor) view += normalized.slice(cursor, start);
+    const masked = normalized.slice(Math.max(start, cursor), end);
+    if (/[\r\n]/u.test(masked)) view += masked.replace(/[^\r\n]/g, "");
+    else if (view && !/\s$/u.test(view)) view += " ";
+    cursor = end;
+  }
+  view += normalized.slice(cursor);
+  return view.trim() ? view : "";
+}
+
 type Handlers = Parameters<Messenger["start"]>[0];
 type Answer = NonNullable<DialogResponse["answers"]>[number];
 interface Progress {
@@ -226,16 +256,21 @@ export class TelegramMessenger implements Messenger {
     if (message.video_note) add(message.video_note, `video-note-${message.video_note.file_unique_id}.mp4`, "video/mp4");
     const originalText = message.text ?? message.caption ?? "";
     let text = originalText;
-    const entities = message.text === undefined ? message.caption_entities : message.entities;
+    const entities = (message.text === undefined ? message.caption_entities : message.entities) ?? [];
+    let commandSuffix = { start: 0, end: 0 };
     // Telegram offsets/lengths are UTF-16, matching JS slice. Only an actual
     // leading bot_command entity may address this bot; body mentions are text.
-    const entity = entities?.find(value => value.type === "bot_command" && value.offset === 0);
+    const entity = entities.find(value => value.type === "bot_command" && value.offset === 0);
     if (entity && Number.isSafeInteger(entity.length) && entity.length > 0 && entity.length <= text.length &&
       (entity.length === text.length || /\s/.test(text[entity.length]!))) {
       const qualified = /^\/([a-z0-9_]{1,32})@([a-z0-9_]+)$/i.exec(text.slice(0, entity.length));
-      if (qualified) {
-        if (!this.me?.username || qualified[2]!.toLowerCase() !== this.me.username.toLowerCase()) return null;
-        if (COMMAND_NAMES.has(qualified[1]!)) text = `/${qualified[1]}${text.slice(entity.length)}`;
+      const name = qualified?.[1], username = qualified?.[2];
+      if (name && username) {
+        if (!this.me?.username || username.toLowerCase() !== this.me.username.toLowerCase()) return null;
+        if (COMMAND_NAMES.has(name)) {
+          commandSuffix = { start: name.length + 1, end: entity.length };
+          text = `/${name}${text.slice(entity.length)}`;
+        }
       }
     }
     if (!text && files.length === 0) return null;
@@ -248,7 +283,8 @@ export class TelegramMessenger implements Messenger {
       revision = `edit:${message.edit_date}:${hash(JSON.stringify([originalText, fileIdentity]))}`;
     }
     return { id: `telegram:${route.accountId}:${route.channelId}:${message.message_id}:${revision}`, route,
-      messageId: String(message.message_id), text, receivedAt: (message.edit_date ?? message.date) * 1000, attachments: files,
+      messageId: String(message.message_id), text, routingText: routingView(originalText, entities, commandSuffix),
+      receivedAt: (message.edit_date ?? message.date) * 1000, attachments: files,
       ...(reply ? { reply } : {}) };
   }
 

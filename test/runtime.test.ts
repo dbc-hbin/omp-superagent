@@ -5965,6 +5965,39 @@ describe("real Store runtime coordination", () => {
     expect(main.prompts).toEqual([]);
   });
 
+  test("editing lane controls or editing work into controls never dispatches or resumes the lane", async () => {
+    const { runtime, main, store, messenger, directory, hosts } = fixture();
+    const thread = route("81");
+    await runtime.start();
+    await admit(runtime, message("829", thread, `cwd: ${directory}\nInspect the release`));
+    const lane = store.laneForRoute(thread)!;
+    const worker = hosts.get(lane.socketPath)!;
+    const task = message("830", thread, "Inspect the changelog too");
+    await admit(runtime, task);
+    const stop = message("831", thread, "/stop");
+    await admit(runtime, stop);
+    await messenger.whenSent(2);
+    expect(store.lane(lane.id)?.workState).toBe("paused");
+    const originalStops = worker.abortCount;
+    const originalPrompts = worker.prompts.length;
+
+    const status = message("832", thread, "/status");
+    await admit(runtime, status);
+    await messenger.whenSent(3);
+    for (const [id, source, text] of [["stop", stop, "Keep implementing the release"], ["status", status, "Continue the release"],
+      ["resume", stop, "/resume"], ["stop-head", task, "/stop head"]] as const) {
+      const edit = { ...source, id: `${source.id}:edit:${id}`, text };
+      await admit(runtime, edit);
+      expect(store.input(edit.id)).toMatchObject({ route: thread, state: "cancelled" });
+      expect(store.output(`${edit.id}:topic`)).toMatchObject({ route: thread, state: "sent" });
+    }
+    expect(store.lane(lane.id)?.workState).toBe("paused");
+    expect(worker.abortCount).toBe(originalStops);
+    expect(worker.prompts).toHaveLength(originalPrompts);
+    expect(main.prompts).toEqual([]);
+    expect(main.abortCount).toBe(0);
+  });
+
   test("Slack submitted DM handoff preserves original ownership and actual DM threads stay physical", async () => {
     const { runtime, config, store, directory, messenger, main } = fixture();
     config.slack = { botTokenEnv: "TEST_SLACK_BOT_TOKEN", appTokenEnv: "TEST_SLACK_APP_TOKEN", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: [] };
@@ -6109,6 +6142,217 @@ describe("real Store runtime coordination", () => {
     expect(main.responses).toContainEqual({ id: frame.id, response: { cancelled: true } });
     expect(messenger.shown.size).toBe(0);
     expect(store.approvals()).toEqual([]);
+  });
+
+  test.each([
+    ["parent", "no workspace evidence", "What should we check before shipping?"],
+    ["parent", "one known repository name", "Review the client-ui release checklist."],
+    ["parent", "conflicting repository names", "Compare the client-ui and client-api release checklists."],
+    ["DM", "no workspace evidence", "What should we check before shipping?"],
+  ] as const)("an unbound owner %s reaches HEAD with %s", async (scope, evidence, task) => {
+    const { runtime, config, store, main, messenger, directory, launched } = fixture();
+    const destination = scope === "DM" ? route(null, { guildId: null }) : route(null);
+    const first = message("1750000000000000100", destination, task);
+    const second = message("1750000000000000101", destination, "Include the release notes too.");
+    const revision = { ...second, id: `discord:${destination.accountId}:${second.messageId}:edit:1750000001`,
+      text: "Include the client-api release notes too." };
+    const knownNames = evidence === "no workspace evidence" ? [] : ["client-ui", "client-api"];
+    const known = knownNames.map((name, index) => {
+      const cwd = join(directory, name);
+      mkdirSync(cwd);
+      return savedLane(store, { ...config, headCwd: cwd }, name, route(String(51 + index)));
+    });
+    await runtime.start();
+
+    const turns = [
+      [first, "Start with the release checklist."],
+      [second, "Include the release notes."],
+      [revision, "Include the client-api release notes."],
+    ] as const;
+    for (const [index, [input, answer]] of turns.entries()) {
+      await admit(runtime, input);
+      await admit(runtime, input);
+      expect(store.input(input.id)).toMatchObject({
+        target: "main", state: "submitted", route: destination, messageId: input.messageId, text: input.text,
+      });
+      expect(main.prompts).toHaveLength(index + 1);
+      expect(main.prompts[index]?.command.message).toContain(input.text);
+
+      const sent = messenger.whenSent(index + 1);
+      main.complete(answer);
+      await sent;
+      await runtime.kick();
+      expect(store.input(input.id)?.state).toBe("done");
+      expect(store.output(`${input.id}:answer`)).toMatchObject({
+        state: "sent", sourceId: input.id, route: destination,
+        replyTo: { route: destination, messageId: input.messageId }, text: answer,
+      });
+      await admit(runtime, input);
+    }
+
+    expect(main.prompts).toHaveLength(turns.length);
+    expect(messenger.attempted.map(output => output.id)).toEqual(turns.map(([input]) => `${input.id}:answer`));
+    expect(store.lanes().map(lane => lane.id)).toEqual(known.map(lane => lane.id));
+    expect(store.laneForRoute(destination)).toBeNull();
+    expect(messenger.threadSources).toEqual([]);
+    expect(launched).toEqual([]);
+  });
+
+  test.each(["Discord thread", "DM", "Slack question thread"] as const)("%s held at an old implicit workspace question retains its exact source without replay", async kind => {
+    const { runtime, store, main, launched, config, messenger } = fixture();
+    const slack = kind === "Slack question thread";
+    if (slack) config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+    const thread = slack ? route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" })
+      : kind === "DM" ? route(null, { guildId: null, topicId: "old-work" }) : route("50");
+    const original = { ...message("158", thread, "Inspect @previous.txt before release."),
+      messageId: slack ? "1750000000.000001" : "158" };
+    if (kind === "DM") store.setMeta(`dm:active:${physicalRouteKey(thread)}`, "old-work");
+    if (slack) {
+      const send = messenger.send.bind(messenger);
+      messenger.send = async out => { const id = await send(out); return out.id === "158:workspace" ? "1750000001.000002" : id; };
+    }
+    // Persisted 0.1.6 shape before any cwd, native admission or lane existed.
+    store.receive(original, null, { "user-source:158": "true", "topic-owner:158": "lane-legacy", "topic-creator:158": "here" });
+    await runtime.start();
+    await runtime.kick();
+    const question = store.output("158:workspace");
+    if (!question?.remoteId) throw new Error("Missing original workspace question");
+    const destination = slack ? { ...thread, threadId: question.remoteId } : thread;
+    const followup = { ...message("159", kind === "DM" ? route(null, { guildId: null }) : destination, "Use @current.txt."),
+      messageId: slack ? "1750000002.000003" : "159",
+      ...(kind === "Discord thread" ? { reply: { messageId: question.remoteId, text: "", authorId: thread.accountId } } : {}) };
+    await admit(runtime, followup);
+    await admit(runtime, followup);
+    expect(main.prompts).toHaveLength(1);
+    expect(main.prompts[0]?.command.message).toContain("Inspect \\u0040previous.txt before release.");
+    expect(main.prompts[0]?.command.message).not.toContain("@previous.txt");
+    expect(main.prompts[0]?.command.message).toContain(followup.text);
+    expect(store.input(followup.id)).toMatchObject({ target: "main", route: destination, state: "submitted" });
+    expect(store.input(original.id)).toMatchObject({ state: "pending", requestId: null });
+    expect(store.output("159:workspace")).toBeNull();
+    expect(launched).toEqual([]);
+  });
+
+  test("a held workspace selected during lookup is not described as unstarted at HEAD submission", async () => {
+    const entered = Promise.withResolvers<string>(), release = Promise.withResolvers<void>();
+    const { runtime, config, directory, store, main, hosts } = fixture(3, undefined, { topicMemory: {
+      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: false }),
+      search: async query => {
+        entered.resolve(query); await release.promise;
+        return { backend: "mnemopi", query, items: [], count: 0 };
+      },
+    } });
+    const other = savedLane(store, config, "prior", route("52"), process.pid);
+    hosts.set(other.socketPath, new HostTransport(other.sessionFile, "session-prior"));
+    const thread = route("51"), original = message("150", thread, "Inspect the rotating credential cache.");
+    const owner = `lane-${createHash("sha256").update("handoff:150:lane").digest("hex").slice(0, 24)}`;
+    store.receive(original, null, { "user-source:150": "true", "topic-owner:150": owner, "topic-creator:150": "here" });
+    await runtime.start();
+    await runtime.kick();
+    await runtime.receive(message("151", thread, "You decide."));
+    try {
+      expect(await entered.promise).toBe(original.text);
+      await admit(runtime, message("152", thread, `cwd: ${directory}`));
+      expect(store.input("150")?.state).toBe("done");
+    } finally { release.resolve(); }
+    await main.whenPrompts(1);
+    const turn = main.prompts[0]?.command.message;
+    expect(turn).toContain("You decide.");
+    expect(turn).not.toContain(original.text);
+    expect(turn).not.toContain("candidateCount");
+  });
+
+  test("an expired steering lookup cannot skip an earlier standalone HEAD request", async () => {
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const { runtime, config, store, main, hosts, messenger } = fixture(3, undefined, { topicMemory: {
+      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: false }),
+      search: async query => {
+        entered.resolve(); await release.promise;
+        return { backend: "mnemopi", query, items: [], count: 0 };
+      },
+    } });
+    const lane = savedLane(store, config, "context", route("55"), process.pid);
+    hosts.set(lane.socketPath, new HostTransport(lane.sessionFile, "session-context"));
+    await runtime.start();
+    await admit(runtime, headMessage("100", route("51"), "Original HEAD task"));
+    await admit(runtime, headMessage("101", route("52"), "Queued first in another thread"));
+    await runtime.receive(message("102", route("51"), "Check the login parser."));
+    try {
+      await entered.promise;
+      main.complete("First task finished");
+      await messenger.whenSent(1);
+      await runtime.kick();
+    } finally { release.resolve(); }
+    await main.whenPrompts(2);
+    expect(main.prompts[1]?.command.message).toContain("Queued first in another thread");
+    main.complete("Second task finished");
+    await main.whenPrompts(3);
+    expect(main.prompts[2]?.command.message).toContain("Check the login parser.");
+    expect(main.prompts[2]?.command.streamingBehavior).toBeUndefined();
+  });
+
+  test("a slow HEAD routing lookup does not delay an existing thread or reorder HEAD work", async () => {
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const { runtime, config, store, main, hosts } = fixture(3, undefined, { topicMemory: {
+      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: false }),
+      search: async query => {
+        entered.resolve();
+        await release.promise;
+        return { backend: "mnemopi", query, items: [], count: 0 };
+      },
+    } });
+    const lane = savedLane(store, config, "busy-thread", route("50"), process.pid);
+    const worker = new HostTransport(lane.sessionFile, "session-busy-thread");
+    hosts.set(lane.socketPath, worker);
+    await runtime.start();
+    await runtime.receive(message("154", route(null), "Inspect the login parser."));
+    try {
+      await entered.promise;
+      await runtime.receive(headMessage("155", route(null), "Keep HEAD admission order."));
+      await admit(runtime, { ...message("156", lane.route, "503"),
+        reply: { messageId: "5000", authorId: "other", text: "Which HTTP status did you see?" } });
+      expect(worker.prompts).toHaveLength(1);
+      expect(worker.prompts[0]?.command.message).toEndWith("503");
+      expect(main.prompts).toEqual([]);
+    } finally { release.resolve(); }
+    await main.whenPrompts(1);
+    expect(main.prompts[0]?.command.message).toContain("Inspect the login parser.");
+  });
+
+  test("HEAD places an unbound Discord thread's work in that thread, not a sibling with a related task", async () => {
+    const { runtime, config, store, messenger, hosts, directory } = fixture();
+    const sibling = savedLane(store, config, "parser", route("51"));
+    const input = message("160", route("50"), "Check the parser too.");
+    await runtime.start();
+    await admit(runtime, input);
+    const start = { ...selection, sourceId: input.id, title: "Parser", kickoff: "Checking the parser.", cwd: directory };
+    await expect(runtime.startLane({ ...start, destination: route(null) })).rejects.toThrow("original thread");
+    await expect(runtime.messageLane(sibling.id, input.text, input.id)).rejects.toThrow("original thread");
+    const lane = await runtime.startLane(start);
+    await runtime.kick();
+    expect(lane.route).toEqual(input.route);
+    expect(messenger.threadSources).toEqual([]);
+    expect(hosts.get(lane.socketPath)?.prompts).toHaveLength(1);
+    expect(store.input(`handoff:${input.id}:${sibling.id}`)).toBeNull();
+  });
+
+  test("an unbound owner parent's explicit invalid cwd stays on the placement path", async () => {
+    const { runtime, store, main, messenger, directory, launched } = fixture();
+    const parent = route(null);
+    const source = message("1750000000000000102", parent, `cwd: ${join(directory, "not-created")}\nInspect the parser.`);
+    await runtime.start();
+
+    await admit(runtime, source);
+    await admit(runtime, source);
+
+    expect(store.input(source.id)).toMatchObject({ state: "cancelled", target: null, route: parent });
+    expect(store.output(`${source.id}:workspace`)).toMatchObject({
+      state: "sent", sourceId: source.id, route: parent, replyTo: { route: parent, messageId: source.messageId },
+    });
+    expect(messenger.attempted.map(output => output.id)).toEqual([`${source.id}:workspace`]);
+    expect(store.lanes()).toEqual([]);
+    expect(launched).toEqual([]);
+    expect(main.prompts).toEqual([]);
   });
 
   test("ordinary first requests start isolated topic sessions and same-topic followups steer only their own run", async () => {
@@ -7752,21 +7996,181 @@ describe("real Store runtime coordination", () => {
     expect(store.getMeta(`cursor:${physicalRouteKey(dm)}`)).toBe("501");
   });
 
-  test("direct main guild delegation creates one independent thread and preserves submitted ownership", async () => {
-    const { runtime, store, directory, messenger } = fixture();
+  test("HEAD delegates an ordinary parent request once and its work thread owns the follow-up", async () => {
+    const { runtime, store, directory, messenger, main, hosts } = fixture();
     await runtime.start();
-    const original = headMessage("170", route(null));
+    const original = message("170", route(null), "Inspect release validation.");
     await admit(runtime, original);
     const [one, two] = await Promise.all([
       runtime.startLane({ ...selection, sourceId: original.id, title: "Delegation", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory }),
       runtime.startLane({ ...selection, sourceId: original.id, title: "Delegation", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory }),
     ]);
+    await admit(runtime, original);
     expect(one.id).toBe(two.id);
-    expect(messenger.threads).toHaveLength(1);
-    expect(one.route.threadId).toBe("900");
-    expect(store.input(original.id)).toMatchObject({ target: "main", state: "submitted" });
-    expect(store.input("handoff:170:lane")?.target).toBe(one.id);
+    expect(messenger.threads).toEqual([route("900")]);
+    expect(messenger.threadSources).toEqual([original.messageId]);
+    expect(one.route).toEqual(route("900"));
+    expect(store.input(original.id)).toMatchObject({ target: "main", state: "submitted", route: original.route });
+    expect(store.input("handoff:170:lane")).toMatchObject({ target: one.id, route: one.route, messageId: original.messageId });
+    expect(store.ownerSource("handoff:170:lane")?.id).toBe(original.id);
     expect(store.laneForRoute(original.route)).toBeNull();
+    expect(main.prompts).toHaveLength(1);
+    const worker = hosts.get(one.socketPath);
+    if (!worker) throw new Error("Missing delegated work Host");
+    expect(worker.prompts).toHaveLength(1);
+
+    main.complete("");
+    worker.complete("Release validation inspected.");
+    await main.whenPrompts(2); // The manager receives the original delegated report.
+    main.complete("");
+    await runtime.kick();
+    const followup = message("901", one.route, "Check the schema validation too.");
+    await admit(runtime, followup);
+    await admit(runtime, followup);
+    const handoffId = `handoff:${followup.id}:${one.id}`;
+    expect(store.input(handoffId)).toMatchObject({ target: one.id, route: one.route, state: "submitted" });
+    expect(worker.prompts).toHaveLength(2);
+    expect(worker.prompts[1]?.command.message).toContain(followup.text);
+    const delivered = messenger.whenSent(messenger.sent.length + 1);
+    worker.complete("Schema validation checked.");
+    await delivered;
+    await runtime.kick();
+    await admit(runtime, original);
+    await admit(runtime, followup);
+
+    expect(store.output(`${handoffId}:answer`)).toMatchObject({
+      state: "sent", sourceId: followup.id, route: one.route,
+      replyTo: { route: one.route, messageId: followup.messageId }, text: "Schema validation checked.",
+    });
+    expect(messenger.attempted.filter(output => output.sourceId === followup.id).map(output => output.id))
+      .toEqual([`${handoffId}:answer`]);
+    expect(store.lanes().map(lane => lane.id)).toEqual([one.id]);
+    expect(worker.prompts).toHaveLength(2);
+    expect(main.prompts).toHaveLength(2);
+    expect(messenger.threadSources).toEqual([original.messageId]);
+  });
+
+  test("HEAD lookup and pinned context verify the original bot of a receipt-bound manager journal opening", async () => {
+    const { runtime, store, config, directory, main, hosts, messenger } = fixture(3, undefined, { topicMemory: {
+      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: true }),
+      search: async query => ({ backend: "mnemopi", query, items: [], count: 0 }),
+    } });
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: ["3"] };
+    const origin = route(null, { platform: "telegram", accountId: "77", channelId: "3" });
+    let telegramAccount = origin.accountId;
+    messenger.assertRoute = route => {
+      if (route.platform === "telegram" && route.accountId !== telegramAccount) {
+        throw new DeliveryError("Bot account no longer owns this message route", "rejected");
+      }
+    };
+    const openedAt = Date.parse("2026-11-18T12:00:00Z");
+    const original = {
+      ...message("171", origin, "Inspect the release validation bug.\nDo not run orchestrate.\nInvestigate credential rotation."),
+      routingText: "Inspect the release validation bug.\nDo not run orchestrate.\n",
+      reply: { messageId: "169", authorId: "other", text: "Investigate invoice rounding." },
+      receivedAt: openedAt,
+    };
+    await runtime.start();
+    await admit(runtime, original);
+    const lane = await runtime.startLane({ ...selection, sourceId: original.id, title: "Review", destination: route("900"),
+      cwd: directory, kickoff: "I will investigate and verify the defect.", brief: "Inspect escrow balances." });
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath);
+    const opening = worker?.prompts[0];
+    if (!worker || !opening) throw new Error("Missing the original delegated native prompt");
+    expect(containsMagicKeyword(String(opening.command.message), "orchestrate")).toBe(false);
+    const receipts: Record<string, unknown>[] = [];
+    worker.onFrame(frame => { if (frame.type === "prompt_result") receipts.push(frame); });
+    main.complete("");
+    worker.complete("Release validation inspected.");
+    await main.whenPrompts(2); // Settle the opening through the original manager-report path.
+    main.complete("");
+    await runtime.kick();
+    const receipt = receipts[0];
+    if (!receipt) throw new Error("Missing native completion receipt for the delegated opening");
+    const timestamp = new Date(openedAt).toISOString();
+    const writeJournal = (completion: Record<string, unknown>, laterTurns: readonly object[] = []) => writeFileSync(lane.sessionFile, [
+      { type: "session", version: 3, id: worker.state.sessionId, timestamp, cwd: lane.cwd },
+      { type: "message", id: "delegated-owner-opening", parentId: null, timestamp, message: { role: "user", content: opening.command.message } },
+      { type: "custom", customType: "rpc_prompt_result", id: "delegated-completion", parentId: "delegated-owner-opening", timestamp,
+        data: { sessionId: worker.state.sessionId, sessionFile: lane.sessionFile, frame: completion } },
+      ...laterTurns,
+    ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    const advisory = async (id: string, text: string, source = route(null)) => {
+      const next = main.whenPrompts(main.prompts.length + 1);
+      await admit(runtime, { ...message(id, source, text), routingText: text, receivedAt: openedAt + 3_000 });
+      await next;
+      const prompt = String(main.prompts.at(-1)?.command.message);
+      main.complete("");
+      await runtime.kick();
+      return prompt;
+    };
+    writeJournal({ ...receipt, id: "forged-receipt" });
+    expect(await advisory("172", "Check release validation.")).toContain('"candidateCount":0');
+
+    writeJournal(receipt);
+    telegramAccount = "replacement";
+    expect(await advisory("179", "Check release validation.")).toContain('"candidateCount":0');
+    expect(await advisory("180", "Check release validation.", { ...origin, accountId: telegramAccount })).toContain('"candidateCount":0');
+    telegramAccount = origin.accountId;
+    expect(await advisory("173", "Check release validation.")).toContain('"entryId":"delegated-owner-opening"');
+    expect(await advisory("174", "Check credential rotation.")).toContain('"candidateCount":0');
+    expect(await advisory("175", "Check invoice rounding.")).toContain('"candidateCount":0');
+    expect(await advisory("176", "Check escrow balances.")).toContain('"candidateCount":0');
+
+    await admit(runtime, { ...message("901", lane.route, "Resume the release validation bug."), receivedAt: openedAt + 1_000 });
+    expect(worker.prompts).toHaveLength(2);
+    expect(worker.prompts[1]?.command.message).toContain("Owner task (entry delegated-owner-opening, 2026-11-18 UTC): Inspect the release validation bug.");
+    worker.complete("Continued the original task.");
+    await runtime.kick();
+
+    const generated = { ...message("177", route(null), "Check certificate expiry."), receivedAt: openedAt + 2_000 };
+    const headTurn = main.whenPrompts(main.prompts.length + 1);
+    await admit(runtime, generated);
+    await headTurn;
+    await runtime.messageLane(lane.id, [
+      generated.text,
+      "```superagent-runtime-context",
+      `Request ID: handoff:${generated.id}:lane`,
+      `Independent lane ${lane.id}; cwd: ${lane.cwd}`,
+      "Delivery mode: manager handoff.",
+      "```",
+    ].join("\n"), generated.id);
+    const followup = worker.prompts[2];
+    if (!followup) throw new Error("Missing the generated lane_message prompt");
+    const reported = main.whenPrompts(main.prompts.length + 1);
+    main.complete("");
+    worker.complete("Checked expiry.");
+    await reported;
+    main.complete("");
+    await runtime.kick();
+    const generatedReceipt = receipts.find(frame => frame.id === followup.id);
+    if (!generatedReceipt) throw new Error("Missing the generated lane_message completion");
+    const later = new Date(generated.receivedAt).toISOString();
+    writeJournal(receipt, [
+      { type: "message", id: "generated-message", parentId: "delegated-completion", timestamp: later, message: { role: "user", content: followup.command.message } },
+      { type: "custom", customType: "rpc_prompt_result", id: "generated-completion", parentId: "generated-message", timestamp: later,
+        data: { sessionId: worker.state.sessionId, sessionFile: lane.sessionFile, frame: generatedReceipt } },
+    ]);
+    expect(await advisory("178", "Inspect certificate expiry.")).toContain('"candidateCount":0');
+
+    writeJournal(receipt, [
+      { type: "message", id: "another-release-task", parentId: "delegated-completion", timestamp: later,
+        message: { role: "user", content: "Inspect the release validation bug in downstream sync." } },
+    ]);
+    const continuation = { ...message("902", lane.route, "Resume the release validation bug."), receivedAt: openedAt + 4_000 };
+    await admit(runtime, continuation);
+    const question = store.output(`${continuation.id}:workspace`);
+    const number = question?.text.split("\n").find(line => line.endsWith(" · delegated-owner-opening"))?.match(/^\d+/)?.[0];
+    if (!question?.remoteId || !number) throw new Error("Expected a choice with the verified original opening");
+    telegramAccount = "replacement";
+
+    await admit(runtime, { ...message("903", lane.route, number), receivedAt: openedAt + 5_000,
+      reply: { messageId: question.remoteId, authorId: null, text: "choice" } });
+
+    expect(worker.prompts).toHaveLength(3);
+    expect(store.output(`handoff:${continuation.id}:${lane.id}:prior-held`)?.state).toBe("sent");
+    expect(messenger.sent.map(output => output.text).join("\n")).not.toContain("credential rotation");
   });
 
   test("DM head delegation creates an active logical topic and ambiguous guild creation is not retried", async () => {
@@ -7792,6 +8196,96 @@ describe("real Store runtime coordination", () => {
     await expect(runtime.startLane({ ...selection, sourceId: "181", title: "Uncertain", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: directory })).rejects.toThrow("interrupted");
     expect(messenger.threads).toEqual([]);
   });
+
+  test.each([true, false])("a DM HEAD edit reuses its verified first placement (native topic: %s)", async native => {
+    const { runtime, config, directory, messenger, store, main, hosts } = fixture();
+    config.telegram = { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: [] };
+    const dm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
+    const original = message("840", dm, "Review the release gate");
+    const args = { ...selection, sourceId: original.id, title: "Release gate", kickoff: "I will check the release gate.", cwd: directory };
+    const probes: Route[] = [];
+    messenger.canCreateThread = async parent => { probes.push(parent); return native; };
+    await runtime.start();
+    await admit(runtime, original);
+    const lane = await runtime.startLane(args);
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath)!;
+    expect(worker.prompts[0]?.command.message).toContain(original.text);
+    worker.complete("Initial inspection");
+    await runtime.kick();
+    await admit(runtime, message("841", dm, "/new"));
+    const activeTopic = store.getMeta(`dm:active:${physicalRouteKey(dm)}`);
+    const edit = {
+      ...original, id: "840:edit", text: "Check the release checksum as well",
+      reply: { messageId: store.output("841:topic")!.remoteId!, authorId: dm.accountId, text: "" },
+    };
+    await admit(runtime, edit);
+    await worker.whenPrompts(2);
+    const handoffId = `handoff:${edit.id}:${lane.id}`;
+    expect(store.input(edit.id)).toMatchObject({ target: null, state: "done", route: dm, messageId: original.messageId });
+    expect(store.input(handoffId)).toMatchObject({ target: lane.id, route: lane.route, state: "submitted" });
+    expect(store.getMeta(`handoff-source:${handoffId}`)).toBe(edit.id);
+    expect(worker.prompts[1]?.command.message).toContain(edit.text);
+    expect(worker.prompts[1]?.command.message).toContain("Delivery mode: topic reply");
+    expect(main.prompts).toHaveLength(1);
+    await expect(runtime.startLane({ ...args, sourceId: edit.id, destination: { ...dm, threadId: "950" } })).rejects.toThrow("Topic-owned");
+    await expect(runtime.startLane({ ...args, sourceId: `handoff:${original.id}:lane` })).rejects.toThrow("first admitted owner source");
+    expect(probes).toEqual([dm]);
+    expect(messenger.threads).toEqual(native ? [lane.route] : []);
+    expect(store.lanes().map(placed => placed.id)).toEqual([lane.id]);
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe(activeTopic);
+    worker.complete("Checksum verified.");
+    await messenger.whenSent(native ? 4 : 3);
+    await runtime.kick();
+    expect(store.output(`${handoffId}:answer`)).toMatchObject({
+      route: lane.route, sourceId: handoffId, text: "Checksum verified.", state: "sent",
+    });
+    await admit(runtime, edit);
+    expect(worker.prompts).toHaveLength(2);
+  });
+
+  test.each(["before placement", "during topic creation", "during kickoff"] as const)(
+    "a DM edit %s cannot claim an unverified placement or create another topic", async phase => {
+      const { runtime, config, directory, messenger, store, main } = fixture();
+      config.telegram = { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: [] };
+      const dm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
+      const original = message("850", dm, "Inspect the release branch");
+      const args = { ...selection, sourceId: original.id, title: "Release branch", kickoff: "I will inspect the release branch.", cwd: directory };
+      const edit = { ...original, id: "850:edit", text: "Check the diff too" };
+      const reached = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+      const create = messenger.createThread.bind(messenger);
+      let probes = 0;
+      messenger.canCreateThread = async () => { probes++; return true; };
+      if (phase === "during topic creation") messenger.createThread = async (...call) => {
+        reached.resolve();
+        await release.promise;
+        return create(...call);
+      };
+      if (phase === "during kickoff") messenger.beforeSend = async output => {
+        if (output.id !== `${original.id}:kickoff`) return;
+        reached.resolve();
+        await release.promise;
+      };
+      await runtime.start();
+      await admit(runtime, original);
+      const placement = phase === "before placement" ? null : runtime.startLane(args);
+      try {
+        if (placement) await reached.promise;
+        await runtime.receive(edit);
+        expect(store.input(edit.id)).toMatchObject({ route: dm, state: "cancelled" });
+        expect(store.getMeta(`topic-owner:${edit.id}`)).toBeNull();
+        await expect(runtime.startLane({ ...args, sourceId: edit.id })).rejects.toThrow("first admitted owner source");
+        expect(store.output(`${edit.id}:kickoff`)).toBeNull();
+      } finally { release.resolve(); }
+      const lane = await (placement ?? runtime.startLane(args));
+      await admit(runtime, edit);
+      expect(store.output(`${edit.id}:topic`)).toMatchObject({ route: dm, state: "sent" });
+      expect(probes).toBe(1);
+      expect(messenger.threads).toEqual([lane.route]);
+      expect(store.lanes().map(placed => placed.id)).toEqual([lane.id]);
+      expect(main.prompts).toHaveLength(1);
+    },
+  );
 
   test("DM /new without content asks once, survives restart, and never launches an empty model prompt", async () => {
     const { runtime, config, directory, store, main, messenger } = fixture();
@@ -8217,12 +8711,12 @@ describe("real Store runtime coordination", () => {
 });
 
 test("workspace replies cannot place another thread's pending request or revive a stopped one", async () => {
-  const { runtime, store, main, hosts, directory } = fixture();
+  const { runtime, store, main, hosts, directory, messenger } = fixture();
   await runtime.start();
   const a = route("41"), b = route("42");
   const send = async (input: Inbound) => { await runtime.receive(input); await runtime.kick(); };
-  await send({ ...message("410", a), text: "Repair project A" });
-  await send({ ...message("420", b), text: "Repair project B" });
+  await send(message("410", a, "/new Repair project A"));
+  await send(message("420", b, "/new Repair project B"));
   const askA = store.output("410:workspace"), askB = store.output("420:workspace");
   expect(askA?.state).toBe("sent");
   expect(askB?.state).toBe("sent");
@@ -8236,9 +8730,12 @@ test("workspace replies cannot place another thread's pending request or revive 
   await send({ ...message("412", a), text: directory, reply: {
     messageId: askA!.remoteId!, authorId: null, text: "workspace",
   } });
-  const lane = store.laneForRoute(a);
-  expect(lane?.cwd).toBe(directory);
-  expect(hosts.get(lane!.socketPath)?.prompts.map(item => item.command.message)).toEqual([expect.stringContaining("Repair project A")]);
+  const [lane] = store.lanes();
+  if (!lane) throw new Error("The authorized answer did not place project A");
+  expect(lane).toMatchObject({ cwd: directory, route: route("900") });
+  expect(messenger.threadSources).toEqual([undefined]); // A sibling is not nested beneath either source thread.
+  expect(store.ownerSource("handoff:410:lane")?.route).toEqual(a);
+  expect(hosts.get(lane.socketPath)?.prompts.map(item => item.command.message)).toEqual([expect.stringContaining("Repair project A")]);
   expect(store.laneForRoute(b)).toBeNull();
   expect(main.prompts).toEqual([]);
 });
@@ -8447,8 +8944,11 @@ describe("historical continuation in an existing Discord work thread", () => {
   test("a stop during timeout evidence verification cancels placement without an uncertain handoff", async () => {
     const { runtime, config, store, destination, current, worker, messenger } = historyFixture();
     config.idleMs = 60 * 60_000;
-    config.telegram = { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: ["3"] };
-    historicalLane(store, config, { id: "recent", route: route("51", { platform: "telegram", channelId: "3" }), detail: "device-cookie" });
+    config.slack = { botTokenEnv: "TEST_SLACK_BOT_TOKEN", appTokenEnv: "TEST_SLACK_APP_TOKEN",
+      ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CWORK"] };
+    historicalLane(store, config, { id: "recent",
+      route: route("1750000000.000001", { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER",
+        guildId: "TTEAM", channelId: "CWORK" }), detail: "device-cookie" });
     historicalLane(store, config, { id: "older", route: route("52"), detail: "callback-state", at: "2026-11-10T12:00:00Z" });
     messenger.assertRoute = async () => {};
     const clock = spyOn(Date, "now").mockReturnValue(historicalNow);
@@ -8747,8 +9247,8 @@ describe("historical continuation in an existing Discord work thread", () => {
   });
 });
 
-test("ambiguous repository names wait for the owner's choice; a quote or another channel cannot supply it", async () => {
-  const { runtime, store, main, hosts, config, directory } = fixture();
+test("explicit placement with ambiguous repository names waits for the owner's scoped choice", async () => {
+  const { runtime, store, main, hosts, config, directory, messenger } = fixture();
   for (const [id, name, destination] of [
     ["a", "client-ui", route("51")], ["b", "client-api", route("52")],
     ["c", "foreign-repo", route("53", { channelId: "99" })],
@@ -8760,22 +9260,25 @@ test("ambiguous repository names wait for the owner's choice; a quote or another
   await runtime.start();
   const thread = route("54");
   const task = "client-ui랑 client-api의 변경을 비교해줘";
-  await admit(runtime, message("540", thread, task));
+  await admit(runtime, message("540", thread, `/new ${task}`));
   const question = store.output("540:workspace");
   if (!question?.remoteId) throw new Error("An ambiguous repository request was not held for clarification");
   const reply = { messageId: question.remoteId, text: "client-ui", authorId: null };
   await admit(runtime, { ...message("541", thread, "foreign-repo"), reply });
-  expect(store.laneForRoute(thread)).toBeNull();
+  expect(messenger.threads).toEqual([]);
+  expect(store.input("540")?.state).toBe("pending");
   expect(store.input("541")?.state).toBe("cancelled");
   await admit(runtime, { ...message("542", thread, "client-api"), reply });
-  const lane = store.laneForRoute(thread);
-  expect(lane?.cwd).toBe(join(directory, "client-api"));
+  const lane = store.laneForRoute(route("900"));
+  if (!lane) throw new Error("The owner's repository choice did not place the new task");
+  expect(lane.cwd).toBe(join(directory, "client-api"));
   await admit(runtime, { ...message("543", thread, "client-ui"), reply });
   await admit(runtime, { ...message("542", thread, "client-ui"), id: "542:edit", reply });
   expect(store.input("543")?.state).toBe("cancelled");
-  expect(hosts.get(lane!.socketPath)?.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(task)]);
-  await admit(runtime, message("544", route("56"), "Do not use client-api; start a new project"));
+  expect(hosts.get(lane.socketPath)?.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(task)]);
+  await admit(runtime, message("544", route("56"), "/new Do not use client-api; start a new project"));
   expect(store.output("544:workspace")?.state).toBe("sent");
+  expect(messenger.threads).toEqual([lane.route]);
   expect(main.prompts).toEqual([]);
 });
 
@@ -8792,7 +9295,7 @@ test("a reply in a Slack workspace question's thread selects the repository for 
   messenger.createThread = async (route, _title, messageId) => ({ ...route, threadId: messageId ?? null });
   savedLane(store, config, "prior", { ...parent, threadId: "1750000000.000000" });
   await runtime.start();
-  await admit(runtime, message(stamp, parent, "Inspect the failing tests"));
+  await admit(runtime, message(stamp, parent, "/new Inspect the failing tests"));
   expect(store.output(`${stamp}:workspace`)?.remoteId).toBe(question);
   const thread = { ...parent, threadId: question };
   await admit(runtime, message("1750000002.000003", thread, basename(directory)));
@@ -8819,9 +9322,10 @@ test("a new parent request can reuse the replied-to workspace but not its sessio
   expect(store.output("551:workspace")).toBeNull();
   await admit(runtime, { ...message("552", route("55"), "관련 작업 하나 더"),
     reply: { messageId: notice.remoteId, authorId: null, text: directory } });
-  expect(store.output("552:workspace")?.state).toBe("sent");
+  expect(store.input("552")).toMatchObject({ target: "main", state: "submitted", route: route("55") });
+  expect(store.output("552:workspace")).toBeNull();
   expect(store.lanes()).toHaveLength(2);
-  expect(main.prompts).toEqual([]);
+  expect(main.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining("관련 작업 하나 더")]);
 });
 
 test("editing a placed request cannot fork a sibling or move the task into global coordination", async () => {
@@ -8849,8 +9353,8 @@ test("stop selects one pending topic and cannot abort HEAD or another workspace 
   const parent = route(null);
   await runtime.start();
   await admit(runtime, headMessage("440", route("44"), "Coordinate other work"));
-  await admit(runtime, message("441", parent, "First project"));
-  await admit(runtime, message("442", parent, "Second project"));
+  await admit(runtime, message("441", parent, "/new First project"));
+  await admit(runtime, message("442", parent, "/new Second project"));
   await admit(runtime, message("443", parent, "/stop"));
   expect([store.input("441")?.state, store.input("442")?.state]).toEqual(["pending", "pending"]);
   const question = store.output("442:workspace");
@@ -8874,12 +9378,59 @@ test("stop selects one pending topic and cannot abort HEAD or another workspace 
   expect(main.abortCount).toBe(0);
 });
 
-test("a fresh DM reserves one topic before placement, and an edited boundary cannot stop it", async () => {
+test.each(["bare", "exact HEAD source", "exact placement", "stale HEAD source", "exact steering source"] as const)(
+  "stop in a conversation with pending placement and active HEAD selects safely: %s", async address => {
+    const { runtime, store, main, messenger } = fixture();
+    const parent = route(null);
+    const older = headMessage("447", parent, "A completed coordination request");
+    const opening = message("448", parent, "/new Inspect a separate project");
+    const active = headMessage("449", parent, "The current HEAD request");
+    const unrelated = headMessage("450", route("44"), "Keep this different conversation queued");
+    const steering = headMessage("454", parent, "A follow-up shares the current native run");
+    await runtime.start();
+    await admit(runtime, older);
+    main.complete("Completed earlier.");
+    await messenger.whenSent(1);
+    await admit(runtime, opening);
+    await admit(runtime, active);
+    if (address === "exact steering source") {
+      await admit(runtime, steering);
+      expect(store.input(steering.id)?.state).toBe("submitted");
+    }
+    await admit(runtime, unrelated);
+    expect(store.input(opening.id)?.state).toBe("pending");
+    expect(store.input(active.id)?.state).toBe("submitted");
+    expect(store.input(unrelated.id)?.state).toBe("pending");
+    const reference = address === "exact HEAD source" ? active.messageId : address === "stale HEAD source" ? older.messageId
+      : address === "exact steering source" ? steering.messageId
+        : address === "exact placement" ? store.output(`${opening.id}:workspace`)?.remoteId : null;
+    if (address !== "bare" && !reference) throw new Error("Missing exact reply address");
+    const stop = { ...message("453", parent, "/stop"),
+      ...(reference ? { reply: { messageId: reference, authorId: null, text: null } } : {}),
+    };
+    const sent = messenger.whenSent(messenger.sent.length + 1);
+
+    await admit(runtime, stop);
+    await sent;
+
+    expect(store.input(opening.id)?.state).toBe(address === "exact placement" ? "cancelled" : "pending");
+    expect(store.input(active.id)?.state).toBe(address === "exact HEAD source" ? "cancelled" : "submitted");
+    if (address === "exact steering source") expect(store.input(steering.id)?.state).toBe("submitted");
+    expect(store.input(unrelated.id)).toMatchObject({ state: expect.stringMatching(/^(?:pending|submitted)$/) });
+    expect(main.abortCount).toBe(address === "exact HEAD source" ? 1 : 0);
+    expect(messenger.sent.find(output => output.sourceId === stop.id)).toMatchObject({ route: parent,
+      text: address === "exact HEAD source" ? expect.stringContaining("HEAD stop confirmed")
+        : expect.stringContaining(address === "exact placement" ? "작업 배정을 취소했습니다" : "/stop head"),
+    });
+  },
+);
+
+test("an explicit new DM task reserves one topic before placement, and an edited boundary cannot stop it", async () => {
   const { runtime, store, main, messenger, directory, hosts } = fixture();
   const dm = route(null, { guildId: null });
   messenger.canCreateThread = async () => false;
   await runtime.start();
-  await admit(runtime, message("451", dm, "Work on A"));
+  await admit(runtime, message("451", dm, "/new Work on A"));
   await admit(runtime, message("452", dm, "Check a second detail"));
   const topic = store.input("451")?.route;
   expect(topic?.topicId).toBeTruthy();

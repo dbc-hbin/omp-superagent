@@ -78,8 +78,8 @@ Owner controls in chat (not shell commands):
   /compact [instructions]       Compact idle HEAD context, optionally with multiline instructions.
   /cron [help]                  Schedule and manage one-time or recurring jobs in this conversation.
   /new [request], /main         Start a topic or return to the main topic in the owner's DM.
-  /stop [head|LANE_ID]          Stop HEAD work or pause a lane, NOT the service. With no argument, pause
-                                the lane bound to this chat, or stop HEAD work if there is no bound lane.
+  /stop [head|LANE_ID]          Stop work, not the service. Pause the bound lane, or reply to select a
+                                pending placement or active request. Use /stop head for the global stop.
   /resume                       Resume the lane bound to this chat, not HEAD.
   /restart                      Interrupt HEAD work and restart Gateway and HEAD with the same session and
                                 memory profile. Independent lanes stay running; interrupted prompts are not replayed.

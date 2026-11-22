@@ -6,8 +6,9 @@ import { dirname, join } from "node:path";
 import { CURRENT_SESSION_VERSION, type SessionEntry, type SessionHeader, type SessionMessageEntry }
   from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
-import type { Lane } from "../src/contracts";
-import { findPastTopic, pastTopicQuery, readPastTopic, refersToPastTopic } from "../src/topic-history";
+import type { Inbound, Lane } from "../src/contracts";
+import { findPastTopic, findRoutingTopics, pastTopicQuery, readPastTopic, refersToPastTopic, routingExcerpt, routingSubject, transportRoutingProse } from "../src/topic-history";
+import { topicRequest } from "../src/topic-request";
 import { workflowContext } from "../src/workflow";
 
 const rootPaths: string[] = [];
@@ -78,6 +79,30 @@ test("native recall receives the original topical clause, not quoted or unrelate
   expect(pastTopicQuery(text)).toBe(korean);
 });
 
+const pastedShell = [
+  "curl \\",
+  "--header example \\",
+  "Resume the login bug from last week.",
+].join("\n");
+
+test.each([
+  [pastedShell, null],
+  [`${pastedShell}\n${korean}`, korean],
+  ['Resume the "login cache" from last week.', null],
+  ['Resume the "login \\"callback\\" failure" from last week.', null],
+  ["Resume the ``login cache`` from last week.", null],
+  [">>> quoted reply\nResume the login bug from last week.", null],
+] as const)("explicit historical lookup only searches owner prose: %s", (text, expected) => {
+  expect(pastTopicQuery(text)).toBe(expected);
+});
+
+test("held routing excerpts omit every shell continuation and retain the next owner line", () => {
+  const ownerText = "Inspect the rotating credential cache.";
+  const text = `${pastedShell}\n$ git show HEAD |\nread unrelated branch label\n${ownerText}`;
+
+  expect(routingExcerpt(text)).toBe(ownerText);
+});
+
 test("retrieves a dated Korean subject from a stock owner turn with no workspace terms", async () => {
   const makeLane = await fixture();
   const matching = makeLane("older-branch");
@@ -124,6 +149,62 @@ test("a bilingual memory can name a historical turn but is never returned as evi
   expect(matches[0]?.evidence).toContain("rotating credential cache on sign-out");
   expect(matches[0]?.evidence).not.toContain("mnemo-private");
   expect(matches[0]?.evidence).not.toContain("보라색 회전문");
+});
+
+test("an ordinary request finds only direct or recall-corroborated owner tasks", async () => {
+  const makeLane = await fixture();
+  const grounded = makeLane("authorized-credential-cache");
+  const direct = makeLane("named-directly");
+  const unrelated = makeLane("newer-unrelated-task");
+  await writeJournal(grounded, [prompt("Investigate the rotating credential cache on sign-out.")]);
+  await writeJournal(direct, [prompt("보라색 회전문 상태를 확인해줘.")]);
+  await writeJournal(unrelated, [prompt("회전문 상태를 확인해줘.\ngit log -- 보라색 회전문", thisWeek)]);
+
+  const matches = await findRoutingTopics("보라색 회전문을 점검해줘.", [unrelated, grounded, direct], receivedAt, [
+    nicknameRecall,
+    { id: "owner-turn", source: unrelated.sessionFile, content: "보라색 회전문 also means the frosted invoice archive." },
+  ]);
+
+  expect(new Set(matches.map(({ laneId, entryId }) => `${laneId}/${entryId}`))).toEqual(new Set([
+    `${grounded.id}/owner-turn`, `${direct.id}/owner-turn`,
+  ]));
+  expect(matches.find(match => match.laneId === grounded.id)?.evidence).toContain("rotating credential cache on sign-out");
+  expect(matches.find(match => match.laneId === grounded.id)?.evidence).not.toContain("mnemo-private");
+});
+
+test.each([
+  ["owner prose mixed with pasted data",
+    '> billing ledger\n```sh\nnpm run billing-ledger\n```\ngit log -- billing-ledger\n    const billingLedger = null;\n'
+      + 'Check the rotating credential cache. "billing ledger" ``billing ledger``',
+    "Check the rotating credential cache."],
+  ["shell input without owner prose", "git log -- credential-cache\n$ bun run nonce-rollover", null],
+  ["unindented shell continuation data", pastedShell, null],
+  ["a multiline shell string", "printf '%s\\n' 'copied data\nrotate invoice secrets\nmore data'\nInspect callback framing.",
+    "Inspect callback framing."],
+  ["a shell heredoc", "$ cat <<-'PAYLOAD'\n> rotate invoice secrets\n> \tPAYLOAD\nInspect callback framing.",
+    "Inspect callback framing."],
+  ["a Discord quote spanning multiple lines", "Check the rotating credential cache.\n>>> billing ledger\ninvoice rounding",
+    "Check the rotating credential cache."],
+  ["one generic action and one term", "Fix credentials please.", null],
+  ["too many topical terms", `Check the rotating credential cache ${Array.from({ length: 17 }, (_, i) => `component${i}`).join(" ")}`, null],
+  ["an excessive request with a relevant prefix", `Check the rotating credential cache.\n${"x".repeat(4096)}`, null],
+] as const)("builds a bounded routing subject from %s", (_kind, text, expected) => {
+  expect(routingSubject(text)).toBe(expected);
+});
+
+test("pasted shell continuations cannot match a prior task or reopen a legacy excerpt pin", async () => {
+  const lane = (await fixture())("shell-paste");
+  const paste = ["curl \\", "--header example \\", "the login bug"].join("\n");
+  const ownerText = "Inspect invoice rounding.";
+  await writeJournal(lane, [prompt(`${ownerText}\n${paste}`)]);
+  const oldExcerpt = `Owner task (entry owner-turn, 2026-11-12 UTC): ${ownerText} ${paste.replaceAll("\n", " ")}`;
+  const oldHash = createHash("sha256").update(oldExcerpt).digest("hex");
+
+  expect(await findPastTopic(english, [lane], receivedAt)).toEqual([]);
+  expect(await findRoutingTopics("Check the login bug.", [lane], receivedAt)).toEqual([]);
+  expect(await readPastTopic(english, lane, receivedAt, "owner-turn", oldHash)).toBeNull();
+  const matches = await findPastTopic("Resume the invoice rounding.", [lane], receivedAt);
+  expect(matches.map(match => match.evidence)).toEqual([`Owner task (entry owner-turn, 2026-11-12 UTC): ${ownerText}`]);
 });
 
 test("a lexically disjoint native recall can identify a journal turn through a distinctive shared passage", async () => {
@@ -298,6 +379,91 @@ function receipt(lane: Lane, request = "original-owner-input"): SessionEntry {
     customType: "rpc_prompt_result", data: { sessionId: lane.sessionId, sessionFile: lane.sessionFile,
       frame: { id: `sg-${digest}-${lane.generation}`, type: "prompt_result", status: "completed", agentInvoked: true } } };
 }
+
+test("partial Telegram entity formatting cannot expose shell continuation to recall or journal evidence", async () => {
+  const original = (await fixture())("telegram-shell-paste");
+  const lane = { ...original, route: { ...original.route, platform: "telegram" as const } };
+  const ownerText = "Inspect the callback recovery race.";
+  const source: Inbound = {
+    id: "original-owner-input", messageId: "10", route: lane.route, receivedAt: Date.parse(lastWeek),
+    text: `curl \\\nthe login bug\n${ownerText}`, routingText: `\nthe login bug\n${ownerText}`, attachments: [],
+  };
+  const current = "Resume the callback recovery race.";
+  const requestText = topicRequest(transportRoutingProse({
+    ...source, text: `/new curl \\\nthe login bug\n${current}`, routingText: `/new \nthe login bug\n${current}`,
+  })).text;
+  expect(routingSubject(requestText)).toBe(current);
+  expect(pastTopicQuery(requestText)).toBe(current);
+
+  const requestId = `sg-${createHash("sha256").update(source.id).digest("hex").slice(0, 24)}-${lane.generation}`;
+  await writeJournal(lane, [
+    prompt(managedPrompt(lane, source.text)),
+    { ...receipt(lane), parentId: "owner-turn" },
+  ]);
+  const owner = async () => ({ requestId, text: transportRoutingProse(source) });
+  expect(await findPastTopic(english, [lane], receivedAt, [], owner)).toEqual([]);
+  const matches = await findPastTopic(current, [lane], receivedAt, [], owner);
+  expect(matches.map(match => match.evidence)).toEqual([`Owner task (entry owner-turn, 2026-11-12 UTC): ${ownerText}`]);
+});
+
+test.each(["unrelated receipt", "steered user and unrelated receipt", "wrong generation only", "unfenced manager text"] as const)(
+  "a managed opener uses its exact receipt without importing a later checkpoint: %s", async kind => {
+    const lane = { ...(await fixture())("manager-opening"), generation: 2 };
+    const openingInput = "handoff:original-owner-input:lane";
+    const openingDigest = createHash("sha256").update(openingInput).digest("hex").slice(0, 24);
+    const requestId = `sg-${openingDigest}-2`;
+    const envelope = workflowContext([
+      `Request ID: ${openingInput}`,
+      `Independent lane ${lane.id}; cwd: ${lane.cwd}\nDelivery mode: manager handoff.`,
+      "Inspect the invoice calculation.",
+    ].join("\n\n"));
+    const opening = prompt(kind === "unfenced manager text"
+      ? `/workflowz\n\n${envelope}\n\nFix the login bug in the nonce-bound credential callback.` : envelope);
+    const turns = kind === "steered user and unrelated receipt"
+      ? [prompt("Change invoice formatting.", lastWeek, "steered", opening.id)] : [];
+    const unrelated = kind === "wrong generation only" ? receipt({ ...lane, generation: 1 }, openingInput) : receipt(lane, "other-input");
+    await writeJournal(lane, [
+      opening, ...turns,
+      { ...unrelated, id: "other-completion", parentId: turns.at(-1)?.id ?? opening.id },
+      workReport(lane, "Unrelated checkpoint must stay out.", "other-completion"),
+      ...(kind === "wrong generation only" ? [] : [receipt(lane, openingInput)]),
+    ]);
+
+    const matches = await findPastTopic(english, [lane], receivedAt, [], async (_lane, inputId, mode, hasCompletion) =>
+      inputId === openingInput && mode === "manager" && hasCompletion(requestId)
+        ? { requestId, text: "Fix the login bug in the nonce-bound credential callback." } : null);
+
+    const eligible = kind === "unrelated receipt" || kind === "steered user and unrelated receipt";
+    expect(matches.map(match => match.entryId)).toEqual(eligible ? [opening.id] : []);
+    if (eligible) {
+      expect(matches[0]?.evidence).toContain("nonce-bound credential callback");
+      expect(matches[0]?.evidence).not.toContain("Unrelated checkpoint");
+    }
+  },
+);
+
+test.each(["retained prose", "empty prose", "legacy turn"] as const)(
+  "Telegram journal evidence uses only the verified durable text: %s", async kind => {
+    const original = (await fixture())("telegram-owner");
+    const lane = { ...original, route: { ...original.route, platform: "telegram" as const } };
+    const requestId = `sg-${createHash("sha256").update("original-owner-input").digest("hex").slice(0, 24)}-${lane.generation}`;
+    await writeJournal(lane, [
+      prompt(managedPrompt(lane, "Fix the login bug in a Telegram quote with no native delimiter.")),
+      { ...receipt(lane), parentId: "owner-turn" },
+    ]);
+
+    const matches = await findPastTopic(english, [lane], receivedAt, [], async (_lane, _, mode, hasCompletion) =>
+      mode === "topic" && kind !== "legacy turn" && hasCompletion(requestId) ? {
+        requestId, text: kind === "retained prose" ? "Fix the login bug in the account selector." : "",
+      } : null);
+
+    expect(matches.map(match => match.entryId)).toEqual(kind === "retained prose" ? ["owner-turn"] : []);
+    if (kind === "retained prose") {
+      expect(matches[0]?.evidence).toContain("account selector");
+      expect(matches[0]?.evidence).not.toContain("Telegram quote");
+    }
+  },
+);
 
 test("adds an anchored same-request checkpoint during the requested week, without private quote text", async () => {
   const lane = (await fixture())("settled-work");
