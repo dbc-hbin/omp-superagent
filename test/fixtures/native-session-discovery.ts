@@ -19,6 +19,7 @@ const id = session.getSessionId();
 await session.close();
 const before = await fs.readFile(original);
 
+await assert.rejects(() => publishNativeSession(original, cwd, "another-lane"), /different managed session identity/);
 const entry = await publishNativeSession(original, cwd);
 assert(entry);
 assert.equal(path.dirname(entry), SessionManager.getDefaultSessionDir(cwd));

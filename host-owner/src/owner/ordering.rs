@@ -3,6 +3,8 @@ use std::future::ready;
 use super::*;
 use tokio::io::{BufReader, ReadHalf, WriteHalf, split};
 
+mod worker;
+
 pub(super) struct Wire {
     input: BufReader<ReadHalf<UnixStream>>,
     output: WriteHalf<UnixStream>,
@@ -57,6 +59,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_identity(OnceLock::new()).await
+    }
+
+    async fn with_identity(identity: OnceLock<Identity>) -> Self {
         let (native, pump) = Channel::new(Link::Stdio);
         let (control, control_pump) = Channel::new(Link::Control);
         let (observations, queue) = mpsc::channel(OBSERVATION_FRAMES);
@@ -71,7 +77,7 @@ impl Fixture {
                 inventory: None,
             },
             control: OnceLock::from(control.clone()),
-            identity: OnceLock::new(),
+            identity,
             native_pid: 1,
             state: Mutex::default(),
             observations,
@@ -199,6 +205,7 @@ async fn stock_state_cannot_advertise_an_unattested_journal_cursor() {
                 session_file: "/session.jsonl".into(),
                 generation: None,
                 instance_key: None,
+                worker_attempt: None,
                 journal_cursor: false,
             })
             .is_ok()
@@ -245,6 +252,7 @@ async fn journal_cursor_waits_for_durable_observations_and_validates_its_owner()
                 session_file: "/session.jsonl".into(),
                 generation: Some(json!(2)),
                 instance_key: Some(json!("instance")),
+                worker_attempt: None,
                 journal_cursor: true,
             })
             .is_ok()

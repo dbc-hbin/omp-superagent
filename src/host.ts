@@ -3,7 +3,7 @@ import { constants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, type Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import {
   RpcClient,
@@ -14,6 +14,7 @@ import { HostChannel, type HostResponse, type HostState } from "./host-protocol"
 import { requireHostOwner } from "./host-owner-path";
 import { inspectInstalledOmp, resolveOmpCommand } from "./installed-omp";
 import type { DialogResponse, LanePresetSnapshot } from "./contracts";
+import type { WorkerHostProfile } from "./worker-profile";
 import { activeManagedUlw, managedUlwLaunchExtensions, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
 
 const CONNECT_TIMEOUT_MS = 5_000;
@@ -23,6 +24,8 @@ const MAX_PENDING_WRITES = 4096;
 
 export interface HostOptions {
   command: string[];
+  /** Target-owned launch policy, never decoded from an SSH request. */
+  readonly worker?: WorkerHostProfile;
   socketPath: string;
   sessionFile: string;
   cwd: string;
@@ -84,31 +87,32 @@ class SocketProcess implements RpcAgentProcess {
   readonly #pending = new Set<(error: Error) => void>();
   #error = "";
 
-  constructor(readonly socket: net.Socket) {
+  constructor(readonly input: Readable, readonly output: Writable, readonly disconnect: (error?: Error) => void) {
     // Node and Bun publish incompatible getReader overloads for the same WHATWG stream.
-    this.stdout = Readable.toWeb(socket) as unknown as ReadableStream<Uint8Array>;
+    this.stdout = Readable.toWeb(input) as unknown as ReadableStream<Uint8Array>;
     const { promise, resolve } = Promise.withResolvers<number>();
     this.exited = promise;
-    socket.once("close", () => {
+    input.once("close", () => {
       const error = new Error(this.#error || "RPC socket disconnected; request outcome may be unknown");
       for (const reject of this.#pending) reject(error);
       resolve(this.#error ? 1 : 0);
     });
-    socket.on("error", error => { this.#error = error.message; });
+    input.on("error", error => { this.#error = error.message; });
+    if (input !== (output as NodeJS.EventEmitter)) output.on("error", error => { this.#error = error.message; });
     this.stdin = { write: data => this.#write(data) };
   }
 
   peekStderr(): string { return this.#error; }
 
   // RpcClient.stop() is a detach operation for this transport, never a host signal.
-  kill(): void { this.socket.destroy(); }
+  kill(): void { this.disconnect(); }
 
   #write(data: string | Uint8Array): Promise<void> {
-    if (this.socket.destroyed || !this.socket.writable) {
+    if (this.output.destroyed || !this.output.writable) {
       return Promise.reject(new Error("RPC socket is disconnected"));
     }
     const bytes = typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
-    if (this.socket.writableLength + bytes > MAX_PENDING_BYTES || this.#pending.size >= MAX_PENDING_WRITES) {
+    if (this.output.writableLength + bytes > MAX_PENDING_BYTES || this.#pending.size >= MAX_PENDING_WRITES) {
       return Promise.reject(new Error("RPC socket write backlog exceeded its bound"));
     }
     const { promise, resolve, reject } = Promise.withResolvers<void>();
@@ -121,11 +125,11 @@ class SocketProcess implements RpcAgentProcess {
     const timer = setTimeout(() => {
       const error = new Error("RPC socket write timed out; request outcome may be unknown");
       finish(error);
-      this.socket.destroy(error);
+      this.disconnect(error);
     }, CONNECT_TIMEOUT_MS);
     timer.unref();
     this.#pending.add(finish);
-    try { this.socket.write(data, finish); }
+    try { this.output.write(data, finish); }
     catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
     return promise;
   }
@@ -146,7 +150,7 @@ export class HostConnection {
 
   private constructor(transport: SocketProcess) {
     this.exited = transport.exited.then(() => {});
-    this.#channel = new HostChannel(transport.socket, transport.socket);
+    this.#channel = new HostChannel(transport.input, transport.output);
     this.#channel.on("frame", frame => this.#emit(frame));
     this.client = new AdapterClient({ spawn: () => transport });
   }
@@ -164,34 +168,57 @@ export class HostConnection {
     return await HostConnection.#open(socketPath, timeoutMs, "full");
   }
 
+  /** The enrolled worker verifies the Unix endpoint on its host. Check its attestation
+   * again in the native handshake on this exact SSH stream, before sending any input. */
+  static async fromWorker(input: Readable, output: Writable, disconnect: () => void,
+    expected: { pid: number; sessionId: string; sessionFile: string }) {
+    const connection = new HostConnection(new SocketProcess(input, output, disconnect));
+    const timeout = setTimeout(disconnect, CONNECT_TIMEOUT_MS);
+    try {
+      const state = await connection.#handshake();
+      if (state.hostPid !== expected.pid || state.sessionId !== expected.sessionId || state.sessionFile !== expected.sessionFile) {
+        throw new Error("Remote Host identity differs from its worker registration");
+      }
+      await connection.#enableActivityUpdates(state);
+      return connection;
+    } catch (error) {
+      disconnect();
+      await connection.close();
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async #handshake() {
+    await this.client.start();
+    const state = await this.client.getState();
+    if (typeof state.sessionId !== "string" || !state.sessionId ||
+        typeof state.sessionFile !== "string" || !path.isAbsolute(state.sessionFile) ||
+        !Number.isSafeInteger(state.hostPid) || state.hostPid < 1 ||
+        state.adapterProtocol !== "owned-stock-stdio-v1" || !Number.isSafeInteger(state.adapterOwnerPid)
+        || state.adapterOwnerPid < 1) {
+      throw new Error("Endpoint did not identify an owned stock-stdio adapter and persistent OMP session");
+    }
+    return { ...state, sessionFile: state.sessionFile };
+  }
+
   /** Identity is captured once per fresh handshake, never reused across probes. */
   static async #open(socketPath: string, timeoutMs: number, messageUpdates: "full" | "activity-v1") {
     const before = await socketIdentity(socketPath);
     const socket = net.createConnection(socketPath);
-    const transport = new SocketProcess(socket);
+    const transport = new SocketProcess(socket, socket, error => socket.destroy(error));
     const connection = new HostConnection(transport);
     const timeout = setTimeout(() => socket.destroy(new Error("RPC socket connection/identity probe timed out")), timeoutMs);
     timeout.unref();
     try {
-      await connection.client.start();
-      const state = await connection.client.getState();
+      const state = await connection.#handshake();
       const after = await socketIdentity(socketPath);
       if (before.dev !== after.dev || before.ino !== after.ino) {
         throw new Error("RPC socket identity changed while connecting");
       }
-      if (typeof state.sessionId !== "string" || !state.sessionId ||
-          typeof state.sessionFile !== "string" || !path.isAbsolute(state.sessionFile) ||
-          !Number.isSafeInteger(state.hostPid) || state.hostPid! < 1 ||
-          state.adapterProtocol !== "owned-stock-stdio-v1" || !Number.isSafeInteger(state.adapterOwnerPid)
-          || state.adapterOwnerPid < 1) {
-        throw new Error("Endpoint did not identify an owned stock-stdio adapter and persistent OMP session");
-      }
-      if (messageUpdates === "activity-v1") {
-        if (typeof state.loadedSuperkitPath !== "string" || !path.isAbsolute(state.loadedSuperkitPath))
-          throw new Error("Native Host has not verified its omp-superkit extension; stop and start the Host");
-        await connection.#enableActivityUpdates();
-      }
-      return { connection, identity: { pid: state.hostPid, ownerPid: state.adapterOwnerPid,
+      if (messageUpdates === "activity-v1") await connection.#enableActivityUpdates(state);
+      return { connection, state, identity: { pid: state.hostPid, ownerPid: state.adapterOwnerPid,
         sessionId: state.sessionId, sessionFile: state.sessionFile, dev: after.dev, ino: after.ino } };
     } catch (error) {
       await connection.close();
@@ -201,7 +228,9 @@ export class HostConnection {
     }
   }
 
-  async #enableActivityUpdates(): Promise<void> {
+  async #enableActivityUpdates(state: HostState): Promise<void> {
+    if (typeof state.loadedSuperkitPath !== "string" || !path.isAbsolute(state.loadedSuperkitPath))
+      throw new Error("Native Host has not verified its omp-superkit extension; stop and start the Host");
     const capability = await this.request({ type: "get_host_admission", messageUpdateCapability: true });
     if (!capability.success || capability.command !== "get_host_admission") {
       throw new Error("Owned Host could not report its message update capability");
@@ -286,13 +315,15 @@ export async function buildHostArgs(options: HostOptions, configPath = `${option
   return [
     "--mode", "rpc-ui",
     "--session", options.sessionFile, "--cwd", options.cwd,
-    ...(composition?.noExtensions ? ["--no-extensions"] : []),
+    ...(options.worker?.flags ?? []),
+    ...(composition?.noExtensions && !options.worker ? ["--no-extensions"] : []),
     ...extensions.flatMap(extension => ["-e", extension]),
     "--config", configPath,
   ];
 }
 
 function selectManagedUlw(options: HostOptions): string {
+  if (options.worker) return validateManagedUlwPackage(options.worker.managedUlwPath);
   const fixture = options.managedUlwPath ?? options.env[MANAGED_ULW_FIXTURE_ENV];
   const root = options.managedUlwRoot ?? options.env[MANAGED_ULW_FIXTURE_ROOT_ENV];
   return fixture ? validateManagedUlwPackage(fixture) : activeManagedUlw(root ? { root } : {});
@@ -348,6 +379,7 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
   try {
     const initialSettings = options.modelPreset?.preset ?? options.modelSettings;
     await fs.writeFile(configPath, JSON.stringify({
+      ...options.worker?.config,
       task: { maxConcurrency: options.subagentConcurrency },
       goal: { continuationModes: [RPC_GOAL_CONTINUATION_MODE] },
       ...(options.modelPreset ? { modelPresets: { [options.modelPreset.name]: options.modelPreset.preset } } : {}),
@@ -371,16 +403,17 @@ async function launchHost(options: HostOptions): Promise<{ pid: number }> {
       fileURLToPath(new URL("./host-extension.ts", import.meta.url))];
     const composition = await managedUlwLaunchExtensions({ cwd: options.cwd, managedUlwPath,
       extensionPaths, configPath, parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
+      ...(options.worker ? { worker: { extensionPaths: options.worker.extensionPaths } } : {}),
       launchArgs: [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
       env: options.env, bunCommand: [bun, "--no-env-file"] });
-    const { env: _inheritedEnvironment, ...launchOptions } = options;
+    const { env: _inheritedEnvironment, worker: _workerProfile, ...launchOptions } = options;
     const helperPath = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
     const manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath, memoryWriteDir: composition.memoryWriteDir,
       processBackend, helperPath, nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
     // Preparation used to run inside the owner; it shares the same startup budget.
     const deadline = Date.now() + START_TIMEOUT_MS;
     const prepare = Bun.spawn([bun, "--no-env-file", helperPath, "prepare"], {
-      cwd: options.cwd, env: options.env, stdin: new Blob([JSON.stringify(manifest)]), stdout: "pipe", stderr: log.fd,
+      cwd: options.worker ? launchDirectory : options.cwd, env: options.env, stdin: new Blob([JSON.stringify(manifest)]), stdout: "pipe", stderr: log.fd,
       timeout: START_TIMEOUT_MS, killSignal: "SIGKILL",
     });
     const [prepared, code] = await Promise.all([new Response(prepare.stdout).text(), prepare.exited]);

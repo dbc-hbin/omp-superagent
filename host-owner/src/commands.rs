@@ -8,6 +8,7 @@ use crate::{
     owner::{Barrier, GoalResume, Operation, Owner, data},
     projection::MessageUpdates,
     transport::{Channel, Error, LONG_TIMEOUT, Result, new_id},
+    worker_rpc,
 };
 
 struct Command {
@@ -72,6 +73,16 @@ impl Command {
         response.insert("id".to_owned(), json!(self.id));
         peer.send(Value::Object(response))
     }
+
+    fn worker_refusal(&self, peer: &Channel) -> Result<()> {
+        self.respond(
+            peer,
+            json!({
+                "success": false, "code": "worker_rpc_forbidden",
+                "error": "Command or arguments are not allowed on a remote worker Host",
+            }),
+        )
+    }
 }
 
 pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<()> {
@@ -81,6 +92,10 @@ pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<
         .to_owned();
     let id = frame["id"].as_str().map_or_else(new_id, str::to_owned);
     let mut command = Command { frame, id, name };
+    let worker = owner.is_worker();
+    if worker && !worker_rpc::allows(&command.name, &command.frame) {
+        return command.worker_refusal(peer);
+    }
     let mut state = owner.state()?;
     match command.name.as_str() {
         "extension_ui_response" => {
@@ -89,6 +104,9 @@ pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<
                 .iter()
                 .position(|frame| frame["id"].as_str() == Some(&command.id))
             {
+                if worker && !worker_rpc::allows_answer(&command.frame, &state.ui[index]) {
+                    return command.worker_refusal(peer);
+                }
                 owner.native.send(command.frame)?;
                 state.ui.remove(index);
             }

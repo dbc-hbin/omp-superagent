@@ -278,6 +278,19 @@ describe("shared durable bulletin board", () => {
     } finally { db.close(); }
   });
 
+  test("a worker registration cannot grant local board access even when its PID and journal path match", () => {
+    const f = fixture();
+    const sessionFile = f.bind("lane-one", "same-native-id");
+    const ledger = new Database(f.path);
+    try {
+      ledger.query("UPDATE lanes SET remote = ? WHERE id = ?").run(JSON.stringify({
+        workerId: "other-machine", repoId: "a".repeat(64), revision: "b".repeat(40), subdir: "", stateDir: f.directory,
+      }), "lane-one");
+      expect(() => new Board(f.path, { role: "lane", actor: "lane-one", sessionId: "same-native-id" },
+        f.channel, sessionFile)).toThrow(BoardMembershipError);
+    } finally { ledger.close(); }
+  });
+
   test("a historical head session and matching file require current Gateway process ownership on every operation", () => {
     const f = fixture();
     const sessionId = "resumed-head-session";

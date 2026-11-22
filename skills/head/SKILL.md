@@ -39,6 +39,11 @@ an independent conversation.
   unsettled interface, identify the owner and sequence only the conflicting step.
   Give each track its exact workspace, allowed changes, independently checkable
   result, and handoff/gate if another track depends on it.
+- For a new lane with an explicit remote, worker platform, or worker ID request,
+  use `lane_start.placement`. Keep `cwd` a verified local repository directory;
+  remote execution uses only its clean committed revision on an approved paired
+  worker. Never choose an SSH destination yourself or silently replace a
+  remote requirement with local execution. A lane's recorded placement is fixed.
 - Use the original stored source and confirmed destinations. Keep same-topic
   work with its existing lane, but the binding neither forwards nor authorizes
   work; send a scoped `lane_message` explicitly.

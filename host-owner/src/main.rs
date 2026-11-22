@@ -4,6 +4,7 @@ mod owner;
 mod projection;
 mod transport;
 mod wire;
+mod worker_rpc;
 
 use std::{env, path::PathBuf, process::ExitCode};
 

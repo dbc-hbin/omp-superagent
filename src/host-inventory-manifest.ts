@@ -2,13 +2,13 @@ import { dirname, isAbsolute, join } from "node:path";
 import { getDaemonDir, getDaemonRuntimeDir } from "@oh-my-pi/pi-utils/dirs";
 
 /** Resolve read-only inventory metadata under the SDK helper's bootstrapped profile and environment. */
-export async function hostInventoryManifest(processBackend: "daemon" | "broker") {
+export async function hostInventoryManifest(processBackend: "daemon" | "broker", cwd = process.cwd()) {
   try {
     switch (processBackend) {
       case "broker": {
         // Fresh SDK processes can select a different state root after an XDG migration.
         if (process.env.XDG_STATE_HOME) return undefined;
-        const projectRoot = dirname(getDaemonRuntimeDir(process.cwd()));
+        const projectRoot = dirname(getDaemonRuntimeDir(cwd));
         const globalRoot = join(dirname(getDaemonDir()), "daemons", "global");
         return isAbsolute(projectRoot) && isAbsolute(globalRoot)
           ? { backend: "broker", projectRoot, globalRoot } as const : undefined;

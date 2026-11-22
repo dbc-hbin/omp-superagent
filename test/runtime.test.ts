@@ -23,6 +23,8 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../src/contracts
 import { headRecoveryEvidence } from "../src/head-recovery";
 import { decisionId } from "../src/decisions";
 import { CronJobs } from "../src/cron-jobs";
+import { remoteLanePaths } from "../src/worker-wire";
+import type { RemotePlacement, WorkerLaneRef, WorkerRegistration } from "../src/worker-wire";
 
 test("a delayed durable receipt cannot cancel a later native run", () => {
   const owner = { sessionId: "native-session", sessionFile: "/private/session.jsonl", requestId: "original", cursor: null };
@@ -397,7 +399,7 @@ function delegated(store: Store, sourceId: string) {
   return store.input(`handoff:${sourceId}:${lane.id}`);
 }
 
-function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<Pick<RuntimeAdapters, "inspectPresets" | "resolvePreset" | "requestRestart" | "readPrSnapshot" | "readOmpUsage" | "topicMemory">> = {}) {
+function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<RuntimeAdapters> = {}) {
   const directory = realpathSync(mkdtempSync("/tmp/sa-runtime-"));
   const config: Config = {
     path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
@@ -462,6 +464,221 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], ada
   fixtures.push({ runtime, directory });
   return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
 }
+
+describe("remote lane ownership", () => {
+  function remoteFixture(options: { loseOpenAcknowledgement?: boolean; busy?: boolean; stream?: boolean; verifyExit?: boolean } = {}) {
+    let placement: RemotePlacement | undefined;
+    let resident: { ref: WorkerLaneRef; host: HostTransport } | undefined;
+    let availableForPlacement = true;
+    let online = true;
+    let workspaceReady = !options.busy;
+    const lookupWorker = async (stateDir: string, remote: RemotePlacement): Promise<WorkerRegistration> => {
+      if (remote.workerId !== placement?.workerId || remote.stateDir !== join(stateDir, "worker-only"))
+        throw new Error("No enrolled worker owns that placement");
+      return { destination: "test@worker.invalid", identityFile: join(stateDir, "unused-test-identity"),
+        description: { workerId: remote.workerId, platform: "linux", stateDir: remote.stateDir,
+          capacity: 1, active: Number(!!resident), repos: [{ id: remote.repoId, cwd: "/worker/repo" }] } };
+    };
+    const f = fixture(2, undefined, {
+      selectWorkerPlacement: async ({ stateDir }, _cwd, selector) => {
+        if (selector?.target === "local") return null;
+        if (!availableForPlacement) throw new Error("Paired worker no longer accepts new placements");
+        placement = { workerId: "lab", stateDir: join(stateDir, "worker-only"), repoId: "b".repeat(64),
+          revision: "a".repeat(40), subdir: "" };
+        return placement;
+      },
+      lookupWorker,
+      workerPlacementReady: async () => workspaceReady,
+      workerProbe: async (_worker, ref) => {
+        if (!online) throw new Error("Worker is unreachable");
+        if (!resident || resident.ref.laneId !== ref.laneId) return {
+          socket: false, sessionFile: false, pidAlive: false, ownerAlive: false, uncertain: false, pid: null, sessionId: null,
+        };
+        if (ref.generation !== resident.ref.generation) throw new Error("Unverified worker generation");
+        const teardown = options.verifyExit && resident.host.commands.some(command => command.type === "shutdown_host");
+        return { socket: !teardown, sessionFile: true, pidAlive: !teardown, ownerAlive: !teardown, uncertain: false,
+          pid: process.pid, sessionId: resident.host.state.sessionId };
+      },
+      workerOpen: async (worker, ref) => {
+        if (resident) throw new Error("Refusing a second worker owner");
+        const host = new HostTransport(remoteLanePaths(worker.description, ref.laneId).sessionFile, "worker-native-session");
+        host.local = !options.loseOpenAcknowledgement && !options.stream;
+        host.shutdownDisconnect = true;
+        resident = { ref, host };
+        if (options.loseOpenAcknowledgement) {
+          online = false;
+          throw new Error("Lost worker open acknowledgement");
+        }
+        return { pid: process.pid }; // Deliberately also alive on the head.
+      },
+      workerConnect: async (_worker, ref) => {
+        if (!resident || ref.laneId !== resident.ref.laneId || ref.generation !== resident.ref.generation)
+          throw new Error("Worker Host is not the requested owner");
+        return resident.host;
+      },
+    });
+    return {
+      ...f,
+      withdrawPlacement: () => { availableForPlacement = false; },
+      restoreConnection: () => { online = true; },
+      confirmWorkspace: () => { workspaceReady = true; },
+      replaceConnection: async () => {
+        if (!resident) throw new Error("Expected an attached worker Host");
+        const previous = resident.host;
+        const replacement = new HostTransport(previous.state.sessionFile ?? "", previous.state.sessionId);
+        replacement.state = structuredClone(previous.state);
+        resident.host = replacement;
+        await previous.close();
+        return replacement;
+      },
+      workerHost: () => {
+        if (!resident) throw new Error("Expected a resident worker Host");
+        return resident.host;
+      },
+    };
+  }
+
+  test("remote placement cannot drop native tool restrictions from the operator's launch command", async () => {
+    const f = remoteFixture();
+    f.config.command.push("--no-tools");
+    await f.runtime.start();
+    const source = headMessage("worker-restricted", route("32"));
+    await admit(f.runtime, source);
+    await expect(f.runtime.startLane({ ...selection, sourceId: source.id, title: "Restricted work", kickoff: "Check worker policy", cwd: f.directory,
+      placement: { target: "remote" } })).rejects.toThrow("cannot inherit custom head OMP command flags");
+    expect(f.store.lanes()).toHaveLength(0);
+    expect(f.launched).toHaveLength(0);
+  });
+
+  test("a cached remote placement keeps work queued without reserving a generation until preflight is ready", async () => {
+    const f = remoteFixture({ busy: true });
+    await f.runtime.start();
+    const source = headMessage("worker-preflight-held", route("32"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Remote-only work", cwd: f.directory,
+      kickoff: "I will use the designated worker.", placement: { target: "remote" } });
+    await f.runtime.kick();
+    const handoff = `handoff:${source.id}:lane`;
+    expect(f.store.lane(lane.id)).toMatchObject({ generation: 0, runtimeState: "unloaded", remote: { workerId: "lab" } });
+    expect(f.store.input(handoff)?.state).toBe("pending");
+    expect(f.launched).toEqual([]);
+    f.confirmWorkspace();
+    await f.runtime.resume(lane.id);
+    await f.runtime.kick();
+    expect(f.workerHost().prompts).toHaveLength(1);
+    expect(f.store.input(handoff)?.state).toBe("done");
+    expect(f.store.lane(lane.id)).toMatchObject({ generation: 1, sessionId: "worker-native-session" });
+  });
+
+  test("a lost remote open ACK is reconciled at the original generation and routes the original approval", async () => {
+    const f = remoteFixture({ loseOpenAcknowledgement: true });
+    await f.runtime.start();
+    const source = headMessage("worker-ambiguous-open", route(null));
+    await admit(f.runtime, source);
+    const start = { ...selection, sourceId: source.id, title: "Remote work", cwd: f.directory,
+      kickoff: "I will review this in the remote workspace.", placement: { target: "remote", worker: "lab" } as const };
+    const lane = await f.runtime.startLane(start);
+    await f.runtime.kick();
+    const handoffId = `handoff:${source.id}:lane`;
+    expect(f.store.input(handoffId)?.state).toBe("pending");
+    expect(f.store.lane(lane.id)).toMatchObject({ generation: 1, runtimeState: "interrupted", pid: null });
+    f.withdrawPlacement();
+    await f.runtime.startLane(start);
+    await expect(f.runtime.startLane({ ...start, placement: { target: "local" } })).rejects.toThrow("durable placement");
+    f.restoreConnection();
+    await f.runtime.resume(lane.id);
+    await f.runtime.kick();
+    const host = f.workerHost();
+    expect(host.prompts).toHaveLength(1);
+    expect(f.store.lane(lane.id)).toMatchObject({
+      generation: 1, sessionId: "worker-native-session", cwd: f.directory, remote: { workerId: "lab" },
+    });
+    expect(f.launched).toEqual([]);
+    expect(existsSync(dirname(lane.sessionFile))).toBe(false);
+    expect(f.messenger.sent.filter(output => output.id === `${source.id}:kickoff`)).toHaveLength(1);
+    const dialog = { type: "extension_ui_request", id: "worker-confirm", method: "confirm", title: "Proceed?" };
+    host.state.pendingUiRequests = [dialog];
+    host.emit(dialog);
+    await f.messenger.whenApproval();
+    const approval = Array.from(f.messenger.shown.values())[0];
+    if (!approval) throw new Error("Expected approval on the original remote work topic");
+    expect(approval.route).toEqual(lane.route);
+    await f.messenger.handlers?.answer(approval.id, { confirmed: true }, lane.route);
+    expect(host.responses).toEqual([{ id: "worker-confirm", response: { confirmed: true } }]);
+  });
+
+  test.each([false, true])("remote shutdown uses worker exit proof (verified=%s) to release head capacity", async verifyExit => {
+    const f = remoteFixture({ verifyExit });
+    await f.runtime.start();
+    const source = headMessage("worker-release", route("30"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Remote work", cwd: f.directory,
+      kickoff: "I will check this in the remote workspace.", placement: { target: "remote" } });
+    await f.runtime.kick();
+    await f.runtime.closeLane(lane.id, "completed", "Native fixture settled the original request.");
+    expect(f.store.lane(lane.id)?.pid).toBe(verifyExit ? null : process.pid);
+    const next = headMessage("capacity-after-remote", route("31"));
+    await admit(f.runtime, next);
+    const local = await f.runtime.startLane({ ...selection, sourceId: next.id, title: "Local work", cwd: f.directory,
+      kickoff: "I will check the next workspace.", placement: { target: "local" } });
+    await f.runtime.kick();
+    expect(f.store.input(`handoff:${next.id}:lane`)?.state).toBe(verifyExit ? "submitted" : "pending");
+    expect(f.hosts.get(local.socketPath)?.prompts.length ?? 0).toBe(verifyExit ? 1 : 0);
+  });
+
+  test("a lost remote connection preserves the original approval without replaying either queued or submitted work", async () => {
+    const f = remoteFixture({ stream: true });
+    await f.runtime.start();
+    const source = headMessage("worker-disconnect", route("33"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Remote execution", cwd: f.directory,
+      kickoff: "I will inspect the remote workspace.", placement: { target: "remote" } });
+    await f.runtime.kick();
+    const original = f.workerHost();
+    const dialog = { type: "extension_ui_request", id: "original-worker-card", method: "confirm", title: "Proceed?" };
+    original.state.pendingUiRequests = [dialog];
+    original.emit(dialog);
+    await f.messenger.whenApproval();
+    const approval = Array.from(f.messenger.shown.values())[0];
+    if (!approval) throw new Error("Expected the original worker approval");
+    const replacement = await f.replaceConnection();
+    await f.runtime.resume(lane.id);
+    const followup = message("worker-disconnect-later", lane.route, "Continue the original work.");
+    await delegate(f.runtime, followup);
+    await f.messenger.handlers?.answer(approval.id, { confirmed: true }, lane.route);
+    expect(replacement.responses).toEqual([{ id: dialog.id, response: { confirmed: true } }]);
+    expect(f.store.input(`handoff:${source.id}:lane`)?.state).toBe("uncertain");
+    expect(delegated(f.store, followup.id)?.state).toBe("pending");
+    expect(replacement.prompts).toEqual([]);
+    expect(f.store.lane(lane.id)).toMatchObject({ generation: 1, sessionId: "worker-native-session" });
+  });
+
+  test("an indeterminate remote shutdown does not become another idle shutdown request", async () => {
+    const f = remoteFixture();
+    await f.runtime.start();
+    const source = headMessage("worker-shutdown-ambiguous", route("34"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Remote work", cwd: f.directory,
+      kickoff: "I will inspect this in the remote workspace.", placement: { target: "remote" } });
+    await f.runtime.kick();
+    const remote = f.workerHost();
+    const respond = remote.request.bind(remote);
+    remote.request = async (command, id) => {
+      if (command.type !== "shutdown_host") return respond(command, id);
+      remote.commands.push(command);
+      throw new Error("Worker shutdown acknowledgement is unknown");
+    };
+    await f.runtime.closeLane(lane.id, "completed", "The original work is settled.");
+    const next = headMessage("worker-shutdown-waiter", route("35"));
+    await admit(f.runtime, next);
+    await f.runtime.startLane({ ...selection, sourceId: next.id, title: "Local waiter", cwd: f.directory,
+      kickoff: "I will check the next workspace.", placement: { target: "local" } });
+    await f.runtime.kick();
+    expect(remote.commands.filter(command => command.type === "shutdown_host")).toHaveLength(1);
+    expect(f.store.input(`handoff:${next.id}:lane`)?.state).toBe("pending");
+    expect(await f.runtime.inspect(lane.id)).toMatchObject({ queueHolds: { runtimeBlocked: true, remoteShutdown: "awaiting verified exit" } });
+  });
+});
 
 describe("explicit outbound result attachments", () => {
   const originalMessage = (id: string, destination: Route, text: string): Inbound => ({

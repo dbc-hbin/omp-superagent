@@ -25,7 +25,7 @@ const networkGuardFixture = path.resolve(import.meta.dir, "native-extension.ts")
 const reply = "Socket host smoke response";
 
 type Handlers = Parameters<Messenger["start"]>[0];
-class RecordingMessenger implements Messenger {
+export class RecordingMessenger implements Messenger {
   readonly sent: OutputRecord[] = [];
   handlers?: Handlers;
   thread?: ThreadInfo;

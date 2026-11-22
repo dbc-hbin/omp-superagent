@@ -3,6 +3,7 @@ import type { LaneEvidence, LaneReport, LaneWaitTarget } from "./lane-report";
 import type { CronUpdate } from "./cron-jobs";
 import type { GroupReply, GroupRequest } from "./group-policy";
 import type { StagedResultAttachment } from "./result-attachment";
+import type { RemotePlacement } from "./worker-wire";
 
 /** Coordination records only. OMP owns transcripts and execution state. */
 export type Platform = "discord" | "telegram" | "slack";
@@ -152,6 +153,8 @@ export interface Lane {
   route: Route;
   cwd: string;
   repoRoot: string | null;
+  /** Immutable remote ownership; absent for a local lane, including legacy rows. */
+  readonly remote?: RemotePlacement;
   brief: string;
   acceptance: string[];
   /** Null only for pre-selection records awaiting native-state adoption. */

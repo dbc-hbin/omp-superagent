@@ -3,6 +3,7 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { WorkerHostProfile } from "./worker-profile";
 
 const projectRoot = fileURLToPath(new URL("../", import.meta.url));
 const ownership = "omp-superagent-managed-ulw-v1";
@@ -201,14 +202,41 @@ export async function managedUlwLaunchExtensions(options: {
   launchArgs: string[];
   env: Record<string, string | undefined>;
   bunCommand: string[];
+  worker?: Pick<WorkerHostProfile, "extensionPaths">;
 }): Promise<{ extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null }> {
   if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
   const { env, bunCommand, ...input } = options;
-  const output = await run([...bunCommand, fileURLToPath(import.meta.url), "--launch-extensions", JSON.stringify(input)],
-    options.cwd, 30_000, Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)));
+  const output = await run([...bunCommand, ...(input.worker ? ["--no-install"] : []), fileURLToPath(import.meta.url),
+    input.worker ? "--worker-launch-extensions" : "--launch-extensions", JSON.stringify(input)],
+    input.worker ? dirname(options.configPath) : options.cwd, 30_000,
+    Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)));
   const result = output.split("\n").findLast(line => line.startsWith("MANAGED_ULW_LAUNCH "));
   if (!result) throw new Error("Stock OMP discovery did not return a launch composition");
   return JSON.parse(result.slice("MANAGED_ULW_LAUNCH ".length));
+}
+
+if (import.meta.main && process.argv[2] === "--worker-launch-extensions") {
+  const input: {
+    cwd: string; managedUlwPath: string; extensionPaths: string[]; launchArgs: string[];
+    worker: Pick<WorkerHostProfile, "extensionPaths">;
+  } = JSON.parse(process.argv[3] ?? "");
+  const { assertWorkerWorkspaceStartup } = await import("./worker-profile");
+  const { homedir } = await import("node:os");
+  assertWorkerWorkspaceStartup(input.cwd, homedir());
+  const { parseNativeLaunch } = await import("./native-launch-profile");
+  const parsed = await parseNativeLaunch(input.launchArgs);
+  if (!parsed.noExtensions || !parsed.noLsp)
+    throw new Error("Stock worker startup requires explicit extensions and disabled LSP discovery");
+  const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
+  const settings = await Settings.loadReadOnly({ cwd: input.cwd, agentDir: parsed.launchAgentDir, configFiles: parsed.config });
+  const { effectiveManagedMemory, memoryBlockReason } = await import("./managed-memory");
+  const memory = await effectiveManagedMemory(settings, null);
+  if (memory.status !== "enabled") throw new Error(memoryBlockReason(memory));
+  // Do not enumerate ambient packages/hooks for a worker. The operator pins
+  // opt-in modules as files, while managed packages retain their own resources.
+  const managed = validateManagedUlwPackage(input.managedUlwPath);
+  const extensionPaths = [...new Set([...input.extensionPaths, managed, ...input.worker.extensionPaths])];
+  console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ extensionPaths, noExtensions: true, memoryWriteDir: null })}`);
 }
 
 if (import.meta.main && process.argv[2] === "--launch-extensions") {

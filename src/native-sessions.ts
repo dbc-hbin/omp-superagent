@@ -4,9 +4,11 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { readSessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 
 /** Stock OMP follows leaf session links for discovery and writes through them. */
-export async function publishNativeSession(sessionFile: string, cwd: string): Promise<string | undefined> {
+export async function publishNativeSession(sessionFile: string, cwd: string, expectedId?: string): Promise<string | undefined> {
   const info = await readSessionInfo(sessionFile);
   if (!info) return;
+  if (expectedId !== undefined && (info.id !== expectedId || info.cwd !== cwd))
+    throw new Error("Refusing to publish a journal with a different managed session identity");
   const source = await fs.realpath(sessionFile);
   const directory = SessionManager.getDefaultSessionDir(cwd);
   const target = join(directory, `${info.created.toISOString().replace(/[:.]/g, "-")}_${info.id}.jsonl`);

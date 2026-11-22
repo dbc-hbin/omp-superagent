@@ -265,7 +265,7 @@ function activeBranch(entries: readonly SessionEntry[]): readonly SessionEntry[]
 
 /** Reuse OMP's title-slot aware parser and leaf replay without opening an OMP session. */
 async function readJournal(lane: Lane, budget: { remaining: number }): Promise<readonly SessionEntry[] | null> {
-  if (!lane.sessionId || !/^[\w-]+$/.test(lane.id) || lane.id === "main" || !isAbsolute(lane.cwd) || normalize(lane.cwd) !== lane.cwd) return [];
+  if (lane.remote || !lane.sessionId || !/^[\w-]+$/.test(lane.id) || lane.id === "main" || !isAbsolute(lane.cwd) || normalize(lane.cwd) !== lane.cwd) return [];
   const root = dirname(dirname(lane.socketPath));
   const parts = ["sessions", lane.id, "session.jsonl"] as const;
   if (!isAbsolute(root) || lane.socketPath !== join(root, "run", `${lane.id}.sock`) || lane.sessionFile !== join(root, ...parts)) return [];

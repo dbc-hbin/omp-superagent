@@ -77,6 +77,24 @@ controls Host capacity.
 - Before adding an editing lane, use `lane_inspect({})` to check recorded ownership;
   inspect relevant IDs for live state. Compare real paths, common repository,
   worktree, branch, intended files, generated outputs, and shared external targets.
+- `lane_start.placement` selects the execution location for a new lane, not its
+  workspace or messaging destination. Omit it for ordinary local placement or
+  an eligible operator-configured default; `{target: "local"}` opts out of that
+  default. `target: "remote"`, `platform: "linux" | "darwin"`, or an exact paired
+  `worker` ID requires remote placement. Do not combine `target: "local"` with
+  `platform` or `worker`. If the explicit requirement cannot be verified, hold
+  and explain that requirement; do not retry locally or switch the selected
+  worker without authority. An unavailable but matching worker can be recorded
+  as the lane's fixed placement while execution waits for its exact checkout and
+  capacity. Never supply a host, credentials, or SSH command.
+- For remote work, continue resolving `cwd` from local evidence. The worker
+  needs the same approved repository identity and exact committed revision,
+  not a familiar repository name. Tracked, staged, or nonignored untracked
+  changes in the source checkout prevent remote placement. Ignored files,
+  private dependencies and credentials are never transferred; if the task
+  depends on them, do not claim the worker can reproduce it. When a lane
+  already exists, use its recorded placement and worker ID; an unavailable
+  worker is not authorization to move or replay that lane.
 - **Several editing lanes in one Git repository:** When the tracks can proceed
   independently, prefer separate authorized checkouts over forcing serial work in
   one checkout. Reuse suitable authorized checkouts. For new checkouts, use the

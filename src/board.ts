@@ -427,9 +427,11 @@ export class Board {
       generation = Number(currentGeneration?.value ?? "0");
     } else {
       if (!tables.some(table => table.name === "lanes")) throw new BoardMembershipError();
-      const row = this.db.query("SELECT generation, data FROM lanes WHERE id = ?")
-        .get(this.identity.actor) as { generation: number; data: string } | null;
-      if (!row) throw new BoardMembershipError();
+      // A remote PID/file pair can have a local namesake. It cannot grant
+      // membership to a process opening this machine's SQLite board.
+      const row = this.db.query<{ generation: number; data: string; remote?: string | null }, [string]>(
+        "SELECT * FROM lanes WHERE id = ?").get(this.identity.actor);
+      if (!row || row.remote != null) throw new BoardMembershipError();
       const lane = JSON.parse(row.data) as Lane;
       if (lane.id !== this.identity.actor || lane.sessionId !== this.identity.sessionId ||
           canonicalSessionFile(lane.sessionFile) !== this.sessionFile || lane.pid !== process.pid ||

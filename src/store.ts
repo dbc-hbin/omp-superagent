@@ -31,7 +31,7 @@ import {
 import type { ApprovalResolution } from "./contracts";
 import { captureDecision, resolveDecision } from "./decisions";
 import { isLaneModel, laneModelArgument, sameLaneModel } from "./lane-models";
-import { readLaneRows, toLane } from "./lane-rows";
+import { laneData, readLaneRows, toLane, type LaneRow } from "./lane-rows";
 import { workflowChoice } from "./workflow";
 import { laneWaitKey, type LaneReport } from "./lane-report";
 import { existingWorkspace, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
@@ -42,7 +42,7 @@ const ACTIVE_INPUTS = "state IN ('pending','submitted','uncertain')";
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS lanes (
     id TEXT PRIMARY KEY, route_key TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL,
-    data TEXT NOT NULL
+    data TEXT NOT NULL, remote TEXT
   );
   CREATE TABLE IF NOT EXISTS inputs (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
@@ -194,6 +194,8 @@ export class Store implements StorePort {
       db.run("PRAGMA synchronous = FULL");
       db.run("PRAGMA foreign_keys = ON");
       db.run(SCHEMA);
+      const laneColumns = db.query<{ name: string }, []>("PRAGMA table_info(lanes)").all();
+      if (!laneColumns.some(column => column.name === "remote")) db.run("ALTER TABLE lanes ADD COLUMN remote TEXT");
       const outputColumns = db.query("PRAGMA table_info(outputs)").all() as Array<{ name: string }>;
       if (!outputColumns.some(column => column.name === "reply_to")) db.run("ALTER TABLE outputs ADD COLUMN reply_to TEXT");
       if (!outputColumns.some(column => column.name === "picker")) db.run("ALTER TABLE outputs ADD COLUMN picker TEXT");
@@ -604,7 +606,7 @@ export class Store implements StorePort {
         changed = true;
       }
       this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
-        .run(JSON.stringify({ ...lane, observation }), lane.id, generation);
+        .run(laneData({ ...lane, observation }), lane.id, generation);
       this.setMeta(seen, serialized);
       // Topic evidence stays inspectable; only assistant commentary is delivered.
       // Legacy HEAD review needs a new evidence snapshot or waiting transition.
@@ -628,7 +630,7 @@ export class Store implements StorePort {
         || !waiting || waiting.target.kind !== kind || waiting.target.id !== nativeId) return false;
       const resolved = { ...observation, waiting: null };
       this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
-        .run(JSON.stringify({ ...lane, observation: resolved }), lane.id, generation);
+        .run(laneData({ ...lane, observation: resolved }), lane.id, generation);
       // Completion/cancellation of a wait is not evidence of successful work.
       if (!this.topicOwner(input)) this.progress(id, generation, sessionId, `resolved:${JSON.stringify([kind, nativeId, waiting.since])}`, [
         `Native waiting target finished or was cancelled: ${JSON.stringify(waiting.target)}.`,
@@ -928,6 +930,9 @@ export class Store implements StorePort {
         || existing.cwd !== lane.cwd || existing.repoRoot !== lane.repoRoot)) {
         throw new Error("Cannot reuse a lane for a different route or repository");
       }
+      if (existing && !isDeepStrictEqual(existing.remote, lane.remote)) {
+        throw new Error("Cannot reuse a lane with different remote placement");
+      }
       if (existing && (!sameLaneModel(existing.model, lane.model) || existing.modelPreset !== lane.modelPreset
         || !isDeepStrictEqual(existing.modelPresetSnapshot, lane.modelPresetSnapshot))) {
         throw new Error("Cannot reuse a lane with a different model; inspect/adopt legacy native state before reusing it");
@@ -940,10 +945,10 @@ export class Store implements StorePort {
       }
       const selected = existing ?? lane;
       if (!existing) {
-        this.db.query("INSERT INTO lanes(id, route_key, generation, data) VALUES (?, ?, ?, ?)")
-          .run(lane.id, routeKey(lane.route), lane.generation, JSON.stringify({
+        this.db.query("INSERT INTO lanes(id, route_key, generation, data, remote) VALUES (?, ?, ?, ?, ?)")
+          .run(lane.id, routeKey(lane.route), lane.generation, laneData({
             ...lane, model: { provider: lane.model.provider, id: lane.model.id },
-          }));
+          }), lane.remote ? JSON.stringify(lane.remote) : null);
       }
       this.db.query("INSERT INTO lane_sources(source_id, lane_id) VALUES (?, ?)").run(sourceId, selected.id);
       this.db.query("UPDATE inputs SET target = ? WHERE id = ? AND state = 'pending'").run(selected.id, sourceId);
@@ -952,12 +957,12 @@ export class Store implements StorePort {
   }
 
   lane(id: string): Lane | null {
-    const row = this.db.query("SELECT data FROM lanes WHERE id = ?").get(id) as { data: string } | null;
+    const row = this.db.query<LaneRow, [string]>("SELECT data, remote FROM lanes WHERE id = ?").get(id);
     return row ? toLane(row) : null;
   }
 
   laneForRoute(route: Route): Lane | null {
-    const row = this.db.query("SELECT data FROM lanes WHERE route_key = ?").get(routeKey(route)) as { data: string } | null;
+    const row = this.db.query<LaneRow, [string]>("SELECT data, remote FROM lanes WHERE route_key = ?").get(routeKey(route));
     return row ? toLane(row) : null;
   }
 
@@ -976,7 +981,7 @@ export class Store implements StorePort {
         if (patch[key] !== undefined) Object.assign(lane, { [key]: patch[key] });
       }
       return this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
-        .run(JSON.stringify(lane), id, generation).changes === 1;
+        .run(laneData(lane), id, generation).changes === 1;
     }).immediate();
   }
 
@@ -988,7 +993,7 @@ export class Store implements StorePort {
       lane.runtimeState = "starting";
       lane.pid = null;
       this.db.query("UPDATE lanes SET generation = ?, data = ? WHERE id = ?")
-        .run(lane.generation, JSON.stringify(lane), id);
+        .run(lane.generation, laneData(lane), id);
       return lane;
     }).immediate();
   }
@@ -1003,7 +1008,7 @@ export class Store implements StorePort {
       lane.model = { provider: model.provider, id: model.id };
       lane.modelReason = reason;
       return this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?")
-        .run(JSON.stringify(lane), id, generation).changes === 1;
+        .run(laneData(lane), id, generation).changes === 1;
     }).immediate();
   }
 
@@ -1020,7 +1025,7 @@ export class Store implements StorePort {
       lane.modelReason = reason;
       lane.modelPreset = preset;
       lane.modelPresetSnapshot = snapshot === null ? null : structuredClone(snapshot);
-      this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?").run(JSON.stringify(lane), id, generation);
+      this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?").run(laneData(lane), id, generation);
       for (const [key, value] of Object.entries(metadata)) this.setMeta(key, value);
       return true;
     }).immediate();

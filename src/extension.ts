@@ -4,10 +4,11 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { Type } from "@sinclair/typebox";
-import { configuredPlatforms, loadConfigSnapshot } from "./config";
+import { configuredPlatforms, hostPaths, loadConfigSnapshot } from "./config";
 import { createGatewayMessenger } from "./gateway-client";
 import { Superagent } from "./runtime";
 import { Store } from "./store";
+import { lanePlacement } from "./lane-rows";
 import { sameLaneModel } from "./lane-models";
 import { NativePresetManager } from "./native-presets";
 import { publishNativeSession } from "./native-sessions";
@@ -260,6 +261,14 @@ export default function superagentExtension(pi: ExtensionAPI): void {
       modelReason: Type.String({ minLength: 1 }),
       brief: Type.Optional(Type.String()), acceptance: Type.Optional(Type.Array(Type.String())),
       workflow: workflowSchema,
+      placement: Type.Optional(Type.Object({
+        target: Type.Optional(Type.Union([Type.Literal("local"), Type.Literal("remote")])),
+        platform: Type.Optional(Type.Union([Type.Literal("linux"), Type.Literal("darwin")])),
+        worker: Type.Optional(Type.String({ minLength: 1, description: "Exact paired worker ID, never an address or SSH command." })),
+      }, {
+        additionalProperties: false,
+        description: "Execution location for new work at the verified local cwd. Omit for local or an eligible operator-configured default. Remote, platform, or worker requires an approved paired worker and a clean committed Git checkout, with no local fallback. A bound worker can hold execution until ready. Local opts out and cannot be combined with platform or worker.",
+      })),
       appliedTags: Type.Optional(threadTagsSchema),
       destination: Type.Optional(Type.Object({
         platform: Type.Union([Type.Literal("discord"), Type.Literal("telegram"), Type.Literal("slack")]),
@@ -378,9 +387,14 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "lane_inspect", label: "Inspect independent work", approval: "read",
-    description: "List managed lanes or read one lane's native state and durable queue holds. Observation ownership is not Host connectivity. Does not read unrelated OMP sessions.",
+    description: "List managed lanes, their recorded placement and any paired worker ID, or read one lane's native state and durable queue holds. Placement and observation ownership are not Host connectivity. Does not read unrelated OMP sessions.",
     parameters: Type.Object({ id: Type.Optional(Type.String()) }),
-    async execute(_id, params, _signal, _onUpdate, ctx) { return result(await requireRuntime(ctx).inspect(params.id)); },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const inspected = await requireRuntime(ctx).inspect(params.id);
+      return result(Array.isArray(inspected)
+        ? inspected.map(lane => ({ ...lane, placement: lanePlacement(lane) }))
+        : { ...inspected, placement: lanePlacement(inspected) });
+    },
   });
   pi.registerTool({
     name: "lane_message", label: "Message independent work", approval: "exec",
@@ -433,7 +447,12 @@ export default function superagentExtension(pi: ExtensionAPI): void {
         const store = new Store(join(config.stateDir, "coordination.sqlite"));
         let messenger: ReturnType<typeof createGatewayMessenger>;
         try {
-          for (const lane of store.lanes()) await publishNativeSession(lane.sessionFile, lane.cwd);
+          for (const lane of store.lanes()) {
+            if (lane.remote || !lane.sessionId) continue;
+            const { sessionFile } = hostPaths(config, lane.id);
+            if (lane.sessionFile !== sessionFile) throw new Error("Refusing to publish a lane outside its managed session path");
+            await publishNativeSession(sessionFile, lane.cwd, lane.sessionId);
+          }
           messenger = createGatewayMessenger(config);
         } catch (error) {
           store.close();

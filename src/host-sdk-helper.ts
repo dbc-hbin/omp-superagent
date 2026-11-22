@@ -16,6 +16,7 @@ type Manifest = {
 type Exit = {
   readonly pid: number; readonly ownerPid: number; readonly code: number | null; readonly signal: string | null;
   readonly sessionId: string; readonly instanceKey?: string | null; readonly runOrdinal: number;
+  readonly workerAttempt?: string | null;
   readonly observationFailure: boolean; readonly expectedObservations: readonly [string, Frame][];
 };
 
@@ -47,6 +48,7 @@ async function verifyExit({ options }: Manifest, exit: Exit) {
   const receipt = `${options.socketPath}.exit.json`;
   const temporary = `${receipt}.${crypto.randomUUID()}`;
   await writeFile(temporary, JSON.stringify({ pid, ownerPid, sessionId, sessionFile: options.sessionFile, code,
+    ...(exit.workerAttempt ? { workerAttempt: exit.workerAttempt } : {}),
     signal, persisted, observationsFlushed }), { mode: 0o600, flag: "wx" });
   await rename(temporary, receipt);
   if (!persisted || !observationsFlushed) throw new Error("Native exit persistence is unconfirmed");
@@ -66,9 +68,21 @@ async function run(operation: string | undefined, manifest: Manifest, input: unk
       const argv = resolveCliArgv(bootstrap.argv);
       if ("error" in argv) throw new Error(argv.error);
       const parsed = parseArgs(argv.argv.slice(1));
-      const { stat } = await import("node:fs/promises");
-      try { await stat(options.sessionFile); } catch (error) {
+      const { lstat, stat } = await import("node:fs/promises");
+      const expectedWorkerSession = process.env.OMP_SUPERAGENT_WORKER_EXPECTED_SESSION;
+      const missing = await (expectedWorkerSession === undefined ? stat : lstat)(options.sessionFile).then(async info => {
+        if (expectedWorkerSession !== undefined) {
+          const { readSessionHeaderId } = await import("@oh-my-pi/pi-coding-agent/session/session-loader");
+          if (!info.isFile() || !expectedWorkerSession || await readSessionHeaderId(options.sessionFile) !== expectedWorkerSession)
+            throw new Error("Worker journal no longer matches the reserved session");
+        }
+        return false;
+      }, error => {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        if (expectedWorkerSession) throw new Error("Worker cannot recreate a missing reserved session");
+        return true;
+      });
+      if (missing) {
         const { SessionManager } = await import("@oh-my-pi/pi-coding-agent/session/session-manager");
         const session = SessionManager.create(options.cwd, dirname(options.sessionFile));
         try {
@@ -86,7 +100,7 @@ async function run(operation: string | undefined, manifest: Manifest, input: unk
       await publishNativeSession(options.sessionFile, options.cwd);
       const { hostInventoryManifest } = await import("./host-inventory-manifest");
       return { toolsExplicitlySelected: parsed.tools !== undefined, noTools: parsed.noTools === true,
-        inventory: await hostInventoryManifest(manifest.processBackend) };
+        inventory: await hostInventoryManifest(manifest.processBackend, options.cwd) };
     }
     case "inventory": {
       const { projectDir, serviceName } = input as { projectDir?: string; serviceName?: string };

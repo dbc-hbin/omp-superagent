@@ -9,6 +9,7 @@ import { physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, typ
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { Store } from "../src/store.ts";
+import { lanePlacement, readLaneRows } from "../src/lane-rows";
 import { TOPIC_CHOICE_WAIT_MS } from "../src/topic-request";
 import type { LaneReport } from "../src/lane-report";
 import type { HeadRecoveryAttempt } from "../src/contracts";
@@ -840,6 +841,56 @@ describe("durable coordination store", () => {
     expect(store.input("source")?.state).toBe("submitted");
     expect(store.input("source")?.target).toBe(selected.id);
     expect(() => store.createLane(lane("another", route(), { cwd: "/unrelated" }), "source")).toThrow("different route or repository");
+  });
+
+  test("a pre-placement ledger is readable as local before and after migration", () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-superagent-legacy-placement-"));
+    directories.push(directory);
+    const path = join(directory, "coordination.sqlite");
+    const legacy = lane();
+    const db = new Database(path);
+    try {
+      db.run("CREATE TABLE lanes (id TEXT PRIMARY KEY, route_key TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL, data TEXT NOT NULL)");
+      db.query("INSERT INTO lanes (id,route_key,generation,data) VALUES (?,?,?,?)")
+        .run(legacy.id, routeKey(legacy.route), legacy.generation, JSON.stringify(legacy));
+      expect(readLaneRows(db).map(lanePlacement)).toEqual([{ target: "local" }]);
+    } finally { db.close(); }
+
+    const migrated = open(path);
+    expect(migrated.lane(legacy.id)).toEqual(legacy);
+    expect(migrated.nextGeneration(legacy.id)).toMatchObject({ id: legacy.id, generation: 1 });
+  });
+
+  test("remote placement survives generations, writer reopen, route lookup, and read-only status", () => {
+    const { store, path } = fixture();
+    const remote = { workerId: "paired-linux", repoId: "1".repeat(64), revision: "2".repeat(40),
+      subdir: "pkg/docs", stateDir: "/worker/state" };
+    store.receive(inbound("source"), "main");
+    const selected = store.createLane(lane("remote-lane", route(), { remote }), "source");
+    store.nextGeneration(selected.id);
+    store.close();
+    const reopened = open(path);
+    expect(reopened.laneForRoute(selected.route)).toMatchObject({ remote, generation: 1 });
+    const readonly = new Database(path, { readonly: true });
+    try {
+      expect(readLaneRows(readonly).map(lanePlacement)).toEqual([{ target: "remote", ...remote }]);
+    } finally { readonly.close(); }
+  });
+
+  test("lane reuse cannot change the pinned worker or downgrade it to local", () => {
+    const { store } = fixture();
+    const remote = { workerId: "paired-linux", repoId: "1".repeat(64), revision: "2".repeat(40),
+      subdir: "", stateDir: "/worker/state" };
+    store.receive(inbound("source"), "main");
+    const selected = store.createLane(lane("remote-lane", route(), { remote }), "source");
+    store.receive(inbound("new-source"), null);
+
+    expect(() => store.createLane(lane("candidate", route(), {
+      remote: { ...remote, workerId: "other-paired-linux" },
+    }), "source")).toThrow("different remote placement");
+    expect(() => store.createLane(lane("candidate"), "new-source")).toThrow("different remote placement");
+    expect(store.input("new-source")?.target).toBeNull();
+    expect(store.lane(selected.id)?.remote).toEqual(remote);
   });
 
   test("a chosen model and reason survive replays, route reuse, generations, and reopen", () => {

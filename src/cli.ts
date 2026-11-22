@@ -1,12 +1,14 @@
 #!/usr/bin/env -S bun --no-env-file
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { configuredPlatforms, credentialEnvNames, hostPaths, loadConfig, requireMessengerCredentials } from "./config";
 import { inspectInstalledOmp } from "./installed-omp";
 import { requireHostOwner } from "./host-owner-path";
 import { loadCredentials } from "./credentials";
 import type { Lane } from "./contracts";
+import type { HostConnection } from "./host";
 import { readLaneRows } from "./lane-rows";
 
 // Keep Host/SDK imports out of setup, doctor and command registration:
@@ -26,6 +28,8 @@ Usage:
   omp-sa discord-commands --config FILE [--apply]
   omp-sa telegram-commands --config FILE [--language CODE] [--apply]
   omp-sa slack-commands --config FILE --manifest-token-env NAME [--apply]
+  omp-sa worker add user@host [--config FILE] [--default [--local-repo PATH]]
+  omp-sa worker init --head-key PUBLIC_KEY --repo PATH [--repo PATH ...]
 
 Setup and service lifecycle:
   setup creates FILE interactively, or preserves an existing FILE and prompts for its configured credentials.
@@ -67,6 +71,12 @@ slack-commands configures /superagent-* commands through the app manifest; NAME 
 All command registration is read-only by default and requires --apply to change remote configuration. No polling, Socket Mode, or native model session is started.
 Running a Host requires an installed stock OMP with stdio RPC (rpc-ui), session resume, and extensions.
 Same-process native TUI attach is not supported.
+
+Remote workers are opt-in:
+  worker add generates a dedicated private key, prints the target init command, and never starts a bot.
+  worker init on the target authorizes only the restricted worker command for that public key and those Git roots.
+  After verifying the SSH host key separately, rerun worker add to verify and register the worker.
+  FILE defaults to ./config.local.json for worker add. Use --default only to opt into default remote placement.
 
 Owner controls in chat (not shell commands):
   Send /help in Discord or Telegram. In Slack messages replace / with ! (e.g. !help, !status);
@@ -141,12 +151,90 @@ function laneRows(stateDir: string): Lane[] {
   } finally { db.close(); }
 }
 
+async function workerCommand(args: string[]): Promise<void> {
+  const [verb, ...operands] = args;
+  switch (verb) {
+    case undefined:
+    case "--help":
+      if (operands.length === 0) { console.log(HELP); return; }
+      throw new Error("Usage: omp-sa worker --help");
+    case "add": {
+      const usage = "Usage: omp-sa worker add user@host [--config FILE] [--default [--local-repo PATH]]";
+      const [destination, ...flags] = operands;
+      if (!destination || destination.startsWith("-")) throw new Error(usage);
+      let configPath: string | undefined;
+      let localRepo: string | undefined;
+      let preferred = false;
+      for (let index = 0; index < flags.length; index++) {
+        const flag = flags[index];
+        if (flag === "--default" && !preferred) { preferred = true; continue; }
+        const value = flags[index + 1];
+        if (!value || value.startsWith("-")) throw new Error(usage);
+        if (flag === "--config" && !configPath) configPath = value;
+        else if (flag === "--local-repo" && !localRepo) localRepo = value;
+        else throw new Error(usage);
+        index++;
+      }
+      if (localRepo && !preferred) throw new Error(usage);
+      const config = await loadConfig(configPath ?? "config.local.json");
+      const { addWorker } = await import("./worker-registration");
+      const { workerDescribe } = await import("./worker-wire");
+      const result = await addWorker({ destination, stateDir: config.stateDir,
+        ...(preferred ? { defaultRepositoryRoot: localRepo ?? config.headCwd } : {}) }, workerDescribe);
+      console.log(JSON.stringify(result, null, 2));
+      if (result.status === "pending" && result.verificationError) process.exitCode = 1;
+      return;
+    }
+    case "init": {
+      const usage = "Usage: omp-sa worker init --head-key PUBLIC_KEY --repo PATH [--repo PATH ...]";
+      let headKey: string | undefined;
+      const repositories: string[] = [];
+      for (let index = 0; index < operands.length; index += 2) {
+        const [flag, value] = [operands[index], operands[index + 1]];
+        if (!value || value.startsWith("-")) throw new Error(usage);
+        if (flag === "--head-key" && headKey === undefined) headKey = value;
+        else if (flag === "--repo") repositories.push(value);
+        else throw new Error(usage);
+      }
+      if (!headKey || !repositories.length) throw new Error(usage);
+      if (process.platform !== "darwin" && process.platform !== "linux") throw new Error("Worker init requires macOS or Linux");
+      const { workerPublicKey } = await import("./worker-registration");
+      const publicKey = workerPublicKey(headKey);
+      const { enrollWorker } = await import("./worker-enrollment");
+      const { activeManagedUlw } = await import("./managed-ulw");
+      await requireHostOwner();
+      activeManagedUlw();
+      const { executable } = await inspectInstalledOmp(["omp"]);
+      const { workerId, stateDir, repos, capacity } = await enrollWorker({ home: homedir(), headKey: publicKey, repositories, executable });
+      console.log(JSON.stringify({ status: "initialized", workerId, stateDir, repos, capacity }, null, 2));
+      return;
+    }
+    case "serve": {
+      const [flag, path] = operands;
+      if (operands.length !== 2 || flag !== "--policy" || !path || !isAbsolute(path) ||
+          process.env.SSH_ORIGINAL_COMMAND !== "omp-sa-worker-v1")
+        throw new Error("Worker serve requires the enrolled SSH forced command");
+      const { readWorkerPolicy } = await import("./worker-enrollment");
+      const policy = readWorkerPolicy(homedir(), path);
+      const { serveWorker } = await import("./worker-service");
+      await serveWorker(policy);
+      return;
+    }
+    default:
+      throw new Error("Usage: omp-sa worker add|init (see omp-sa worker --help)");
+  }
+}
+
 export async function main(args = process.argv.slice(2)): Promise<void> {
+  if (args[0] === "worker") { await workerCommand(args.slice(1)); return; }
   if (!args.length || args.includes("--help") || args[0] === "help") { console.log(HELP); return; }
   const [command] = args;
   if (!["setup", "start", "install", "uninstall", "status", "group", "stop", "doctor", "discord-commands", "telegram-commands", "slack-commands"].includes(command!)) throw new Error(`Unknown command: ${command}`);
   const configAt = args.indexOf("--config");
   if (configAt < 0 || !args[configAt + 1]) throw new Error("--config FILE is required");
+  if (command === "stop" && !((configAt === 1 && args.length === 3) ||
+      (configAt === 2 && args.length === 4 && !args[1]?.startsWith("-"))))
+    throw new Error("Usage: omp-sa stop [main|LANE_ID] --config FILE");
   if (command === "install" || command === "uninstall") {
     if (args.length !== 3 || configAt !== 1 || args[2]!.startsWith("-"))
       throw new Error(`Usage: ${command} --config FILE`);
@@ -205,7 +293,6 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   const target = args[1] && !args[1]!.startsWith("-") ? args[1]! : "main";
-  const paths = hostPaths(config, target);
   if (command === "doctor") {
     const { requireGateway } = await import("./gateway-native");
     const { inspectManagedMemory, memoryBlockReason } = await import("./managed-memory");
@@ -228,21 +315,24 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (command === "status") {
     const { gatewayStatus } = await import("./gateway-protocol");
     const { autostartStatus } = await import("./autostart");
+    const { listWorkers } = await import("./worker-registration");
+    const { lanePlacement } = await import("./lane-rows");
     console.log(JSON.stringify({
       gateway: await gatewayStatus(config),
       autostart: await autostartStatus(config),
       main: { socketPath: hostPaths(config, "main").socketPath },
+      workers: listWorkers(config.stateDir).map(({ destination, description, defaultRepository }) =>
+        ({ destination, ...description, default: !!defaultRepository, ...(defaultRepository ? { defaultRepository } : {}) })),
       lanes: laneRows(config.stateDir).map(l => ({
         id: l.id, title: l.title, cwd: l.cwd, workState: l.workState,
         model: l.model, modelReason: l.modelReason, modelPreset: l.modelPreset,
         recordedRuntimeState: l.runtimeState, sessionId: l.sessionId, socketPath: l.socketPath,
+        placement: lanePlacement(l),
       })),
-      note: "Gateway/head readiness is live when the Gateway is reachable; lane records are not a completion guarantee.",
+      note: "Gateway/head readiness is live when reachable. Lane records are not a completion guarantee; workers are last verified, not live probes.",
     }, null, 2));
     return;
   }
-  if (target !== "main" && !laneRows(config.stateDir).some(l => l.id === target))
-    throw new Error("Unknown managed lane");
   if (command === "stop") {
     if (target === "main") {
       const { stopGateway } = await import("./gateway-native");
@@ -250,16 +340,36 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       console.log("Gateway and supervised main host accepted graceful shutdown.");
       return;
     }
-    const { connect } = await import("./host");
-    const host = await connect(paths.socketPath);
+    const lane = laneRows(config.stateDir).find(record => record.id === target);
+    if (!lane) throw new Error("Unknown managed lane");
+    const remote = lane.remote;
+    let host: HostConnection;
+    if (remote) {
+      const { lookupWorker, remoteLanePaths, workerConnect, workerRef } = await import("./worker-wire");
+      const paths = remoteLanePaths(remote, lane.id);
+      if (lane.pid === null || !lane.sessionId || lane.sessionFile !== paths.sessionFile || lane.socketPath !== paths.socketPath)
+        throw new Error("Remote lane has no recorded Host identity eligible for shutdown");
+      host = await workerConnect(await lookupWorker(config.stateDir, remote), workerRef(lane));
+    } else {
+      const { connect } = await import("./host");
+      host = await connect(hostPaths(config, target).socketPath);
+    }
     try {
+      if (remote) {
+        const state = await host.client.getState();
+        if (state.hostPid !== lane.pid || state.sessionId !== lane.sessionId || state.sessionFile !== lane.sessionFile)
+          throw new Error("Remote Host identity no longer matches the recorded lane; shutdown was not sent");
+      }
       const response = await host.request({ type: "shutdown_host" });
       if (!response.success) throw new Error(response.error ?? "Host refused shutdown");
       console.log(`Host ${target} accepted graceful shutdown.`);
     } finally { await host.close(); }
     return;
   }
-  if (target !== "main") throw new Error("start only activates the Gateway/main service; lanes remain head-owned");
+  if (target !== "main") {
+    if (!laneRows(config.stateDir).some(lane => lane.id === target)) throw new Error("Unknown managed lane");
+    throw new Error("start only activates the Gateway/main service; lanes remain head-owned");
+  }
   loadCredentials(config);
   // Only pass validated messenger credentials to the native launcher.
   requireMessengerCredentials(config);

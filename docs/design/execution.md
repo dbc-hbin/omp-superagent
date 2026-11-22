@@ -16,6 +16,25 @@ do not isolate shared refs, services or integration effects.
 
 ### Management tools
 
+**Remote placement.** The head may bind a new lane to a verified SSH worker.
+The durable binding includes the target enrollment, repository identity, revision
+and subdirectory. Admission, approvals and messenger delivery remain head-owned;
+the worker launches the stock Host and owns its Unix socket, processes and native
+journal. An SSH disconnect is client detach, not cancellation, an exit receipt,
+or authority to reassign work. Open and attachment are separate from sending
+the first input. A pending or ambiguous launch must be reconciled on that
+worker, never retried on another machine. Remote PIDs and session paths are not
+local filesystem or board identities. See [worker enrollment](../../README.md#add-a-remote-worker).
+
+Only an operator-approved head checkout may use a default worker implicitly;
+Git origin and commit identify compatible contents, not permission to send a
+task. Worker verification must not execute checkout-configured Git filters.
+The remote native owner accepts only session-bound control, inspection and
+ordinary prompts, not the full stock RPC surface. In particular, callers
+cannot use attach to choose a different session or invoke native shell commands.
+The target account and its explicitly approved extensions remain trusted;
+OpenSSH command restrictions are not an OS sandbox for native agent tools.
+
 The [head extension](../../src/extension.ts) restricts manager tools to
 the managed root. Use live tool schemas for arguments and [head role
 references](../../skills/head/SKILL.md) for operating policy.

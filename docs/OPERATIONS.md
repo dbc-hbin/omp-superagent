@@ -1326,6 +1326,16 @@ bun --no-env-file src/cli.ts uninstall --config config.local.json
 
 ## 6. 개발자 검증
 
+원격 등록·레인 제어는 [워커 추가 절차](../README.ko.md#원격-워커-추가)로 설정한다.
+OpenSSH 클라이언트·서버와 stock OMP가 설치되어 있으면 아래 명령으로 별도 머신 없이
+등록 → 원격 시작 → 연결 해제/재접속 → 후속 메시지와 답변 → 종료를 시험할 수 있다.
+임시 HOME과 전용 키, 루프백 `sshd`, 오프라인 모델을 사용한다. 실제 테일넷 연결이나
+메신저 계정은 검사하지 않는다.
+
+```sh
+OMP_SUPERAGENT_WORKER_SSH_TEST=1 bun test test/native-worker-ssh.test.ts
+```
+
 일반 회귀는 `bun run check`와 `bun test test`(`bun run test`와 같음)로 실행한다.
 기본 테스트는 opt-in native/PTY 시나리오를 제외한다. `.upstream`까지 탐색하는 인수 없는
 `bun test`로 대체하지 않는다. 설치 OMP와 ULW가 준비된 checkout의 `bun run test:ci`는

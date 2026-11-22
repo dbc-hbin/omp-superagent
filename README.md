@@ -200,6 +200,9 @@ CLI with automatic `.env` loading disabled.
 
 ### 2. Configure
 
+For optional remote execution, configure the head normally, then follow
+[Add a remote worker](#add-a-remote-worker). The worker does **not** need a messenger setup.
+
 Prepare your platform apps using the [operations guide](docs/OPERATIONS.md#2-플랫폼별-앱과-접근-범위),
 then run:
 
@@ -270,6 +273,64 @@ not managed-Host attachment or a manager/board permission grant. See
 For status, shutdown, macOS login startup, and recovery, use the
 [operations guide](docs/OPERATIONS.md). Login startup is a one-shot launch, not a
 crash supervisor; Linux service installation is not provided.
+
+## Add a remote worker
+
+Use this when the head should open an ordinary lane on another machine, for example
+when you say **“test this repository on Linux.”** Only the head needs messenger
+credentials. Use a build with `omp-sa worker` on **both** machines (for an unreleased
+checkout, use the source installation above, not an older npm release).
+
+1. **On the worker:** install Git, Bun, stock OMP and `omp-superagent` as above.
+   Configure the worker account's own OMP provider access and enable its native
+   memory backend (for example `omp config set memory.backend mnemopi` if none
+   is enabled). Prepare a dedicated clean clone of the same Git repository
+   **at the requested commit**. Enable **OpenSSH
+   server** for this account over your private network (e.g. a tailnet). The
+   endpoint must enforce OpenSSH `authorized_keys` forced commands; Tailscale
+   SSH's own login policy is not a substitute. No public port, second head,
+   `omp-sa setup` or `omp-sa start` is needed on the worker.
+2. **On the head:** verify the worker's SSH host-key fingerprint with its operator
+   and trust it in the head account's `known_hosts`. Use a directly resolvable DNS
+   name/IP, not a nickname from `~/.ssh/config`. Create the enrollment:
+   ```sh
+   omp-sa worker add dev@linux-box --config ./config.local.json
+   ```
+3. **On the worker, as `dev`:** run the `worker init` command printed in step 2.
+   Keep its generated **public** head key and replace the example repository path:
+   ```sh
+   omp-sa worker init --head-key 'ssh-ed25519 …' --repo "$HOME/src/my-app"
+   ```
+   This authorizes a dedicated forced-command key in that account's
+   `~/.ssh/authorized_keys`. Do not copy the head's private key, bot tokens or
+   configuration. Use a dedicated OS account if the worker should not have access
+   to your other files: an OMP lane runs tools as the worker user, not in a sandbox.
+4. **Back on the head:** repeat the same `worker add` command. Enrollment is complete
+   when the head reports **`verified`**, not when it prints the initial pairing
+   instructions. To prefer this worker for one **specific head checkout**,
+   repeat `worker add` with `--default --local-repo /path/on/head/my-app`.
+   Omitting `--local-repo` uses the configured `headCwd`. Other checkouts with
+   the same Git origin do not inherit permission to send ordinary tasks there.
+
+Now ask for a remote lane or name the required platform in chat. Superagent matches
+the repository by Git origin, not folder name; local edits and ignored files are
+not synchronized. Start with a clean, committed source tree. The worker reserves
+its checkout for one resident lane; it does not fetch, switch branches, or discard
+edits. Follow-ups stay on the same worker and native session; disconnecting SSH
+does not stop that Host. A cold reopen is held if the checkout has changed.
+Chat replies and approval cards use the original route; messenger file transfer
+and access to the head's local SQLite board are not provided across SSH.
+Remote lanes require the normal stock OMP command without extra head-side flags:
+custom tool/profile/approval flags are never silently removed to run remotely.
+Use a dedicated worker OMP profile without ambient plugins. Worker startup
+rejects project execution configuration (such as `.omp/`, `.env` or Git filter
+drivers), linked worktrees and submodules rather than loading or rewriting
+them. An operator who needs a custom model extension can list its trusted,
+absolute module path in a private `worker-extensions.json` array in the worker's
+OMP agent directory (`0600`, outside enrolled checkouts).
+Check `omp-sa status --config ./config.local.json` for the saved placement.
+To revoke new SSH connections, remove **only this enrollment's key** on the
+worker. That is not a stop command for an already running lane.
 
 ## Working from chat
 

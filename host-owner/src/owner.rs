@@ -92,6 +92,7 @@ struct Identity {
     session_file: String,
     generation: Option<Value>,
     instance_key: Option<Value>,
+    worker_attempt: Option<String>,
     journal_cursor: bool,
 }
 
@@ -265,6 +266,12 @@ impl Owner {
         self.control.get().ok_or(Error::Unavailable(
             "Native lifecycle control is unavailable",
         ))
+    }
+
+    pub(crate) fn is_worker(&self) -> bool {
+        self.identity
+            .get()
+            .is_some_and(|identity| identity.worker_attempt.is_some())
     }
 
     pub(crate) fn observations_known(&self, state: &State) -> bool {
@@ -561,6 +568,7 @@ impl Owner {
             || owned["hostPid"].as_u64() != Some(u64::from(self.native_pid))
             || owned.get("generation") != identity.generation.as_ref()
             || owned.get("instanceKey") != identity.instance_key.as_ref()
+            || owned["workerAttempt"].as_str() != identity.worker_attempt.as_deref()
         {
             return Err(Error::Unavailable("Native identity/generation changed"));
         }
@@ -633,6 +641,9 @@ impl Owner {
         // Only publish the capability attested by this owner's private launch control.
         native.remove("journalCursorControlVersion");
         native.remove("journalCursorVersion");
+        if identity.worker_attempt.is_none() {
+            native.remove("workerAttempt");
+        }
         native.insert("adapterOwnerPid".to_owned(), json!(std::process::id()));
         native.insert("adapterProtocol".to_owned(), json!("owned-stock-stdio-v1"));
         if identity.journal_cursor {
@@ -806,13 +817,24 @@ pub(crate) async fn run(path: PathBuf) -> anyhow::Result<ExitCode> {
             && manifest.helper_path.is_absolute(),
         "Owner manifest paths must be absolute"
     );
+    // For an enrolled worker the stock CLI receives --cwd explicitly. Start
+    // its runtime in private state so eager loader inputs aren't taken from
+    // the checkout before OMP can apply the worker launch policy.
+    let bootstrap_cwd = if env::var_os("OMP_SUPERAGENT_WORKER_ATTEMPT").is_some() {
+        manifest
+            .config_path
+            .parent()
+            .context("Missing worker launch directory")?
+    } else {
+        &options.cwd
+    };
     let helper = Helper {
         bun: env::var_os("OMP_SUPERAGENT_BUN")
             .filter(|value| !value.is_empty())
             .context("Bun helper executable is unavailable")?,
         script: manifest.helper_path.clone(),
         manifest: path,
-        cwd: options.cwd.clone(),
+        cwd: bootstrap_cwd.to_path_buf(),
         inventory,
     };
     let (program, prefix) = options
@@ -822,7 +844,7 @@ pub(crate) async fn run(path: PathBuf) -> anyhow::Result<ExitCode> {
     let mut child = Command::new(program)
         .args(prefix)
         .args(&manifest.args)
-        .current_dir(&options.cwd)
+        .current_dir(bootstrap_cwd)
         .env("OMP_SUPERAGENT_HOST_SOCKET", &options.socket_path)
         .env("OMP_SUPERAGENT_NATIVE_SOCKET", &manifest.native_socket)
         .env("OMP_SUPERAGENT_HOST_CONFIG", &manifest.config_path)
@@ -978,6 +1000,17 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
             == Some(manifest.options.managed_ulw_path.as_path()),
         "Native session did not confirm loading the selected omp-superkit package"
     );
+    let worker_attempt = env::var("OMP_SUPERAGENT_WORKER_ATTEMPT").ok();
+    if worker_attempt.is_some() {
+        ensure!(
+            identity["workerCwd"].as_str().map(Path::new) == Some(manifest.options.cwd.as_path()),
+            "Worker native session did not enter its reserved checkout"
+        );
+    }
+    ensure!(
+        identity["workerAttempt"].as_str() == worker_attempt.as_deref(),
+        "Native worker launch attempt identity mismatch"
+    );
     owner
         .identity
         .set(Identity {
@@ -988,6 +1021,7 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
             session_file: manifest.options.session_file.clone(),
             instance_key: identity.get("instanceKey").cloned(),
             generation: identity.get("generation").cloned(),
+            worker_attempt,
             journal_cursor: identity["journalCursorControlVersion"].as_u64() == Some(1),
         })
         .map_err(|_| anyhow::anyhow!("Duplicate native launch identity"))?;
@@ -1045,6 +1079,7 @@ struct ExitObservation<'a> {
     owner_pid: u32,
     session_id: &'a str,
     instance_key: Option<&'a Value>,
+    worker_attempt: Option<&'a str>,
     code: Option<i32>,
     signal: Option<&'static str>,
     expected_observations: Vec<(&'a str, &'a Value)>,
@@ -1087,6 +1122,7 @@ async fn exit(
                 owner_pid: std::process::id(),
                 session_id: &identity.session_id,
                 instance_key: identity.instance_key.as_ref(),
+                worker_attempt: identity.worker_attempt.as_deref(),
                 code: status.code(),
                 signal: signal(status),
                 expected_observations: observations

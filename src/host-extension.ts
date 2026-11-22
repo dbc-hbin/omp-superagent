@@ -64,6 +64,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
   let runOrdinal = 0;
   let instanceKey: string | undefined;
   const selectedSuperkit = process.env[MANAGED_ULW_ENV];
+  const workerAttempt = process.env.OMP_SUPERAGENT_WORKER_ATTEMPT;
   let loadedSuperkitPath: string | undefined;
   type ServiceStart = {
     readonly name: string; readonly scope: UnitScope; readonly owner: string;
@@ -137,6 +138,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
   };
   const ownerIdentity = ({ id, file, ref, session }: ReturnType<typeof exact>) => ({
     hostPid: process.pid, sessionId: id, sessionFile: file, generation: ref.generation, instanceKey: session.instanceKey,
+    ...(workerAttempt ? { workerAttempt, workerCwd: context?.cwd } : {}),
   });
   const snapshot = () => {
     const { session } = exact();
