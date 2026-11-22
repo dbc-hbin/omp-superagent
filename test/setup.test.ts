@@ -362,6 +362,23 @@ describe("effective native memory configuration", () => {
     expect(result.result).toEqual({ memory: { status: "unknown" }, updated: false });
   }, 30_000);
 
+  test.each(["enabled", "disabled"])("unreadable native project settings only block fallback for an enabled provider (%s)", async provider => {
+    const original = provider === "disabled"
+      ? { memory: { backend: "off" }, disabledProviders: ["native"] }
+      : { memory: { backend: "off" } };
+    const result = await nativeMemoryCase(`
+      await writeConfig(${JSON.stringify(original)});
+      await mkdir(join(getProjectAgentDir(cwd), "settings.json"), { recursive: true });
+    `);
+    if (provider === "disabled") {
+      expect(result.result).toMatchObject({ memory: { status: "enabled", backend: "mnemopi" }, updated: true });
+      expect(result.disk).toEqual({ ...original, memory: { backend: "mnemopi" } });
+    } else {
+      expect(result.result).toEqual({ memory: { status: "unknown" }, updated: false });
+      expect(result.disk).toEqual(original);
+    }
+  }, 30_000);
+
   test.each(["hindsight", "local", "mnemopi", "sharpshooter"])("keeps configured %s memory through RPC defaults without starting it", async backend => {
     const original = {
       memory: { backend }, modelRoles: { default: "vendor/model", judge: "vendor/judge" },

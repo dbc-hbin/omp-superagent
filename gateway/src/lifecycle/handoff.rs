@@ -13,6 +13,7 @@ use super::{
     LifecycleConfig,
     config::{GATEWAY_START_CONFIG_ENV, RUNNER_CONFIG_ENV},
     fs::{EXIT_TIMEOUT, Endpoint, WAIT_SLICE, alive, log, metadata, socket_stat},
+    host_launch::ensure_launchable_memory,
     process::{ChildKind, detached},
     restart_record::{
         self as restart, ACTIVE, FENCE, Fence, HEAD, Plan, Record, SOCKET, STOP, Stage, plan_key,
@@ -21,7 +22,10 @@ use super::{
     ulw::Ulw,
 };
 
-const RUNNER_TIMEOUT: Duration = Duration::from_secs(90);
+// Budget for serial session, stock CLI and memory probes (130s combined),
+// plus runner bootstrap/config loading. Predecessor exit has its own deadline.
+pub(super) const PREPARATION_TIMEOUT: Duration = Duration::from_secs(150);
+const PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(90);
 const GATEWAY_TIMEOUT: Duration = Duration::from_secs(45);
 const STATUS_POLL: Duration = Duration::from_millis(50);
 const FAILURE: &str = "One-shot restart handoff failed or timed out; no retry or forced kill was attempted. Inspect the exact durable request before recovery.";
@@ -177,7 +181,7 @@ fn mark_ready(db: &mut Connection, config: &LifecycleConfig, id: &str, expected:
 pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
     config.require_credentials()?;
     let mut db = database(&config.state_dir, true)?;
-    let deadline = Instant::now() + RUNNER_TIMEOUT;
+    let mut deadline = Instant::now() + PREPARATION_TIMEOUT;
     let store = loop {
         let (record, plan) = read_pair(&db, id)?;
         if !record.state.pending() {
@@ -201,11 +205,12 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
             restart::validate_plan(config, &record, &plan, &session_file).await?;
             Ulw::load(config)?.package()?;
             inspect_omp(config, &config.head_environment()).await?;
-            // The predecessor cannot shut down until this exact runner has enabled memory.
-            // Recheck its authority on both sides of the native settings operation.
-            validate_preparation(&db, config, id, &plan)?;
-            config.ensure_memory().await?;
+            // Predecessor stop and durable intake remain independent of native
+            // settings writes. Publish only a read-only preflight, under the
+            // same short transaction that verifies the request still owns it.
+            config.preflight_memory().await?;
             mark_ready(&mut db, config, id, &plan)?;
+            deadline = Instant::now() + PREDECESSOR_EXIT_TIMEOUT;
         }
         if record.state == Stage::HeadStopped {
             ensure!(
@@ -226,7 +231,11 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
         }
         ensure!(
             Instant::now() < deadline,
-            "Predecessor did not exit and release its lifetime lock"
+            if plan.runner_ready == Some(true) {
+                "Predecessor did not exit and release its lifetime lock"
+            } else {
+                "Runner preparation did not finish"
+            }
         );
         sleep(WAIT_SLICE).await;
     };
@@ -236,8 +245,10 @@ pub async fn restart_runner(config: &LifecycleConfig, id: &str) -> Result<()> {
     restart::validate_plan(config, &record, &plan, &session_file).await?;
     if record.state != Stage::HeadStopped
         || plan.runner_pid != Some(std::process::id())
+        || plan.runner_ready != Some(true)
         || store.get_meta(ACTIVE)?.as_deref() != Some(id)
         || plan.launch_pid.is_some()
+        || record.successor_pid.is_some()
         || alive(record.gateway_pid)?
         || alive(record.head_pid)?
         || alive(plan.head.owner_pid)?
@@ -276,6 +287,11 @@ async fn spawn_successor(
         status_or_recorded_stale(config).await?.is_none(),
         "Restart cannot adopt an existing Gateway endpoint"
     );
+    restart::validate_config(config, &plan)?;
+    // Only the validated handoff owner may edit native settings. The
+    // predecessor and its stop endpoint are gone, but the runner still holds
+    // the lifetime lock, not a coordination.sqlite write transaction.
+    ensure_launchable_memory(config, &Ulw::load(config)?).await?;
     restart::validate_config(config, &plan)?;
     let child = spawn_gateway(config, Some(&record.request.request_id))?;
     let pid = child.id().context("Restart successor PID is unavailable")?;

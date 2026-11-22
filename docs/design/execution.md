@@ -128,6 +128,13 @@ select a different profile for native reads, but cannot authorize a global
 write there. Lanes also honor the profile bound in the head's private launch
 manifest, rather than treating its post-dotenv environment as operator input.
 
+A restart runner checks eligibility without writing while the predecessor can
+still accept a stop. If the fallback is needed, the runner applies it after
+the predecessor exits and the runner obtains the lifetime lock, before spawning
+the validated successor. A failure to write at that point fails the restart;
+it does not restart the predecessor or activate adapters. Head and lane extension
+composition must be valid before either launch can persist a fallback.
+
 The [guarded native writer](../../src/native-settings.ts) rechecks the expected
 configuration under the native lock, preserves unrelated settings, and reads
 back the effective value. It does not overwrite stale values, higher-priority

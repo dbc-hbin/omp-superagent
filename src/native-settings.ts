@@ -1,11 +1,12 @@
 import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
-import { settingsCapability } from "@oh-my-pi/pi-coding-agent/capability/settings";
+import { settingsCapability, type Settings as DiscoveredSettings } from "@oh-my-pi/pi-coding-agent/capability/settings";
 import { cfgDisabledProviders } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { writeFileAtomically } from "@oh-my-pi/pi-coding-agent/utils/atomic-file";
+import { isEnoent } from "@oh-my-pi/pi-utils";
 import { getAgentDbPath, getProjectAgentDir, MAIN_CONFIG_FILENAMES, normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { expandTilde } from "@oh-my-pi/pi-utils/path";
@@ -31,9 +32,9 @@ export async function hasUnresolvedNativeLegacy(agentDir: string): Promise<boole
 }
 
 /**
- * Before a global fallback, check a fresh read-only snapshot for a native project
- * settings.json that discovery rejected. Other providers, paths and warnings are
- * not evidence about this file; strict YAML failures are handled by Settings.
+ * Before a global fallback, distinguish an absent native project settings.json
+ * from one native discovery silently omitted or rejected. Settings already
+ * handles strict project YAML read and parse errors.
  */
 export async function hasUnresolvedNativeProjectSettings(settings: Settings): Promise<boolean> {
   const provider = "native";
@@ -42,11 +43,16 @@ export async function hasUnresolvedNativeProjectSettings(settings: Settings): Pr
   // Native discovery treats the home directory as user scope only.
   if (normalizePathForComparison(cwd) === normalizePathForComparison(homedir())) return false;
   const file = join(getProjectAgentDir(cwd), "settings.json");
-  const { warnings } = await loadCapability(settingsCapability.id, {
+  try {
+    // Inspect the entry itself so a dangling settings symlink is not treated as absent.
+    await lstat(file);
+  } catch (error) {
+    return !isEnoent(error);
+  }
+  const { items } = await loadCapability<DiscoveredSettings>(settingsCapability.id, {
     cwd, agentDir: settings.getAgentDir(), providers: [provider], includeDisabledProviders: true,
   });
-  return warnings.includes(`[OMP] Failed to parse ${file}`) ||
-    warnings.includes(`[OMP] Invalid item at ${file}: Missing or invalid data`);
+  return !items.some(item => item.level === "project" && item.path === file);
 }
 
 export function readNativeSettings(settings: Settings): Promise<Settings> {

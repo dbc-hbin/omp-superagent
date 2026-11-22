@@ -213,7 +213,7 @@ export async function managedUlwLaunchExtensions(options: {
 
 if (import.meta.main && process.argv[2] === "--launch-extensions") {
   const input = JSON.parse(process.argv[3]!) as {
-    cwd: string; managedUlwPath: string; extensionPaths: string[]; configPath: string; parentConfigPath?: string;
+    cwd: string; managedUlwPath: string; extensionPaths: string[]; parentConfigPath?: string;
     commandArgs: string[]; launchArgs: string[];
   };
   const { parseNativeLaunch } = await import("./native-launch-profile");
@@ -252,8 +252,7 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
     if (!parent || typeof parent !== "object" || !("configPath" in parent) || parent.configPath !== input.parentConfigPath ||
         !("memoryWriteDir" in parent) || parent.memoryWriteDir !== memoryWriteDir) memoryWriteDir = null;
   }
-  const { memory } = await ensureManagedMemory(settings, memoryWriteDir);
-  if (memory.status !== "enabled") throw new Error(memoryBlockReason(memory));
+  let composition: { extensionPaths: string[]; noExtensions: boolean };
   const restore = initializeWithSettings(settings);
   try {
     const managed = validateManagedUlwPackage(input.managedUlwPath);
@@ -330,9 +329,7 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
     if (!conflict) {
       // Ordinary native discovery preserves every native surface, including
       // TypeScript commands, when no other ULW copy needs exclusion.
-      console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({
-        extensionPaths: [...new Set([...input.extensionPaths, managed])], noExtensions: !!parsed.noExtensions, memoryWriteDir,
-      })}`);
+      composition = { extensionPaths: [...new Set([...input.extensionPaths, managed])], noExtensions: !!parsed.noExtensions };
     } else {
       const commands = parsed.noExtensions ? [] : (await discoverCustomCommands({ cwd, agentDir: getAgentDir() })).paths;
       if (commands.length) {
@@ -366,9 +363,15 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
           throw new Error(`Stock OMP explicit -e would change ${root.level} resource scope to ${actualLevel} scope: ${root.path}`);
         }
       }
-      console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ extensionPaths: explicit, noExtensions: true, memoryWriteDir })}`);
+      composition = { extensionPaths: explicit, noExtensions: true };
     }
   } finally { restore(); }
+  // Discovery can refuse an incompatible launch. Do not persist memory for it.
+  const { readNativeSettings } = await import("./native-settings");
+  const current = await readNativeSettings(settings).catch(() => { throw new Error(memoryBlockReason({ status: "unknown" })); });
+  const { memory } = await ensureManagedMemory(current, memoryWriteDir);
+  if (memory.status !== "enabled") throw new Error(memoryBlockReason(memory));
+  console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ ...composition, memoryWriteDir })}`);
 }
 
 /** Serialized source preparation only. No Gateway, account adapter, or Host starts here. */

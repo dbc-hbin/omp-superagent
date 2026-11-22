@@ -93,8 +93,14 @@ struct Preparation {
     inventory: Option<Value>,
 }
 
-impl PreparedHost {
-    pub async fn prepare(config: &LifecycleConfig, store: &Store, ulw: &Ulw, rotation: Option<&Rotation>) -> Result<Self> {
+struct HeadLaunch {
+    package: PathBuf,
+    extensions: [PathBuf; 5],
+    environment: BTreeMap<OsString, OsString>,
+}
+
+impl HeadLaunch {
+    fn new(config: &LifecycleConfig, ulw: &Ulw) -> Result<Self> {
         let package = ulw.package()?;
         let source = config.root.join("src");
         let extension = match env::var_os("OMP_SUPERAGENT_TEST_EXTENSION_PATH") {
@@ -123,6 +129,35 @@ impl PreparedHost {
             "OMP_SUPERAGENT_MANAGED_ULW_PATH".into(),
             package.as_os_str().to_os_string(),
         );
+        Ok(Self { package, extensions, environment })
+    }
+
+    async fn discover(&self, config: &LifecycleConfig, files: (Option<&Path>, &Path)) -> Result<Discovery> {
+        let default_args = host_args(config, files, &self.extensions, false);
+        let (_, prefix) = config.command.split_first().context("No OMP executable provided")?;
+        let input = json!({
+            "cwd": config.cwd, "managedUlwPath": self.package, "extensionPaths": self.extensions,
+            "commandArgs": prefix, "launchArgs": prefix.iter().chain(default_args.iter()).collect::<Vec<_>>(),
+        });
+        let mut discover = bun(config, &self.environment);
+        discover.arg(config.root.join("src/managed-ulw.ts")).arg("--launch-extensions").arg(input.to_string());
+        tagged_output(&capture(discover, None, START_TIMEOUT).await?, "MANAGED_ULW_LAUNCH ")
+    }
+}
+
+/// On the fallback path, validate the same operator flags and extension roots as the
+/// real HEAD launch. Its generated overlay carries model/task/goal settings only.
+pub(super) async fn ensure_launchable_memory(config: &LifecycleConfig, ulw: &Ulw) -> Result<()> {
+    if !config.memory_enabled().await? {
+        HeadLaunch::new(config, ulw)?.discover(config, (None, &config.head_session)).await?;
+    }
+    Ok(())
+}
+
+impl PreparedHost {
+    pub async fn prepare(config: &LifecycleConfig, store: &Store, ulw: &Ulw, rotation: Option<&Rotation>) -> Result<Self> {
+        let launch = HeadLaunch::new(config, ulw)?;
+        let source = config.root.join("src");
         let session_file = rotation::session_file(config, store)?;
         if session_file != config.head_session {
             // Rotated sessions live under a unique trusted directory, never
@@ -160,7 +195,7 @@ impl PreparedHost {
             owned::metadata(&config.head_socket)?.is_none(),
             "Existing HEAD endpoint requires explicit adoption"
         );
-        let (command, backend) = inspect_omp(config, &environment).await?;
+        let (command, backend) = inspect_omp(config, &launch.environment).await?;
         let run_dir = config
             .head_socket
             .parent()
@@ -175,25 +210,11 @@ impl PreparedHost {
         let log = owned::log(&config.head_log)?;
         let config_data = settings_config(config, settings.as_ref(), restoring)?;
         owned::private_json(&config_path, &config_data)?;
-        let default_args = host_args(config, (&config_path, &session_file), &extensions, false);
-        let (_, prefix) = command
-            .split_first()
-            .context("No OMP executable provided")?;
-        let discover_input = json!({ "cwd": config.cwd, "managedUlwPath": package, "extensionPaths": extensions,
-            "configPath": config_path, "commandArgs": prefix,
-            "launchArgs": prefix.iter().chain(default_args.iter()).collect::<Vec<_>>() });
-        let mut discover = bun(config, &environment);
-        discover
-            .arg(source.join("managed-ulw.ts"))
-            .arg("--launch-extensions")
-            .arg(discover_input.to_string());
-        let discovery: Discovery = tagged_output(
-            &capture(discover, None, START_TIMEOUT).await?,
-            "MANAGED_ULW_LAUNCH ",
-        )?;
+        let discovery = launch.discover(config, (Some(&config_path), &session_file)).await?;
+        let HeadLaunch { package, mut environment, .. } = launch;
         let args = host_args(
             config,
-            (&config_path, &session_file),
+            (Some(&config_path), &session_file),
             &discovery.extension_paths,
             discovery.no_extensions,
         );
@@ -398,7 +419,7 @@ fn settings_config(
 
 fn host_args(
     config: &LifecycleConfig,
-    files: (&Path, &Path),
+    files: (Option<&Path>, &Path),
     extensions: &[PathBuf],
     no_extensions: bool,
 ) -> Vec<String> {
@@ -416,6 +437,8 @@ fn host_args(
     for extension in extensions {
         args.extend(["-e".into(), extension.to_string_lossy().into_owned()]);
     }
-    args.extend(["--config".into(), files.0.to_string_lossy().into_owned()]);
+    if let Some(overlay) = files.0 {
+        args.extend(["--config".into(), overlay.to_string_lossy().into_owned()]);
+    }
     args
 }

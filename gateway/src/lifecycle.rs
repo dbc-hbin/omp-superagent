@@ -185,7 +185,12 @@ impl Lifecycle {
             .status = Some(status);
         let old: Option<Endpoint> = restart_record::meta(store.get_meta(SOCKET)?)?;
         remove_dead_socket(&config.gateway_socket, old, None).await?;
-        config.ensure_memory().await?;
+        if request.is_some() {
+            // The runner prepared this profile after the predecessor's confirmed exit.
+            ensure!(config.memory_enabled().await?, "Prepared restart memory is no longer enabled");
+        } else {
+            host_launch::ensure_launchable_memory(config, self.0.ulw.get().context("Missing managed integration")?).await?;
+        }
         self.schedule_maintenance()?;
         Ok(())
     }

@@ -21,30 +21,11 @@ const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 impl LifecycleConfig {
     /// Refuse unsupported profiles without changing native settings or creating state.
     pub(super) async fn preflight_memory(&self) -> Result<()> {
-        self.check_memory("preflight").await
-    }
-
-    /// An owned startup can apply the fallback, but must observe enabled memory after the edit.
-    pub(super) async fn ensure_memory(&self) -> Result<()> {
-        self.check_memory("ensure").await
-    }
-
-    async fn check_memory(&self, operation: &str) -> Result<()> {
-        let (_, args) = self
-            .command
-            .split_first()
-            .context("No OMP executable provided")?;
-        let mut check = bun(self, &self.head_environment());
-        check
-            .arg(self.root.join("src/managed-memory-helper.ts"))
-            .arg(operation)
-            .args(args);
         let result = async {
-            let allowed: bool = tagged_output(
-                &capture(check, None, OPERATION_TIMEOUT).await?,
-                "MANAGED_MEMORY ",
-            )?;
-            ensure!(allowed, "Native OMP memory profile cannot be prepared");
+            ensure!(
+                self.check_memory("preflight").await?,
+                "Native OMP memory profile cannot be prepared"
+            );
             Ok(())
         }
         .await;
@@ -55,6 +36,27 @@ impl LifecycleConfig {
             );
         }
         result
+    }
+
+    /// Read back enabled memory without granting permission to repair it.
+    pub(super) async fn memory_enabled(&self) -> Result<bool> {
+        self.check_memory("enabled").await
+    }
+
+    async fn check_memory(&self, operation: &str) -> Result<bool> {
+        let (_, args) = self
+            .command
+            .split_first()
+            .context("No OMP executable provided")?;
+        let mut check = bun(self, &self.head_environment());
+        check
+            .arg(self.root.join("src/managed-memory-helper.ts"))
+            .arg(operation)
+            .args(args);
+        tagged_output(
+            &capture(check, None, OPERATION_TIMEOUT).await?,
+            "MANAGED_MEMORY ",
+        )
     }
 }
 

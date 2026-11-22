@@ -366,8 +366,9 @@ else process.exit(8);
     }
   }, 40_000);
 
-  test("owned native Gateway refuses an incompatible OMP before repairing memory or exposing messenger credentials", async () => {
-    const f = await executable(testedVersion, "--mode rpc --resume PATH --extension FILE --model MODEL");
+  test.each(["incompatible CLI", "incompatible extensions"])("owned Gateway rejects %s before repairing memory", async reason => {
+    const incompatibleCli = reason === "incompatible CLI";
+    const f = await executable(testedVersion, incompatibleCli ? "--mode rpc --resume PATH --extension FILE --model MODEL" : undefined);
     const agent = join(f.directory, "agent");
     mkdirSync(agent, { mode: 0o700 });
     const settings = Bun.file(join(agent, "config.yml"));
@@ -375,7 +376,7 @@ else process.exit(8);
     await Bun.write(settings, bytes);
     const tokenEnv = "INSTALLED_OMP_TEST_TOKEN";
     const file = await config({
-      command: [f.command],
+      command: incompatibleCli ? [f.command] : [f.command, "--trusted-extension", f.directory],
       discord: { tokenEnv, ownerId: "123", allowedGuildIds: [], allowedChannelIds: [] },
     });
     const { code, stdout, stderr } = await runGateway(f.directory, ["serve", "--config", file], {
@@ -389,6 +390,7 @@ else process.exit(8);
     expect(rows.map(({ args, credential }) => ({ args, credential }))).toEqual([
       { args: ["--version"], credential: null },
       { args: ["--help"], credential: null },
+      ...(incompatibleCli ? [] : [{ args: ["ps", "--help"], credential: null }]),
     ]);
     expect(await settings.text()).toBe(bytes);
     expect(existsSync(join(dirname(file), "state/run/gateway.sock"))).toBe(false);

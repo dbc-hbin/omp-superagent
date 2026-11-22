@@ -168,9 +168,13 @@ test("stock launch reports package hook order that explicit discovery cannot pre
 
 test("stock launch reports TypeScript commands that --no-extensions cannot preserve", async () => {
   const f = await launchFixture();
+  const global = join(f.agentDir, "config.yml");
+  const bytes = "memory: { backend: off }\n";
+  await writeFile(global, bytes);
   await mkdir(join(f.agentDir, "commands/operator"), { recursive: true });
   await writeFile(join(f.agentDir, "commands/operator/index.ts"), "throw new Error('command discovery must not execute factories');\n");
   await expect(f.launch()).rejects.toThrow("cannot preserve TypeScript custom commands");
+  expect(await readFile(global, "utf8")).toBe(bytes);
 }, 60_000);
 
 test("stock launch preserves ordinary native discovery and TypeScript commands when there is no other ULW copy", async () => {

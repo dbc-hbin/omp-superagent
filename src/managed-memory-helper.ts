@@ -6,21 +6,20 @@ const unavailable: ManagedMemoryReport = { memory: { status: "unknown" }, update
 const [operation, ...args] = process.argv.slice(2);
 async function check(): Promise<ManagedMemoryReport> {
   const cwd = process.cwd();
-  if (operation !== "inspect" && operation !== "preflight" && operation !== "ensure" && operation !== "apply-consented") return unavailable;
+  if (operation !== "inspect" && operation !== "preflight" && operation !== "enabled" && operation !== "apply-consented") return unavailable;
   const parsed = await parseNativeLaunch([...args, "--mode", "rpc-ui", "--cwd", cwd]);
   if (parsed.mode !== "rpc-ui" || parsed.cwd !== cwd) return unavailable;
   const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
   const settings = await Settings.loadReadOnly({ cwd, configFiles: parsed.config });
-  if (operation === "inspect" || operation === "preflight") {
-    return { memory: await effectiveManagedMemory(settings, parsed.launchAgentDir), updated: false };
+  if (operation === "apply-consented") {
+    return ensureManagedMemory(settings, parsed.launchAgentDir, parseMemoryConsent(await Bun.stdin.text()));
   }
-  return ensureManagedMemory(settings, parsed.launchAgentDir,
-    operation === "apply-consented" ? parseMemoryConsent(await Bun.stdin.text()) : undefined);
+  return { memory: await effectiveManagedMemory(settings, parsed.launchAgentDir), updated: false };
 }
 
 // Native parse/read diagnostics may include private settings. Emit only known fields.
 const report = await check().catch(() => unavailable);
-const output = operation === "preflight" || operation === "ensure"
+const output = operation === "preflight" || operation === "enabled"
   ? report.memory.status === "enabled" || (operation === "preflight" && canEnableGlobalMemory(report.memory))
   : report;
 process.stdout.write(`MANAGED_MEMORY ${JSON.stringify(output)}\n`);

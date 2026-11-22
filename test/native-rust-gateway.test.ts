@@ -125,6 +125,30 @@ async function verifyTranscript(fixture: NativeRustGateway, heads: readonly Head
   });
 }
 
+async function withNativeSettingsLock(fixture: NativeRustGateway, config: string, proof: () => Promise<void>): Promise<void> {
+  const held = join(fixture.root, "native-settings-locked");
+  const release = join(fixture.root, "release-native-settings-lock");
+  // Use the SDK's actual platform lock in the fixture's private native environment.
+  const locker = fixture.run([process.execPath, "--no-env-file", "--no-install", "-e", `
+    const { acquireFileLock } = await import(${JSON.stringify(import.meta.resolve("@oh-my-pi/pi-utils/file-lock"))});
+    const lock = await acquireFileLock(${JSON.stringify(config)});
+    try {
+      await Bun.write(${JSON.stringify(held)}, "");
+      while (!await Bun.file(${JSON.stringify(release)}).exists()) await Bun.sleep(25);
+    } finally { lock.release(); }
+  `]);
+  try {
+    await Promise.race([
+      until(() => existsSync(held) || undefined, "the native settings writer lock"),
+      locker.then(() => { throw new Error("Native settings lock exited before release"); }),
+    ]);
+    await proof();
+  } finally {
+    await writeFile(release, "");
+    await locker;
+  }
+}
+
 nativeTest("native Gateway stops only settled work and resumes the original stock OMP session", () =>
   withNativeRustGateway(async fixture => {
     const nativeConfig = join(fixture.root, "agent", "config.yml");
@@ -187,11 +211,21 @@ nativeTest("authorized messenger /restart accepts compatible config drift and ha
     await writeFile(fixture.config, nextConfig);
     const nativeConfig = join(fixture.root, "agent", "config.yml");
     const enabledSettings = JSON.parse(await readFile(nativeConfig, "utf8"));
-    await writeFile(nativeConfig, JSON.stringify({ ...enabledSettings, memory: { backend: "off" } }));
+    const globallyOff = JSON.stringify({ ...enabledSettings, memory: { backend: "off" } });
+    await writeFile(nativeConfig, globallyOff);
     const acceptedHash = createHash("sha256").update(nextConfig).digest("hex");
     const restart = input("211", "/restart");
-    await fixture.deliver(restart);
-    assert.match(await verifyDelivery(fixture, restart.id, "211:restart-ack"), /ACK, not restart completion/);
+    await withNativeSettingsLock(fixture, nativeConfig, async () => {
+      await fixture.deliver(restart);
+      assert.match(await verifyDelivery(fixture, restart.id, "211:restart-ack"), /ACK, not restart completion/);
+      await fixture.initialExit();
+      await fixture.headExit(first.head);
+      const record = ledger(fixture, db => JSON.parse(meta(db, "gateway:restart")!) as GatewayRestartRecord);
+      assert.equal(record.state, "head-stopped");
+      assert.equal(record.successorPid, undefined, "Handoff must not publish a launch before the settings repair");
+      assert.equal(await readFile(nativeConfig, "utf8"), globallyOff,
+        "Runner readiness and predecessor shutdown must not wait for or write native settings");
+    });
     const handoff = await until(() => ledger(fixture, db => {
       const saved = meta(db, "gateway:restart");
       if (!saved) return;
@@ -219,8 +253,6 @@ nativeTest("authorized messenger /restart accepts compatible config drift and ha
     assert.deepEqual(await fixture.detached(), [
       { role: "runner", pid: runner }, { role: "successor", pid: handoff.successorPid },
     ]);
-    await fixture.initialExit();
-    await fixture.headExit(first.head);
     await waitForFixtureProcessExit([runner]);
     const successor = await fixture.ready(handoff.successorPid);
     assert.deepEqual(Bun.YAML.parse(await readFile(nativeConfig, "utf8")), enabledSettings,
@@ -245,4 +277,31 @@ nativeTest("authorized messenger /restart accepts compatible config drift and ha
     assert.equal(ledger(fixture, db => db.query<{ count: number }, []>(
       "SELECT count(*) AS count FROM metadata WHERE key LIKE 'gateway:restart:%'").get()?.count), 1);
     await verifyTranscript(fixture, [first.head, successor.head], ["201", "212"]);
+  }), 300_000);
+
+nativeTest("native Gateway refuses an unsupported restart memory profile before shutting down HEAD", () =>
+  withNativeRustGateway(async fixture => {
+    const first = await fixture.start();
+    const nativeConfig = join(fixture.root, "agent", "config.yml");
+    const blocked = JSON.stringify({ ...JSON.parse(await readFile(nativeConfig, "utf8")), memory: { backend: "unsupported-fixture" } });
+    await writeFile(nativeConfig, blocked);
+    const restart = input("211", "/restart");
+    await fixture.deliver(restart);
+    assert.match(await verifyDelivery(fixture, restart.id, "211:restart-ack"), /ACK, not restart completion/);
+    const record = await until(() => ledger(fixture, db => {
+      const saved = meta(db, "gateway:restart");
+      if (!saved) return;
+      const result: GatewayRestartRecord = JSON.parse(saved);
+      if (result.state === "refused") return result;
+    }), "pre-shutdown refusal of unsupported native memory");
+    assert.equal(record.headPid, first.head.pid);
+    assert.equal(record.successorPid, undefined);
+    assert.match(record.reason ?? "", /no process was stopped/);
+    assert.equal(await readFile(nativeConfig, "utf8"), blocked);
+    const processes = await fixture.detached();
+    assert.deepEqual(processes.map(process => process.role), ["runner"]);
+    await waitForFixtureProcessExit(processes.map(process => process.pid));
+    assert.deepEqual(await fixture.snapshot("settled"), first.head);
+    await fixture.stop(first);
+    await verifyTranscript(fixture, [first.head], []);
   }), 300_000);

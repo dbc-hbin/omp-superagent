@@ -8,8 +8,8 @@ use crate::{adapter::EffectError, store::AuthorityError};
 
 use super::{
     Lifecycle, LifecycleConfig, Phase,
-    fs::{EXIT_TIMEOUT, Endpoint, WAIT_SLICE, alive, socket_stat},
-    handoff::spawn_runner,
+    fs::{Endpoint, WAIT_SLICE, alive, socket_stat},
+    handoff::{PREPARATION_TIMEOUT, spawn_runner},
     host_rpc::Head,
     restart_record::{
         self as restart, ACTIVE, FENCE, Fence, Plan, Record, Request, SOCKET, STOP, Stage, plan_key,
@@ -268,7 +268,7 @@ impl Lifecycle {
             store.set_meta(&plan_key(id), &serde_json::to_string(&plan)?)?;
             runner
         };
-        let deadline = Instant::now() + EXIT_TIMEOUT;
+        let deadline = Instant::now() + PREPARATION_TIMEOUT;
         loop {
             let saved =
                 restart::record(store, Some(id))?.context("Successor lost its durable request")?;
