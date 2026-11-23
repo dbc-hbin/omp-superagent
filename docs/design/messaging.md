@@ -144,16 +144,18 @@ The head receipt does not wait for a [historical topic search](#topic-routing-an
 which may read large native journals. An input that needs one is appended to a
 durable deferred-routing queue in the coordination store (`intake:deferred-routing`),
 receipted, and then searched and admitted in the background. Until it is admitted,
-every later input of the same physical channel or DM (including its threads and
-logical topics) is queued behind it, so none overtakes it; other conversations are
-not held. A redelivery of a queued input shares the store's immutable-payload
-and signed attachment URL reconciliation. Fresh recovery controls (`/restart`,
-`/stop head`, never edited revisions) bypass deferred waiting so a failed
-admission cannot trap them, and a queued bare `/stop` is promoted ahead of
-ordinary waiting items if the head admission becomes unresolved while ordinary
-items remain ordered. Both global HEAD stops and lane-specific stops snapshot
-receipt order across both queues without cancelling later requests, later lane
-resumes, or independent lane work. A pending queued
+later ordinary inputs of the same physical channel or DM (including its threads
+and logical topics) queue behind it; other conversations are not held. A
+redelivery of a queued input shares the store's immutable-payload and signed
+attachment URL reconciliation. Fresh `/restart`, `/stop head`, and
+`/stop <exact authorized lane-id>` bypass deferred waiting, including after
+restart. A bare `/stop` bypasses failing admission only if it is not a reply and
+comes from an already-bound physical Discord work thread. Bare DM and
+reply-relative stops wait for earlier routing, rather than choosing today's
+apparent target; edits cannot acquire priority. Global HEAD stops and
+lane-specific stops snapshot receipt order across both queues. A later resume
+waits for an older deferred stop of that exact lane without being cancelled by
+it; other lanes' work is independent. A pending queued
 choice fences the automatic history choice like an unreceipted Gateway event. A
 failed admission stays first in its conversation and is retried with bounded
 backoff; a permanent denial is dropped. The queue survives a restart and resumes
@@ -511,6 +513,12 @@ approval.
   Progress reports are coalesced before submission where safe; a final result
   takes precedence over undelivered progress. Already started external sends
   cannot be recalled.
+- Pending outbox delivery runs concurrently across distinct physical routes
+  (platform, account, authority, guild, channel, thread) while preserving
+  strict sequence order within each physical route and never automatically
+  retrying uncertain sends. Routes wake as soon as outputs become pending
+  without waiting behind an unrelated command tail; restart checkpoints still
+  wait for all in-flight route deliveries to settle before lifecycle handoff.
 
 ## Discord voice
 

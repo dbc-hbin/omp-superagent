@@ -1589,4 +1589,30 @@ describe("durable coordination store", () => {
     }
     expect(open(path).getMeta("crash-owner")).toBe("durable");
   }, 10_000);
+
+  test("outputs(physicalRoute) queries only matching pending outputs and migrates legacy rows", () => {
+    const { store, path } = fixture();
+    const routeA = route({ channelId: "4", threadId: "10", topicId: "topic-a" });
+    const routeATopicB = route({ channelId: "4", threadId: "10", topicId: "topic-b" });
+    const routeC = route({ channelId: "5", threadId: null });
+    store.receive(inbound("a1", routeA), "main");
+    store.receive(inbound("a2", routeATopicB), "main");
+    store.receive(inbound("c1", routeC), "main");
+    store.settle("a1", "done", { id: "out-a1", text: "A1" });
+    store.settle("a2", "done", { id: "out-a2", text: "A2" });
+    store.settle("c1", "done", { id: "out-c1", text: "C1" });
+
+    expect(store.outputs(physicalRouteKey(routeA)).map(o => o.id)).toEqual(["out-a1", "out-a2"]);
+    expect(store.outputs(physicalRouteKey(routeC)).map(o => o.id)).toEqual(["out-c1"]);
+    store.close();
+
+    // Simulate a legacy DB row lacking physical_route before reopen.
+    const raw = new Database(path, { strict: true });
+    raw.run("UPDATE outputs SET physical_route = NULL");
+    raw.close();
+
+    const reopened = open(path);
+    expect(reopened.outputs(physicalRouteKey(routeA)).map(o => o.id)).toEqual(["out-a1", "out-a2"]);
+    expect(reopened.outputs(physicalRouteKey(routeC)).map(o => o.id)).toEqual(["out-c1"]);
+  });
 });
