@@ -102,3 +102,15 @@ New cases in `test/runtime.test.ts` (`same-HEAD evidence recovery`):
 
 The existing quota-recovery cases still pass, including those for a prior
 tool, a foreign PID, instance or run, and an unbroadcast receipt.
+
+## CI: Superkit SUPER layout
+
+CI failed in `postinstall` because the managed Superkit (`upstream/ulw.json`,
+`ref: HEAD`) moved its workflow directive from `skills/ultrawork` to the
+canonical `skills/super` and now points workflows at `skills/super-*`, with the
+legacy IDs kept as alias skills. `src/managed-ulw-probe.ts` reads the directive
+and expects pointers from the canonical layout when `skills/super` exists, and
+uses the legacy layout otherwise. The pointer tag keeps its legacy name. A new
+`test/managed-ulw.test.ts` case prepares a SUPER-layout package with alias
+skills. `bun scripts/prepare-ulw.ts` now activates the current Superkit
+revision locally.
