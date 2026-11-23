@@ -7,6 +7,7 @@ fn worker_identity() -> OnceLock<Identity> {
         generation: None,
         instance_key: None,
         worker_attempt: Some("worker-attempt".into()),
+        pr_review_only: false,
         journal_cursor: true,
     })
 }

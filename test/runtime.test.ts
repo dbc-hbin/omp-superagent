@@ -23,6 +23,8 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../src/contracts
 import { headRecoveryEvidence } from "../src/head-recovery";
 import { decisionId } from "../src/decisions";
 import { CronJobs } from "../src/cron-jobs";
+import { CronPrIntake } from "../src/cron-pr-intake";
+import { prReviewApis } from "../src/pr-intake-review";
 import { PrWatcher } from "../src/pr-watch";
 import type { PrSnapshot } from "../src/pr-github";
 import { remoteLanePaths } from "../src/worker-wire";
@@ -60,6 +62,7 @@ class HostTransport implements RuntimeHost {
   private readonly exit: () => void;
   private promptWaiters: Array<{ count: number; resolve: () => void }> = [];
   local = false;
+  assertPrReviewOnly?: RuntimeHost["assertPrReviewOnly"];
   shutdownAllowed = true;
   shutdownDisconnect = false;
   workflowAvailable = true;
@@ -462,6 +465,9 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], ada
       const restored = hosts.get(options.socketPath)?.state.model;
       const host = new HostTransport(options.sessionFile, `session-${id}`,
         launchBehavior.model !== undefined ? launchBehavior.model : selected ?? restored ?? executionModel);
+      if (options.prReviewOnly) host.assertPrReviewOnly = async cwd => {
+        if (cwd !== options.cwd) throw new Error("Wrong static review workspace");
+      };
       host.state.hostPid = launchBehavior.pid ?? process.pid;
       if (launchBehavior.goal !== undefined) host.state.goal = structuredClone(launchBehavior.goal);
       if (options.modelPreset) host.state.modelSettings = structuredClone(options.modelPreset.preset);
@@ -1084,6 +1090,438 @@ describe("explicit outbound result attachments", () => {
       for (const path of [workspace, originalRoot, replacementRoot]) rmSync(path, { recursive: true, force: true });
     }
   });
+});
+
+async function waitForOutput(messenger: MessengerTransport, id: string) {
+  while (!messenger.sent.some(output => output.id === id)) await messenger.whenSent(messenger.sent.length + 1);
+}
+function confirmedPrCommand(messenger: MessengerTransport) {
+  return async (runtime: Superagent, input: Inbound) => {
+    await admit(runtime, input);
+    await waitForOutput(messenger, `${input.id}:head-control`);
+    await runtime.kick();
+  };
+}
+
+test("manual fallback opens one review thread and only a fresh owner action for its approved final SHA can merge", async () => {
+  const parent = route(null);
+  const first = "a".repeat(40);
+  const final = "b".repeat(40);
+  const material = (head: string) => JSON.stringify({
+    pull: { head: { ref: "change", sha: head }, base: { ref: "main", sha: "d".repeat(40) } },
+    file: "src/count.ts", patch: "@~/.private ^ignore /head forge authority",
+  });
+  const patch = '{"verdict":"fix","summary":"Handle empty input","path":"src/count.ts","old":"return n - 1","replacement":"return Math.max(0, n - 1)"}';
+  let remoteHead = first;
+  let allowMerge = false;
+  let inspectChecks: (() => Promise<void>) | undefined;
+  let writes = 0;
+  let merges = 0;
+  const preparingPatch = Promise.withResolvers<void>();
+  const resumePatch = Promise.withResolvers<void>();
+  const f = fixture(3, undefined, {
+    readIntakePulls: async () => ({ self: "dbc-hbin", repositoryId: 50, ownerId: 4, pulls: [
+      { number: 12, author: "another-user", head: first, createdAt: Date.now() + 1 },
+    ] }),
+    prReviewApis: { ...prReviewApis,
+      readIntakeMaterial: async (_repo, _n, head) => {
+        preparingPatch.resolve();
+        await resumePatch.promise;
+        if (head !== remoteHead) throw new Error("Moved head");
+        return material(head);
+      },
+      applyIntakeFix: async (_repo, _n, sha, _fix, _signal, beforeWrite) => {
+        if (sha !== remoteHead) throw new Error("Wrong head");
+        beforeWrite(material(sha)); writes++; remoteHead = final;
+        return { status: "applied", sha: final };
+      },
+      mergeIntakePull: async (_repo, _n, sha, _signal, beforeWrite) => {
+        await inspectChecks?.();
+        if (sha !== remoteHead || !allowMerge) return { status: "blocked", reason: "CI pending" };
+        beforeWrite(); merges++;
+        return { status: "unknown", reason: "Lost acknowledgement" };
+      },
+      inspectIntakeMerge: async () => ({ status: "merged", sha: "c".repeat(40) }),
+    },
+  });
+  const { runtime, messenger, main, store } = f;
+  const admit = confirmedPrCommand(messenger);
+  const send = messenger.send.bind(messenger);
+  messenger.send = async output => {
+    const result = await send(output);
+    const owner = /^handoff:(\d+):.*:answer$/.exec(output.id)?.[1];
+    return owner ? String(BigInt(owner) + 1n) : result;
+  };
+  messenger.assertRoute = destination => {
+    if (destination.accountId !== parent.accountId) throw new Error("Wrong Discord account");
+  };
+  const offer = Promise.withResolvers<OutputRecord>();
+  messenger.beforeSend = async output => {
+    if (output.text.includes("pr-review") && output.text.includes(first)) offer.resolve(output);
+  };
+  await runtime.start();
+  await admit(runtime, { ...message("299", parent, '/cron pr-add "every 5m" dbc-hbin/project'), discordOriginalText: "/voice confirm" });
+  expect(store.input("299")?.state).toBe("cancelled");
+  await admit(runtime, message("300", parent, '/cron pr-add "every 5m" dbc-hbin/project'));
+  const job = store.output("300:head-control")?.text.match(/[a-f0-9-]{36}/)?.[0];
+  if (!job) throw new Error(`Missing enrollment: ${store.output("300:head-control")?.text}`);
+  await admit(runtime, message("301", parent, `/cron run ${job}`));
+  const notice = await offer.promise;
+  expect(notice.route).toEqual(parent);
+  expect(messenger.threads).toEqual([]);
+  expect(store.lanes()).toEqual([]);
+  expect(main.prompts).toEqual([]);
+  await expect(runtime.startLane({ ...selection, sourceId: notice.sourceId, cwd: f.directory, title: "invalid", kickoff: "invalid" }))
+    .rejects.toThrow();
+  const review = `/cron pr-review ${job} 12 ${first}`;
+  await admit(runtime, message("302", route("999"), review));
+  await admit(runtime, message("303", parent, `/cron pr-review ${job} 12 ${final}`));
+  expect(messenger.threads).toEqual([]);
+  const startingReview = admit(runtime, message("304", parent, review));
+  await preparingPatch.promise;
+  const lane = store.lanes()[0];
+  if (!lane) throw new Error(`Missing lane: ${store.output("304:head-control")?.text}`);
+  const host = f.hosts.get(lane.socketPath);
+  if (!host) throw new Error(`Missing review Host: ${f.errors.join("; ")}; ${store.input("handoff:304:lane")?.state}`);
+  const idleMs = f.config.idleMs;
+  try {
+    f.config.idleMs = 0;
+    await runtime.kick();
+    expect(host.commands.filter(cmd => cmd.type === "shutdown_host")).toEqual([]);
+  } finally { f.config.idleMs = idleMs; resumePatch.resolve(); }
+  await startingReview;
+  expect(messenger.threads).toEqual([lane.route]);
+  expect(messenger.threadSources).toEqual(["304"]);
+  expect(f.launched.at(-1)?.prReviewOnly).toBe(true);
+  await host.whenPrompts(1);
+  expect(host.prompts).toHaveLength(1);
+  expect(host.prompts[0]?.command.message).not.toContain("@~/.private");
+  await admit(runtime, message("305", parent, review));
+  const count = messenger.sent.length;
+  host.complete(patch);
+  await messenger.whenSent(count + 1);
+  await admit(runtime, message("306", lane.route, `/cron pr-status ${job} 12`));
+  const fix = store.output("306:head-control")?.text.match(/\/cron pr-fix .+$/)?.[0];
+  if (!fix) throw new Error(`Missing source-bound fix: ${store.output("306:head-control")?.text}`);
+  await admit(runtime, message("307", lane.route, `/cron pr-merge ${job} 12 ${first}`));
+  await admit(runtime, message("308", route("999"), fix));
+  await admit(runtime, message("309", lane.route, fix.replace(/[a-f0-9]{64}$/, "0".repeat(64))));
+  expect([writes, merges]).toEqual([0, 0]);
+  await admit(runtime, message("310", lane.route, fix));
+  await admit(runtime, message("310", lane.route, fix));
+  expect(writes).toBe(1);
+  await admit(runtime, message("311", lane.route, `/cron pr-merge ${job} 12 ${first}`));
+  expect(merges).toBe(0);
+  await admit(runtime, message("312", lane.route, `/cron pr-review ${job} 12 ${final}`));
+  await host.whenPrompts(2);
+  expect(host.prompts).toHaveLength(2);
+  expect(messenger.threads).toEqual([lane.route]);
+  const merge = `/cron pr-merge ${job} 12 ${final}`;
+  const atProbe = Promise.withResolvers<void>();
+  const letThrough = Promise.withResolvers<void>();
+  messenger.assertRoute = async () => { atProbe.resolve(); await letThrough.promise; };
+  allowMerge = true;
+  const premature = admit(runtime, message("322", lane.route, merge));
+  await atProbe.promise;
+  host.complete('{"verdict":"approve","summary":"Empty input handled"}');
+  await waitForOutput(messenger, `handoff:312:${lane.id}:answer`);
+  letThrough.resolve();
+  await premature;
+  expect(merges).toBe(0);
+  expect(store.input("322")?.state).toBe("cancelled");
+  allowMerge = false;
+  await admit(runtime, message("323", lane.route, merge));
+  expect(merges).toBe(0);
+  allowMerge = true;
+  const checking = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  inspectChecks = () => { checking.resolve(); return release.promise; };
+  const inFlight = admit(runtime, message("317", lane.route, merge));
+  await checking.promise;
+  // Pause and resume while this exact old owner command awaits GitHub. Opening
+  // the schedule again must not revive its previous review or publication.
+  await runtime.receive(message("318", parent, `/cron pause ${job}`));
+  await runtime.receive(message("319", parent, `/cron resume ${job}`));
+  release.resolve();
+  await inFlight;
+  inspectChecks = undefined;
+  expect(merges).toBe(0);
+  await admit(runtime, message("320", lane.route, merge));
+  expect(merges).toBe(0);
+  await admit(runtime, message("321", lane.route, `/cron pr-review ${job} 12 ${final}`));
+  await host.whenPrompts(3);
+  const beforeRenewal = messenger.sent.length;
+  host.complete('{"verdict":"approve","summary":"Reviewed current commit again"}');
+  await messenger.whenSent(beforeRenewal + 1);
+  await admit(runtime, message("2999", lane.route, merge));
+  await admit(runtime, message("3000", lane.route, merge));
+  await admit(runtime, message("3001", lane.route, `/cron pr-status ${job} 12`));
+  expect(store.output("3001:head-control")?.text).toContain("c".repeat(40));
+  expect([writes, merges]).toEqual([1, 1]);
+  expect(main.prompts).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test.each([
+  ["review", null],
+  ["fix", "무인으로 리뷰 후 수정커밋까지"],
+  ["merge", "무인으로 수정커밋후 머지까지"],
+  ["downgrade", "무인으로 수정커밋후 머지까지"],
+  ["thread-refused", null],
+  ["review-refused", null],
+] as const)("unattended %s uses a confirmed bot thread, never impersonates an owner, and stops at its selected stage", async (mode, command) => {
+  const parent = route(null);
+  const repository = mode === "thread-refused" ? `owner/${"r".repeat(100)}` : "owner/project";
+  const original = "a".repeat(40);
+  const corrected = "b".repeat(40);
+  const base = "d".repeat(40);
+  const material = (sha: string) => JSON.stringify({
+    pull: { base: { ref: "main", sha: base }, head: { ref: "change", sha } }, patch: "src/count.ts changed",
+  });
+  let head = original;
+  let ci = false;
+  const effects: string[] = [];
+  const firstReview = Promise.withResolvers<void>();
+  const atWrite = Promise.withResolvers<void>();
+  const resumeWrite = Promise.withResolvers<void>();
+  const f = fixture(3, undefined, {
+    readIntakePulls: async () => ({ repositoryId: 50, ownerId: 4, self: "owner",
+      pulls: [{ number: 7, createdAt: Date.now() + 1, author: "contributor", head }] }),
+    prReviewApis: { ...prReviewApis,
+      readIntakeMaterial: async (_repo, _number, sha) => {
+        if (sha !== head) throw new Error("stale PR");
+        firstReview.resolve();
+        if (mode === "review-refused") throw new Error("Fixture: unsupported static material");
+        return material(sha);
+      },
+      publishIntakeComment: async (_repo, _number, sha, summary, _signal, claim) => {
+        expect(sha).toBe(head); expect(summary).not.toContain('"replacement"'); claim();
+        effects.push(`comment:${sha}`); return { status: "posted", id: `review-${sha}` };
+      },
+      inspectIntakeComment: async () => ({ status: "unknown", reason: "No ambiguous fixture comment" }),
+      reconcileIntakeFix: async () => ({ status: "unknown", reason: "No ambiguous fixture fix" }),
+      applyIntakeFix: async (_repo, _number, sha, _fix, _signal, claim) => {
+        expect(sha).toBe(original); claim(material(sha));
+        effects.push(`fix:${sha}`); head = corrected; return { status: "applied", sha: corrected };
+      },
+      inspectIntakeMerge: async () => ci ? { status: "ready" } : { status: "blocked", reason: "CI pending" },
+      mergeIntakePull: async (_repo, _number, sha, _signal, claim) => {
+        if (!ci) return { status: "blocked", reason: "CI pending" };
+        if (mode === "downgrade") { atWrite.resolve(); await resumeWrite.promise; }
+        expect(sha).toBe(corrected); claim(); effects.push(`merge:${sha}`); return { status: "merged", sha: "c".repeat(40) };
+      },
+    },
+  });
+  const { runtime, store, messenger } = f;
+  const send = messenger.send.bind(messenger);
+  let physical = 1000;
+  messenger.send = async output => { await send(output); return `${++physical}`; };
+  messenger.assertRoute = () => {};
+  messenger.canCreateThread = async () => true;
+  messenger.createThread = async (parent, title, source) => {
+    if (!source) throw new Error("Missing confirmed starter");
+    messenger.threadSources.push(source);
+    expect(title.length).toBeLessThanOrEqual(100);
+    if (mode === "thread-refused" && messenger.threadSources.length === 1) throw new DeliveryError("HTTP 429", "rejected");
+    const thread = { ...parent, threadId: source };
+    messenger.threads.push(thread);
+    if (mode === "fix") throw new Error("Thread created; Discord response lost");
+    return thread;
+  };
+  messenger.inspectThread = async route => {
+    expect(route).toEqual(messenger.threads[0]!);
+    return { route, archived: false, title: "owner/project #7", availableTags: [], appliedTags: [], requiresTag: false };
+  };
+  await runtime.start();
+  const owner = confirmedPrCommand(messenger);
+  await owner(runtime, message("801", parent, `/cron pr-add "every 5m" ${repository}`));
+  const job = store.output("801:head-control")?.text.match(/[a-f0-9-]{36}/)?.[0];
+  if (!job) throw new Error("No registration");
+  if (command) {
+    await owner(runtime, message("802", parent, command));
+    expect(store.output("802:head-control")?.text).toContain(mode === "downgrade" ? "merge" : mode);
+  }
+  const jobs = new CronJobs(store, f.config);
+  let when = Date.now();
+  let settled = Promise.withResolvers<void>();
+  const set = store.setMeta.bind(store);
+  spyOn(store, "setMeta").mockImplementation((key, value) => {
+    set(key, value);
+    if (key === `pr-intake-status:${job}:7`) settled.resolve();
+  });
+  // Move the actual schedule clock, not an owner "/cron run" per PR or phase.
+  const tick = async () => {
+    settled = Promise.withResolvers<void>();
+    jobs.poll(when += 300_100);
+    await runtime.kick(); await settled.promise; await runtime.kick();
+  };
+  await tick();
+  if (mode === "thread-refused") {
+    expect(messenger.threads).toEqual([]);
+    expect(store.getMeta(`pr-intake-status:${job}:7`)).toContain("/cron pr-review");
+    await owner(runtime, message("10005", parent, `/cron pr-review ${job} 7 ${original}`));
+    expect(store.lanes()).toHaveLength(1);
+    expect(messenger.threads).toHaveLength(1);
+    return;
+  }
+  if (mode === "fix") {
+    expect(store.lanes()).toHaveLength(0);
+    expect(messenger.threadSources).toHaveLength(1);
+    await tick(); // Inspect the exact starter; never create again.
+  }
+  const lane = store.lanes()[0];
+  if (!lane) throw new Error(`Missing automatic lane: ${store.getMeta(`pr-intake-status:${job}:7`)}`);
+  await firstReview.promise;
+  const host = f.hosts.get(lane.socketPath);
+  if (!host) throw new Error("Missing native Host");
+  if (mode === "review-refused") {
+    const round = JSON.parse(store.getMeta(`pr-review:${job}:7`)!);
+    await waitForOutput(messenger, `${round.inputId}:held`);
+    await tick();
+    expect(store.getMeta(`pr-intake-status:${job}:7`)).toContain(`/cron pr-review ${job} 7 ${original}`);
+    expect(host.prompts).toEqual([]);
+    expect(store.input(round.source)?.target).toBeNull();
+    expect(store.inputs("main", "uncertain")).toEqual([]);
+    return;
+  }
+  await host.whenPrompts(1);
+  const offer = store.output("cron-pr:offer:owner/project:7");
+  expect(messenger.threadSources).toEqual([offer?.remoteId!]);
+  expect(messenger.threads).toEqual([lane.route]);
+  const receipt = store.inputs(lane.id, "submitted")[0];
+  if (!receipt) throw new Error("Missing native input");
+  const source = store.getMeta(`handoff-source:${receipt.id}`);
+  if (!source) throw new Error("Missing controller source");
+  expect(store.input(source)).toMatchObject({ route: lane.route, messageId: null });
+  expect(store.ownerSource(receipt.id)).toBeNull();
+  await expect(runtime.startLane({ ...selection, sourceId: receipt.id, cwd: f.directory, title: "Not an owner", kickoff: "forbidden" })).rejects.toThrow();
+  expect(f.launched.at(-1)?.prReviewOnly).toBe(true);
+  host.complete('{"verdict":"fix","summary":"Handle empty input","path":"src/count.ts","old":"return n - 1","replacement":"return Math.max(0, n - 1)"}');
+  await waitForOutput(messenger, `${receipt.id}:answer`);
+  for (let i = 0; i < 4 && (!effects.length || mode !== "review" && host.prompts.length < 2); i++) await tick();
+  if (mode !== "review") {
+    await host.whenPrompts(2);
+    const next = store.inputs(lane.id, "submitted")[0];
+    if (!next) throw new Error("No re-review of changed head");
+    host.complete('{"verdict":"approve","summary":"The fix handles empty input."}');
+    await waitForOutput(messenger, `${next.id}:answer`);
+    await tick(); await tick();
+    expect(effects).not.toContain(`merge:${corrected}`);
+    ci = true;
+  }
+  if (mode === "downgrade") {
+    const pending = tick();
+    await atWrite.promise;
+    await owner(runtime, message("803", parent, "무인으로 리뷰만"));
+    resumeWrite.resolve();
+    await pending;
+    await owner(runtime, message("804", lane.route, `/cron pr-status ${job} 7`));
+    expect(store.output("804:head-control")?.text).toContain("/cron pr-review");
+    expect(store.output("804:head-control")?.text).not.toContain("/cron pr-merge");
+  } else { await tick(); await tick(); }
+  expect(effects).toEqual([`comment:${original}`, ...(mode === "review" ? [] : [`fix:${original}`, `comment:${corrected}`]),
+    ...(mode === "merge" ? [`merge:${corrected}`] : [])]);
+  expect(store.lanes()).toHaveLength(1);
+  expect(messenger.threads).toHaveLength(1);
+  expect(f.main.prompts).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test.each(["lost create response", "confirmed route before lane binding"] as const)(
+  "recover a %s only in its verified Discord thread; a missing native guard receives no patch", async mode => {
+  const sha = "a".repeat(40);
+  const parent = route(null);
+  const f = fixture(3, undefined, {
+    readIntakePulls: async () => ({ self: "owner", repositoryId: 42, ownerId: 9,
+      pulls: [{ number: 7, author: "contributor", createdAt: Date.now() + 1, head: sha }] }),
+    prReviewApis: { ...prReviewApis, readIntakeMaterial: async () => {
+      const host = f.hosts.get(f.launched.at(-1)?.socketPath ?? "");
+      if (!host) throw new Error("Expected a verified lane Host");
+      host.assertPrReviewOnly = undefined; // An old attached Host without the new policy capability.
+      return JSON.stringify({ pull: { head: { ref: "topic", sha }, base: { ref: "main", sha: "b".repeat(40) } }, patch: "PRIVATE REVIEW FIXTURE DATA" });
+    } },
+  });
+  const { runtime, messenger, store, main } = f;
+  const admit = confirmedPrCommand(messenger);
+  const anchored = mode === "lost create response";
+  const nativeThread = route(anchored ? "403" : "902");
+  const offer = Promise.withResolvers<void>();
+  messenger.beforeSend = async output => { if (output.text.includes(sha)) offer.resolve(); };
+  messenger.assertRoute = () => {};
+  messenger.createThread = async (parent, _title, source) => {
+    expect(source).toBe(anchored ? "403" : undefined);
+    const result = { ...parent, threadId: nativeThread.threadId };
+    messenger.threads.push(result);
+    if (anchored) throw new Error("Lost create receipt");
+    return result;
+  };
+  messenger.inspectThread = async destination => {
+    if (routeKey(destination) !== routeKey(messenger.threads[0]!)) throw new Error("Unknown Discord thread");
+    return { route: destination, title: "owner/project #7", archived: false, availableTags: [], appliedTags: [], requiresTag: false };
+  };
+  await runtime.start();
+  await admit(runtime, message("401", parent, '/cron pr-add "every 5m" owner/project'));
+  const job = store.output("401:head-control")?.text.match(/[a-f0-9-]{36}/)?.[0];
+  if (!job) throw new Error("Missing registration");
+  await admit(runtime, message("402", parent, `/cron run ${job}`));
+  await offer.promise;
+  const review = `/cron pr-review ${job} 7 ${sha}`;
+  const creation = anchored ? message("403", parent, review) : applicationCommand("403", parent, review);
+  if (!anchored) {
+    const persist = store.setMeta.bind(store);
+    spyOn(store, "setMeta").mockImplementation((key, value) => {
+      persist(key, value);
+      if (key === `handoff-route:${creation.id}` && value !== "uncertain") throw new Error("Interrupted before lane binding");
+    });
+  }
+  await admit(runtime, creation);
+  await admit(runtime, message("404", parent, review));
+  await admit(runtime, message("405", route("777"), review));
+  expect(store.lanes()).toEqual([]);
+  expect(messenger.threads).toEqual([nativeThread]);
+  await admit(runtime, message("406", nativeThread, review));
+  const [lane] = store.lanes();
+  expect(lane?.route).toEqual(nativeThread);
+  expect(messenger.threads).toEqual([nativeThread]);
+  await waitForOutput(messenger, "handoff:406:lane:held");
+  expect(store.input("handoff:406:lane")?.state).toBe("cancelled");
+  expect([...f.hosts.values()].flatMap(host => host.prompts)).toEqual([]);
+  expect(main.prompts).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test("a pending discovery offer survives a transient restart fence without sending through it", async () => {
+  const { runtime, config, store, messenger } = fixture(2, undefined, {
+    readIntakePulls: async () => { throw new Error("No additional PR scan is due"); },
+    requestRestart: async () => { throw new Error("A refused restart acknowledgement must not reach the Gateway"); },
+  });
+  const parent = route(null);
+  await runtime.start();
+  await admit(runtime, message("501", parent, '/cron pr-add "every 30m" owner/project'));
+  // Recovery boundary: a scan committed the offer, but the outbox has not
+  // sent anything from it when an authenticated restart fences dispatch.
+  const jobs = new CronJobs(store, config);
+  jobs.poll(Date.now() + 3_600_000);
+  const run = store.inputs("main", "pending").find(input => jobs.isPrIntakeRun(input));
+  if (!run) throw new Error("Missing discovery receipt");
+  await new CronPrIntake(store, jobs, async () => ({ repositoryId: 2, ownerId: 3, self: "owner",
+    pulls: [{ number: 9, head: "a".repeat(40), author: "someone", createdAt: Date.now() + 1 }],
+  })).consume(run, new AbortController().signal);
+  const [offer] = store.outputs();
+  if (!offer) throw new Error("Missing pending PR offer");
+  const beforeAck = Promise.withResolvers<string>();
+  messenger.beforeSend = async output => {
+    if (output.id === "502:restart-ack") {
+      beforeAck.resolve(store.output(offer.id)?.state ?? "missing");
+      throw new DeliveryError("Offline restart refused", "rejected");
+    }
+  };
+  await runtime.receive(message("502", parent, "/restart"));
+  expect(await beforeAck.promise).toBe("pending");
+  await waitForOutput(messenger, offer.id);
+  await runtime.kick();
+  expect(store.output(offer.id)?.state).toBe("sent");
+  expect(messenger.sent.filter(output => output.id === offer.id)).toHaveLength(1);
 });
 
 test("cron controls scope job management to the original thread and send one HEAD result after route verification", async () => {
@@ -7445,9 +7883,10 @@ describe("real Store runtime coordination", () => {
     expect(launched).toEqual([]);
   });
 
-  test.each(["Discord thread", "DM", "Slack question thread"] as const)("%s held at an old implicit workspace question retains its exact source without replay", async kind => {
+  test.each(["Discord thread", "steering in a Discord thread", "DM", "Slack question thread"] as const)("%s held at an old implicit workspace question retains its exact source without replay", async kind => {
     const { runtime, store, main, launched, config, messenger } = fixture();
     const slack = kind === "Slack question thread";
+    const steering = kind === "steering in a Discord thread";
     if (slack) config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
     const thread = slack ? route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" })
       : kind === "DM" ? route(null, { guildId: null, topicId: "old-work" }) : route("50");
@@ -7465,15 +7904,18 @@ describe("real Store runtime coordination", () => {
     const question = store.output("158:workspace");
     if (!question?.remoteId) throw new Error("Missing original workspace question");
     const destination = slack ? { ...thread, threadId: question.remoteId } : thread;
+    if (steering) await admit(runtime, headMessage("157", destination, "Review the release."));
     const followup = { ...message("159", kind === "DM" ? route(null, { guildId: null }) : destination, "Use @current.txt."),
       messageId: slack ? "1750000002.000003" : "159",
-      ...(kind === "Discord thread" ? { reply: { messageId: question.remoteId, text: "", authorId: thread.accountId } } : {}) };
+      ...(kind === "Discord thread" || steering ? { reply: { messageId: question.remoteId, text: "", authorId: thread.accountId } } : {}) };
     await admit(runtime, followup);
     await admit(runtime, followup);
-    expect(main.prompts).toHaveLength(1);
-    expect(main.prompts[0]?.command.message).toContain("Inspect \\u0040previous.txt before release.");
-    expect(main.prompts[0]?.command.message).not.toContain("@previous.txt");
-    expect(main.prompts[0]?.command.message).toContain(followup.text);
+    expect(main.prompts).toHaveLength(steering ? 2 : 1);
+    const prompt = main.prompts.at(-1)?.command;
+    expect(prompt?.streamingBehavior).toBe(steering ? "steer" : undefined);
+    expect(prompt?.message).toContain("Inspect \\u0040previous.txt before release.");
+    expect(prompt?.message).not.toContain("@previous.txt");
+    expect(prompt?.message).toContain(followup.text);
     expect(store.input(followup.id)).toMatchObject({ target: "main", route: destination, state: "submitted" });
     expect(store.input(original.id)).toMatchObject({ state: "pending", requestId: null });
     expect(store.output("159:workspace")).toBeNull();
@@ -7509,26 +7951,22 @@ describe("real Store runtime coordination", () => {
     expect(turn).not.toContain("candidateCount");
   });
 
-  test("an expired steering lookup cannot skip an earlier standalone HEAD request", async () => {
+  test("a steer whose run ends during native preflight cannot skip an earlier standalone HEAD request", async () => {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    const { runtime, config, store, main, hosts, messenger } = fixture(3, undefined, { topicMemory: {
-      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: false }),
-      search: async query => {
-        entered.resolve(); await release.promise;
-        return { backend: "mnemopi", query, items: [], count: 0 };
-      },
-    } });
-    const lane = savedLane(store, config, "context", route("55"), process.pid);
-    hosts.set(lane.socketPath, new HostTransport(lane.sessionFile, "session-context"));
+    const { runtime, store, main } = fixture();
     await runtime.start();
     await admit(runtime, headMessage("100", route("51"), "Original HEAD task"));
     await admit(runtime, headMessage("101", route("52"), "Queued first in another thread"));
+    main.beforeState = async () => {
+      main.beforeState = undefined;
+      entered.resolve();
+      await release.promise;
+    };
     await runtime.receive(message("102", route("51"), "Check the login parser."));
     try {
       await entered.promise;
       main.complete("First task finished");
-      await messenger.whenSent(1);
-      await runtime.kick();
+      expect(store.input("102")?.state).toBe("pending");
     } finally { release.resolve(); }
     await main.whenPrompts(2);
     expect(main.prompts[1]?.command.message).toContain("Queued first in another thread");
@@ -7536,6 +7974,29 @@ describe("real Store runtime coordination", () => {
     await main.whenPrompts(3);
     expect(main.prompts[2]?.command.message).toContain("Check the login parser.");
     expect(main.prompts[2]?.command.streamingBehavior).toBeUndefined();
+  });
+
+  test("an acknowledged approval wakes a pending steer in the same active HEAD run", async () => {
+    const { runtime, store, main, messenger } = fixture();
+    const destination = route("51");
+    await runtime.start();
+    await admit(runtime, headMessage("100", destination, "Review the proposed change."));
+    const frame = { type: "extension_ui_request", id: "steering-confirm", method: "confirm", title: "Proceed?", message: "Continue reviewing?" };
+    main.state.pendingUiRequests = [frame];
+    main.emit(frame);
+    await messenger.whenApproval();
+    const [card] = messenger.shown.values();
+    if (!card || !messenger.handlers) throw new Error("HEAD did not surface its approval");
+    await messenger.handlers.message(message("101", destination, "Recheck the parser before continuing."));
+    await runtime.kick();
+    expect(store.input("101")?.state).toBe("pending");
+
+    await messenger.handlers.answer(card.id, { confirmed: true }, card.route);
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(store.input("100")?.state).toBe("submitted");
+    expect(store.input("101")?.state).toBe("submitted");
+    expect(main.prompts[1]?.command.streamingBehavior).toBe("steer");
   });
 
   test("a slow HEAD routing lookup does not delay an existing thread or reorder HEAD work", async () => {
