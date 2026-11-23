@@ -221,7 +221,15 @@ Create only missing presets and verify native readback before ordinary work
 starts. Invalid, tombstoned, shadowed or operator-edited entries are not
 overwritten. Managed presets follow the native `slow`, `default`, and `smol`
 roles respectively when their available selections change. Refresh only the
-entries still under management; do not switch existing sessions. These labels
+entries still under management; do not switch existing sessions. Preset role
+synchronization watches the configured native preset/role files, parent
+directories (so replaced directories with new inodes rebind cleanly), and
+every symlink hop (`fs.watch`, debounced), watches surviving ancestors for
+uncreated directories, and reconciles once after installing watchers. Errors
+and explicit `"deferred"` outcomes get bounded backoff retries. Deferred work
+continues at a slow interval after those retries so late model availability
+can apply without another config edit. Slow periodic polling also stays
+active whenever any source is uncovered or a watcher errors. These labels
 are preset names, not custom roles or tested performance/cost tiers.
 
 Each lane records a resolved model, selection reason, and the complete native

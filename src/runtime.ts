@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
 import type { MemoryRuntimeContext } from "@oh-my-pi/pi-coding-agent/memory-backend";
@@ -21,7 +21,7 @@ import { HostConnection, type HostOptions, PR_REVIEW_INPUT_PREFIX, startHost } f
 import { compareMessageIds } from "./message-order";
 import { codingModels, isLaneModel, laneModelArgument, resolveLaneModelChoice, sameLaneModel, type LaneModelCandidate } from "./lane-models";
 import { advertisedLegacyWorkflow, advertisedWorkflow, headWorkflow, leadingWorkflow, workflowChoice, workflowContext, workflowPrompt } from "./workflow";
-import type { NativePresetInspection } from "./native-presets";
+import type { NativePresetInspection, PresetSyncOutcome } from "./native-presets";
 import type { HeadInitialization } from "./gateway-wire";
 import { repositoryRoot } from "./repository";
 import { discordThreadSplit, editsTopicPlacement, existingWorkspace, inferredWorkspace, namedWorkspaces, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
@@ -48,7 +48,14 @@ import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, 
 import type { RemotePlacement, WorkerProbe, WorkerRegistration, WorkerSelector } from "./worker-wire";
 
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
-const presetSyncIntervalMs = 30_000;
+const presetSyncFallbackIntervalMs = 120_000;
+const presetSyncDebounceMs = 150;
+const presetSyncRetryBaseMs = 100;
+const presetSyncRetryMaxMs = 1_600;
+const presetSyncMaxRetries = 5;
+// Idle HEAD rotation keeps the 50% context threshold to rotate before stock
+// auto-compaction fires, matching host-extension.ts, Gateway rotation.rs, and DESIGN.md.
+const HEAD_ROTATION_CONTEXT_PERCENT = 50;
 const headPickerLifetimeMs = 5 * 60_000;
 const headControlPattern = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/;
 const dialogs = new Set(["select", "confirm", "input", "editor", "ask"]);
@@ -157,7 +164,8 @@ export interface RuntimeAdapters {
   workerConnect(...args: Parameters<typeof workerConnect>): Promise<RuntimeHost>;
   resolvePreset?: (name: string, thinkingContext?: Pick<LanePresetSnapshot, "defaultThinkingLevel">) => Promise<ResolvedLanePreset>;
   inspectPresets?: () => Promise<NativePresetInspection>;
-  syncPresetRoles?: (canWrite: () => boolean) => Promise<void>;
+  syncPresetRoles?: (canWrite: () => boolean) => Promise<void | PresetSyncOutcome>;
+  presetRolePaths?: () => Promise<readonly string[]> | readonly string[];
   persistPreset?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot>;
   reapHeadJobs?: (identity: Pick<HeadRestart, "sessionId" | "sessionFile">) => Promise<boolean>;
   requestRestart?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord>;
@@ -416,6 +424,15 @@ export class Superagent {
   private prObservation?: Promise<void>;
   private presetSync?: Promise<void>;
   private nextPresetSync = 0;
+  private nextDeferredPresetSync?: number;
+  private presetSyncDirty = false;
+  private presetWatchFallback = false;
+  private presetWatchDebounce?: NodeJS.Timeout;
+  private presetSyncRetryTimer?: NodeJS.Timeout;
+  private presetSyncRetryCount = 0;
+  private presetWatchPaths: readonly string[] = [];
+  private presetWatchSnapshot = "";
+  private readonly presetWatchers: FSWatcher[] = [];
   private readonly remoteReconnect = new Map<string, RemoteRetry>();
   private readonly remoteAttaching = new Map<string, Promise<Live>>();
 
@@ -582,7 +599,12 @@ export class Superagent {
       this.timer.unref?.();
       await this.kick();
       this.observePrs();
+      await this.startPresetWatcher();
+      // Reconcile once after installing watchers so changes in the gap after
+      // initial startup sync are never left unapplied.
+      this.presetSyncDirty = true;
       this.observePresetRoles();
+      await this.presetSync;
     } catch (error) {
       await this.stop();
       throw error;
@@ -626,7 +648,7 @@ export class Superagent {
     const head = this.live.get("main");
     if (!head || !this.current(head) || !this.ready || this.stopped
       || state.hostPid !== process.pid || state.sessionId !== head.sessionId || state.sessionFile !== this.headSessionFile()
-      || !Number.isFinite(state.contextPercent) || state.contextPercent < 50
+      || !Number.isFinite(state.contextPercent) || state.contextPercent < HEAD_ROTATION_CONTEXT_PERCENT
       || head.busy || head.running || head.input || head.admitted.size || head.finishing
       || this.blocked.has("main") || this.headStopping || this.headCompaction || this.bootstrapActive
       || this.initializationHoldsHead() || this.restartFence() || this.restartActive || this.restartReconciliation
@@ -706,9 +728,9 @@ export class Superagent {
     const live = this.live.get("main")!;
     const recovery = "Inspect /model preset list and the native head log/session. Repair native high/middle/low presets with the existing OMP preset tools, then restart the head to verify; no initializer is automatically replayed.";
     try {
-      if (rotated) this.nextPresetSync = Date.now() + presetSyncIntervalMs;
+      if (rotated) this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
       if (!rotated && this.adapters.syncPresetRoles && !this.restartFence()) {
-        this.nextPresetSync = Date.now() + presetSyncIntervalMs;
+        this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
         await this.adapters.syncPresetRoles(() => this.current(live) && !this.restartFence() && !this.headStopping).catch(this.report);
       }
       const inspection = await this.adapters.inspectPresets!();
@@ -788,6 +810,7 @@ export class Superagent {
       this.bootstrapActive = undefined;
       live.busy = !actual.isSettled;
       if (!complete) this.report(new Error(this.initialization!.detail));
+      this.observePresetRoles();
     } catch (error) {
       if (!this.current(live) || !this.bootstrapActive) return;
       this.bootstrapActive = undefined;
@@ -3406,13 +3429,279 @@ export class Superagent {
       .finally(() => { this.prObservation = undefined; });
   }
 
+  private clearPresetSyncRetry(): void {
+    if (this.presetSyncRetryTimer) {
+      clearTimeout(this.presetSyncRetryTimer);
+      this.presetSyncRetryTimer = undefined;
+    }
+  }
+
+  private presetWatchState(paths: readonly string[]): {
+    direct: Map<string, Set<string>>;
+    ancestors: Map<string, Set<string>>;
+    uncovered: boolean;
+    snapshot: string;
+  } {
+    const direct = new Map<string, Set<string>>();
+    const ancestors = new Map<string, Set<string>>();
+    const add = (map: Map<string, Set<string>>, dir: string, name: string) => {
+      let names = map.get(dir);
+      if (!names) { names = new Set(); map.set(dir, names); }
+      names.add(name);
+    };
+    const addAncestor = (missingDir: string): boolean => {
+      let child = missingDir;
+      let parent = dirname(child);
+      while (parent !== child && !existsSync(parent)) {
+        child = parent;
+        parent = dirname(child);
+      }
+      if (parent !== child && existsSync(parent)) {
+        add(ancestors, parent, basename(child));
+        return true;
+      }
+      return false;
+    };
+    const statIdentity = (filePath: string, follow: boolean): string => {
+      try {
+        const info = (follow ? statSync : lstatSync)(filePath, { bigint: true });
+        const kind = !follow && info.isSymbolicLink() ? "l" : info.isDirectory() ? "d" : "f";
+        return `${info.dev}:${info.ino}:${kind}`;
+      } catch {
+        return "missing";
+      }
+    };
+    let uncovered = false;
+    const entries: string[] = [];
+    const watchLinks = (target: string) => {
+      const absolute = resolve(target);
+      let dir = parse(absolute).root;
+      let parts = absolute.slice(dir.length).split(sep);
+      let followed = 0;
+      while (parts.length) {
+        const name = parts.shift()!;
+        if (!name || name === ".") continue;
+        if (name === "..") { dir = dirname(dir); continue; }
+        const path = join(dir, name);
+        let info;
+        try { info = lstatSync(path, { bigint: true }); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") uncovered = true;
+          else add(ancestors, dir, name);
+          return;
+        }
+        if (!info.isSymbolicLink()) {
+          if (parts.length && !info.isDirectory()) { uncovered = true; return; }
+          dir = path;
+          continue;
+        }
+        // Subscribe to every physical hop, not just the input path and the final realpath.
+        add(ancestors, dir, name);
+        const parent = dirname(dir);
+        if (parent !== dir) add(ancestors, parent, basename(dir));
+        try {
+          const link = readlinkSync(path);
+          entries.push(`link:${path}|${info.dev}:${info.ino}|${link}`);
+          // Linux stops resolving paths after this many symlinks, including cycles.
+          if (++followed > 40) { uncovered = true; return; }
+          const root = parse(link).root;
+          if (root) dir = root;
+          parts = [...link.slice(root.length).split(sep), ...parts];
+        } catch { uncovered = true; return; }
+      }
+    };
+    for (const target of paths) {
+      const directory = dirname(target);
+      const name = basename(target);
+      watchLinks(target);
+      if (!existsSync(directory)) {
+        uncovered = true;
+        const watched = addAncestor(directory);
+        entries.push(`${target}|missing|${watched}`);
+        continue;
+      }
+      add(direct, directory, name);
+      const parentDir = dirname(directory);
+      if (parentDir !== directory && existsSync(parentDir)) add(ancestors, parentDir, basename(directory));
+      let realDir = "";
+      try {
+        realDir = realpathSync(directory);
+        if (realDir !== directory) {
+          add(direct, realDir, name);
+          const realParent = dirname(realDir);
+          if (realParent !== realDir && existsSync(realParent)) add(ancestors, realParent, basename(realDir));
+        }
+      } catch {
+        uncovered = true;
+      }
+      let resolved: string | null = null;
+      let covered = true;
+      try {
+        lstatSync(target);
+        try {
+          const real = realpathSync(target);
+          resolved = real;
+          if (real !== target) {
+            const realTargetDir = dirname(real);
+            if (existsSync(realTargetDir)) {
+              add(direct, realTargetDir, basename(real));
+              const realTargetParent = dirname(realTargetDir);
+              if (realTargetParent !== realTargetDir && existsSync(realTargetParent)) {
+                add(ancestors, realTargetParent, basename(realTargetDir));
+              }
+            } else {
+              covered = false;
+            }
+          }
+        } catch {
+          // Dangling symlink or unresolvable target: watch link target's parent/ancestor if possible and keep fallback active.
+          covered = false;
+          try {
+            const linkDest = resolve(directory, readlinkSync(target));
+            const linkDir = dirname(linkDest);
+            if (existsSync(linkDir)) add(direct, linkDir, basename(linkDest));
+            else addAncestor(linkDir);
+          } catch {}
+        }
+      } catch {
+        // File does not exist yet inside an existing directory: directory watch covers creation.
+      }
+      if (!covered) uncovered = true;
+      entries.push(`${target}|exists|${statIdentity(directory, true)}|${realDir}|${statIdentity(realDir, true)}|${resolved ?? ""}|${statIdentity(target, false)}|${statIdentity(target, true)}|${covered}`);
+    }
+    return { direct, ancestors, uncovered, snapshot: entries.join("\n") };
+  }
+
+  private async startPresetWatcher(): Promise<void> {
+    this.stopPresetWatcher(false);
+    this.presetWatchFallback = false;
+    if (!this.adapters.syncPresetRoles) return;
+    if (!this.adapters.presetRolePaths) {
+      this.presetWatchFallback = true;
+      return;
+    }
+    let paths: readonly string[];
+    try { paths = await this.adapters.presetRolePaths(); }
+    catch (error) {
+      this.presetWatchFallback = true;
+      this.report(error);
+      return;
+    }
+    if (this.stopped || !paths.length) {
+      this.presetWatchFallback = true;
+      return;
+    }
+    this.presetWatchPaths = paths;
+    const state = this.presetWatchState(paths);
+    this.presetWatchSnapshot = state.snapshot;
+    let uncovered = state.uncovered;
+    const directories = new Set([...state.direct.keys(), ...state.ancestors.keys()]);
+    for (const directory of directories) {
+      const directNames = state.direct.get(directory);
+      const ancestorNames = state.ancestors.get(directory);
+      try {
+        const watcher = watch(directory, { persistent: false }, (_event, filename) => {
+          if (this.stopped) return;
+          if (filename !== null) {
+            const name = String(filename);
+            if (!directNames?.has(name) && !ancestorNames?.has(name)) return;
+          } else if (!directNames?.size && ancestorNames?.size
+            && (!this.presetWatchPaths.length
+              || this.presetWatchState(this.presetWatchPaths).snapshot === this.presetWatchSnapshot)) {
+            return;
+          }
+          if (this.presetWatchDebounce) clearTimeout(this.presetWatchDebounce);
+          this.presetWatchDebounce = setTimeout(() => {
+            this.presetWatchDebounce = undefined;
+            void (async () => {
+              if (this.stopped) return;
+              if (this.presetWatchPaths.length
+                && this.presetWatchState(this.presetWatchPaths).snapshot !== this.presetWatchSnapshot) {
+                await this.startPresetWatcher();
+              }
+              if (this.stopped) return;
+              this.presetSyncRetryCount = 0;
+              this.clearPresetSyncRetry();
+              this.presetSyncDirty = true;
+              this.observePresetRoles();
+            })().catch(this.report);
+          }, presetSyncDebounceMs);
+          this.presetWatchDebounce.unref?.();
+        });
+        watcher.unref?.();
+        watcher.on("error", error => {
+          this.presetWatchFallback = true;
+          const next = Date.now() + presetSyncFallbackIntervalMs;
+          if (!this.nextPresetSync || next < this.nextPresetSync) this.nextPresetSync = next;
+          this.report(error);
+          watcher.close();
+        });
+        this.presetWatchers.push(watcher);
+      } catch (error) {
+        uncovered = true;
+        this.report(error);
+      }
+    }
+    if (uncovered || !this.presetWatchers.length) this.presetWatchFallback = true;
+  }
+
+  private stopPresetWatcher(clearRetry = true): void {
+    if (clearRetry) this.clearPresetSyncRetry();
+    if (this.presetWatchDebounce) {
+      clearTimeout(this.presetWatchDebounce);
+      this.presetWatchDebounce = undefined;
+    }
+    while (this.presetWatchers.length) {
+      try { this.presetWatchers.pop()!.close(); }
+      catch {}
+    }
+  }
+
   private observePresetRoles(): void {
     const sync = this.adapters.syncPresetRoles;
     const canWrite = () => this.ready && !this.stopped && !this.restartFence() && !this.headRotationHeld()
       && !this.headStopping && !this.bootstrapActive;
-    if (!sync || this.presetSync || Date.now() < this.nextPresetSync || !canWrite()) return;
-    this.nextPresetSync = Date.now() + presetSyncIntervalMs;
-    this.presetSync = sync(canWrite).catch(this.report).finally(() => { this.presetSync = undefined; });
+    if (!sync || this.presetSync || !canWrite()) return;
+    const now = Date.now();
+    const dueFallback = this.presetWatchFallback && now >= this.nextPresetSync;
+    const dueDeferred = this.nextDeferredPresetSync !== undefined && now >= this.nextDeferredPresetSync;
+    if (!this.presetSyncDirty && !dueFallback && !dueDeferred) return;
+    this.presetSyncDirty = false;
+    this.clearPresetSyncRetry();
+    if (this.presetWatchFallback) this.nextPresetSync = now + presetSyncFallbackIntervalMs;
+    if (this.nextDeferredPresetSync !== undefined) this.nextDeferredPresetSync = now + presetSyncFallbackIntervalMs;
+    let retryable = false;
+    this.presetSync = sync(canWrite)
+      .then(outcome => {
+        if (outcome === "deferred") {
+          retryable = true;
+          // Model availability can recover without changing any watched configuration.
+          this.nextDeferredPresetSync = Date.now() + presetSyncFallbackIntervalMs;
+        } else {
+          this.presetSyncRetryCount = 0;
+          this.nextDeferredPresetSync = undefined;
+        }
+      })
+      .catch(error => {
+        retryable = true;
+        this.report(error);
+      })
+      .finally(() => {
+        this.presetSync = undefined;
+        if (this.stopped) return;
+        if (this.presetSyncDirty) {
+          this.observePresetRoles();
+        } else if (retryable && this.presetSyncRetryCount < presetSyncMaxRetries) {
+          const delay = Math.min(presetSyncRetryBaseMs * 2 ** this.presetSyncRetryCount, presetSyncRetryMaxMs);
+          this.presetSyncRetryCount++;
+          this.presetSyncRetryTimer = setTimeout(() => {
+            this.presetSyncRetryTimer = undefined;
+            this.presetSyncDirty = true;
+            this.observePresetRoles();
+          }, delay);
+          this.presetSyncRetryTimer.unref?.();
+        }
+      });
   }
 
   async inspectThread(sourceId: string, laneId?: string): Promise<ThreadInfo> {
@@ -4150,6 +4439,7 @@ export class Superagent {
       || hold && this.store.getMeta("gateway:operator-stop") !== (restart.stopBoundary ?? null)) return;
     this.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(restart));
     this.store.setMeta("head:restart-fence", hold ? JSON.stringify(restart) : "");
+    if (!hold) this.observePresetRoles();
   }
 
   private assertRestartCurrent(restart: HeadRestart): void {
@@ -4893,6 +5183,7 @@ export class Superagent {
       this.controlReply(input, "The selected HEAD turn was cancelled in the queue, but native stop completion is unverified. It was not replayed.", "uncertain");
     } finally {
       this.headStopping--;
+      this.observePresetRoles();
     }
   }
 
@@ -5022,6 +5313,7 @@ export class Superagent {
       } finally {
         this.headStopping--;
         this.background(this.reconcileHeadRecovery());
+        this.observePresetRoles();
       }
     });
     this.headStopTail = operation;
@@ -7205,6 +7497,7 @@ export class Superagent {
     if (this.timer) clearInterval(this.timer);
     for (const retry of this.threadTitleRetries.values()) clearTimeout(retry);
     this.threadTitleRetries.clear();
+    this.stopPresetWatcher();
     this.discordCatchupRetries.clear();
     this.stopSignal.abort();
     for (const live of this.live.values()) {
