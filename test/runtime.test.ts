@@ -3797,8 +3797,9 @@ describe("controlled Gateway AND HEAD restart", () => {
   test("an ACK queued during another output drain still requires its own durable sent receipt", async () => {
     const { runtime, store, messenger, requests, handoff, config } = restartFixture();
     await runtime.start();
-    const sourceId = modelChangeSource(store, "restart-drain-source");
-    store.queueOutput({ id: "existing-drain", sourceId, route: store.input(sourceId)!.route, text: "Earlier output" });
+    store.receive(message("restart-drain-source", route()), "main");
+    store.settle("restart-drain-source", "done");
+    store.queueOutput({ id: "existing-drain", sourceId: "restart-drain-source", route: route(), text: "Earlier output" });
     const started = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     messenger.beforeSend = async output => { if (output.id === "existing-drain") { started.resolve(); await release.promise; } };
@@ -11108,5 +11109,81 @@ describe("ordinary placement in owner parents without native threads", () => {
       await expect(runtime.receive(message("9151", destination))).rejects.toThrow(/not authorized|Unauthorized/);
     }
     expect(store.input("9151")).toBeNull();
+  });
+});
+
+
+describe("per-route outbox flushing", () => {
+  test("a slow physical route does not block delivery on another route", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5"] };
+    const slowChannel = route("10", { channelId: "4" });
+    const siblingThread = route("11", { channelId: "4" });
+    const otherChannel = route(null, { channelId: "5" });
+    const slowStarted = Promise.withResolvers<void>();
+    const releaseSlow = Promise.withResolvers<void>();
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      if (output.route.channelId === "4" && output.route.threadId === "10") {
+        slowStarted.resolve();
+        await releaseSlow.promise;
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    try {
+      await runtime.receive(message("9201", slowChannel, "/status"));
+      await slowStarted.promise;
+      await runtime.receive(message("9202", siblingThread, "/status"));
+      await runtime.receive(message("9203", otherChannel, "/status"));
+      await messenger.whenSent(2);
+      await Bun.sleep(20);
+      expect(store.output("9201:head-control")?.state).toBe("sending");
+      expect(store.output("9202:head-control")?.state).toBe("sent");
+      expect(store.output("9203:head-control")?.state).toBe("sent");
+    } finally {
+      releaseSlow.resolve();
+    }
+    await messenger.whenSent(3);
+    await Bun.sleep(20);
+    expect(store.output("9201:head-control")?.state).toBe("sent");
+  });
+
+  test("preserves strict sequence order within a physical route and leaves ambiguous failures uncertain", async () => {
+    const { runtime, store, messenger, errors } = fixture();
+    const dmA: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: null, channelId: "dm-1", threadId: null, topicId: "topic-a" };
+    const dmB: Route = { ...dmA, topicId: "topic-b" };
+    const firstStarted = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const attempted: string[] = [];
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      attempted.push(output.id);
+      if (output.id === "9211:head-control") {
+        firstStarted.resolve();
+        await releaseFirst.promise;
+        throw new DeliveryError("Gateway timeout", "uncertain");
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    try {
+      await runtime.receive(message("9211", dmA, "/help"));
+      await firstStarted.promise;
+      await runtime.receive(message("9212", dmB, "/help"));
+      await runtime.receive(message("9213", dmA, "/help"));
+      await Bun.sleep(20);
+      // Logical topics on the same physical DM share one serial queue.
+      expect(attempted).toEqual(["9211:head-control"]);
+    } finally {
+      releaseFirst.resolve();
+    }
+    await messenger.whenSent(2);
+    await Bun.sleep(20);
+    expect(attempted).toEqual(["9211:head-control", "9212:head-control", "9213:head-control"]);
+    expect(store.output("9211:head-control")).toMatchObject({ state: "uncertain", remoteId: null });
+    expect(store.output("9212:head-control")?.state).toBe("sent");
+    expect(store.output("9213:head-control")?.state).toBe("sent");
+    expect(errors.length).toBe(1);
   });
 });

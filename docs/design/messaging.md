@@ -480,6 +480,10 @@ approval.
   Progress reports are coalesced before submission where safe; a final result
   takes precedence over undelivered progress. Already started external sends
   cannot be recalled.
+- Pending outbox delivery runs concurrently across distinct physical routes
+  (platform, account, authority, guild, channel, thread) while preserving
+  strict sequence order within each physical route and never automatically
+  retrying uncertain sends.
 
 ## Discord voice
 

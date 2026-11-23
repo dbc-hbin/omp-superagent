@@ -384,7 +384,7 @@ export class Superagent {
   private nextHeadQuotaCheck?: number;
   private readonly adapters: RuntimeAdapters;
   private pumping?: Promise<void>;
-  private outbound?: Promise<void>;
+  private readonly routeOutbounds = new Map<string, Promise<void>>();
   private catchupTask?: Promise<void>;
   private discordCatchupRetry?: Promise<void>;
   private readonly discordCatchupRetries = new Map<string, DiscordCatchupRetry>();
@@ -616,7 +616,7 @@ export class Superagent {
       || this.blocked.has("main") || this.headStopping || this.headCompaction || this.bootstrapActive
       || this.initializationHoldsHead() || this.restartFence() || this.restartActive || this.restartReconciliation
       || this.recoveryReconciliation || this.headRecoveryActive() || this.restartControllerBusy()
-      || this.controls.size || this.tasks.size || this.pumping || this.catchupTask || this.outbound || this.prObservation
+      || this.controls.size || this.tasks.size || this.pumping || this.catchupTask || this.routeOutbounds.size || this.prObservation
       || this.presetSync || this.reactionQueues.size || this.threadEditQueues.size || this.groups?.busy
       || this.store.approvals().length || this.store.outputs().length || this.store.hasUnresolvedHeadDelivery()
       || this.store.inputs().some(input => input.state === "pending" || input.state === "uncertain" || input.target === "main")
@@ -5086,7 +5086,7 @@ export class Superagent {
     const selection = input.pickerSelection;
     const head = this.live.get("main");
     if (selection) {
-      if (this.store.output(selection.outputId)?.state === "sending") await this.outbound;
+      await this.awaitSendingOutput(selection.outputId);
       const output = this.store.output(selection.outputId);
       const picker = output?.picker;
       const stale = () => !head || !this.current(head) || picker?.kind !== "usage-reset"
@@ -5259,7 +5259,7 @@ export class Superagent {
       if (selection) {
         // A fast click may reach IPC before the outbox has recorded its result.
         // An uncertain send is not permission to mutate HEAD.
-        if (this.store.output(selection.outputId)?.state === "sending") await this.outbound;
+        await this.awaitSendingOutput(selection.outputId);
         const delivery = this.store.output(selection.outputId);
         if (!delivery?.picker || delivery.state !== "sent" || delivery.remoteId !== selection.cardId) {
           reply(`The original menu delivery could not be verified. Open ${prefix}${command.name} again; nothing was changed.`, "cancelled");
@@ -6708,77 +6708,106 @@ export class Superagent {
     return "ready";
   }
 
-  private async flushOutputs(): Promise<void> {
-    if (this.outbound) return this.outbound;
-    if (this.stopped) return;
+  private async awaitSendingOutput(outputId: string): Promise<void> {
+    const pending = this.store.output(outputId);
+    if (pending?.state === "sending") await this.routeOutbounds.get(physicalRouteKey(pending.route));
+  }
+
+  private flushableOutputs(): OutputRecord[] {
+    return this.store.outputs().filter(output => this.watchDeliveryReady
+      || !(isLaneWatchNotice(output.id) || isPrObservation(output.sourceId)));
+  }
+
+  private async flushOutputRoute(routeKeyValue: string): Promise<boolean> {
+    const deferredLaneNotices = new Set<string>();
     let delivered = false;
-    this.outbound = Promise.resolve().then(async () => {
-      const deferredLaneNotices = new Set<string>();
-      try {
-        while (!this.stopped) {
-          const outputs = this.store.outputs().filter(output => this.watchDeliveryReady
-            || !(isLaneWatchNotice(output.id) || isPrObservation(output.sourceId)));
-          if (outputs.every(output => deferredLaneNotices.has(output.id))) break;
-          for (const output of outputs) {
-            if (isLaneWatchNotice(output.id)) {
-              if (deferredLaneNotices.has(output.id)) continue;
-              let verification: "ready" | "held" | "deferred";
-              try { verification = await this.verifyLaneWatchDelivery(output); }
-              catch (error) {
-                this.report(new Error("Lane watch notice cannot be verified", { cause: error }));
-                verification = "held";
-              }
-              if (verification === "deferred") { deferredLaneNotices.add(output.id); continue; }
-              if (verification === "held") {
-                if (!this.stopped && this.store.claimOutput(output.id))
-                  this.store.finishOutput(output.id, "failed", undefined, "Lane watch notice is held or no longer tracked");
-                continue;
-              }
-            }
-            if (this.stopped || !this.store.claimOutput(output.id)) continue;
-            const resultInputId = /^(.+):answer(?::done)?$/.exec(output.id)?.[1];
-            let remoteId: string;
-            try {
-              if (isLaneWatchNotice(output.id)) {
-                let scope: ReturnType<LaneWatcher["deliveryScope"]>;
-                try { scope = this.laneWatcher.deliveryScope(output); }
-                catch (error) { throw new DeliveryError("Lane watch notice cannot be verified", "rejected", undefined, { cause: error }); }
-                if (!scope) throw new DeliveryError("Lane watch notice is held or no longer tracked", "rejected");
-              }
-              if (isPrObservation(output.sourceId)) {
-                let deliverable: boolean;
-                try { deliverable = this.prWatcher.deliverable(output); }
-                catch (error) { throw new DeliveryError("PR observation cannot be verified", "rejected", undefined, { cause: error }); }
-                if (!deliverable) throw new DeliveryError("PR observation is held or no longer tracked", "rejected");
-              }
-              if (groupRoom(this.config, output.route)) {
-                throw new DeliveryError("Owner output is not authorized in a restricted group room", "rejected");
-              }
-              if (output.resultAttachment) {
-                try { this.authorizeResultOwner(output.route); }
-                catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }
-              }
-              remoteId = await this.messenger.send(output);
-            }
-            catch (error) {
-              const rejected = error instanceof DeliveryError && error.certainty === "rejected";
-              this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
-              if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
-              this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
-              continue;
-            }
-            // Persist a successful remote send without reinterpreting a local failure.
-            this.store.finishOutput(output.id, "sent", remoteId);
-            if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
-            delivered = true;
+    while (!this.stopped) {
+      const outputs = this.flushableOutputs().filter(output => physicalRouteKey(output.route) === routeKeyValue);
+      if (outputs.every(output => deferredLaneNotices.has(output.id))) break;
+      for (const output of outputs) {
+        if (isLaneWatchNotice(output.id)) {
+          if (deferredLaneNotices.has(output.id)) continue;
+          let verification: "ready" | "held" | "deferred";
+          try { verification = await this.verifyLaneWatchDelivery(output); }
+          catch (error) {
+            this.report(new Error("Lane watch notice cannot be verified", { cause: error }));
+            verification = "held";
+          }
+          if (verification === "deferred") { deferredLaneNotices.add(output.id); continue; }
+          if (verification === "held") {
+            if (!this.stopped && this.store.claimOutput(output.id))
+              this.store.finishOutput(output.id, "failed", undefined, "Lane watch notice is held or no longer tracked");
+            continue;
           }
         }
-      } finally { this.outbound = undefined; }
-    });
-    await this.outbound;
-    // A successful uncertainty notice changes the effect evidence. Wake the
-    // finite recovery drain on that event, not the ordinary maintenance timer.
-    if (delivered && !this.recoveryReconciliation) await this.reconcileHeadRecovery();
+        if (this.stopped || !this.store.claimOutput(output.id)) continue;
+        const resultInputId = /^(.+):answer(?::done)?$/.exec(output.id)?.[1];
+        let remoteId: string;
+        try {
+          if (isLaneWatchNotice(output.id)) {
+            let scope: ReturnType<LaneWatcher["deliveryScope"]>;
+            try { scope = this.laneWatcher.deliveryScope(output); }
+            catch (error) { throw new DeliveryError("Lane watch notice cannot be verified", "rejected", undefined, { cause: error }); }
+            if (!scope) throw new DeliveryError("Lane watch notice is held or no longer tracked", "rejected");
+          }
+          if (isPrObservation(output.sourceId)) {
+            let deliverable: boolean;
+            try { deliverable = this.prWatcher.deliverable(output); }
+            catch (error) { throw new DeliveryError("PR observation cannot be verified", "rejected", undefined, { cause: error }); }
+            if (!deliverable) throw new DeliveryError("PR observation is held or no longer tracked", "rejected");
+          }
+          if (groupRoom(this.config, output.route)) {
+            throw new DeliveryError("Owner output is not authorized in a restricted group room", "rejected");
+          }
+          if (output.resultAttachment) {
+            try { this.authorizeResultOwner(output.route); }
+            catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }
+          }
+          remoteId = await this.messenger.send(output);
+        }
+        catch (error) {
+          const rejected = error instanceof DeliveryError && error.certainty === "rejected";
+          this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
+          if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
+          this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
+          continue;
+        }
+        // Persist a successful remote send without reinterpreting a local failure.
+        this.store.finishOutput(output.id, "sent", remoteId);
+        if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
+        delivered = true;
+      }
+    }
+    return delivered;
+  }
+
+  private async flushOutputs(): Promise<void> {
+    if (this.stopped) return;
+    const routes = new Set(this.flushableOutputs().map(output => physicalRouteKey(output.route)));
+    if (!routes.size) {
+      if (this.routeOutbounds.size) await Promise.all([...this.routeOutbounds.values()]);
+      else await Promise.resolve().then(() => {});
+      return;
+    }
+    const active: Promise<void>[] = [];
+    for (const routeKeyValue of routes) {
+      const existing = this.routeOutbounds.get(routeKeyValue);
+      if (existing) { active.push(existing); continue; }
+      let delivered = false;
+      let worker: Promise<void>;
+      worker = Promise.resolve().then(async () => {
+        try { delivered = await this.flushOutputRoute(routeKeyValue); }
+        finally {
+          if (this.routeOutbounds.get(routeKeyValue) === worker) this.routeOutbounds.delete(routeKeyValue);
+        }
+        // A successful uncertainty notice changes the effect evidence. Wake the
+        // finite recovery drain on that event, not the ordinary maintenance timer.
+        if (!this.stopped && delivered && !this.recoveryReconciliation) await this.reconcileHeadRecovery();
+      });
+      this.routeOutbounds.set(routeKeyValue, worker);
+      active.push(worker);
+    }
+    await Promise.all(active);
   }
 
   async stop(): Promise<void> {
@@ -6799,7 +6828,7 @@ export class Superagent {
     for (const live of this.live.values()) {
       for (const { input } of live.admitted.values()) this.activity(input, false);
     }
-    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values()]);
+    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, ...this.routeOutbounds.values(), this.catchupTask, ...this.tasks, ...this.operations.values()]);
     await this.messenger.stop();
     await Promise.allSettled([...this.live.values()].map(async live => { live.unsubscribe(); await live.connection.close(); }));
     this.live.clear();
