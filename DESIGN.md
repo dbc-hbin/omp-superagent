@@ -170,9 +170,9 @@ upstream [v19.0.0 source](https://github.com/can1357/oh-my-pi/commit/57771ae562b
 That pin is not a CLI version allowlist. [CLI inspection](src/installed-omp.ts)
 checks CLI identity, public `rpc-ui`, resume, extension and model flags, and the
 advertised process interface. A process reuses an inspection only while the
-configured executable's resolved file (path, device, inode, size, mtime, ctime) is
-unchanged; replacing or rewriting it re-runs the probes, and failures are never
-reused. Host initialization checks the real RPC/extension
+configured executable's resolved regular file (path, device, inode, size, mtime,
+ctime), its resolved shebang interpreter and the inspected loader environment
+are unchanged. Failures are never reused. Host initialization checks the real RPC/extension
 surface. Do not patch or build OMP, use the in-tree SDK as the CLI, or use a
 runtime wrapper in place of the native CLI.
 

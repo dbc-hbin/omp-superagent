@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,13 +45,15 @@ function fileIdentity(filePath: string): [string, ...string[]] {
 }
 
 function readShebangTokens(filePath: string): string[] | null {
-  const fd = openSync(filePath, "r");
+  const fd = openSync(filePath, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
+    if (!fstatSync(fd).isFile()) throw new Error("OMP executable must be a regular file");
     const buffer = Buffer.allocUnsafe(256);
     const bytes = readSync(fd, buffer, 0, buffer.length, 0);
     if (bytes < 2 || buffer[0] !== 0x23 || buffer[1] !== 0x21) return null;
     const line = buffer.subarray(2, bytes).toString("utf8");
     const newline = line.indexOf("\n");
+    if (newline < 0 && bytes === buffer.length) return [];
     const trimmed = (newline >= 0 ? line.slice(0, newline) : line).replace(/\r$/, "").trim();
     return trimmed ? trimmed.split(/[ \t]+/) : [];
   } finally {
@@ -60,24 +62,11 @@ function readShebangTokens(filePath: string): string[] | null {
 }
 
 function resolveEnvCommand(tokens: readonly string[], path: string): string | null {
-  let index = 1;
-  while (index < tokens.length) {
-    const token = tokens[index]!;
-    if (token === "--") { index++; break; }
-    if (token.startsWith("-") && token.length > 1) {
-      if ((token === "-u" || token === "--unset" || token === "-C" || token === "--chdir" || token === "-a" || token === "--argv0")
-        && index + 1 < tokens.length) {
-        index += 2;
-        continue;
-      }
-      index++;
-      continue;
-    }
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) { index++; continue; }
-    break;
-  }
-  const target = tokens[index];
-  if (!target) return null;
+  // Only cache forms whose interpreter search uses the provided PATH
+  // unchanged. env options, assignments, quoting and substitutions can
+  // change the interpreter; use the uncached real probe for those forms.
+  const target = tokens[1] === "-S" ? tokens[2] : tokens.length === 2 ? tokens[1] : undefined;
+  if (!target || target.startsWith("-") || !/^[\w./+-]+$/.test(target)) return null;
   if (isAbsolute(target) || target.includes("/")) return resolve(target);
   return Bun.which(target, { PATH: path });
 }
@@ -93,9 +82,10 @@ function executionIdentity(
   const files: [string, ...string[]][] = [];
   const seen = new Set<string>();
   let current: string | null = executable;
-  for (let depth = 0; depth < 4 && current; depth++) {
+  for (let depth = 0; current; depth++) {
+    if (depth === 4) return null;
     const id = fileIdentity(current);
-    if (seen.has(id[0])) break;
+    if (seen.has(id[0])) return null;
     seen.add(id[0]);
     files.push(id);
     const tokens = readShebangTokens(id[0]);

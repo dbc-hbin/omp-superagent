@@ -110,6 +110,12 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
             result
         }
         ("GET", "/channels/89") => json!({"id":"89", "guild_id":"77", "type":0}),
+        ("POST", "/channels/89/messages") => {
+            let nonce = body["nonce"].as_str().unwrap();
+            let id = u64::from_str_radix(&nonce[..12], 16).unwrap().to_string();
+            fixture.emitted.send((path, body)).unwrap();
+            json!({"id":id,"guild_id":"77","channel_id":"89","author":{"id":"71","bot":true}})
+        }
         ("POST", "/channels/90/messages") => {
             fixture.emitted.send((path, body)).unwrap();
             json!({"id":"701","guild_id":"77","channel_id":"90","author":{"id":"71","bot":true}})
@@ -309,6 +315,53 @@ async fn discord_fixture_with_store(mut config: Value, store: &Arc<Store>) -> (
     })
     .unwrap();
     (hub, ws, observed, last_card, server, responses, state.unwrap())
+}
+
+#[tokio::test]
+async fn discord_review_table_posts_stacked_markdown_in_order_without_touching_code() {
+    let (_temporary, _store, hub, ws, mut observed, _last_card, server) =
+        discord_fixture(json!({"discord":{"allowedChannelIds":["89"]}})).await;
+    let (started, _socket) = time::timeout(Duration::from_secs(5), async {
+        tokio::join!(hub.start(), identify(&ws, false))
+    })
+    .await
+    .unwrap();
+    started.unwrap();
+    let route = json!({"platform":"discord","accountId":"71","authorityId":"42",
+        "guildId":"77","channelId":"89","threadId":null});
+    let review = "**확인:** `main | 비교`에서 덮어쓰기 옵션과 진행 상태를 다시 확인했습니다. ".repeat(22);
+    let link = |pr: u32| format!("https://github.com/dbc-hbin/omp-superagent/pull/{pr}#pullrequestreview-6016947392");
+    let code = "```markdown\n| 예제 | 값 |\n| --- | --- |\n| 그대로 | 유지 |\n```";
+    let source = format!(
+        "재리뷰 요약\n| PR | 재리뷰 결과 | 상태 |\n| --- | --- | ---: |\n\
+        | [#40 · Discord 진행 보고]({}) | {} | 완료 |\n\
+        | [#41 · 채널별 병렬 전송]({}) | {} | 보류 \\| 확인 |\n{code}",
+        link(40), review.trim_end(), link(41), review.trim_end(),
+    );
+    assert!(source.encode_utf16().count() > 2_000);
+    hub.effect("send", &[json!({"id":"review-table","route":route,"text":source})])
+        .await
+        .unwrap();
+
+    let first = received(&mut observed, "/channels/89/messages").await;
+    let second = received(&mut observed, "/channels/89/messages").await;
+    for body in [&first, &second] {
+        assert!(body["content"].as_str().unwrap().encode_utf16().count() <= 2_000);
+        assert_eq!(body["allowed_mentions"], rest::no_mentions());
+    }
+    assert_eq!(
+        first["content"],
+        format!("재리뷰 요약\n\n- PR: [#40 · Discord 진행 보고]({})\n  - 재리뷰 결과: {}\n  - 상태: 완료",
+            link(40), review.trim_end())
+    );
+    assert_eq!(
+        second["content"],
+        format!("- PR: [#41 · 채널별 병렬 전송]({})\n  - 재리뷰 결과: {}\n  - 상태: 보류 \\| 확인\n\n{code}",
+            link(41), review.trim_end())
+    );
+    assert!(observed.try_recv().is_err());
+    hub.stop().await.unwrap();
+    server.abort();
 }
 
 #[tokio::test]

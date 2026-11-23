@@ -18,7 +18,6 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, ChildStdout, Command},
-    task::JoinHandle,
     time::{Instant, sleep, timeout, timeout_at},
 };
 use uuid::Uuid;
@@ -106,22 +105,16 @@ struct LaunchHelper {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
-    stderr_drain: JoinHandle<()>,
     leftover: Vec<u8>,
     phase1_deadline: Instant,
     discovery: Discovery,
 }
 
-impl Drop for LaunchHelper {
-    fn drop(&mut self) {
-        self.stderr_drain.abort();
-    }
-}
-
-async fn kill_wait(child: &mut Child, stderr_drain: &mut JoinHandle<()>) {
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    let _ = stderr_drain.await;
+async fn kill_wait(child: &mut Child, deadline: Instant) {
+    let _ = child.start_kill();
+    // Try to reap the direct child without extending the phase deadline. On
+    // drop, Tokio still takes care of a child that has not been reaped yet.
+    let _ = timeout_at(deadline, child.wait()).await;
 }
 
 impl LaunchHelper {
@@ -133,7 +126,9 @@ impl LaunchHelper {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // The diagnostic stream is private and not used by the Gateway.
+            // A background child can inherit it, so do not wait for its EOF.
+            .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .context("Could not start Host SDK launch helper")?;
@@ -145,15 +140,6 @@ impl LaunchHelper {
             .stdout
             .take()
             .context("Host SDK launch output was not piped")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("Host SDK launch stderr was not piped")?;
-        // Drain stderr concurrently up to OUTPUT_LIMIT so private child output
-        // never stalls the helper pipe or enters logs.
-        let mut stderr_drain = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stderr.take(OUTPUT_LIMIT), &mut tokio::io::sink()).await;
-        });
 
         let phase1_deadline = Instant::now() + phase1_timeout;
         let mut discovery_line = serde_json::to_vec(input)?;
@@ -174,19 +160,17 @@ impl LaunchHelper {
                     if let Some(payload) = line.strip_prefix(b"MANAGED_ULW_LAUNCH ") {
                         let discovery: Discovery = serde_json::from_slice(payload)?;
                         let leftover = buffer.split_off(line_end + 1);
-                        return Ok::<_, anyhow::Error>(Ok((discovery, leftover)));
+                        return Ok::<_, anyhow::Error>((discovery, leftover));
                     }
                     if let Some(payload) = line.strip_prefix(b"MANAGED_ULW_LAUNCH_ERROR ") {
                         let message: String = serde_json::from_slice(payload)?;
-                        return Ok(Err(anyhow::anyhow!(message)));
+                        return Err(anyhow::anyhow!(message));
                     }
                     scan_from = line_end + 1;
                 }
                 let read = stdout.read(&mut chunk).await?;
                 if read == 0 {
-                    return Ok(Err(anyhow::anyhow!(
-                        "Stock OMP discovery did not return a launch composition"
-                    )));
+                    anyhow::bail!("Stock OMP discovery did not return a launch composition");
                 }
                 let next_len = buffer.len().saturating_add(read);
                 ensure!(
@@ -201,28 +185,18 @@ impl LaunchHelper {
         match outcome {
             Err(_) => {
                 drop(stdin);
-                kill_wait(&mut child, &mut stderr_drain).await;
+                kill_wait(&mut child, phase1_deadline).await;
                 anyhow::bail!("Native launch discovery timed out");
             }
             Ok(Err(error)) => {
                 drop(stdin);
-                kill_wait(&mut child, &mut stderr_drain).await;
+                kill_wait(&mut child, phase1_deadline).await;
                 Err(error)
             }
-            Ok(Ok(Err(error))) => {
-                drop(stdin);
-                if timeout(Duration::from_secs(1), child.wait()).await.is_err() {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                }
-                let _ = (&mut stderr_drain).await;
-                Err(error)
-            }
-            Ok(Ok(Ok((discovery, leftover)))) => Ok(Self {
+            Ok(Ok((discovery, leftover))) => Ok(Self {
                 child,
                 stdin: Some(stdin),
                 stdout,
-                stderr_drain,
                 leftover,
                 phase1_deadline,
                 discovery,
@@ -235,27 +209,19 @@ impl LaunchHelper {
         drop(self.stdin.take());
         match timeout_at(self.phase1_deadline, self.child.wait()).await {
             Err(_) => {
-                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                kill_wait(&mut self.child, self.phase1_deadline).await;
                 anyhow::bail!("Native launch discovery timed out");
             }
             Ok(Err(error)) => {
-                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                kill_wait(&mut self.child, self.phase1_deadline).await;
                 Err(error.into())
             }
             Ok(Ok(status)) => {
-                let _ = (&mut self.stderr_drain).await;
                 ensure!(
                     status.success(),
                     "Stock OMP operation failed; private diagnostics suppressed"
                 );
-                Ok(std::mem::replace(
-                    &mut self.discovery,
-                    Discovery {
-                        extension_paths: Vec::new(),
-                        no_extensions: false,
-                        memory_write_dir: None,
-                    },
-                ))
+                Ok(self.discovery)
             }
         }
     }
@@ -285,7 +251,6 @@ impl LaunchHelper {
                 self.leftover.extend_from_slice(&chunk[..read]);
             }
             let status = self.child.wait().await?;
-            let _ = (&mut self.stderr_drain).await;
             ensure!(
                 status.success(),
                 "Stock OMP operation failed; private diagnostics suppressed"
@@ -296,11 +261,11 @@ impl LaunchHelper {
 
         match outcome {
             Err(_) => {
-                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                kill_wait(&mut self.child, deadline).await;
                 anyhow::bail!("Native session preparation timed out");
             }
             Ok(Err(error)) => {
-                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                kill_wait(&mut self.child, deadline).await;
                 Err(error)
             }
             Ok(Ok(())) => {
@@ -686,12 +651,17 @@ IFS= read -r _input
 printf '\nMANAGED_ULW_LAUNCH {"extensionPaths":["/ext/a"],"noExtensions":true,"memoryWriteDir":"/mem"}\n'
 rest=$(cat)
 if [ -n "$rest" ]; then exit 9; fi
+# Inherit only stderr. Discovery must not wait for this background child.
+sleep 4 </dev/null >/dev/null &
 "#,
         );
         let helper = LaunchHelper::start(mock_launch_command(&discovery_only), &json!({"ok":true}), Duration::from_secs(5))
             .await
             .unwrap();
-        let discovery = helper.finish_discovery().await.unwrap();
+        let discovery = timeout(Duration::from_secs(2), helper.finish_discovery())
+            .await
+            .expect("discovery waited on inherited stderr")
+            .unwrap();
         assert_eq!(discovery.extension_paths, vec![PathBuf::from("/ext/a")]);
         assert!(discovery.no_extensions);
         assert_eq!(discovery.memory_write_dir, Some(PathBuf::from("/mem")));
@@ -722,7 +692,7 @@ esac
             r#"
 IFS= read -r _input
 printf '\nMANAGED_ULW_LAUNCH_ERROR "custom discovery refusal"\n'
-exit 1
+exec sleep 4
 "#,
         );
         let err = LaunchHelper::start(mock_launch_command(&refused), &json!({}), Duration::from_secs(5))
@@ -739,10 +709,45 @@ IFS= read -r _input
 sleep 5
 "#,
         );
-        let err = LaunchHelper::start(mock_launch_command(&slow), &json!({}), Duration::from_millis(50))
-            .await
-            .err()
-            .unwrap();
+        let err = timeout(
+            Duration::from_secs(2),
+            LaunchHelper::start(mock_launch_command(&slow), &json!({}), Duration::from_millis(50)),
+        )
+        .await
+        .expect("timeout cleanup waited on a background child")
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("Native launch discovery timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn launch_helper_preparation_failure_and_held_stdout_are_bounded() {
+        let tmp = tempdir().unwrap();
+        for (name, tail, deadline, expected) in [
+            ("nonzero", "exit 7", Duration::from_secs(2), "Stock OMP operation failed"),
+            ("inherited-stdout", "sleep 4 &", Duration::from_millis(50), "Native session preparation timed out"),
+        ] {
+            let script = write_script(
+                tmp.path(),
+                name,
+                &format!(
+                    r#"
+IFS= read -r _input
+printf '\nMANAGED_ULW_LAUNCH {{"extensionPaths":[],"noExtensions":true,"memoryWriteDir":null}}\n'
+cat >/dev/null
+{tail}
+"#,
+                ),
+            );
+            let helper = LaunchHelper::start(mock_launch_command(&script), &json!({}), Duration::from_secs(2))
+                .await
+                .unwrap();
+            let error = timeout(Duration::from_secs(2), helper.prepare(b"{}", deadline))
+                .await
+                .expect("preparation waited on a background child")
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 }

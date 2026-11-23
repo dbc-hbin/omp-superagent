@@ -1013,16 +1013,10 @@ describe("Discord output delivery", () => {
 });
 
 describe("Discord markdown tables in outbound payloads", () => {
-  test("a pipe table is sent as an aligned fenced block", async () => {
+  test("a pipe table is sent as labeled list items", async () => {
     const { messenger, channel } = await fixture();
     await messenger.send(output(["| Name | Count |", "| --- | ---: |", "| a | 12 |"].join("\n")));
-    expect(channel.sent[0]!.content).toBe([
-      "```",
-      "| Name | Count |",
-      "| ---- | ----- |",
-      "| a    |    12 |",
-      "```",
-    ].join("\n"));
+    expect(channel.sent[0]?.content).toBe("- Name: a\n  - Count: 12");
     await messenger.stop();
   });
 
@@ -1031,7 +1025,7 @@ describe("Discord markdown tables in outbound payloads", () => {
     const record = output(["| a | b |", "| --- | --- |", "| 1 | 2 |"].join("\n"));
     await messenger.send(record);
     expect(record.text).toBe("| a | b |\n| --- | --- |\n| 1 | 2 |");
-    expect(channel.sent[0]!.content).toContain("```");
+    expect(channel.sent[0]?.content).toBe("- a: 1\n  - b: 2");
     await messenger.stop();
   });
 
@@ -1043,25 +1037,24 @@ describe("Discord markdown tables in outbound payloads", () => {
     await messenger.stop();
   });
 
-  test("a table crossing the message limit still becomes one attachment without a dangling fence", async () => {
+  test("a table crossing the message limit becomes one attachment with all rendered rows", async () => {
     const { messenger, channel } = await fixture();
-    const rows = Array.from({ length: 120 }, (_, index) => `| row ${index} | value ${index} |`);
-    const text = ["| key | value |", "| --- | --- |", ...rows, "trailing prose"].join("\n");
+    const rows = Array.from({ length: 120 }, (_, index) => index);
+    const text = ["| key | value |", "| --- | --- |", ...rows.map(index => `| row ${index} | value ${index} |`), "trailing prose"].join("\n");
     expect(text.length).toBeGreaterThan(2000);
     await messenger.send(output(text));
     expect(channel.sent).toHaveLength(1);
     expect(channel.sent[0]!.files).toHaveLength(1);
     const attached = String((channel.sent[0]!.files![0] as unknown as { attachment: Buffer }).attachment);
-    // The fence is emitted complete inside the attachment, never cut mid-table.
-    expect(attached.startsWith("```\n| key     | value     |\n")).toBe(true);
-    expect(attached.endsWith("```\ntrailing prose")).toBe(true);
-    expect(attached.split("```")).toHaveLength(3);
+    const expected = rows.map(index => `- key: row ${index}\n  - value: value ${index}`).join("\n\n");
+    expect(attached).toBe(`${expected}\n\ntrailing prose`);
     await messenger.stop();
   });
 
-  test("a sparse table that would exceed the upload limit is attached as its original text", async () => {
+  test("a table whose repeated labels exceed the upload limit is attached as its original text", async () => {
     const { messenger, channel } = await fixture();
-    const text = ["| a | b |", "|---|---|", `| ${"x".repeat(10_000)} | y |`, ...Array(1000).fill("| 1 | 2 |")].join("\n");
+    // The first label alone would account for 8 MiB across all rendered rows.
+    const text = `| ${"x".repeat(8192)} | b |\n|---|---|${"\n| 1 | 2 |".repeat(1024)}`;
     const record = output(text);
     await expect(messenger.send(record)).resolves.toBe("remote-1");
     expect(channel.sent).toHaveLength(1);

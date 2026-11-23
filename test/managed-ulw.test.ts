@@ -315,6 +315,33 @@ test("Host memory writes stay within the original launch profile across dotenv a
   expect(await readFile(config, "utf8")).toBe(enabled);
 }, 60_000);
 
+test("combined discovery and preparation publish under the same effective native profile", async () => {
+  const f = await launchFixture();
+  const agentDir = join(f.root, "dotenv-agent");
+  await mkdir(agentDir);
+  await writeFile(join(agentDir, "config.yml"), JSON.stringify(offlineMnemopi));
+  await writeFile(join(f.root, ".env"), `PI_CODING_AGENT_DIR=${agentDir}\n`);
+  const sessionFile = join(f.root, "native", "session.jsonl");
+  await mkdir(join(f.root, "native"), { mode: 0o700 });
+  const args = ["--mode", "rpc-ui", "--cwd", f.root, "-e", f.remote, "--config", f.configPath, "--session", sessionFile];
+
+  await managedUlwLaunch({
+    cwd: f.root, managedUlwPath: f.remote, extensionPaths: [], configPath: f.configPath,
+    commandArgs: [], launchArgs: args,
+    env: { PATH: process.env.PATH, HOME: f.home, XDG_CONFIG_HOME: join(f.home, "config"), CI: "true" },
+    bunCommand: [process.execPath, "--no-env-file"],
+  }, {
+    stderr: 2, timeoutMs: 10_000,
+    manifest: () => ({ options: { command: [process.execPath], cwd: f.root, sessionFile },
+      args, configPath: f.configPath, processBackend: "daemon" }),
+  });
+
+  const links = await readdir(join(agentDir, "sessions"), { recursive: true, withFileTypes: true });
+  const names = links.filter(entry => entry.isSymbolicLink() && entry.name.endsWith(".jsonl"));
+  expect(names).toHaveLength(1);
+  expect(await realpath(join(names[0]!.parentPath, names[0]!.name))).toBe(sessionFile);
+}, 20_000);
+
 test("stock launch includes original plugin-dir hooks in native exclusion snapshots", async () => {
   const f = await launchFixture();
   const plugin = join(f.root, "operator-plugin");
@@ -621,4 +648,51 @@ test("managedUlwLaunch enforces discovery timeout independently of preparation t
     },
   })).rejects.toThrow("Stock OMP discovery timed out");
   expect(manifestCalled).toBe(false);
+});
+
+function mockLaunchOptions(script: string) {
+  return {
+    cwd: import.meta.dir,
+    managedUlwPath: import.meta.dir,
+    extensionPaths: [],
+    configPath: join(import.meta.dir, "unused"),
+    commandArgs: [],
+    launchArgs: [],
+    env: { PATH: process.env.PATH },
+    bunCommand: ["/bin/sh", "-c", script],
+    discoveryTimeoutMs: 1_000,
+  };
+}
+
+test("returns the typed discovery refusal without waiting for the helper to exit", async () => {
+  await expect(managedUlwLaunch(mockLaunchOptions(`
+IFS= read -r _input
+printf '\nMANAGED_ULW_LAUNCH_ERROR "test discovery refusal"\n'
+exec sleep 4
+`))).rejects.toThrow("test discovery refusal");
+}, 2_000);
+
+test("preparation timeout does not wait on a background process holding stdout", async () => {
+  await expect(managedUlwLaunch(mockLaunchOptions(`
+IFS= read -r _input
+printf '\nMANAGED_ULW_LAUNCH {"extensionPaths":[],"noExtensions":true,"memoryWriteDir":null}\n'
+cat >/dev/null
+sleep 4 &
+`), { stderr: 2, timeoutMs: 100, manifest: () => ({}) })).rejects.toThrow("Native session preparation timed out");
+}, 2_000);
+
+test("a late manifest builder cannot cross the worker launch fence", async () => {
+  const manifest = Promise.withResolvers<object>();
+  let fenced = false;
+  await expect(managedUlwLaunch(mockLaunchOptions(`
+IFS= read -r _input
+printf '\nMANAGED_ULW_LAUNCH {"extensionPaths":[],"noExtensions":true,"memoryWriteDir":null}\n'
+cat >/dev/null
+`), {
+    stderr: 2, timeoutMs: 100, manifest: () => manifest.promise,
+    beforeManifest: () => { fenced = true; },
+  })).rejects.toThrow("Native session preparation timed out");
+  manifest.resolve({});
+  await Bun.sleep(0);
+  expect(fenced).toBe(false);
 });

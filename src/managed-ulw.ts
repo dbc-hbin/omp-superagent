@@ -189,7 +189,7 @@ async function probe(packagePath: string, stage: string, manifest: UlwManifest):
     home, manifest.probeTimeoutMs, env);
 }
 
-type ManagedUlwLaunchOptions = {
+export type ManagedUlwLaunchInput = {
   cwd: string;
   managedUlwPath: string;
   extensionPaths: string[];
@@ -199,20 +199,35 @@ type ManagedUlwLaunchOptions = {
   commandArgs: string[];
   /** Exact native OMP argv, including the original command's flags and generated Host args; no executable prefix. */
   launchArgs: string[];
+  worker?: Pick<WorkerHostProfile, "extensionPaths">;
+};
+type ManagedUlwLaunchOptions = Omit<ManagedUlwLaunchInput, "managedUlwPath"> & {
+  managedUlwPath?: string;
   env: Record<string, string | undefined>;
   bunCommand: string[];
   discoveryTimeoutMs?: number;
-  worker?: Pick<WorkerHostProfile, "extensionPaths">;
 };
-export type ManagedUlwLaunchInput = Omit<ManagedUlwLaunchOptions, "env" | "bunCommand" | "discoveryTimeoutMs">;
 export type ManagedUlwLaunchComposition = { extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null };
 
 const LAUNCH_DISCOVERY_TIMEOUT_MS = 30_000;
+const LAUNCH_OUTPUT_LIMIT = 16 * 1024 * 1024; // Same bound as the Rust Gateway.
 const LAUNCH_MARKER = "MANAGED_ULW_LAUNCH ";
 const LAUNCH_ERROR_MARKER = "MANAGED_ULW_LAUNCH_ERROR ";
 
+async function launchPhase<T>(deadline: number, message: string, run: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), Math.max(0, deadline - performance.now()));
+    });
+    const result = await Promise.race([timeout, run()]);
+    if (performance.now() >= deadline) throw new Error(message);
+    return result;
+  } finally { clearTimeout(timer); }
+}
+
 /** Snapshot native discovery in the exact environment the installed CLI will use. */
-export async function managedUlwLaunchExtensions(options: ManagedUlwLaunchOptions): Promise<ManagedUlwLaunchComposition> {
+export async function managedUlwLaunchExtensions(options: ManagedUlwLaunchOptions & { managedUlwPath: string }): Promise<ManagedUlwLaunchComposition> {
   return (await managedUlwLaunch(options)).composition;
 }
 
@@ -226,109 +241,81 @@ export async function managedUlwLaunch(options: ManagedUlwLaunchOptions, prepare
   /** Native stderr destination; preparation output may contain session data. */
   stderr: number;
   timeoutMs: number;
+  beforeManifest?: () => void;
   manifest: (composition: ManagedUlwLaunchComposition) => unknown;
-}): Promise<{ composition: ManagedUlwLaunchComposition; prepared?: string }> {
+}): Promise<{ composition: ManagedUlwLaunchComposition; prepared?: string; deadline?: number }> {
   if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
   const { env, bunCommand, discoveryTimeoutMs = LAUNCH_DISCOVERY_TIMEOUT_MS, ...input } = options;
   const helper = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
   const child = Bun.spawn([...bunCommand, ...(input.worker ? ["--no-install"] : []), helper, "launch"], {
     cwd: input.worker ? dirname(options.configPath) : options.cwd,
     env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)),
-    stdin: "pipe", stdout: "pipe", stderr: prepare?.stderr ?? "pipe",
+    stdin: "pipe", stdout: "pipe", stderr: prepare?.stderr ?? "ignore",
   });
-  const stderr = typeof child.stderr === "number" || !child.stderr ? Promise.resolve("") : new Response(child.stderr).text();
   const reader = child.stdout.getReader();
   const decoder = new TextDecoder();
   let output = "";
-  let discoveryTimer: ReturnType<typeof setTimeout> | undefined;
-  let prepareTimer: ReturnType<typeof setTimeout> | undefined;
-  let timedOutPhase: "discovery" | "prepare" | undefined;
-  const timedOut = () => timedOutPhase;
-  const armPhase = (phase: "discovery" | "prepare", ms: number) => {
-    const timer = setTimeout(() => {
-      timedOutPhase = phase;
-      child.stdin.end();
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    }, Math.max(1, ms));
-    timer.unref?.();
-    return timer;
-  };
-  const fail = async (message: string): Promise<never> => {
-    child.stdin.end();
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    const [code, diagnostic] = await Promise.all([child.exited, stderr]);
-    throw new Error(`${message} (${code})${diagnostic ? `: ${diagnostic.slice(-2000)}` : ""}`);
+  let bytes = 0;
+  const read = async () => {
+    const chunk = await reader.read();
+    if (chunk.done) return false;
+    bytes += chunk.value.byteLength;
+    if (bytes > LAUNCH_OUTPUT_LIMIT) throw new Error("Host SDK launch output exceeded its bound");
+    output += decoder.decode(chunk.value, { stream: true });
+    return true;
   };
   try {
-    discoveryTimer = armPhase("discovery", discoveryTimeoutMs);
-    child.stdin.write(`${JSON.stringify(input)}\n`);
-    child.stdin.flush();
-    let line: string | undefined;
-    for (;;) {
-      const lines = output.split("\n");
-      const index = lines.slice(0, -1).findIndex(entry => entry.startsWith(LAUNCH_MARKER) || entry.startsWith(LAUNCH_ERROR_MARKER));
-      if (index >= 0) { line = lines[index]!; output = lines.slice(index + 1).join("\n"); break; }
-      const chunk = await reader.read();
-      if (chunk.done) {
-        if (timedOut() === "discovery") {
-          await Promise.all([child.exited, stderr]);
-          throw new Error("Stock OMP discovery timed out");
+    const discoveryDeadline = performance.now() + Math.max(1, discoveryTimeoutMs);
+    const composition = await launchPhase(discoveryDeadline, "Stock OMP discovery timed out", async () => {
+      child.stdin.write(JSON.stringify(input.managedUlwPath === undefined ? null : input) + "\n");
+      child.stdin.flush();
+      let scan = 0;
+      for (;;) {
+        const newline = output.indexOf("\n", scan);
+        if (newline < 0) {
+          scan = output.length;
+          if (await read()) continue;
+          throw new Error("Stock OMP discovery did not return a launch composition");
         }
-        return await fail("Stock OMP discovery did not return a launch composition");
+        const line = output.slice(0, newline);
+        output = output.slice(newline + 1);
+        scan = 0;
+        if (line.startsWith(LAUNCH_ERROR_MARKER)) throw new Error(JSON.parse(line.slice(LAUNCH_ERROR_MARKER.length)));
+        if (line.startsWith(LAUNCH_MARKER)) {
+          const result: ManagedUlwLaunchComposition = JSON.parse(line.slice(LAUNCH_MARKER.length));
+          if (!prepare) {
+            child.stdin.end();
+            // Discovery-only mode has no further output to consume.
+            if (await child.exited !== 0) throw new Error("Stock OMP discovery failed");
+          }
+          return result;
+        }
       }
-      output += decoder.decode(chunk.value, { stream: true });
-    }
-    if (timedOut() === "discovery") {
-      await Promise.all([child.exited, stderr]);
-      throw new Error("Stock OMP discovery timed out");
-    }
-    if (line.startsWith(LAUNCH_ERROR_MARKER)) {
-      clearTimeout(discoveryTimer);
-      discoveryTimer = undefined;
+    });
+    if (!prepare) return { composition };
+
+    const deadline = performance.now() + Math.max(1, prepare.timeoutMs);
+    const timeout = "Native session preparation timed out";
+    bytes = Buffer.byteLength(output);
+    const prepared = await launchPhase(deadline, timeout, async () => {
+      const payload = JSON.stringify(await prepare.manifest(composition));
+      // A timed-out manifest builder must never cross the worker launch fence.
+      if (performance.now() >= deadline) throw new Error(timeout);
+      prepare.beforeManifest?.();
+      child.stdin.write(payload);
       child.stdin.end();
-      await child.exited;
-      throw new Error(JSON.parse(line.slice(LAUNCH_ERROR_MARKER.length)));
-    }
-    const composition: ManagedUlwLaunchComposition = JSON.parse(line.slice(LAUNCH_MARKER.length));
-    if (prepare) {
-      clearTimeout(discoveryTimer);
-      discoveryTimer = undefined;
-      prepareTimer = armPhase("prepare", prepare.timeoutMs);
-      let manifestPayload: string;
-      try {
-        manifestPayload = JSON.stringify(await prepare.manifest(composition));
-        if (timedOut() === "prepare") {
-          await child.exited;
-          throw new Error("Native session preparation timed out");
-        }
-        child.stdin.write(manifestPayload);
-      } catch (error) {
-        if (timedOut() === "prepare") {
-          await child.exited;
-          throw new Error("Native session preparation timed out");
-        }
-        throw error;
-      }
-    }
-    child.stdin.end();
-    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) output += decoder.decode(chunk.value, { stream: true });
-    output += decoder.decode();
-    const code = await child.exited;
-    if (timedOut() === "discovery") throw new Error("Stock OMP discovery timed out");
-    if (timedOut() === "prepare") throw new Error("Native session preparation timed out");
-    if (code !== 0) {
-      if (prepare) throw new Error("Native session preparation failed");
-      return await fail("Stock OMP discovery failed");
-    }
-    return prepare ? { composition, prepared: output } : { composition };
+      while (await read()) {}
+      if (await child.exited !== 0) throw new Error("Native session preparation failed");
+      return output + decoder.decode();
+    });
+    return { composition, prepared, deadline };
   } finally {
-    clearTimeout(discoveryTimer);
-    clearTimeout(prepareTimer);
+    // A descendant can hold a pipe open after the helper exits. Stop observing
+    // its stdout rather than waiting on it (or stderr) past a phase deadline.
     if (child.exitCode === null && child.signalCode === null) {
-      // A caller refusal before the manifest leaves the helper unprepared; never let it continue.
-      child.kill("SIGKILL");
-      await child.exited;
+      try { child.kill("SIGKILL"); } catch {} // The child may have just exited.
     }
+    void reader.cancel().catch(() => {});
   }
 }
 

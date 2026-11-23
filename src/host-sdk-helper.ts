@@ -6,6 +6,7 @@ import type { RpcAbortAndRestoreQueueResult } from "@oh-my-pi/pi-coding-agent/mo
 import type { HostOptions } from "./host";
 import type { Frame } from "./host-protocol";
 import type { RotationSelection } from "./head-rotation";
+import type { ManagedUlwLaunchInput } from "./managed-ulw";
 
 type Manifest = {
   readonly options: Omit<HostOptions, "env">;
@@ -56,12 +57,17 @@ async function verifyExit({ options }: Manifest, exit: Exit) {
   return { persisted, observationsFlushed };
 }
 
-async function run(operation: string | undefined, manifest: Manifest, input: unknown) {
+async function run(operation: string | undefined, manifest: Manifest, input: unknown, profileResolved = false) {
   const { options } = manifest;
   const { extractProfileFlags } = await import("@oh-my-pi/pi-coding-agent/cli/profile-bootstrap");
-  const { setProfile, resolveProfileEnv } = await import("@oh-my-pi/pi-utils/dirs");
   const bootstrap = extractProfileFlags([...options.command.slice(1), ...manifest.args]);
-  setProfile(bootstrap.profile ?? resolveProfileEnv(process.env.OMP_PROFILE, process.env.PI_PROFILE));
+  // Native discovery already selected the profile and applied dotenv.
+  // Rebootstrapping now would re-select from the mutated environment or
+  // clear its effective agent directory before publishing the session.
+  if (!profileResolved) {
+    const { setProfile, resolveProfileEnv } = await import("@oh-my-pi/pi-utils/dirs");
+    setProfile(bootstrap.profile ?? resolveProfileEnv(process.env.OMP_PROFILE, process.env.PI_PROFILE));
+  }
   switch (operation) {
     case "prepare": {
       const { resolveCliArgv } = await import("@oh-my-pi/pi-coding-agent/cli-commands");
@@ -188,7 +194,7 @@ async function launch() {
     buffered += decoder.decode(chunk.value, { stream: true });
   }
   const newline = buffered.indexOf("\n");
-  const input = JSON.parse(buffered.slice(0, newline));
+  const input: ManagedUlwLaunchInput | null = JSON.parse(buffered.slice(0, newline));
   let rest = buffered.slice(newline + 1);
   let composition;
   if (input === null) {
@@ -208,7 +214,7 @@ async function launch() {
   rest += decoder.decode();
   if (!rest) return;
   const manifest: Manifest = JSON.parse(rest);
-  process.stdout.write(JSON.stringify(await run("prepare", manifest, manifest)));
+  process.stdout.write(JSON.stringify(await run("prepare", manifest, manifest, input !== null && !input.worker)));
 }
 
 const [, , operation, path] = process.argv;

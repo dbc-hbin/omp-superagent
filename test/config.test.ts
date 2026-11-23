@@ -274,6 +274,23 @@ else process.exit(8);
     expect(await calls()).toBe(8);
   });
 
+  test("rejects a configured FIFO without blocking the inspector", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "superagent-omp-fifo-"));
+    dirs.push(dir);
+    const fifo = join(dir, "omp");
+    expect(Bun.spawnSync(["mkfifo", "-m", "700", fifo]).exitCode).toBe(0);
+    const module = join(import.meta.dir, "../src/installed-omp.ts");
+    // A blocked synchronous open cannot be interrupted by a test timer in the same process.
+    const inspector = Bun.spawn([process.execPath, "--no-env-file", "-e", `
+      import { inspectInstalledOmp } from ${JSON.stringify(module)};
+      try { await inspectInstalledOmp([${JSON.stringify(fifo)}]); }
+      catch { process.exit(0); }
+      process.exit(1);
+    `], { env: { PATH: process.env.PATH }, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+      timeout: 2_000, killSignal: "SIGKILL" });
+    expect(await inspector.exited).toBe(0);
+  });
+
   test("invalidates cached inspection when PATH removes a script's shebang interpreter", async () => {
     const f = await executable();
     const interpDir = mkdtempSync(join(tmpdir(), "superagent-interp-"));
@@ -290,6 +307,23 @@ else process.exit(8);
     expect(first.version).toBe(testedVersion);
     await expect(inspectInstalledOmp([f.command], [], envWithoutInterp)).rejects.toThrow("failed");
     await expect(inspectInstalledOmp([f.command], [], envWithInterp)).resolves.toEqual(first);
+  });
+
+  test("does not reuse inspection through an env shebang that replaces PATH", async () => {
+    const f = await executable();
+    const selected = mkdtempSync(join(realpathSync("/tmp"), "superagent-env-selected-"));
+    const inherited = mkdtempSync(join(realpathSync("/tmp"), "superagent-env-inherited-"));
+    dirs.push(selected, inherited);
+    const interpName = "omp-custom-bun-interp";
+    symlinkSync(process.execPath, join(selected, interpName));
+    symlinkSync(process.execPath, join(inherited, interpName));
+    const scriptBody = await Bun.file(f.command).text();
+    writeFileSync(f.command, scriptBody.replace(/^#!.*\n/, `#!/usr/bin/env -S PATH=${selected} ${interpName}\n`));
+    const env = { PATH: `${inherited}:/usr/bin:/bin` };
+
+    await expect(inspectInstalledOmp([f.command], [], env)).resolves.toMatchObject({ version: testedVersion });
+    rmSync(join(selected, interpName));
+    await expect(inspectInstalledOmp([f.command], [], env)).rejects.toThrow("failed");
   });
 
   test.each(["18.22.2", "20.0.0", `${testedVersion}-preview`])("reports OMP %s when the CLI exposes the required capabilities", async version => {
