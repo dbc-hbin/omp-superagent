@@ -426,6 +426,25 @@ approval.
   Progress reports are coalesced before submission where safe; a final result
   takes precedence over undelivered progress. Already started external sends
   cannot be recalled.
+- On Discord, nonterminal progress for one request is a single `⏳` status
+  message edited in place. Each update stays its own immutable output; when it
+  is claimed for delivery, the controller fixes `editOf` to the physical message
+  of the stream's first confirmed post and persists it with the output, so a
+  redelivery edits that same message. An uncertain post never becomes an edit
+  target. A rejected edit fails only that update and is never reposted; it
+  releases the target so a later update posts a fresh status message. An
+  ambiguous edit stays uncertain. The final answer is still a new message.
+  Telegram and Slack keep posting ordinary progress messages; the Gateway
+  rejects `editOf` outside Discord.
+- Discord turns a fenced ```` ```card ```` [json-render](https://github.com/vercel-labs/json-render)
+  spec (`{"root", "elements"}`, root `Card`; `Card`, `Section`, `Text`,
+  `Fields`, `Field`, `Table`, `Divider`, `Image`) into an embed at delivery.
+  Tables become aligned code blocks in the embed description. A spec that is
+  invalid, uses another component, reuses an element or exceeds Discord's embed
+  limits stays verbatim as its code block, which is also what Telegram and Slack
+  show. The [Rust renderer](../../gateway/src/discord/embeds.rs) and
+  [`extractDiscordCards`](../../src/discord-markdown.ts) share one
+  [fixture](../../test/fixtures/discord-cards.json).
 
 ## Discord voice
 

@@ -2131,7 +2131,7 @@ describe("event-driven nonterminal progress", () => {
     expect(store.input(original.id)?.state).toBe("submitted");
     expect(main.state.isSettled).toBe(false);
     expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route,
-      text: "Located the defect; applying the bounded fix." }]);
+      text: "⏳ Located the defect; applying the bounded fix." }]);
     main.emit({ type: "message_end", message: structuredClone(progress) });
     main.emit({ type: "agent_end", isTerminal: true, messages: [progress, { role: "assistant", stopReason: "stop", content: [] }] });
     main.complete("");
@@ -2156,7 +2156,7 @@ describe("event-driven nonterminal progress", () => {
     main.emit({ type: "agent_end", isTerminal: true, messages: [mixed] });
     main.complete("");
     await messenger.whenSent(2);
-    expect(messenger.sent.map(output => output.text)).toEqual(["Verification is running.", "Verified final result."]);
+    expect(messenger.sent.map(output => output.text)).toEqual(["⏳ Verification is running.", "Verified final result."]);
     expect(store.output(`${original.id}:answer`)?.text).toBe("Verified final result.");
   });
 
@@ -2349,7 +2349,7 @@ describe("topic-owned lane delivery", () => {
     expect([store.input(handoffId)?.state, store.input(joinedId)?.state]).toEqual(["done", "done"]);
     const replyTo = { route: original.route, messageId: original.messageId };
     expect(messenger.sent).toMatchObject([
-      { sourceId: original.id, route: original.route, replyTo, text: "The totals are being checked." },
+      { sourceId: original.id, route: original.route, replyTo, text: "⏳ The totals are being checked." },
       { id: `${handoffId}:answer`, sourceId: original.id, route: original.route, replyTo, text: "Both sets of totals match." },
     ]);
     expect(store.inputs("main").map(input => input.id)).toEqual(["busy-head-manager"]);

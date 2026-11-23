@@ -17,6 +17,7 @@ mod cards;
 mod commands;
 mod dialogs;
 mod dispatch;
+mod embeds;
 mod ingress;
 mod login;
 mod markdown;

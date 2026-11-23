@@ -1,0 +1,117 @@
+[
+  {
+    "name": "full card becomes one embed and leaves surrounding prose",
+    "text": "Summary below.\n\n```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"Build report\", \"description\": \"Nightly run\", \"color\": \"#22c55e\"}, \"children\": [\"intro\", \"sec\", \"fields\", \"div\", \"tbl\", \"img\"]}, \"intro\": {\"type\": \"Text\", \"props\": {\"text\": \"All checks finished.\"}}, \"sec\": {\"type\": \"Section\", \"props\": {\"title\": \"Details\"}, \"children\": [\"detail\"]}, \"detail\": {\"type\": \"Text\", \"props\": {\"text\": \"Two suites ran.\"}}, \"fields\": {\"type\": \"Fields\", \"children\": [\"f1\", \"f2\"]}, \"f1\": {\"type\": \"Field\", \"props\": {\"label\": \"Passed\", \"value\": \"42\", \"inline\": true}}, \"f2\": {\"type\": \"Field\", \"props\": {\"label\": \"Failed\", \"value\": \"0\"}}, \"div\": {\"type\": \"Divider\"}, \"tbl\": {\"type\": \"Table\", \"props\": {\"columns\": [\"Suite\", \"Time\"], \"rows\": [[\"unit\", \"1s\"], [\"integration\", \"12s\"]]}}, \"img\": {\"type\": \"Image\", \"props\": {\"url\": \"https://example.com/chart.png\", \"alt\": \"chart\"}}}}\n```\n\nDone.",
+    "content": "Summary below.\n\n\nDone.",
+    "embeds": [
+      {
+        "title": "Build report",
+        "color": 2278750,
+        "description": "Nightly run\nAll checks finished.\n**Details**\nTwo suites ran.\n────────────────\n```\n| Suite       | Time |\n| ----------- | ---- |\n| unit        | 1s   |\n| integration | 12s  |\n```",
+        "fields": [
+          {
+            "name": "Passed",
+            "value": "42",
+            "inline": true
+          },
+          {
+            "name": "Failed",
+            "value": "0",
+            "inline": false
+          }
+        ],
+        "image": {
+          "url": "https://example.com/chart.png"
+        }
+      }
+    ]
+  },
+  {
+    "name": "card-only text has empty content",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"Only\"}}}}\n```",
+    "content": "",
+    "embeds": [
+      {
+        "title": "Only"
+      }
+    ]
+  },
+  {
+    "name": "invalid json stays verbatim",
+    "text": "Before\n```card\n{not json}\n```",
+    "content": "Before\n```card\n{not json}\n```",
+    "embeds": []
+  },
+  {
+    "name": "root must be a Card",
+    "text": "```card\n{\"root\": \"t\", \"elements\": {\"t\": {\"type\": \"Text\", \"props\": {\"text\": \"x\"}}}}\n```",
+    "content": "```card\n{\"root\": \"t\", \"elements\": {\"t\": {\"type\": \"Text\", \"props\": {\"text\": \"x\"}}}}\n```",
+    "embeds": []
+  },
+  {
+    "name": "unknown component invalidates the spec",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"b\"]}, \"b\": {\"type\": \"Button\", \"props\": {\"label\": \"x\"}}}}\n```",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"b\"]}, \"b\": {\"type\": \"Button\", \"props\": {\"label\": \"x\"}}}}\n```",
+    "embeds": []
+  },
+  {
+    "name": "cycle invalidates the spec",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"x\"}, \"children\": [\"s\"]}, \"s\": {\"type\": \"Section\", \"children\": [\"card\"]}}}\n```",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"x\"}, \"children\": [\"s\"]}, \"s\": {\"type\": \"Section\", \"children\": [\"card\"]}}}\n```",
+    "embeds": []
+  },
+  {
+    "name": "ragged table invalidates the spec",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"t\"]}, \"t\": {\"type\": \"Table\", \"props\": {\"columns\": [\"a\", \"b\"], \"rows\": [[\"1\"]]}}}}\n```",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"t\"]}, \"t\": {\"type\": \"Table\", \"props\": {\"columns\": [\"a\", \"b\"], \"rows\": [[\"1\"]]}}}}\n```",
+    "embeds": []
+  },
+  {
+    "name": "non-https image invalidates the spec",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"i\"]}, \"i\": {\"type\": \"Image\", \"props\": {\"url\": \"http://example.com/a.png\"}}}}\n```",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"i\"]}, \"i\": {\"type\": \"Image\", \"props\": {\"url\": \"http://example.com/a.png\"}}}}\n```",
+    "embeds": []
+  },
+  {
+    "name": "Fields accepts only Field children",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"fs\"]}, \"fs\": {\"type\": \"Fields\", \"children\": [\"t\"]}, \"t\": {\"type\": \"Text\", \"props\": {\"text\": \"x\"}}}}\n```",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"fs\"]}, \"fs\": {\"type\": \"Fields\", \"children\": [\"t\"]}, \"t\": {\"type\": \"Text\", \"props\": {\"text\": \"x\"}}}}\n```",
+    "embeds": []
+  },
+  {
+    "name": "empty card invalidates the spec",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\"}}}\n```",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\"}}}\n```",
+    "embeds": []
+  },
+  {
+    "name": "card fence inside another code block is content",
+    "text": "````md\n```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"x\"}}}}\n```\n````",
+    "content": "````md\n```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"x\"}}}}\n```\n````",
+    "embeds": []
+  },
+  {
+    "name": "unclosed card fence is content",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"x\"}}}}",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"x\"}}}}",
+    "embeds": []
+  },
+  {
+    "name": "valid and invalid cards mix; integer color and wide characters align",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"\\uc0c1\\ud0dc\", \"color\": 255}, \"children\": [\"t\"]}, \"t\": {\"type\": \"Table\", \"props\": {\"columns\": [\"\\uc774\\ub984\", \"\\uac12\"], \"rows\": [[\"a\", \"1\"]]}}}}\n```\nmiddle\n```card\n[]\n```",
+    "content": "middle\n```card\n[]\n```",
+    "embeds": [
+      {
+        "title": "상태",
+        "color": 255,
+        "description": "```\n| 이름 | 값  |\n| ---- | --- |\n| a    | 1   |\n```"
+      }
+    ]
+  },
+  {
+    "name": "field value over the Discord limit invalidates the spec",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"f\"]}, \"f\": {\"type\": \"Field\", \"props\": {\"label\": \"x\", \"value\": \"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\"}}}}\n```",
+    "content": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"children\": [\"f\"]}, \"f\": {\"type\": \"Field\", \"props\": {\"label\": \"x\", \"value\": \"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\"}}}}\n```",
+    "embeds": []
+  }
+]

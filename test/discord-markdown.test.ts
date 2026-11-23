@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { renderDiscordMarkdown } from "../src/discord-markdown.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "../src/discord-markdown.ts";
 
 describe("Discord markdown table rendering", () => {
   test("converts a pipe table into one aligned fenced block", () => {
@@ -167,5 +169,25 @@ describe("Discord markdown table rendering", () => {
   test("handles many short rows without spreading them into function arguments", () => {
     const source = ["| a | b |", "|---|---|", ...Array(150_000).fill("| 1 | 2 |")].join("\n");
     expect(renderDiscordMarkdown(source, Buffer.byteLength(source, "utf8"))).toBe(source);
+  });
+});
+
+describe("Discord card fences", () => {
+  // The Rust Gateway's embeds.rs test reads this same fixture.
+  const cases = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "discord-cards.json"), "utf8")) as
+    Array<{ name: string; text: string; content: string; embeds: DiscordEmbed[] }>;
+
+  for (const fixture of cases) {
+    test(fixture.name, () => {
+      expect(extractDiscordCards(fixture.text)).toEqual({ text: fixture.content, embeds: fixture.embeds });
+    });
+  }
+
+  test("more than ten valid cards keep the overflow as text", () => {
+    const card = (index: number) => ["```card", JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: `#${index}` } } } }), "```"].join("\n");
+    const source = Array.from({ length: 11 }, (_, index) => card(index)).join("\n");
+    const result = extractDiscordCards(source);
+    expect(result.embeds.map(embed => embed.title)).toEqual(Array.from({ length: 10 }, (_, index) => `#${index}`));
+    expect(result.text).toBe(card(10));
   });
 });

@@ -5,7 +5,7 @@ import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { Client, Collection, type ClientUser, type Message } from "discord.js";
-import { physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { Store } from "../src/store.ts";
@@ -459,12 +459,91 @@ describe("durable coordination store", () => {
     store.submit("head-progress", "request", 0);
     expect(store.progress("head-progress", 0, "native-head", "event", "Meaningful milestone")).toBe(true);
     const outputId = "progress:head-progress:event";
-    expect(store.output(outputId)?.text).toBe("Meaningful milestone");
+    expect(store.output(outputId)?.text).toBe("⏳ Meaningful milestone");
     expect(store.claimOutput(outputId)).toBe(true);
     store.finishOutput(outputId, "uncertain");
     expect(store.progress("head-progress", 0, "native-head", "event", "Meaningful milestone")).toBe(false);
     expect(store.outputs()).toEqual([]);
     expect(store.output(outputId)?.state).toBe("uncertain");
+  });
+
+  test("Discord head progress edits one confirmed status message in place and keeps its physical id on redelivery", () => {
+    const { store, path } = fixture();
+    const source = inbound("status-source");
+    store.receive(source, "main");
+    store.setMeta("main:sessionId", "native-head");
+    store.submit(source.id, "request", 0);
+    const update = (event: string, text: string) => {
+      expect(store.progress(source.id, 0, "native-head", event, text)).toBe(true);
+      const id = `progress:${source.id}:${event}`;
+      expect(store.claimOutput(id)).toBe(true);
+      return id;
+    };
+    const first = update("one", "Reading the code");
+    expect(store.output(first)).toMatchObject({ text: "⏳ Reading the code", state: "sending" });
+    expect(store.output(first)?.editOf).toBeUndefined();
+    store.finishOutput(first, "sent", "900");
+
+    const target = { route: physicalRoute(source.route), messageId: "900" };
+    const second = update("two", "Running tests");
+    expect(store.output(second)?.editOf).toEqual(target);
+    // An ambiguous edit is not retried by itself; an explicit redelivery keeps the target.
+    store.finishOutput(second, "uncertain");
+    expect(store.outputs()).toEqual([]);
+    store.finishOutput(second, "pending");
+    store.close();
+    const reopened = open(path);
+    expect(reopened.claimOutput(second)).toBe(true);
+    expect(reopened.output(second)?.editOf).toEqual(target);
+    reopened.finishOutput(second, "sent", "900");
+    // Reply lookups still resolve the edited message to the output that created it.
+    expect(reopened.sentOutputForMessage(source.route, "900")?.id).toBe(first);
+
+    expect(reopened.progress(source.id, 0, "native-head", "three", "Fixing")).toBe(true);
+    const third = `progress:${source.id}:three`;
+    expect(reopened.claimOutput(third)).toBe(true);
+    expect(reopened.output(third)?.editOf).toEqual(target);
+    // A rejected edit fails that update only; it is never requeued as a new post.
+    reopened.finishOutput(third, "failed", undefined, "Messenger rejected delivery");
+    expect(reopened.outputs()).toEqual([]);
+    expect(reopened.output(third)).toMatchObject({ state: "failed", editOf: target });
+
+    expect(reopened.progress(source.id, 0, "native-head", "four", "Almost done")).toBe(true);
+    const fourth = `progress:${source.id}:four`;
+    expect(reopened.claimOutput(fourth)).toBe(true);
+    expect(reopened.output(fourth)?.editOf).toBeUndefined();
+    reopened.finishOutput(fourth, "sent", "901");
+    expect(reopened.progress(source.id, 0, "native-head", "five", "Done soon")).toBe(true);
+    const fifth = `progress:${source.id}:five`;
+    expect(reopened.claimOutput(fifth)).toBe(true);
+    expect(reopened.output(fifth)?.editOf).toEqual({ ...target, messageId: "901" });
+  });
+
+  test("an uncertain status post is never edited, and non-Discord progress keeps posting plain messages", () => {
+    const { store } = fixture();
+    const source = inbound("uncertain-status");
+    store.receive(source, "main");
+    store.setMeta("main:sessionId", "native-head");
+    store.submit(source.id, "request", 0);
+    store.progress(source.id, 0, "native-head", "one", "First");
+    expect(store.claimOutput(`progress:${source.id}:one`)).toBe(true);
+    store.finishOutput(`progress:${source.id}:one`, "uncertain");
+    store.progress(source.id, 0, "native-head", "two", "Second");
+    expect(store.claimOutput(`progress:${source.id}:two`)).toBe(true);
+    expect(store.output(`progress:${source.id}:two`)?.editOf).toBeUndefined();
+
+    const telegram = route({ platform: "telegram", accountId: "bot", authorityId: "owner", guildId: null, channelId: "42", threadId: null });
+    const plain = inbound("telegram-status", telegram);
+    store.receive(plain, "main");
+    store.submit(plain.id, "request-telegram", 0);
+    for (const event of ["one", "two"]) {
+      store.progress(plain.id, 0, "native-head", event, `Update ${event}`);
+      const id = `progress:${plain.id}:${event}`;
+      expect(store.claimOutput(id)).toBe(true);
+      expect(store.output(id)).toMatchObject({ text: `Update ${event}`, state: "sending" });
+      expect(store.output(id)?.editOf).toBeUndefined();
+      store.finishOutput(id, "sent", `telegram-${event}`);
+    }
   });
 
   test("Slack invocation origins survive handoffs, reports, and reopen without a source timestamp", () => {

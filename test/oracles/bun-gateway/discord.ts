@@ -11,7 +11,7 @@ import { validateDecisionAnswer, validateDecisionResponse } from "../../../src/d
 import { parseDialog, type Dialog } from "../../../src/dialog.ts";
 import { approvalCardToken, DeliveryError } from "../../../src/delivery.ts";
 import { parseDiscordCommand } from "../../../src/discord-commands.ts";
-import { renderDiscordMarkdown } from "../../../src/discord-markdown.ts";
+import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "../../../src/discord-markdown.ts";
 import { DiscordVoice } from "./discord-voice";
 import { VOICE_DRAFT_HEADER } from "./discord-voice-draft";
 import type { DiscordVoiceConfig } from "../../../src/config";
@@ -413,22 +413,39 @@ export class DiscordMessenger implements Messenger {
     }
   }
 
-  private payload(text: string, nonce: string, components?: Controls): MessageCreateOptions {
-    // Discord renders no markdown tables, so outbound tables become aligned fences.
+  private payload(text: string, nonce: string, components?: Controls): MessageCreateOptions & { embeds: DiscordEmbed[] } {
+    // Discord renders no markdown tables, so outbound tables become aligned fences,
+    // and valid ```card specs become embeds.
     // The stored OutputRecord text is never modified; only this payload changes.
-    const content = renderDiscordMarkdown(text, FILE_LIMIT);
+    const cards = extractDiscordCards(text);
+    const content = renderDiscordMarkdown(cards.text, FILE_LIMIT);
     if (Buffer.byteLength(content, "utf8") > FILE_LIMIT) throw new DeliveryError("Discord text attachment exceeds the safe 8 MiB upload limit", "rejected");
     return {
-      ...(content.length <= MESSAGE_LIMIT ? { content: content || "(empty output)" } : {
+      ...(content.length <= MESSAGE_LIMIT ? { content: content || (cards.embeds.length ? "" : "(empty output)") } : {
         content: "Full text is attached (exceeds Discord's message limit).",
         files: [new AttachmentBuilder(Buffer.from(content, "utf8"), { name: `omp-${nonce}.txt` })],
       }),
+      embeds: cards.embeds,
       allowedMentions: NO_MENTIONS, nonce, enforceNonce: true, ...(components ? { components } : {}),
     };
   }
 
   async send(output: OutputRecord): Promise<string> {
     try {
+      if (output.editOf !== undefined) {
+        // A status update replaces its message; a rejected edit is never reposted.
+        if (!object(output.editOf) || typeof output.editOf.messageId !== "string" || !/^[0-9]{1,20}$/.test(output.editOf.messageId)
+          || !object(output.editOf.route) || physicalRouteKey(output.editOf.route) !== physicalRouteKey(output.route)) {
+          throw new DeliveryError("Discord status edit requires a plain message in the exact destination conversation", "rejected");
+        }
+        const channel = await this.destination(output.route);
+        const payload = this.payload(output.text, discordNonce(output.id, output.route));
+        const message = await channel.messages.edit(output.editOf.messageId, {
+          content: payload.content ?? "", embeds: payload.embeds, files: payload.files ?? [], attachments: [], allowedMentions: NO_MENTIONS,
+        });
+        if (message.id !== output.editOf.messageId) throw new DeliveryError("Discord status edit receipt could not be verified", "uncertain");
+        return message.id;
+      }
       if (output.replyTo !== undefined && (!object(output.replyTo) || !object(output.replyTo.route)
         || typeof output.replyTo.messageId !== "string" || !/^[0-9]{1,20}$/.test(output.replyTo.messageId)
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(output.route))) {

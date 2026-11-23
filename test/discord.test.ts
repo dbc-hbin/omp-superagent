@@ -77,6 +77,10 @@ class Channel {
     const message = this.remote.get(query);
     if (!message) throw Object.assign(new Error("Unknown message"), { code: 10008, status: 404 });
     return message;
+  }, edit: async (id: string, payload: MessageCreateOptions) => {
+    const message = this.remote.get(id);
+    if (!message) throw Object.assign(new Error("Unknown message"), { code: 10008, status: 404 });
+    return message.edit(payload);
   } };
   threads = { create: async (_options: unknown) => new Channel("created-thread", this.guildId, this.id) };
 }
@@ -905,6 +909,23 @@ describe("Discord output delivery", () => {
       expect(channel.sent[0]?.nonce).toBe(discordNonce("ordinary-answer", route));
       expect(channel.sent[0]?.enforceNonce).toBe(true);
     } finally { store.close(); await messenger.stop(); }
+  });
+
+  test("card fences become embeds and status updates edit their message without reposting", async () => {
+    const { messenger, channel } = await fixture();
+    const card = JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: "Status" } } } });
+    await messenger.send(output(`⏳ working\n\`\`\`card\n${card}\n\`\`\``));
+    expect(channel.sent[0]).toMatchObject({ content: "⏳ working", embeds: [{ title: "Status" }] });
+    const status = new RemoteMessage("700", channel.id, channel.guildId, {});
+    channel.remote.set(status.id, status);
+    expect(await messenger.send({ ...output("⏳ still working"), editOf: { route, messageId: "700" } })).toBe("700");
+    expect(status.edits).toEqual([expect.objectContaining({ content: "⏳ still working", embeds: [], attachments: [] })]);
+    await expect(messenger.send({ ...output("⏳ gone"), editOf: { route, messageId: "701" } })).rejects.toMatchObject({ certainty: "rejected" });
+    await expect(messenger.send({ ...output("⏳ moved"), editOf: { route: { ...route, channelId: "foreign" }, messageId: "700" } }))
+      .rejects.toMatchObject({ certainty: "rejected" });
+    expect(channel.sent).toHaveLength(1);
+    expect(status.edits).toHaveLength(1);
+    await messenger.stop();
   });
 
   test("deleted original messages can send unlinked in one native attempt without fetching or retrying", async () => {

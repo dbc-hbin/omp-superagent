@@ -238,6 +238,8 @@ export interface OutputRecord {
   route: Route;
   /** Durable original owner message, only in the same physical conversation. */
   replyTo?: MessageReference;
+  /** Discord status message replaced in place; fixed when the output is claimed. */
+  readonly editOf?: MessageReference;
   readonly picker?: HeadPicker;
   readonly resultAttachment?: StagedResultAttachment;
   text: string;
@@ -351,7 +353,7 @@ export interface StorePort {
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[];
   prepareHeadRecovery(attempt: HeadRecoveryAttempt): boolean;
   commitHeadRecovery(expected: HeadRecoveryAttempt, decided: HeadRecoveryAttempt): boolean;
-  queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error">): boolean;
+  queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean;
   output(id: string): OutputRecord | null;
   outputs(): OutputRecord[];
   claimOutput(id: string): boolean;

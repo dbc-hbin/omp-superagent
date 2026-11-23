@@ -6463,7 +6463,8 @@ export class Superagent {
                 try { this.authorizeResultOwner(output.route); }
                 catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }
               }
-              remoteId = await this.messenger.send(output);
+              // The claim may have fixed an in-place status edit target.
+              remoteId = await this.messenger.send(this.store.output(output.id)!);
             }
             catch (error) {
               const rejected = error instanceof DeliveryError && error.certainty === "rejected";

@@ -151,9 +151,11 @@ impl Hub {
     }
 }
 
+/// A reply or an in-place status edit names a real Discord message in the
+/// output's exact physical conversation; other platforms accept neither.
 fn validate_reply(output: &Value) -> WireResult<()> {
     let output = object(output)?;
-    if let Some(reply) = output.get("replyTo") {
+    for reply in ["replyTo", "editOf"].into_iter().filter_map(|key| output.get(key)) {
         let reply = object(reply)?;
         let source = object(reply.get("route").unwrap_or(&Value::Null))?;
         let destination = object(output.get("route").unwrap_or(&Value::Null))?;

@@ -149,7 +149,9 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
         ("GET", "/channels/99/messages/700") => fixture.last_card.lock().unwrap().clone(),
         ("PATCH", "/channels/99/messages/700") => {
             let mut card = fixture.last_card.lock().unwrap();
-            card["components"] = body["components"].clone();
+            if let Some(components) = body.get("components") {
+                card["components"] = components.clone();
+            }
             fixture.emitted.send((path, body)).unwrap();
             card.clone()
         }
@@ -891,6 +893,66 @@ async fn group_thread_accepts_only_live_member_text_and_replies_without_owner_ef
     assert_eq!(posted["allowed_mentions"]["parse"], json!([]));
     assert!(posted.get("attachments").is_none());
     assert!(posted.get("components").is_none());
+
+    hub.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn status_edits_replace_their_message_and_cards_become_embeds() {
+    let (_temporary, store, hub, ws, mut observed, _, server) =
+        discord_fixture(json!({"discord":{}})).await;
+    let (started, mut socket) = time::timeout(Duration::from_secs(5), async {
+        tokio::join!(hub.start(), identify(&ws, false))
+    })
+    .await
+    .unwrap();
+    started.unwrap();
+    hub.ready.send_replace(true);
+    dispatch(&mut socket, 2, "MESSAGE_CREATE", message("501", None, "99", "42", "owner DM")).await;
+    let route = event(&hub, &store).await["input"]["route"].clone();
+
+    let card = r#"{"root":"c","elements":{"c":{"type":"Card","props":{"title":"Status"}}}}"#;
+    let created = hub
+        .effect("send", &[json!({"id":"status-1","route":route,
+            "text":format!("⏳ working\n```card\n{card}\n```")})])
+        .await
+        .unwrap();
+    assert_eq!(created, "700");
+    let posted = received(&mut observed, "/channels/99/messages").await;
+    assert_eq!(posted["content"], "⏳ working");
+    assert_eq!(posted["embeds"], json!([{"title":"Status"}]));
+
+    let target = json!({"route":route,"messageId":"700"});
+    let edited = hub
+        .effect("send", &[json!({"id":"status-2","route":route,"text":"⏳ still working",
+            "editOf":target})])
+        .await
+        .unwrap();
+    assert_eq!(edited, "700", "an edit keeps the physical message identity");
+    let patch = received(&mut observed, "/channels/99/messages/700").await;
+    assert_eq!(patch["content"], "⏳ still working");
+    assert_eq!(patch["embeds"], json!([]), "an edit clears embeds the new text lacks");
+    assert_eq!(patch["attachments"], json!([]));
+    assert!(patch.get("nonce").is_none());
+    assert!(observed.try_recv().is_err());
+
+    // Discord no longer has the message: the edit fails and is never reposted.
+    let missing = hub
+        .effect("send", &[json!({"id":"status-3","route":route,"text":"⏳ gone",
+            "editOf":{"route":route,"messageId":"702"}})])
+        .await
+        .unwrap_err();
+    assert_eq!(missing.certainty, "rejected");
+    let mut elsewhere = route.clone();
+    elsewhere["channelId"] = json!("98");
+    let foreign = hub
+        .effect("send", &[json!({"id":"status-4","route":route,"text":"⏳ moved",
+            "editOf":{"route":elsewhere,"messageId":"700"}})])
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.certainty, "rejected");
+    assert!(observed.try_recv().is_err(), "no rejected edit becomes a new post");
 
     hub.stop().await.unwrap();
     server.abort();

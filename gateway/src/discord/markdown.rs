@@ -5,7 +5,7 @@ use unicode_width::UnicodeWidthStr;
 use super::model::utf16;
 
 #[derive(Clone, Copy)]
-enum Align {
+pub(super) enum Align {
     Left,
     Center,
     Right,
@@ -81,13 +81,13 @@ fn fence(line: &str) -> Option<(u8, usize, &str)> {
     (count >= 3).then(|| (ch, count, &line[count..]))
 }
 
-fn opens(line: &str) -> Option<(u8, usize, &str)> {
+pub(super) fn opens(line: &str) -> Option<(u8, usize, &str)> {
     // A backtick fence's info string cannot contain backticks. In particular,
     // a line that starts and ends with the same backtick run is inline code.
     fence(line).filter(|(ch, _, rest)| *ch != b'`' || !rest.contains('`'))
 }
 
-fn closes(line: &str, ch: u8, length: usize) -> bool {
+pub(super) fn closes(line: &str, ch: u8, length: usize) -> bool {
     fence(line).is_some_and(|(kind, count, rest)| {
         kind == ch && count >= length && rest.trim_matches([' ', '\t', '\r']).is_empty()
     })
@@ -122,7 +122,7 @@ fn block_start(line: &str) -> bool {
     matches!(line.as_bytes().get(marker), None | Some(b' ' | b'\t'))
 }
 
-fn table(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Option<String> {
+pub(super) fn table(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Option<String> {
     let mut widths = vec![3; aligns.len()];
     let mut extra_bytes = 0;
     for row in rows {

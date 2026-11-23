@@ -11,7 +11,7 @@ use crate::result_attachment::ResultAttachment;
 use super::picker::components as picker_components;
 use super::rest::{FILE_LIMIT, Rest, broken, no_mentions};
 use super::{
-    Effect, EffectError, State, markdown,
+    Effect, EffectError, State, embeds, markdown,
     model::{RemoteAttachment, RemoteMessage, Route, hash, snowflake, utf16},
 };
 
@@ -28,6 +28,8 @@ pub(super) struct Output {
     route: Route,
     text: String,
     reply_to: Option<MessageReference>,
+    /// A durable status message this output replaces in place.
+    edit_of: Option<MessageReference>,
     picker: Option<Picker>,
     result_attachment: Option<ResultAttachment>,
 }
@@ -95,28 +97,35 @@ impl Payload {
 
     /// One payload per Discord message, in order: up to `parts` text messages,
     /// or one text attachment named after `nonce` when the text needs more.
+    /// Valid ```card fences become embeds on the last payload.
     fn split(text: &str, nonce: &str, parts: usize) -> Effect<Vec<Self>> {
-        let rendered = markdown::render(text, FILE_LIMIT);
+        let (text, cards) = embeds::extract(text);
+        let rendered = markdown::render(&text, FILE_LIMIT);
         if rendered.len() > FILE_LIMIT {
             return Err(EffectError::rejected(
                 "Discord text attachment exceeds the safe 8 MiB upload limit",
             ));
         }
-        if rendered.is_empty() {
-            return Ok(vec![Self::text("(empty output)".to_owned())]);
+        let mut payloads = if rendered.is_empty() {
+            vec![Self::text(if cards.is_empty() { "(empty output)".to_owned() } else { String::new() })]
+        } else if utf16(&rendered) <= MESSAGE_LIMIT {
+            vec![Self::text(rendered.into_owned())]
+        } else if let Some(chunks) = markdown::split(&rendered, MESSAGE_LIMIT, parts) {
+            chunks.into_iter().map(Self::text).collect()
+        } else {
+            let name = format!("omp-{nonce}.txt");
+            vec![Self::attachment(
+                "Full text is attached (exceeds Discord's message limit).",
+                name,
+                rendered.into_owned().into_bytes(),
+            )]
+        };
+        if !cards.is_empty()
+            && let Some(last) = payloads.last_mut()
+        {
+            last.body["embeds"] = Value::Array(cards);
         }
-        if utf16(&rendered) <= MESSAGE_LIMIT {
-            return Ok(vec![Self::text(rendered.into_owned())]);
-        }
-        if let Some(chunks) = markdown::split(&rendered, MESSAGE_LIMIT, parts) {
-            return Ok(chunks.into_iter().map(Self::text).collect());
-        }
-        let name = format!("omp-{nonce}.txt");
-        Ok(vec![Self::attachment(
-            "Full text is attached (exceeds Discord's message limit).",
-            name,
-            rendered.into_owned().into_bytes(),
-        )])
+        Ok(payloads)
     }
 
     fn attachment(content: &str, name: String, bytes: Vec<u8>) -> Self {
@@ -143,6 +152,10 @@ impl Payload {
         if self.file.is_none() {
             self.body["attachments"] = json!([]);
         }
+        // An edit replaces the whole message: drop embeds the new text lacks.
+        if self.body.get("embeds").is_none() {
+            self.body["embeds"] = json!([]);
+        }
     }
 
     pub fn apply(self, request: RequestBuilder) -> RequestBuilder {
@@ -163,6 +176,9 @@ impl Payload {
 impl State {
     pub(super) async fn send(&self, output: &Output) -> Effect<String> {
         let deadline = Instant::now() + OUTPUT_SEND_BUDGET;
+        if let Some(target) = &output.edit_of {
+            return self.edit_status(output, target, deadline).await;
+        }
         if let Some(reply) = &output.reply_to
             && (!snowflake(&reply.message_id) || reply.route.physical() != output.route.physical())
         {
@@ -294,6 +310,45 @@ impl State {
                 .map_err(|_| broken("Discord output part receipts could not be saved"))?;
         }
         Ok(first)
+    }
+
+    /// Replace a status message in place. A rejected edit fails this output;
+    /// it is never turned into a new post, and an ambiguous edit stays uncertain.
+    async fn edit_status(
+        &self,
+        output: &Output,
+        target: &MessageReference,
+        deadline: Instant,
+    ) -> Effect<String> {
+        if !snowflake(&target.message_id)
+            || target.route.physical() != output.route.physical()
+            || output.picker.is_some()
+            || output.result_attachment.is_some()
+        {
+            return Err(EffectError::rejected(
+                "Discord status edit requires a plain message in the exact destination conversation",
+            ));
+        }
+        let not_started =
+            || EffectError::rejected("Discord output deadline expired before sending");
+        let channel = timeout_at(deadline, self.destination(&output.route))
+            .await
+            .map_err(|_| not_started())??;
+        let mut payload =
+            Payload::split(&output.text, &nonce(&output.id, &output.route, 0), 1)?.remove(0);
+        payload.edit();
+        let request = payload.apply(self.rest.request(
+            Method::PATCH,
+            &format!("channels/{}/messages/{}", channel.id, target.message_id),
+        ));
+        if Instant::now() >= deadline {
+            return Err(not_started());
+        }
+        let edited: RemoteMessage = Rest::response_before(request, deadline).await?;
+        if !edited.belongs(&output.route) || edited.id != target.message_id {
+            return Err(broken("Discord status edit receipt could not be verified"));
+        }
+        Ok(edited.id)
     }
 
     pub(super) async fn activity(
