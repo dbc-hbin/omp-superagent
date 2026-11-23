@@ -37,6 +37,8 @@ import { laneWaitKey, type LaneReport } from "./lane-report";
 import { laneWatchReplySource } from "./lane-watch";
 import { existingWorkspace, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
 import type { CronUpdate } from "./cron-jobs";
+import { unattendedSource, hasIntakeReplyRoute, intakeThreadKey, intakeWorkId } from "./pr-intake-work";
+import type { ReviewRound } from "./pr-intake-review";
 
 const ACTIVE_INPUTS = "state IN ('pending','submitted','uncertain')";
 
@@ -66,7 +68,7 @@ const SCHEMA = `
   );
   CREATE TABLE IF NOT EXISTS outputs (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-    source_id TEXT NOT NULL, route TEXT NOT NULL, text TEXT NOT NULL,
+    source_id TEXT NOT NULL, route TEXT NOT NULL, physical_route TEXT, text TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending'
       CHECK(state IN ('pending','sending','sent','uncertain','failed')),
     remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT, result_attachment TEXT
@@ -205,6 +207,15 @@ export class Store implements StorePort {
       if (!outputColumns.some(column => column.name === "reply_to")) db.run("ALTER TABLE outputs ADD COLUMN reply_to TEXT");
       if (!outputColumns.some(column => column.name === "picker")) db.run("ALTER TABLE outputs ADD COLUMN picker TEXT");
       if (!outputColumns.some(column => column.name === "result_attachment")) db.run("ALTER TABLE outputs ADD COLUMN result_attachment TEXT");
+      if (!outputColumns.some(column => column.name === "physical_route")) db.run("ALTER TABLE outputs ADD COLUMN physical_route TEXT");
+      db.run("CREATE INDEX IF NOT EXISTS outputs_route_queue ON outputs(state, physical_route, sequence)");
+      const missingPhysical = db.query<{ id: string; route: string }, []>("SELECT id, route FROM outputs WHERE physical_route IS NULL").all();
+      if (missingPhysical.length) {
+        const update = db.query("UPDATE outputs SET physical_route = ? WHERE id = ?");
+        db.transaction(() => {
+          for (const row of missingPhysical) update.run(physicalRouteKey(JSON.parse(row.route) as Route), row.id);
+        })();
+      }
       this.db = db;
       this.writerLock = lock;
     } catch (error) {
@@ -229,6 +240,33 @@ export class Store implements StorePort {
       || (input.messageId === null ? input.interactionId === undefined && !slackInvocation : typeof input.messageId !== "string" || !input.messageId.length)) {
       throw new Error("Inbound event requires a real message ID, Discord interaction snowflake, scoped Slack invocation, or valid picker selection");
     }
+    return this.insertInput(input, target, metadata, workflow);
+  }
+
+  receivePrWork(input: Inbound, target: string | null, r: ReviewRound): boolean {
+    const parent = { ...input.route, threadId: null };
+    const offer = this.output(`cron-pr:offer:${r.repository}:${r.number}`);
+    if (!r.automation || input.route.platform !== "discord" || !input.route.guildId || input.route.topicId !== undefined
+      || input.messageId !== null || input.interactionId !== undefined || input.invocationId !== undefined
+      || input.pickerSelection || input.attachments.length || input.discordOriginalText !== undefined || input.reply
+      || this.getMeta(`user-source:${input.id}`) !== null || r.automation.anchor !== input.route.threadId
+      || r.source !== intakeWorkId(r.job, r.number, r.automation.revision, r.head)
+      || !offer || offer.state !== "sent" || offer.remoteId !== r.automation.anchor || routeKey(offer.route) !== routeKey(parent)
+      || this.getMeta(intakeThreadKey(r.job, r.number)) !== r.automation.anchor)
+      throw new Error("Static PR work requires the exact noninteractive receipt and confirmed bot starter.");
+    const scope = `pr-review:${r.job}:${r.number}`;
+    if (input.id === r.source && target === null)
+      return this.insertInput(input, target, { [scope]: JSON.stringify(r), [`pr-review-lane:${r.laneId}`]: scope,
+        [`topic-owner:${r.source}`]: r.laneId }, null);
+    const source = this.input(r.source);
+    if (input.id !== r.inputId || (target !== null && target !== r.laneId) || source?.target !== null
+      || source.state !== "pending" || routeKey(source.route) !== routeKey(input.route)
+      || this.getMeta(scope) !== JSON.stringify(r) || this.getMeta(`pr-review-lane:${r.laneId}`) !== scope)
+      throw new Error("Static PR lane handoff does not match its registered controller receipt.");
+    return this.insertInput(input, target, { [`handoff-source:${input.id}`]: r.source }, null);
+  }
+
+  private insertInput(input: Inbound, target: string | null, metadata: Readonly<Record<string, string>>, workflow: WorkflowActivation | null): boolean {
     return this.db.transaction(() => {
       const existing = this.input(input.id);
       if (existing) {
@@ -664,9 +702,22 @@ export class Store implements StorePort {
       if (lane && (lane.generation !== generation || lane.workState !== "open")) return false;
       const submitted = this.db.query(`UPDATE inputs SET state = 'submitted', request_id = ?, generation = ?
         WHERE id = ? AND state = 'pending'`).run(requestId, generation, id).changes === 1;
+      const ownerId = submitted && lane ? this.getMeta(`steering-owner:${id}`) : null;
+      if (ownerId && ownerId !== id) {
+        const topic = this.topicDelivery(id);
+        if (topic && !this.topicDelivery(ownerId)) {
+          const owner = this.input(ownerId);
+          const source = owner && this.ownerSource(owner.id);
+          if (!owner || !source || owner.state !== "submitted" || owner.target !== input.target || owner.generation !== generation
+            || routeKey(owner.route) !== routeKey(input.route) || routeKey(this.laneReplyRoute(owner, source)) !== routeKey(topic.route)) {
+            throw new Error(`Steering reply route differs from the current lane run: ${id}`);
+          }
+          // A later lane_start of the manager source must not redirect this cohort.
+          this.setMeta(`steering-topic-reply:${owner.id}`, JSON.stringify(topic.route));
+        }
+      }
       if (submitted && lane?.route.platform === "discord" && lane.route.guildId && lane.route.threadId) {
-        const owner = this.getMeta(`steering-owner:${id}`);
-        if (owner === null || owner === id) this.setMeta(`lane-latest-run:${lane.id}`, id);
+        if (ownerId === null || ownerId === id) this.setMeta(`lane-latest-run:${lane.id}`, id);
       }
       return submitted;
     }).immediate();
@@ -694,6 +745,7 @@ export class Store implements StorePort {
       const context = { inputId: id, generation, sessionId };
       if (!this.progressOpen(context)) return false;
       const input = this.requireInput(id);
+      if (unattendedSource(this, input)) return false; // Static review has one final answer, not a HEAD progress prompt.
       const receiptId = `progress:${id}:${eventId}`;
       const seen = `progress-seen:${receiptId}`;
       if (this.getMeta(seen)) return false;
@@ -720,7 +772,7 @@ export class Store implements StorePort {
       const previous = this.getMeta(pendingKey);
       if (previous) this.db.query("UPDATE inputs SET state = 'cancelled' WHERE id = ? AND state = 'pending'").run(previous);
       this.receive({
-        id: receiptId, route: this.deliveryRoute(source), messageId: source.messageId,
+        id: receiptId, route: this.laneReplyRoute(input, source), messageId: source.messageId,
         receivedAt: source.receivedAt, attachments: [],
         ...(source.interactionId === undefined ? {} : { interactionId: source.interactionId }),
         ...(source.invocationId === undefined ? {} : { invocationId: source.invocationId }),
@@ -830,8 +882,12 @@ export class Store implements StorePort {
       const progress = this.getMeta(`progress-source:${id}`);
       if (progress && !this.progressOpen(JSON.parse(progress))) output = undefined;
       // An uncertain request can only be resolved explicitly, never resubmitted.
-      const topic = output && this.topicDelivery(id);
-      if (output && topic) {
+      const reviewSource = unattendedSource(this, input);
+      const topic = output && !reviewSource && this.topicDelivery(id);
+      if (reviewSource) {
+        if (output?.text.trim() && hasIntakeReplyRoute(this, input, reviewSource))
+          this.queueOutput({ ...output, sourceId: input.id, route: input.route });
+      } else if (output && topic) {
         if (output.text.trim() && (topic.source.id === id
           || topic.source.state !== "cancelled" && topic.source.state !== "uncertain")) {
           this.queueOutput({
@@ -847,7 +903,7 @@ export class Store implements StorePort {
         const receiptId = input.state === "uncertain" ? `${reportId}:${state}` : reportId;
         this.receive({
           id: receiptId,
-          route: this.deliveryRoute(source), messageId: source.messageId, receivedAt: source.receivedAt, attachments: [],
+          route: this.laneReplyRoute(input, source), messageId: source.messageId, receivedAt: source.receivedAt, attachments: [],
           ...(source.interactionId === undefined ? {} : { interactionId: source.interactionId }),
           ...(source.invocationId === undefined ? {} : { invocationId: source.invocationId }),
           text: [
@@ -977,6 +1033,11 @@ export class Store implements StorePort {
     }).immediate();
   }
 
+  laneReplyRoute(input: InputRecord, source: InputRecord): Route {
+    const pinned = this.getMeta(`steering-topic-reply:${input.id}`);
+    return pinned ? JSON.parse(pinned) : this.deliveryRoute(source);
+  }
+
   private deliveryRoute(source: InputRecord, expectedLane?: string | null): Route {
     const stored = this.getMeta(`head-delivery:${source.id}`);
     if (!stored) return source.route;
@@ -1038,13 +1099,17 @@ export class Store implements StorePort {
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(replyTo.route))) {
         throw new Error(`Output reply differs from its source: ${output.id}`);
       }
-      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to, picker, result_attachment) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .run(output.id, output.sourceId, JSON.stringify(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
+      return this.db.query("INSERT INTO outputs(id, source_id, route, physical_route, text, reply_to, picker, result_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(output.id, output.sourceId, JSON.stringify(output.route), physicalRouteKey(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
           output.picker ? JSON.stringify(output.picker) : null, attachment ? JSON.stringify(attachment) : null).changes === 1;
     }).immediate();
   }
 
-  outputs(): OutputRecord[] {
+  outputs(physicalRoute?: string): OutputRecord[] {
+    if (physicalRoute !== undefined) {
+      return (this.db.query("SELECT * FROM outputs WHERE state = 'pending' AND physical_route = ? ORDER BY sequence")
+        .all(physicalRoute) as OutputRow[]).map(toOutput);
+    }
     return (this.db.query("SELECT * FROM outputs WHERE state = 'pending' ORDER BY sequence")
       .all() as OutputRow[]).map(toOutput);
   }

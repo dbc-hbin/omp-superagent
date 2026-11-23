@@ -346,23 +346,35 @@ function promptText(content: unknown): string {
   return text;
 }
 
+export const joinedTopicProvenance = "Input provenance: bound owner topic reply.";
+
 /** OMP journals the RPC completion ID; the fenced request identifies its input. */
 function journalRequest(raw: string, lane: Lane) {
-  const headers = [...raw.matchAll(/^(`{3,})superagent-runtime-context\nRequest ID: ([^\r\n]{1,512})\n/gm)]
-    .sort((a, b) => b[1].length - a[1].length);
+  const headers = [...raw.matchAll(/^(`{3,})superagent-runtime-context\nRequest ID: ([^\r\n]{1,512})\n/gm)];
+  if (!headers.length) return;
+  // Ordinary prompts start with the controller header. Pasted task text after
+  // its closing fence cannot replace it or make it ambiguous.
+  const leading = headers[0]?.index === 0;
+  if (!leading) headers.sort((a, b) => b[1].length - a[1].length);
   const header = headers[0];
-  if (!header || headers[1]?.[1].length === header[1].length) return;
-  const scope = raw.slice(header.index + header[0].length, header.index + header[0].length + 4096).split("\n", 12);
-  if (scope.includes(`Independent lane ${lane.id}; cwd: ${lane.cwd}`)) {
-    // Same request identity used by runtime's prompt submission, excluding generation.
-    const inputId = header[2];
-    const closing = `\n${header[1]}`;
-    const manager = scope.includes("Delivery mode: manager handoff.");
-    const fencedManager = manager && header.index === 0 && raw.endsWith(closing)
-      && !raw.slice(header[0].length, -closing.length).includes(header[1]);
-    const topicReply = scope.includes("Delivery mode: topic reply.");
-    return { inputId, digest: createHash("sha256").update(inputId).digest("hex").slice(0, 24), manager, fencedManager, topicReply };
-  }
+  if (!header || !leading && headers[1]?.[1].length === header[1].length) return false;
+  const body = raw.slice(header.index + header[0].length);
+  const closing = `\n${header[1]}`;
+  const closeBeforeText = body.indexOf(`${closing}\n`);
+  const end = closeBeforeText >= 0 ? closeBeforeText : body.endsWith(closing) ? body.length - closing.length : -1;
+  if (end < 0) return false;
+  const scope = body.slice(0, Math.min(end, 4096)).split("\n", 12);
+  const laneIndex = scope.indexOf(`Independent lane ${lane.id}; cwd: ${lane.cwd}`);
+  if (laneIndex < 0) return false;
+  // Same request identity used by runtime's prompt submission, excluding generation.
+  const inputId = header[2];
+  const delivery = scope[laneIndex + 1];
+  const manager = delivery === "Delivery mode: manager handoff.";
+  const topicReply = delivery === "Delivery mode: topic reply.";
+  if (!manager && !topicReply) return false;
+  const fencedManager = manager && leading && closeBeforeText < 0 && !body.slice(0, end).includes(header[1]);
+  const joinedTopic = manager && scope[laneIndex + 2] === joinedTopicProvenance && scope[laneIndex + 3]?.startsWith("Brief: ");
+  return { inputId, digest: createHash("sha256").update(inputId).digest("hex").slice(0, 24), manager, fencedManager, topicReply, joinedTopic };
 }
 
 function journalReceipt(data: unknown, lane: Lane) {
@@ -461,7 +473,7 @@ type TopicQuery = {
 type TopicSelection = { readonly anchors: ReadonlySet<string> } | { readonly entryId: string };
 type JournalQuery = TopicQuery & { readonly selection: TopicSelection };
 /** Resolve durable owner prose only after verifying its route and the exact completion. */
-type OwnerOpening = (lane: Lane, inputId: string, mode: "manager" | "topic",
+type OwnerOpening = (lane: Lane, inputId: string, mode: "manager" | "topic" | "joined-topic",
   hasCompletion: (requestId: string) => boolean) => Promise<{ readonly text: string; readonly requestId: string } | null>;
 
 function topicQuery(text: string, receivedAt: number): TopicQuery | null {
@@ -502,13 +514,14 @@ async function matchJournal(entries: readonly SessionEntry[], lane: Lane, query:
       if (user.synthetic === true || user.parentIrc || user.attribution === "agent") continue;
       const raw = promptText(user.content);
       const request = journalRequest(raw, lane);
+      if (request === false) continue;
       // A manager fence can contain generated instructions and quotes. Use
       // only the independent original source, never the fenced task bytes.
       // Telegram's formatting entities are not recoverable from native text.
       // Workflow envelopes may put raw instructions before or after the fence;
       // recognizing manager delivery must not depend on the entire turn being fenced.
-      if (request?.manager && !request.fencedManager) continue;
-      const mode = request?.manager ? "manager" : lane.route.platform === "telegram" ? "topic" : null;
+      if (request?.manager && !request.fencedManager && !request.joinedTopic) continue;
+      const mode = request?.joinedTopic ? "joined-topic" : request?.manager ? "manager" : lane.route.platform === "telegram" ? "topic" : null;
       let ownerText: string;
       let ownerRequestId: string | undefined;
       if (mode !== null) {

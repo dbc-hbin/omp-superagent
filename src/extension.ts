@@ -12,6 +12,7 @@ import { lanePlacement } from "./lane-rows";
 import { sameLaneModel } from "./lane-models";
 import { NativePresetManager } from "./native-presets";
 import { publishNativeSession } from "./native-sessions";
+import { isPrReviewLane } from "./pr-intake-review";
 import { MODEL_PRESET_NAMES, WORKFLOW_NAMES } from "./contracts";
 import type { PrWatchCommand } from "./pr-watch";
 import type { LaneWatchCommand } from "./lane-watch";
@@ -487,7 +488,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
         let messenger: ReturnType<typeof createGatewayMessenger>;
         try {
           for (const lane of store.lanes()) {
-            if (lane.remote || !lane.sessionId) continue;
+            if (lane.remote || !lane.sessionId || isPrReviewLane(store, lane.id)) continue;
             const { sessionFile } = hostPaths(config, lane.id);
             if (lane.sessionFile !== sessionFile) throw new Error("Refusing to publish a lane outside its managed session path");
             await publishNativeSession(sessionFile, lane.cwd, lane.sessionId);

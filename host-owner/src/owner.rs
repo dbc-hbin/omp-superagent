@@ -61,7 +61,9 @@ struct Manifest {
 struct Options {
     command: Vec<String>,
     cwd: PathBuf,
-    managed_ulw_path: PathBuf,
+    managed_ulw_path: Option<PathBuf>,
+    #[serde(default)]
+    pr_review_only: bool,
     session_file: String,
     socket_path: PathBuf,
     model_preset: Option<Preset>,
@@ -93,6 +95,7 @@ struct Identity {
     generation: Option<Value>,
     instance_key: Option<Value>,
     worker_attempt: Option<String>,
+    pr_review_only: bool,
     journal_cursor: bool,
 }
 
@@ -272,6 +275,10 @@ impl Owner {
         self.identity
             .get()
             .is_some_and(|identity| identity.worker_attempt.is_some())
+    }
+
+    pub(crate) fn pr_review_only(&self) -> bool {
+        self.identity.get().is_some_and(|identity| identity.pr_review_only)
     }
 
     pub(crate) fn observations_known(&self, state: &State) -> bool {
@@ -615,6 +622,9 @@ impl Owner {
         let native = data(rpc.request(request).await?)?;
         let owned = data(control.request(json!({"type": "snapshot"})).await?)?;
         let identity = self.validate_control_identity(&owned)?;
+        if (owned["prReviewPolicy"]["version"] == 1) != identity.pr_review_only {
+            return Err(Error::Unavailable("Static PR review policy identity changed"));
+        }
         if owned.get("sessionId") != native.get("sessionId")
             || owned.get("sessionFile") != native.get("sessionFile")
         {
@@ -637,6 +647,7 @@ impl Owner {
             owned.remove("configuredThinkingLevel");
             native.entry("configuredThinkingLevel").or_insert(Value::Null);
         }
+        native.remove("prReviewPolicy");
         native.extend(owned);
         // Only publish the capability attested by this owner's private launch control.
         native.remove("journalCursorControlVersion");
@@ -809,13 +820,20 @@ pub(crate) async fn run(path: PathBuf) -> anyhow::Result<ExitCode> {
     let options = &manifest.options;
     ensure!(
         options.cwd.is_absolute()
-            && options.managed_ulw_path.is_absolute()
+            && (options.pr_review_only && options.managed_ulw_path.is_none()
+                || !options.pr_review_only && options.managed_ulw_path.as_deref().is_some_and(Path::is_absolute))
             && Path::new(&options.session_file).is_absolute()
             && options.socket_path.is_absolute()
             && manifest.config_path.is_absolute()
             && manifest.native_socket.is_absolute()
             && manifest.helper_path.is_absolute(),
         "Owner manifest paths must be absolute"
+    );
+    ensure!(
+        !options.pr_review_only || manifest.no_tools && !manifest.tools_explicitly_selected
+            && env::var_os("OMP_SUPERAGENT_WORKER_ATTEMPT").is_none()
+            && options.model_preset.is_none() && options.model_settings.is_none(),
+        "Static PR review must be local with the stock no-tools selection"
     );
     // For an enrolled worker the stock CLI receives --cwd explicitly. Start
     // its runtime in private state so eager loader inputs aren't taken from
@@ -841,7 +859,12 @@ pub(crate) async fn run(path: PathBuf) -> anyhow::Result<ExitCode> {
         .command
         .split_first()
         .context("Missing native OMP executable")?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command.env_remove("OMP_SUPERAGENT_PR_REVIEW_CWD");
+    if options.pr_review_only {
+        command.env("OMP_SUPERAGENT_PR_REVIEW_CWD", &options.cwd);
+    }
+    let mut child = command
         .args(prefix)
         .args(&manifest.args)
         .current_dir(bootstrap_cwd)
@@ -995,11 +1018,21 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
             && identity["sessionFile"].as_str() == Some(&manifest.options.session_file),
         "Native launch identity mismatch"
     );
-    ensure!(
-        identity["loadedSuperkitPath"].as_str().map(Path::new)
-            == Some(manifest.options.managed_ulw_path.as_path()),
-        "Native session did not confirm loading the selected omp-superkit package"
-    );
+    if manifest.options.pr_review_only {
+        ensure!(
+            identity["prReviewPolicy"]["version"] == 1
+                && identity["prReviewPolicy"]["cwd"].as_str().map(Path::new) == Some(manifest.options.cwd.as_path())
+                && identity["loadedSuperkitPath"].is_null(),
+            "Native session did not confirm the local static PR review policy"
+        );
+    } else {
+        ensure!(
+            identity["loadedSuperkitPath"].as_str().map(Path::new)
+                == manifest.options.managed_ulw_path.as_deref()
+                && identity["prReviewPolicy"].is_null(),
+            "Native session did not confirm loading the selected omp-superkit package"
+        );
+    }
     let worker_attempt = env::var("OMP_SUPERAGENT_WORKER_ATTEMPT").ok();
     if worker_attempt.is_some() {
         ensure!(
@@ -1022,6 +1055,7 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
             instance_key: identity.get("instanceKey").cloned(),
             generation: identity.get("generation").cloned(),
             worker_attempt,
+            pr_review_only: manifest.options.pr_review_only,
             journal_cursor: identity["journalCursorControlVersion"].as_u64() == Some(1),
         })
         .map_err(|_| anyhow::anyhow!("Duplicate native launch identity"))?;
