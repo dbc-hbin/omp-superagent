@@ -4,10 +4,13 @@ import { routeKey, type Inbound, type InputRecord, type StorePort } from "./cont
 import { describeCronSchedule, nextCronTime, parseCronSchedule, type CronSchedule } from "./cron-schedule";
 
 const jobsKey = "cron:jobs";
+export const CRON_SHELL_SILENT = "[SILENT]";
+const shellKey = (runId: string) => `cron-shell:${runId}`;
 export const CRON_RUN_PREFIX = "cron-run:";
 const usage = [
   '/cron add "every 2h" Check the build', '/cron add "in 30m" Remind me',
   '/cron add "TZ=Asia/Seoul 0 9 * * 1-5" Summarize CI',
+  '/cron add shell "every 1h" df -h   (runs the command alone, no model turn; posts stdout)',
   '/cron list | show ID | pause ID | resume ID | run ID | remove ID',
   '/cron edit ID "schedule" [prompt] | /cron edit ID prompt NEW_PROMPT',
 ].join("\n");
@@ -21,6 +24,10 @@ interface CronJob {
   readonly paused: boolean;
   readonly stopBoundary: string | null;
   readonly lastRunId: string | null;
+  /** The prompt is a shell command run alone; its stdout is posted verbatim. */
+  readonly shell?: true;
+  /** SHA-256 of the last posted shell output; the only output state kept. */
+  readonly outputHash?: string;
 }
 
 interface CronState {
@@ -32,6 +39,20 @@ export interface CronCreate {
   readonly sourceId: string;
   readonly schedule: string;
   readonly prompt: string;
+}
+
+export interface CronShellResult {
+  readonly exitCode: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly error?: string;
+}
+
+export interface CronShellOutcome {
+  /** Text to post, or null to stay silent. */
+  readonly text: string | null;
+  /** Hash to persist after a successful post; null leaves the stored hash unchanged. */
+  readonly hash: string | null;
 }
 
 export interface CronUpdate {
@@ -48,13 +69,15 @@ function jobMetadata(state: CronState, changed: CronJob, remove = false) {
   return { [jobsKey]: JSON.stringify({ ...state, jobs: next }) };
 }
 
+const outputHash = (text: string) => createHash("sha256").update(text).digest("hex");
+
 function cronRun(job: CronJob, source: InputRecord, trigger: string, now: number): Inbound {
   return {
     id: `${CRON_RUN_PREFIX}${job.id}:${trigger}`, route: source.route, messageId: source.messageId,
     ...(source.interactionId === undefined ? {} : { interactionId: source.interactionId }),
     ...(source.invocationId === undefined ? {} : { invocationId: source.invocationId }),
     receivedAt: now, attachments: [],
-    text: `Scheduled job ${job.id}. Execute only the stored owner prompt below. No interactive follow-up, delegation authority, standing approval or new schedule is implied.\n\n${job.prompt}`,
+    text: job.shell ? job.prompt : `Scheduled job ${job.id}. Execute only the stored owner prompt below. No interactive follow-up, delegation authority, standing approval or new schedule is implied.\n\n${job.prompt}`,
   };
 }
 
@@ -117,7 +140,7 @@ export class CronJobs {
     const state = last === "uncertain" || last === "missing" ? "held (reconcile the original HEAD input)"
       : job.paused ? "paused" : job.stopBoundary !== this.store.getMeta("head:stop-boundary") ? "held by HEAD stop"
       : job.nextAt === null ? "no next run" : "scheduled";
-    return `${job.id} — ${state}; ${describeCronSchedule(job.schedule)}; next: ${job.nextAt === null ? "none" : new Date(job.nextAt).toISOString()}; last: ${last}${job.lastRunId ? ` (${job.lastRunId})` : ""}`;
+    return `${job.id} — ${state}${job.shell ? "; shell" : ""}; ${describeCronSchedule(job.schedule)}; next: ${job.nextAt === null ? "none" : new Date(job.nextAt).toISOString()}; last: ${last}${job.lastRunId ? ` (${job.lastRunId})` : ""}`;
   }
 
   control(input: InputRecord, argument: string, now: number): CronUpdate {
@@ -145,16 +168,21 @@ export class CronJobs {
     if (action === "add" || action === "create" || action === "edit") {
       if (action === "edit" && !found) return reject("No cron job with that ID in this conversation.");
       const previous = action === "edit" ? found?.job : undefined;
-      const body = previous ? details : tail;
+      const shellAdd = !previous && /^shell\s+/.test(tail);
+      const body = previous ? details : shellAdd ? tail.replace(/^shell\s+/, "") : tail;
       const pair = /^"([^"\r\n]+)"(?:\s+([\s\S]+))?$/.exec(body);
       const schedule = pair ? parseCronSchedule((pair[1] ?? "").trim(), now) : previous?.schedule;
       const prompt = pair ? (pair[2] ? promptText(pair[2]) : previous?.prompt)
         : previous && /^prompt\s+/.test(body) ? promptText(body.replace(/^prompt\s+/, "")) : undefined;
       if (!schedule || !prompt) return reject(`Invalid schedule or missing prompt. Recurring intervals must be at least one minute.\n${usage}`);
-      const job = { id: previous?.id ?? randomUUID(), sourceId: previous?.sourceId ?? input.id,
+      const shell = shellAdd || previous?.shell === true;
+      // A changed command is new output territory: its first run always posts.
+      const keepHash = previous?.outputHash !== undefined && prompt === previous.prompt;
+      const job: CronJob = { id: previous?.id ?? randomUUID(), sourceId: previous?.sourceId ?? input.id,
         schedule, prompt, nextAt: pair ? nextCronTime(schedule, now) : previous?.nextAt ?? null,
         paused: previous?.paused ?? false, stopBoundary: previous ? previous.stopBoundary : boundary,
-        lastRunId: previous?.lastRunId ?? null };
+        lastRunId: previous?.lastRunId ?? null, ...(shell ? { shell: true as const } : {}),
+        ...(keepHash ? { outputHash: previous.outputHash } : {}) };
       return { text: `${previous ? "Updated" : "Created"} cron job. ${this.status(job)}`, metadata: jobMetadata(state, job) };
     }
     if (!["show", "pause", "resume", "run", "remove", "delete"].includes(action) || !id || details) return reject(usage);
@@ -181,7 +209,37 @@ export class CronJobs {
     if (last?.state === "pending" || last?.state === "submitted") return reject(`Cron run ${last.id} is already queued or running.`);
     const run = cronRun(job, source, input.id, now);
     return { text: `Queued cron run ${run.id}. The schedule is unchanged; queued is not completed.`,
-      metadata: jobMetadata(state, { ...job, lastRunId: run.id }), run };
+      metadata: { ...jobMetadata(state, { ...job, lastRunId: run.id }), ...(job.shell ? { [shellKey(run.id)]: job.id } : {}) }, run };
+  }
+
+  /** The verbatim shell job a cron run input belongs to, if any. */
+  shellRun(input: InputRecord): { readonly jobId: string; readonly command: string } | null {
+    if (!input.id.startsWith(CRON_RUN_PREFIX)) return null;
+    const jobId = this.store.getMeta(shellKey(input.id));
+    return jobId ? { jobId, command: input.text } : null;
+  }
+
+  /**
+   * Decide what a finished shell run posts. Failures are always reported and
+   * never touch the stored hash; empty/[SILENT]/unchanged output stays quiet.
+   */
+  shellOutcome(jobId: string, run: CronShellResult): CronShellOutcome {
+    if (run.error !== undefined || run.exitCode !== 0) {
+      const detail = run.error ?? `exit code ${run.exitCode}`;
+      const output = [run.stdout, run.stderr].filter(part => part.trim()).join("\n");
+      return { text: `Cron shell job ${jobId} failed (${detail}).${output ? `\n${output}` : ""}`, hash: null };
+    }
+    if (!run.stdout.trim() || run.stdout.includes(CRON_SHELL_SILENT)) return { text: null, hash: null };
+    const hash = outputHash(run.stdout);
+    const job = this.state().jobs.find(job => job.id === jobId);
+    return job?.outputHash === hash ? { text: null, hash: null } : { text: run.stdout, hash };
+  }
+
+  /** Persist the hash of an output that was queued for posting. */
+  recordShellHash(jobId: string, hash: string): void {
+    const state = this.state();
+    const job = state.jobs.find(job => job.id === jobId);
+    if (job) this.store.setMeta(jobsKey, jobMetadata(state, { ...job, outputHash: hash })[jobsKey]);
   }
 
   poll(now: number): void {
@@ -206,7 +264,7 @@ export class CronJobs {
       const next = { ...job, nextAt, lastRunId: run?.id ?? job.lastRunId };
       state = { ...state, jobs: state.jobs.map(current => current.id === job.id ? next : current) };
       const committed = JSON.stringify(state);
-      if (run) this.store.receive(run, "main", { [jobsKey]: committed });
+      if (run) this.store.receive(run, "main", { [jobsKey]: committed, ...(job.shell ? { [shellKey(run.id)]: job.id } : {}) });
       else this.store.setMeta(jobsKey, committed);
     }
   }

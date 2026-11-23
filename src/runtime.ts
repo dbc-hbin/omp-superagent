@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
@@ -32,7 +33,7 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
 import { headRecoveryEvidence, type HeadQuotaFailure } from "./head-recovery";
 import { HEAD_QUOTA_CHECK_MS } from "./head-quota";
 import { isPrObservation, PrWatcher, type PrWatchCommand } from "./pr-watch";
-import { CRON_RUN_PREFIX, CronJobs, type CronCreate } from "./cron-jobs";
+import { CRON_RUN_PREFIX, CronJobs, type CronCreate, type CronShellResult } from "./cron-jobs";
 import { couldMatchResetAccount, listOmpUsageResets, OmpResetUnsupported, readOmpUsage, redeemOmpUsageReset, type OmpResetAccount } from "./omp-usage";
 import type { readPrSnapshot } from "./pr-github";
 import { acknowledgeDecision, decisionRequestId, decisionViews, validateDecisionResponse, type DecisionView } from "./decisions";
@@ -5433,6 +5434,26 @@ export class Superagent {
     }
   }
 
+  // A verbatim shell run has no model turn. Claim it as submitted before the
+  // spawn so a crash leaves it uncertain (never re-run), then settle with the
+  // verbatim stdout, or with nothing when the job's output is silent or unchanged.
+  private async cronShell(input: InputRecord, shell: { readonly jobId: string; readonly command: string }): Promise<void> {
+    if (!this.store.submit(input.id, `cron-shell-${key(input.id)}`, 0)) return;
+    const env = { ...process.env };
+    for (const name of credentialEnvNames(this.config)) delete env[name];
+    const result = await new Promise<CronShellResult>(resolve => {
+      execFile("/bin/sh", ["-c", shell.command], { cwd: this.config.headCwd, env, timeout: 30_000, maxBuffer: 1 << 20 },
+        (error, stdout, stderr) => {
+          const code = error ? (error as { code?: unknown }).code : 0;
+          resolve({ exitCode: typeof code === "number" ? code : null, stdout, stderr,
+            ...(error && typeof code !== "number" ? { error: error.message } : {}) });
+        });
+    });
+    const outcome = this.cronJobs.shellOutcome(shell.jobId, result);
+    this.store.settle(input.id, "done", outcome.text === null ? undefined : { id: `${input.id}:cron-shell`, text: outcome.text });
+    if (outcome.hash !== null && this.store.input(input.id)?.state === "done") this.cronJobs.recordShellHash(shell.jobId, outcome.hash);
+  }
+
   private cronControl(id: string, argument: string): void {
     const input = this.store.input(id);
     if (input?.state !== "pending" || this.headCommand(input)?.name !== "cron") return;
@@ -5717,6 +5738,11 @@ export class Superagent {
           const control = this.headCommand(input);
           if (control?.name === "cron") {
             this.cronControl(input.id, control.argument);
+            continue;
+          }
+          const shell = input.target === "main" ? this.cronJobs.shellRun(input) : null;
+          if (shell) {
+            if (!this.restartFence() && this.headStopping === 0 && !this.initializationHoldsHead()) await this.cronShell(input, shell);
             continue;
           }
           if (control?.name === "stop") {

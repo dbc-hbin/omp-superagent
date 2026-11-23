@@ -1149,6 +1149,40 @@ test("cron controls scope job management to the original thread and send one HEA
   expect(errors).toEqual([]);
 });
 
+test("verbatim shell cron jobs post stdout without a model turn, suppress silent and repeated output, and always report failures", async () => {
+  const { runtime, main, store, errors, directory } = fixture();
+  const origin = route("11");
+  await runtime.start();
+  const mode = join(directory, "shell-mode");
+  writeFileSync(mode, "alpha");
+  const add = message("301", origin, `/cron add shell "every 2h" cat ${mode}`);
+  await admit(runtime, add);
+  const id = store.output(`${add.id}:head-control`)?.text.match(/[0-9a-f-]{36}/)?.[0];
+  if (!id) throw new Error("Cron registration did not return a job ID");
+  const trigger = async (n: number) => {
+    await admit(runtime, message(String(n), origin, `/cron run ${id}`));
+    return store.output(`cron-run:${id}:${n}:cron-shell`)?.text ?? null;
+  };
+  expect(await trigger(302)).toBe("alpha");
+  expect(store.input(`cron-run:${id}:302`)?.state).toBe("done");
+  expect(await trigger(303)).toBeNull(); // identical output is suppressed
+  expect(store.input(`cron-run:${id}:303`)?.state).toBe("done");
+  writeFileSync(mode, "alpha [SILENT] beta");
+  expect(await trigger(304)).toBeNull();
+  writeFileSync(mode, "");
+  expect(await trigger(305)).toBeNull();
+  writeFileSync(mode, "beta");
+  expect(await trigger(306)).toBe("beta");
+  expect(await trigger(307)).toBeNull();
+  writeFileSync(mode, "alpha"); // a silent run did not replace the last posted hash
+  expect(await trigger(308)).toBe("alpha");
+  await admit(runtime, message("309", origin, `/cron edit ${id} prompt sh -c 'echo broken >&2; exit 3'`));
+  expect(await trigger(310)).toContain("failed (exit code 3).\nbroken");
+  expect(await trigger(311)).toContain("failed (exit code 3)"); // failures are never deduplicated
+  expect(main.prompts).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
 test("pausing a cron job while HEAD is busy cancels its pending execution without interrupting HEAD", async () => {
   const { runtime, messenger, main, store, errors } = fixture();
   messenger.assertRoute = () => {};
