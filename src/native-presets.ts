@@ -1,4 +1,7 @@
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { getProjectAgentDir, MAIN_CONFIG_FILENAMES, normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { IsStandardObject as isRecord } from "@sinclair/typebox/value";
 import { acquireModelRoleMutation, getModelPreset, getModelPresetNames, isValidModelPresetName } from "@oh-my-pi/pi-coding-agent/config/model-presets";
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
@@ -67,6 +70,24 @@ export class NativePresetManager {
       throw new Error("Native presets require the persistent native base settings");
     }
     this.source = settings;
+  }
+
+  watchedPaths(): string[] {
+    const agentDir = this.settings.getAgentDir();
+    const paths = [
+      ...MAIN_CONFIG_FILENAMES.map(filename => join(agentDir, filename)),
+      join(agentDir, "settings.json"),
+    ];
+    const cwd = resolve(this.settings.getCwd());
+    if (normalizePathForComparison(cwd) !== normalizePathForComparison(homedir())) {
+      const projectDir = getProjectAgentDir(cwd);
+      paths.push(
+        ...MAIN_CONFIG_FILENAMES.map(filename => join(projectDir, filename)),
+        join(projectDir, "settings.json"),
+      );
+    }
+    paths.push(...this.settings.getConfigFiles());
+    return [...new Set(paths)];
   }
 
   private async reload(): Promise<void> {

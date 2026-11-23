@@ -11110,3 +11110,120 @@ describe("ordinary placement in owner parents without native threads", () => {
     expect(store.input("9151")).toBeNull();
   });
 });
+
+
+describe("preset role watcher and HEAD rotation threshold", () => {
+  test("syncPresetRoles uses debounced fs.watch without polling when healthy", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-watch-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "modelRoles: {}\n");
+    let calls = 0;
+    const synced = Promise.withResolvers<void>();
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile],
+      syncPresetRoles: async () => {
+        calls++;
+        if (calls >= 2) synced.resolve();
+      },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(1);
+      // Advancing past 30s and 120s must not trigger periodic polling while fs.watch is active.
+      clock.mockReturnValue(now + 130_000);
+      await Bun.sleep(30);
+      expect(calls).toBe(1);
+
+      // Burst writes on the watched file coalesce into a single debounced sync.
+      writeFileSync(configFile, "modelRoles:\n  slow: a\n");
+      writeFileSync(configFile, "modelRoles:\n  slow: b\n");
+      const tmpFile = join(watchDir, "config.yml.tmp");
+      writeFileSync(tmpFile, "modelRoles:\n  slow: c\n");
+      renameSync(tmpFile, configFile);
+      await synced.promise;
+      await Bun.sleep(200);
+      expect(calls).toBe(2);
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("falls back to slow poll when fs.watch is unavailable and guards watch sync during restartFence", async () => {
+    let calls = 0;
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime, config, store, main } = fixture(3, undefined, {
+      presetRolePaths: () => ["/tmp/sa-nonexistent-preset-dir-999999/config.yml"],
+      syncPresetRoles: async () => { calls++; },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(1);
+      // 30s must not trigger the slow fallback poll.
+      clock.mockReturnValue(now + 35_000);
+      await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(10);
+      expect(calls).toBe(1);
+      // At 120s without a restart fence, the slow fallback poll runs.
+      clock.mockReturnValue(now + 120_000);
+      await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(10);
+      expect(calls).toBe(2);
+      // Restart fence blocks sync even when due.
+      store.setMeta("head:restart-fence", JSON.stringify({
+        inputId: "r-1", requestId: "req-1", ackOutputId: "ack-1",
+        ownerPid: process.pid, sessionId: main.state.sessionId,
+        sessionFile: hostPaths(config, "main").sessionFile, state: "handoff",
+      }));
+      clock.mockReturnValue(now + 240_000);
+      await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(10);
+      expect(calls).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("attestHeadRotation enforces 50% context threshold, idle window, and stop/restart guards", async () => {
+    const { runtime, config, store, main } = fixture();
+    await runtime.start();
+    // Allow startup background PR/restart observers to settle before probing idle rotation.
+    await Bun.sleep(20);
+    const sessionFile = join(config.stateDir, "sessions", "main", "session.jsonl");
+    const headState = {
+      hostPid: process.pid,
+      sessionId: main.state.sessionId,
+      sessionFile,
+      nativeRun: 1,
+      contextPercent: 49.9,
+      selection: {
+        provider: "fixture", modelId: "capable", reasoning: false,
+        thinkingLevel: "high", configuredThinkingLevel: "high",
+        modelSettings: main.state.modelSettings!,
+      },
+    };
+    const perfSpy = spyOn(performance, "now");
+    try {
+      const basePerf = performance.now();
+      perfSpy.mockReturnValue(basePerf + 31 * 60 * 1000);
+      expect(await runtime.attestHeadRotation(headState)).toBeNull();
+
+      expect(await runtime.attestHeadRotation({ ...headState, contextPercent: 50 })).toMatchObject({
+        contextPercent: 50,
+      });
+
+      store.setMeta("head:restart-fence", JSON.stringify({
+        inputId: "r-2", requestId: "req-2", ackOutputId: "ack-2",
+        ownerPid: process.pid, sessionId: main.state.sessionId,
+        sessionFile, state: "handoff",
+      }));
+      expect(await runtime.attestHeadRotation({ ...headState, contextPercent: 50 })).toBeNull();
+    } finally {
+      perfSpy.mockRestore();
+    }
+  });
+});

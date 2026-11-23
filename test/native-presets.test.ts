@@ -711,4 +711,12 @@ if (!workerRoot) {
     expect(getModelPreset(f.settings, "operator")).toEqual({ kind: "found", preset: inserted });
     expect((await racing.resolve("middle")).model).toEqual(id(opus));
   });
+
+  test("watchedPaths includes global, project, and overlay config paths", async () => {
+    const f = await fixture({ global: { modelRoles: configured.modelRoles } });
+    const watched = f.manager.watchedPaths();
+    expect(watched).toContain(f.configPath);
+    expect(watched).toContain(path.join(f.agent, "settings.json"));
+    expect(watched.some(p => p.endsWith("settings.json"))).toBe(true);
+  });
 }

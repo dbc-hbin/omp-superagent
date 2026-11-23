@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -43,7 +43,11 @@ import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, 
 import type { RemotePlacement, WorkerProbe, WorkerRegistration, WorkerSelector } from "./worker-wire";
 
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
-const presetSyncIntervalMs = 30_000;
+const presetSyncFallbackIntervalMs = 120_000;
+const presetSyncDebounceMs = 150;
+// Idle HEAD rotation keeps the 50% context threshold to rotate before stock
+// auto-compaction fires, matching host-extension.ts, Gateway rotation.rs, and DESIGN.md.
+const HEAD_ROTATION_CONTEXT_PERCENT = 50;
 const headPickerLifetimeMs = 5 * 60_000;
 const headControlPattern = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/;
 const dialogs = new Set(["select", "confirm", "input", "editor", "ask"]);
@@ -152,6 +156,7 @@ export interface RuntimeAdapters {
   resolvePreset?: (name: string, thinkingContext?: Pick<LanePresetSnapshot, "defaultThinkingLevel">) => Promise<ResolvedLanePreset>;
   inspectPresets?: () => Promise<NativePresetInspection>;
   syncPresetRoles?: (canWrite: () => boolean) => Promise<void>;
+  presetRolePaths?: () => Promise<readonly string[]> | readonly string[];
   persistPreset?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot>;
   reapHeadJobs?: (identity: Pick<HeadRestart, "sessionId" | "sessionFile">) => Promise<boolean>;
   requestRestart?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord>;
@@ -403,6 +408,10 @@ export class Superagent {
   private prObservation?: Promise<void>;
   private presetSync?: Promise<void>;
   private nextPresetSync = 0;
+  private presetSyncDirty = false;
+  private presetWatchFallback = false;
+  private presetWatchDebounce?: NodeJS.Timeout;
+  private readonly presetWatchers: FSWatcher[] = [];
   private readonly remoteReconnect = new Map<string, RemoteRetry>();
   private readonly remoteAttaching = new Map<string, Promise<Live>>();
 
@@ -567,6 +576,7 @@ export class Superagent {
       this.timer.unref?.();
       await this.kick();
       this.observePrs();
+      await this.startPresetWatcher();
       this.observePresetRoles();
     } catch (error) {
       await this.stop();
@@ -611,7 +621,7 @@ export class Superagent {
     const head = this.live.get("main");
     if (!head || !this.current(head) || !this.ready || this.stopped
       || state.hostPid !== process.pid || state.sessionId !== head.sessionId || state.sessionFile !== this.headSessionFile()
-      || !Number.isFinite(state.contextPercent) || state.contextPercent < 50
+      || !Number.isFinite(state.contextPercent) || state.contextPercent < HEAD_ROTATION_CONTEXT_PERCENT
       || head.busy || head.running || head.input || head.admitted.size || head.finishing
       || this.blocked.has("main") || this.headStopping || this.headCompaction || this.bootstrapActive
       || this.initializationHoldsHead() || this.restartFence() || this.restartActive || this.restartReconciliation
@@ -691,9 +701,9 @@ export class Superagent {
     const live = this.live.get("main")!;
     const recovery = "Inspect /model preset list and the native head log/session. Repair native high/middle/low presets with the existing OMP preset tools, then restart the head to verify; no initializer is automatically replayed.";
     try {
-      if (rotated) this.nextPresetSync = Date.now() + presetSyncIntervalMs;
+      if (rotated) this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
       if (!rotated && this.adapters.syncPresetRoles && !this.restartFence()) {
-        this.nextPresetSync = Date.now() + presetSyncIntervalMs;
+        this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
         await this.adapters.syncPresetRoles(() => this.current(live) && !this.restartFence() && !this.headStopping).catch(this.report);
       }
       const inspection = await this.adapters.inspectPresets!();
@@ -3348,13 +3358,88 @@ export class Superagent {
       .finally(() => { this.prObservation = undefined; });
   }
 
+  private async startPresetWatcher(): Promise<void> {
+    this.stopPresetWatcher();
+    this.presetWatchFallback = false;
+    if (!this.adapters.syncPresetRoles) return;
+    if (!this.adapters.presetRolePaths) {
+      this.presetWatchFallback = true;
+      return;
+    }
+    let paths: readonly string[];
+    try { paths = await this.adapters.presetRolePaths(); }
+    catch (error) {
+      this.presetWatchFallback = true;
+      this.report(error);
+      return;
+    }
+    if (this.stopped || !paths.length) {
+      this.presetWatchFallback = true;
+      return;
+    }
+    const byDirectory = new Map<string, Set<string>>();
+    for (const target of paths) {
+      const directory = dirname(target);
+      const name = basename(target);
+      let names = byDirectory.get(directory);
+      if (!names) { names = new Set(); byDirectory.set(directory, names); }
+      names.add(name);
+    }
+    for (const [directory, names] of byDirectory) {
+      if (!existsSync(directory)) continue;
+      try {
+        const watcher = watch(directory, { persistent: false }, (_event, filename) => {
+          if (this.stopped) return;
+          if (filename !== null && !names.has(String(filename))) return;
+          if (this.presetWatchDebounce) clearTimeout(this.presetWatchDebounce);
+          this.presetWatchDebounce = setTimeout(() => {
+            this.presetWatchDebounce = undefined;
+            this.presetSyncDirty = true;
+            this.observePresetRoles();
+          }, presetSyncDebounceMs);
+          this.presetWatchDebounce.unref?.();
+        });
+        watcher.unref?.();
+        watcher.on("error", error => {
+          this.presetWatchFallback = true;
+          const next = Date.now() + presetSyncFallbackIntervalMs;
+          if (!this.nextPresetSync || next < this.nextPresetSync) this.nextPresetSync = next;
+          this.report(error);
+          watcher.close();
+        });
+        this.presetWatchers.push(watcher);
+      } catch (error) {
+        this.presetWatchFallback = true;
+        this.report(error);
+      }
+    }
+    if (!this.presetWatchers.length) this.presetWatchFallback = true;
+  }
+
+  private stopPresetWatcher(): void {
+    if (this.presetWatchDebounce) {
+      clearTimeout(this.presetWatchDebounce);
+      this.presetWatchDebounce = undefined;
+    }
+    while (this.presetWatchers.length) {
+      try { this.presetWatchers.pop()!.close(); }
+      catch {}
+    }
+  }
+
   private observePresetRoles(): void {
     const sync = this.adapters.syncPresetRoles;
     const canWrite = () => this.ready && !this.stopped && !this.restartFence() && !this.headRotationHeld()
       && !this.headStopping && !this.bootstrapActive;
-    if (!sync || this.presetSync || Date.now() < this.nextPresetSync || !canWrite()) return;
-    this.nextPresetSync = Date.now() + presetSyncIntervalMs;
-    this.presetSync = sync(canWrite).catch(this.report).finally(() => { this.presetSync = undefined; });
+    if (!sync || this.presetSync || !canWrite()) return;
+    const dueFallback = this.presetWatchFallback && Date.now() >= this.nextPresetSync;
+    if (!this.presetSyncDirty && !dueFallback) return;
+    this.presetSyncDirty = false;
+    if (this.presetWatchFallback) this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
+    this.presetSync = sync(canWrite).catch(this.report).finally(() => {
+      this.presetSync = undefined;
+      if (this.presetSyncDirty) this.observePresetRoles();
+    });
   }
 
   async inspectThread(sourceId: string, laneId?: string): Promise<ThreadInfo> {
@@ -6794,6 +6879,7 @@ export class Superagent {
     if (this.timer) clearInterval(this.timer);
     for (const retry of this.threadTitleRetries.values()) clearTimeout(retry);
     this.threadTitleRetries.clear();
+    this.stopPresetWatcher();
     this.discordCatchupRetries.clear();
     this.stopSignal.abort();
     for (const live of this.live.values()) {

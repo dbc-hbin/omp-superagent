@@ -509,6 +509,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
           resolvePreset: async (name, thinkingContext) => (await nativePresets(ctx)).resolve(name, thinkingContext),
           inspectPresets: async () => (await nativePresets(ctx)).inspect(),
           syncPresetRoles: async canWrite => (await nativePresets(ctx)).syncRoles(store, canWrite, () => ctx.modelRegistry.refresh("offline")),
+          presetRolePaths: async () => (await nativePresets(ctx)).watchedPaths(),
           persistPreset: async selection => (await nativePresets(ctx)).persistSelection(selection),
           reapHeadJobs: async ({ sessionId, sessionFile }) => {
             const root = pi.pi.AgentRegistry.global().get(pi.pi.MAIN_AGENT_ID);
