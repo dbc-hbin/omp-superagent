@@ -21,7 +21,7 @@ import { HostConnection, type HostOptions, startHost } from "./host";
 import { compareMessageIds } from "./message-order";
 import { codingModels, isLaneModel, laneModelArgument, resolveLaneModelChoice, sameLaneModel, type LaneModelCandidate } from "./lane-models";
 import { advertisedLegacyWorkflow, advertisedWorkflow, headWorkflow, leadingWorkflow, workflowChoice, workflowContext, workflowPrompt } from "./workflow";
-import type { NativePresetInspection } from "./native-presets";
+import type { NativePresetInspection, PresetSyncOutcome } from "./native-presets";
 import type { HeadInitialization } from "./gateway-wire";
 import { repositoryRoot } from "./repository";
 import { discordThreadSplit, editsTopicPlacement, existingWorkspace, inferredWorkspace, namedWorkspaces, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
@@ -158,7 +158,7 @@ export interface RuntimeAdapters {
   workerConnect(...args: Parameters<typeof workerConnect>): Promise<RuntimeHost>;
   resolvePreset?: (name: string, thinkingContext?: Pick<LanePresetSnapshot, "defaultThinkingLevel">) => Promise<ResolvedLanePreset>;
   inspectPresets?: () => Promise<NativePresetInspection>;
-  syncPresetRoles?: (canWrite: () => boolean) => Promise<void>;
+  syncPresetRoles?: (canWrite: () => boolean) => Promise<void | PresetSyncOutcome>;
   presetRolePaths?: () => Promise<readonly string[]> | readonly string[];
   persistPreset?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot>;
   reapHeadJobs?: (identity: Pick<HeadRestart, "sessionId" | "sessionFile">) => Promise<boolean>;
@@ -794,6 +794,7 @@ export class Superagent {
       this.bootstrapActive = undefined;
       live.busy = !actual.isSettled;
       if (!complete) this.report(new Error(this.initialization!.detail));
+      this.observePresetRoles();
     } catch (error) {
       if (!this.current(live) || !this.bootstrapActive) return;
       this.bootstrapActive = undefined;
@@ -3402,11 +3403,57 @@ export class Superagent {
       }
       return false;
     };
+    const statIdentity = (filePath: string, follow: boolean): string => {
+      try {
+        const info = (follow ? statSync : lstatSync)(filePath, { bigint: true });
+        const kind = !follow && info.isSymbolicLink() ? "l" : info.isDirectory() ? "d" : "f";
+        return `${info.dev}:${info.ino}:${kind}`;
+      } catch {
+        return "missing";
+      }
+    };
+    const pathSegments = (dir: string): string[] => {
+      const absolute = resolve(dir);
+      const segments: string[] = [];
+      let cursor = absolute;
+      for (;;) {
+        segments.push(cursor);
+        const parent = dirname(cursor);
+        if (parent === cursor) break;
+        cursor = parent;
+      }
+      segments.reverse();
+      return segments;
+    };
     let uncovered = false;
     const entries: string[] = [];
     for (const target of paths) {
       const directory = dirname(target);
       const name = basename(target);
+      for (const segment of pathSegments(directory)) {
+        try {
+          if (!lstatSync(segment).isSymbolicLink()) continue;
+        } catch {
+          break;
+        }
+        const segParent = dirname(segment);
+        if (segParent !== segment && existsSync(segParent)) add(ancestors, segParent, basename(segment));
+        else uncovered = true;
+        let linkTarget = "";
+        try { linkTarget = readlinkSync(segment); } catch { uncovered = true; }
+        let resolvedSegment = "";
+        try {
+          resolvedSegment = realpathSync(segment);
+          const realSegParent = dirname(resolvedSegment);
+          if (realSegParent !== resolvedSegment && existsSync(realSegParent)) {
+            add(ancestors, realSegParent, basename(resolvedSegment));
+          }
+        } catch {
+          uncovered = true;
+          if (linkTarget) addAncestor(resolve(segParent, linkTarget));
+        }
+        entries.push(`seg:${segment}|${linkTarget}|${statIdentity(segment, false)}|${resolvedSegment}|${statIdentity(segment, true)}`);
+      }
       if (!existsSync(directory)) {
         uncovered = true;
         const watched = addAncestor(directory);
@@ -3414,6 +3461,19 @@ export class Superagent {
         continue;
       }
       add(direct, directory, name);
+      const parentDir = dirname(directory);
+      if (parentDir !== directory && existsSync(parentDir)) add(ancestors, parentDir, basename(directory));
+      let realDir = "";
+      try {
+        realDir = realpathSync(directory);
+        if (realDir !== directory) {
+          add(direct, realDir, name);
+          const realParent = dirname(realDir);
+          if (realParent !== realDir && existsSync(realParent)) add(ancestors, realParent, basename(realDir));
+        }
+      } catch {
+        uncovered = true;
+      }
       let resolved: string | null = null;
       let covered = true;
       try {
@@ -3422,9 +3482,16 @@ export class Superagent {
           const real = realpathSync(target);
           resolved = real;
           if (real !== target) {
-            const realDir = dirname(real);
-            if (existsSync(realDir)) add(direct, realDir, basename(real));
-            else covered = false;
+            const realTargetDir = dirname(real);
+            if (existsSync(realTargetDir)) {
+              add(direct, realTargetDir, basename(real));
+              const realTargetParent = dirname(realTargetDir);
+              if (realTargetParent !== realTargetDir && existsSync(realTargetParent)) {
+                add(ancestors, realTargetParent, basename(realTargetDir));
+              }
+            } else {
+              covered = false;
+            }
           }
         } catch {
           // Dangling symlink or unresolvable target: watch link target's parent/ancestor if possible and keep fallback active.
@@ -3440,7 +3507,7 @@ export class Superagent {
         // File does not exist yet inside an existing directory: directory watch covers creation.
       }
       if (!covered) uncovered = true;
-      entries.push(`${target}|exists|${resolved ?? ""}|${covered}`);
+      entries.push(`${target}|exists|${statIdentity(directory, true)}|${realDir}|${statIdentity(realDir, true)}|${resolved ?? ""}|${statIdentity(target, false)}|${statIdentity(target, true)}|${covered}`);
     }
     return { direct, ancestors, uncovered, snapshot: entries.join("\n") };
   }
@@ -3479,7 +3546,8 @@ export class Superagent {
             const name = String(filename);
             if (!directNames?.has(name) && !ancestorNames?.has(name)) return;
           } else if (!directNames?.size && ancestorNames?.size
-            && ![...ancestorNames].some(name => existsSync(join(directory, name)))) {
+            && (!this.presetWatchPaths.length
+              || this.presetWatchState(this.presetWatchPaths).snapshot === this.presetWatchSnapshot)) {
             return;
           }
           if (this.presetWatchDebounce) clearTimeout(this.presetWatchDebounce);
@@ -3539,11 +3607,14 @@ export class Superagent {
     this.presetSyncDirty = false;
     this.clearPresetSyncRetry();
     if (this.presetWatchFallback) this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
-    let failed = false;
+    let retryable = false;
     this.presetSync = sync(canWrite)
-      .then(() => { this.presetSyncRetryCount = 0; })
+      .then(outcome => {
+        if (outcome === "deferred") retryable = true;
+        else this.presetSyncRetryCount = 0;
+      })
       .catch(error => {
-        failed = true;
+        retryable = true;
         this.report(error);
       })
       .finally(() => {
@@ -3551,7 +3622,7 @@ export class Superagent {
         if (this.stopped) return;
         if (this.presetSyncDirty) {
           this.observePresetRoles();
-        } else if (failed && this.presetSyncRetryCount < presetSyncMaxRetries) {
+        } else if (retryable && this.presetSyncRetryCount < presetSyncMaxRetries) {
           const delay = Math.min(presetSyncRetryBaseMs * 2 ** this.presetSyncRetryCount, presetSyncRetryMaxMs);
           this.presetSyncRetryCount++;
           this.presetSyncRetryTimer = setTimeout(() => {
@@ -4295,6 +4366,7 @@ export class Superagent {
       || hold && this.store.getMeta("gateway:operator-stop") !== (restart.stopBoundary ?? null)) return;
     this.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(restart));
     this.store.setMeta("head:restart-fence", hold ? JSON.stringify(restart) : "");
+    if (!hold) this.observePresetRoles();
   }
 
   private assertRestartCurrent(restart: HeadRestart): void {
@@ -5034,6 +5106,7 @@ export class Superagent {
       this.controlReply(input, "The selected HEAD turn was cancelled in the queue, but native stop completion is unverified. It was not replayed.", "uncertain");
     } finally {
       this.headStopping--;
+      this.observePresetRoles();
     }
   }
 
@@ -5160,6 +5233,7 @@ export class Superagent {
       } finally {
         this.headStopping--;
         this.background(this.reconcileHeadRecovery());
+        this.observePresetRoles();
       }
     });
     this.headStopTail = operation;

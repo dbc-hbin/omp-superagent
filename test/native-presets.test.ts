@@ -719,4 +719,20 @@ if (!workerRoot) {
     expect(watched).toContain(path.join(f.agent, "settings.json"));
     expect(watched.some(p => p.endsWith("settings.json"))).toBe(true);
   });
+
+  test("syncRoles returns explicit deferred outcome when gated or when a role model is unavailable", async () => {
+    const meta = new Map<string, string>();
+    const store = {
+      getMeta: (key: string) => meta.get(key) ?? null,
+      setMeta: (key: string, value: string) => { meta.set(key, value); },
+    };
+    const f = await fixture({ global: { modelRoles: { default: selector(sonnet), slow: selector(opus), smol: selector(sonnet) } } });
+    expect(await f.manager.syncRoles(store, () => false)).toBe("deferred");
+    expect(await f.manager.syncRoles(store, () => true)).toBe("applied");
+
+    const missingModel = await fixture({
+      global: { modelRoles: { default: "unavailable/missing-model", slow: selector(opus), smol: selector(sonnet) } },
+    });
+    expect(await missingModel.manager.syncRoles(store, () => true)).toBe("deferred");
+  });
 }

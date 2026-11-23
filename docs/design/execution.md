@@ -216,11 +216,13 @@ starts. Invalid, tombstoned, shadowed or operator-edited entries are not
 overwritten. Managed presets follow the native `slow`, `default`, and `smol`
 roles respectively when their available selections change. Refresh only the
 entries still under management; do not switch existing sessions. Preset role
-synchronization watches the configured native preset/role files and resolved
-symlink targets (`fs.watch`, debounced), watches surviving ancestors for
-uncreated directories, reconciles once after installing watchers, retries failed
-syncs with bounded backoff, and keeps slow periodic polling active whenever any
-source is uncovered or a watcher errors. These labels
+synchronization watches the configured native preset/role files, parent
+directories (so replaced directories with new inodes rebind cleanly), and
+intermediate/direct symlink targets (`fs.watch`, debounced), watches surviving
+ancestors for uncreated directories, reconciles once after installing watchers,
+treats explicit `"deferred"` sync outcomes and errors alike with bounded
+backoff retries, and keeps slow periodic polling active whenever any source is
+uncovered or a watcher errors. These labels
 are preset names, not custom roles or tested performance/cost tiers.
 
 Each lane records a resolved model, selection reason, and the complete native

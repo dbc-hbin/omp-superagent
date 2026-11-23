@@ -11337,6 +11337,109 @@ describe("preset role watcher and HEAD rotation threshold", () => {
     }
   }, 10_000);
 
+  test("retries explicit deferred sync outcomes without errors and stops polling once applied", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-deferred-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "v1");
+    let attempts = 0;
+    const applied = Promise.withResolvers<void>();
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime, errors } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile],
+      syncPresetRoles: async () => {
+        attempts++;
+        if (attempts <= 3) return "deferred";
+        applied.resolve();
+        return "applied";
+      },
+    });
+    try {
+      await runtime.start();
+      expect(attempts).toBe(2);
+      await applied.promise;
+      expect(attempts).toBe(4);
+      expect(errors).toEqual([]);
+      clock.mockReturnValue(now + 240_000);
+      await Bun.sleep(100);
+      expect(attempts).toBe(4);
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("rebinds watchers when a watched .omp directory or intermediate symlink is replaced", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/sa-preset-replace-"));
+    const ompDir = join(root, ".omp");
+    const ompOld = join(root, ".omp.old");
+    mkdirSync(ompDir);
+    const configFile = join(ompDir, "config.yml");
+    writeFileSync(configFile, "v1");
+
+    const targetOne = join(root, "target-1");
+    const targetTwo = join(root, "target-2");
+    mkdirSync(targetOne);
+    mkdirSync(targetTwo);
+    writeFileSync(join(targetOne, "config.yml"), "s1");
+    writeFileSync(join(targetTwo, "config.yml"), "s2");
+    const symSub = join(root, "sub");
+    symlinkSync(targetOne, symSub);
+    const symConfig = join(symSub, "config.yml");
+
+    let calls = 0;
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile, symConfig],
+      syncPresetRoles: async () => { calls++; },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(2);
+
+      // Replace the .omp directory with a brand-new inode; later edits inside it must still fire.
+      renameSync(ompDir, ompOld);
+      mkdirSync(ompDir);
+      writeFileSync(configFile, "v2-new-dir");
+      const afterDirReplace = calls;
+      for (let i = 0; i < 40 && calls === afterDirReplace; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(afterDirReplace);
+      await Bun.sleep(200);
+
+      const beforeSubsequentEdit = calls;
+      writeFileSync(configFile, "v3-subsequent-edit");
+      for (let i = 0; i < 40 && calls === beforeSubsequentEdit; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(beforeSubsequentEdit);
+
+      // Swap an intermediate symlink directory atomically and verify subsequent edits in the new target fire.
+      const symTmp = join(root, "sub.tmp");
+      symlinkSync(targetTwo, symTmp);
+      renameSync(symTmp, symSub);
+      const afterSymSwap = calls;
+      for (let i = 0; i < 40 && calls === afterSymSwap; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(afterSymSwap);
+      await Bun.sleep(200);
+
+      const beforeSymEdit = calls;
+      writeFileSync(join(targetTwo, "config.yml"), "s3-subsequent");
+      for (let i = 0; i < 40 && calls === beforeSymEdit; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(beforeSymEdit);
+
+      // Fallback polling stays off when both replacement paths are covered.
+      const steady = calls;
+      clock.mockReturnValue(now + 300_000);
+      (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(20);
+      expect(calls).toBe(steady);
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test("attestHeadRotation enforces 50% context threshold, idle window, and stop/restart guards", async () => {
     const { runtime, config, store, main } = fixture();
     await runtime.start();
