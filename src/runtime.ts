@@ -969,8 +969,8 @@ export class Superagent {
         || owner.sessionId !== state.sessionId || owner.sessionFile !== state.sessionFile
         || owner.cursor !== null && typeof owner.cursor !== "string") continue;
       const evidence = headRecoveryEvidence(entries, owner);
-      const quota = evidence?.quotaFailure;
-      if (quota && this.adapters.readHeadQuota && sameLaneModel(quota.model, confirmed.model)) {
+      if (evidence?.quotaFailure && this.adapters.readHeadQuota && sameLaneModel(evidence.quotaFailure.model, confirmed.model)) {
+        const quota = evidence.quotaFailure;
         quotaHold = true;
         if (!checkQuota || this.headUsageResetActive
           || this.store.headRecoveryEffects(input.id).some(effect => !["sent", "complete", "failed"].includes(effect.state))) continue;
@@ -981,9 +981,15 @@ export class Superagent {
         const recovered = await this.adapters.readHeadQuota(quota, head.sessionId, signal).catch(() => false);
         if (!recovered || signal.aborted || !this.recoveryControllerIdle()) return;
         const latest = await this.state(head);
+        // Some no-agent receipts are persisted without a lifecycle broadcast.
+        // The native activity counter alone cannot witness an unchanged journal.
+        const journal = successful(await head.connection.request({ type: "get_entries" }), "recheck HEAD quota recovery evidence").entries;
+        const latestEvidence = Array.isArray(journal) ? headRecoveryEvidence(journal, owner) : null;
         const held = this.store.input(input.id);
         if (signal.aborted || !this.current(head) || head.nativeVersion !== version || head.preparing || this.headUsageResetActive
           || !this.recoveryControllerIdle() || !this.recoveryIdle(latest) || latest.hostPid !== confirmed.hostPid
+          || !latestEvidence || latestEvidence.fingerprint !== evidence.fingerprint
+          || !isDeepStrictEqual(latestEvidence.quotaFailure, quota)
           || !sameLaneModel(quota.model, latest.model) || this.store.getMeta("head:stop-boundary") !== stopBoundary
           || this.store.getMeta(ownerKey) !== ownerRecord || !authorizeRoute(this.config, input.route)
           || held?.target !== "main" || held.state !== "uncertain" || held.requestId !== owner.requestId

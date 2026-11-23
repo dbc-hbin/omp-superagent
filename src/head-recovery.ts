@@ -52,18 +52,30 @@ export function headRecoveryEvidence(entries: unknown[], owner: Pick<HeadRecover
   const error = object(frame.error);
   const failedAt = typeof receipt.timestamp === "string" ? Date.parse(receipt.timestamp) : NaN;
   const receiptIndex = slice.indexOf(receipt);
+  const sameQuotaRun = typeof receiptData.hostPid === "number" && Number.isSafeInteger(receiptData.hostPid)
+    && receiptData.hostPid > 0 && typeof receiptData.instanceKey === "string" && receiptData.instanceKey !== ""
+    && typeof receiptData.runOrdinal === "number" && Number.isSafeInteger(receiptData.runOrdinal) && receiptData.runOrdinal > 0
+    && receiptData.hostPid === startData.hostPid && receiptData.instanceKey === startData.instanceKey
+    && receiptData.runOrdinal === startData.runOrdinal;
   // The exact provider refused the entire turn. An earlier tool, partial
   // answer, other request, or unknown journal effect makes this unsafe to close.
   const quotaFailure: HeadQuotaFailure | null = frame.status === "error" && frame.sessionSettled === true
     && frame.agentInvoked === true && error.provider === "openai-codex" && typeof error.model === "string" && error.model !== ""
     && error.retryable === false && typeof error.message === "string"
-    && /^Codex error event: .+ \(code=usage_limit_reached\)$/.test(error.message)
-    && Number.isFinite(failedAt) && latestStart && receiptAfterStart && latestRunStatus === "error"
+    // Stock OMP's RPC error lacks a structured quota code. Match either
+    // native Codex formatter, but require the exact code in its metadata.
+    && /^Codex (?:error event|response failed)(?:: [\s\S]+)? \(code=usage_limit_reached(?:, status=[a-z_]+)?\)$/.test(error.message)
+    && Number.isFinite(failedAt) && sameQuotaRun && latestRunStatus === "error"
     && users.length === 1 && receiptIndex > latestStartIndex
     && slice.every((entry, index) => {
       if (entry.type === "model_usage" || entry === receipt) return true;
       if (index >= receiptIndex) return false;
-      if (matches(entry, "rpc_agent_start")) return true;
+      if (matches(entry, "rpc_agent_start")) {
+        const start = object(entry.data);
+        return start.hostPid === receiptData.hostPid && start.instanceKey === receiptData.instanceKey
+          && typeof start.runOrdinal === "number" && Number.isSafeInteger(start.runOrdinal)
+          && start.runOrdinal > 0 && start.runOrdinal <= Number(receiptData.runOrdinal);
+      }
       if (entry.type !== "message") return false;
       const message = object(entry.message);
       return message.role === "user" || message.role === "assistant" && message.stopReason === "error"
