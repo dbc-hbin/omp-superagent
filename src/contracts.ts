@@ -320,6 +320,11 @@ export interface StorePort {
   tryAutoTopicChoice(input: InputRecord, deadline: number, pin: string): boolean;
   inputs(target?: string, state?: ActiveInputState): InputRecord[];
   hasInput(target: string, state: ActiveInputState): boolean;
+  /** Latest admitted lane run, excluding inputs joined to another run. */
+  latestLaneRun(target: string): InputRecord | null;
+  /** A successful lane run still has an unresolved final report or delivery. */
+  hasPendingLaneResult(target: string): boolean;
+  hasPendingLanePlacement(target: string): boolean;
   /** An uncertain HEAD input with a nonempty original native-owner record. */
   hasHeadRecoveryInput(): boolean;
   /** No automatic head replacement while an original HEAD delivery is unresolved. */
