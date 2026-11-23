@@ -2986,27 +2986,35 @@ describe("event-driven nonterminal progress", () => {
     const worker = f.hosts.get(lane.socketPath)!;
     worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Worker step 1" }] } });
     await f.main.whenPrompts(2);
-    f.main.complete("Lane summary 1");
+    f.main.emit({ type: "message_end", message: step("HEAD reviewing worker step 1") });
     await f.messenger.whenSent(4);
+    f.main.complete("Lane summary 1");
+    await f.messenger.whenSent(5);
     worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Worker step 2" }] } });
     await f.main.whenPrompts(3);
     f.main.complete("Lane summary 2");
-    await f.messenger.whenSent(5);
+    await f.messenger.whenSent(6);
     worker.complete("Worker finished");
     await f.main.whenPrompts(4);
     f.main.complete("Final lane answer");
-    await f.messenger.whenSent(6);
+    await f.messenger.whenSent(7);
 
-    expect(f.messenger.sent[3]).toMatchObject({ text: "⏳ Lane summary 1", status: true });
+    expect(f.messenger.sent[3]).toMatchObject({ text: "⏳ HEAD reviewing worker step 1", status: true });
     expect(f.messenger.sent[3]?.editOf).toBeUndefined();
+    const laneAnchor = `remote-${f.messenger.sent[3]!.id}`;
     expect(f.messenger.sent[4]).toMatchObject({
+      text: "⏳ Lane summary 1",
+      status: true,
+      editOf: { route: physicalRoute(laneRoute), messageId: laneAnchor },
+    });
+    expect(f.messenger.sent[5]).toMatchObject({
       text: "⏳ Lane summary 2",
       status: true,
-      editOf: { route: physicalRoute(laneRoute), messageId: `remote-${f.messenger.sent[3]!.id}` },
+      editOf: { route: physicalRoute(laneRoute), messageId: laneAnchor },
     });
-    expect(f.messenger.sent[5]).toMatchObject({ text: "Final lane answer" });
-    expect(f.messenger.sent[5]?.editOf).toBeUndefined();
-    expect(f.messenger.sent[5]?.status).toBeUndefined();
+    expect(f.messenger.sent[6]).toMatchObject({ text: "Final lane answer" });
+    expect(f.messenger.sent[6]?.editOf).toBeUndefined();
+    expect(f.messenger.sent[6]?.status).toBeUndefined();
   });
 
   test("busy HEAD coalesces lane progress to the latest meaningful observation without steering or redispatch", async () => {

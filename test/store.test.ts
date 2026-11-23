@@ -8,6 +8,7 @@ import { Client, Collection, type ClientUser, type Message } from "discord.js";
 import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
+import { extractDiscordCards } from "../src/discord-markdown.ts";
 import { Store } from "../src/store.ts";
 import { lanePlacement, readLaneRows } from "../src/lane-rows";
 import { TOPIC_CHOICE_WAIT_MS } from "../src/topic-request";
@@ -562,15 +563,30 @@ describe("durable coordination store", () => {
     expect(store.output(`progress:${defaultHead.id}:p2`)).toMatchObject({ text: "Step 2" });
     expect(store.output(`progress:${defaultHead.id}:p2`)?.editOf).toBeUndefined();
 
-    // Card-only update places the marker on its own line so the fence stays intact.
+    // Card-only update places the marker on its own line so the fence stays intact,
+    // and preserving original indentation prevents 4-space fences from hiding following cards.
     const cardHead = inbound("card-progress");
     store.receive(cardHead, "main");
     store.submit(cardHead.id, "req-card", 0);
     const cardFence = "```card\n{\"root\":\"c\",\"elements\":{\"c\":{\"type\":\"Card\",\"props\":{\"title\":\"T\"}}}}\n```";
     expect(store.progress(cardHead.id, 0, "native-head", "c1", cardFence, true)).toBe(true);
     expect(store.output(`progress:${cardHead.id}:c1`)).toMatchObject({ text: `⏳\n${cardFence}`, status: true });
+    const indentedAndCard = "    ```not-a-fence\n```card\n{\"root\":\"c\",\"elements\":{\"c\":{\"type\":\"Card\",\"props\":{\"title\":\"Visible\"}}}}\n```";
+    expect(store.progress(cardHead.id, 0, "native-head", "c2", indentedAndCard, true)).toBe(true);
+    const c2Text = store.output(`progress:${cardHead.id}:c2`)?.text;
+    expect(c2Text).toBe(`⏳\n${indentedAndCard}`);
+    expect(extractDiscordCards(c2Text!)).toEqual({
+      text: "⏳\n    ```not-a-fence",
+      embeds: [{ title: "Visible" }],
+    });
+    const indentedLiteralCard = "    ```card\n{\"root\":\"c\",\"elements\":{\"c\":{\"type\":\"Card\",\"props\":{\"title\":\"Literal\"}}}}\n```";
+    expect(store.progress(cardHead.id, 0, "native-head", "c3", indentedLiteralCard, true)).toBe(true);
+    const c3Text = store.output(`progress:${cardHead.id}:c3`)?.text;
+    expect(c3Text).toBe(`⏳\n${indentedLiteralCard}`);
+    expect(extractDiscordCards(c3Text!)).toEqual({ text: c3Text!, embeds: [] });
 
-    // Non-topic lane progress summarized by HEAD shares one stream per lane input, while the final report stays separate.
+    // Non-topic lane progress summarized by HEAD shares one stream per lane input across both
+    // intermediate HEAD commentary and settled summaries, while keeping receipt ownership intact.
     const selected = admitLane(store, "lane-summary");
     store.updateLane(selected.id, 0, { sessionId: "native-lane" });
     const laneInput = "source-lane-summary";
@@ -578,20 +594,38 @@ describe("durable coordination store", () => {
     expect(store.progress(laneInput, 0, "native-lane", "u1", "Working 1", true)).toBe(true);
     const p1Id = `progress:${laneInput}:u1`;
     store.submit(p1Id, "head-sum-1", 0);
+    expect(store.progress(p1Id, 0, "native-head", "h1", "Checking worker...", true)).toBe(true);
+    const h1OutId = `progress:${p1Id}:h1`;
+    expect(store.claimOutput(h1OutId, true)).toBe(true);
+    expect(store.output(h1OutId)).toMatchObject({ sourceId: p1Id, text: "⏳ Checking worker...", status: true });
+    expect(store.output(h1OutId)?.editOf).toBeUndefined();
+    store.finishOutput(h1OutId, "sent", "910");
+
     expect(store.settle(p1Id, "done", { id: `${p1Id}:answer`, text: "Summary 1" }, undefined, true)).toBe(true);
     expect(store.claimOutput(`${p1Id}:answer`, true)).toBe(true);
-    expect(store.output(`${p1Id}:answer`)).toMatchObject({ text: "⏳ Summary 1", status: true });
+    expect(store.output(`${p1Id}:answer`)).toMatchObject({
+      sourceId: p1Id, text: "⏳ Summary 1", status: true, editOf: { route: physicalRoute(selected.route), messageId: "910" },
+    });
     store.finishOutput(`${p1Id}:answer`, "sent", "910");
+    expect(store.sentOutputForMessage(selected.route, "910")?.id).toBe(h1OutId);
 
     expect(store.progress(laneInput, 0, "native-lane", "u2", "Working 2", true)).toBe(true);
     const p2Id = `progress:${laneInput}:u2`;
     store.submit(p2Id, "head-sum-2", 0);
+    expect(store.progress(p2Id, 0, "native-head", "h2", "Checking worker 2...", true)).toBe(true);
+    const h2OutId = `progress:${p2Id}:h2`;
+    expect(store.claimOutput(h2OutId, true)).toBe(true);
+    expect(store.output(h2OutId)).toMatchObject({
+      sourceId: p2Id, text: "⏳ Checking worker 2...", status: true, editOf: { route: physicalRoute(selected.route), messageId: "910" },
+    });
+    store.finishOutput(h2OutId, "sent", "910");
     expect(store.settle(p2Id, "done", { id: `${p2Id}:answer`, text: "Summary 2" }, undefined, true)).toBe(true);
     expect(store.claimOutput(`${p2Id}:answer`, true)).toBe(true);
     expect(store.output(`${p2Id}:answer`)).toMatchObject({
-      text: "⏳ Summary 2", status: true, editOf: { route: physicalRoute(selected.route), messageId: "910" },
+      sourceId: p2Id, text: "⏳ Summary 2", status: true, editOf: { route: physicalRoute(selected.route), messageId: "910" },
     });
     store.finishOutput(`${p2Id}:answer`, "sent", "910");
+    expect(store.sentOutputForMessage(selected.route, "910")?.id).toBe(h1OutId);
 
     // Final lane completion report settles separately with no status marker or editOf.
     expect(store.settle(laneInput, "done", { id: "lane-done", text: "Final lane text" }, undefined, true)).toBe(true);

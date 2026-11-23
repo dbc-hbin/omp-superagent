@@ -739,6 +739,19 @@ export class Store implements StorePort {
     return !!lane && lane.workState === "open" && lane.generation === context.generation && lane.sessionId === context.sessionId;
   }
 
+  private progressStream(id: string): string {
+    let current = id;
+    const seen = new Set<string>([current]);
+    while (true) {
+      const parent = this.getMeta(`progress-source:${current}`);
+      if (!parent) return current;
+      const { inputId } = JSON.parse(parent) as { inputId: string };
+      if (seen.has(inputId)) return current;
+      seen.add(inputId);
+      current = inputId;
+    }
+  }
+
   /**
    * When opted in on Discord (`editInPlace`), nonterminal progress uses one
    * `⏳` status message edited in place. Each update stays its own immutable
@@ -752,8 +765,7 @@ export class Store implements StorePort {
   ): boolean {
     if (!editInPlace || output.route.platform !== "discord") return this.queueOutput(output);
     this.setMeta(`status-stream:${output.id}`, stream);
-    const trimmed = output.text.trimStart();
-    const text = /^(?:`{3,}|~{3,})/.test(trimmed) ? `⏳\n${trimmed}` : `⏳ ${output.text}`;
+    const text = /^(?:`{3,}|~{3,})/.test(output.text.trimStart()) ? `⏳\n${output.text}` : `⏳ ${output.text}`;
     return this.queueOutput({ ...output, text, status: true });
   }
 
@@ -770,7 +782,7 @@ export class Store implements StorePort {
       this.setMeta(seen, "true");
       if (input.target === "main") {
         this.setMeta(`progress-output:${receiptId}`, JSON.stringify(context));
-        return this.queueStatus({ id: receiptId, sourceId: id, route: input.route, text }, id, editInPlace);
+        return this.queueStatus({ id: receiptId, sourceId: id, route: input.route, text }, this.progressStream(id), editInPlace);
       }
       const topic = this.topicDelivery(id);
       if (topic) {
@@ -936,8 +948,7 @@ export class Store implements StorePort {
         if (progress) {
           this.setMeta(`progress-output:${output.id}`, progress);
           if (!output.picker) {
-            const { inputId } = JSON.parse(progress) as { inputId: string };
-            this.queueStatus({ ...output, sourceId: id, route: input.route }, inputId, editInPlace);
+            this.queueStatus({ ...output, sourceId: id, route: input.route }, this.progressStream(id), editInPlace);
           } else {
             this.queueOutput({ ...output, sourceId: id, route: input.route });
           }

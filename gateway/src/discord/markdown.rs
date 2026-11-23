@@ -129,6 +129,10 @@ enum TableBudget {
 
 fn render_table(rows: &[Vec<String>], aligns: &[Align], budget: TableBudget) -> Option<String> {
     let mut widths = vec![3usize; aligns.len()];
+    let mut extra_bytes = 0usize;
+    let mut less_bytes = 0usize;
+    let mut extra_utf16 = 0usize;
+    let mut less_utf16 = 0usize;
     for row in rows {
         for (column, cell) in row.iter().enumerate() {
             let width = cell.width();
@@ -136,6 +140,20 @@ fn render_table(rows: &[Vec<String>], aligns: &[Align], budget: TableBudget) -> 
                 *previous = width.max(*previous);
             } else {
                 widths.push(width.max(3));
+            }
+            let cell_bytes = cell.len();
+            if cell_bytes >= width {
+                extra_bytes = extra_bytes.checked_add(cell_bytes - width)?;
+            } else {
+                less_bytes = less_bytes.checked_add(width - cell_bytes)?;
+            }
+            if matches!(budget, TableBudget::Utf16(_)) {
+                let cell_utf16 = utf16(cell);
+                if cell_utf16 >= width {
+                    extra_utf16 = extra_utf16.checked_add(cell_utf16 - width)?;
+                } else {
+                    less_utf16 = less_utf16.checked_add(width - cell_utf16)?;
+                }
             }
         }
     }
@@ -147,25 +165,20 @@ fn render_table(rows: &[Vec<String>], aligns: &[Align], budget: TableBudget) -> 
         .checked_mul(3)?
         .checked_add(2)?
         .checked_add(width_sum)?;
-    // 7 accounts for "```\n" (4) + "```" (3).
-    let mut total_bytes = 7usize.checked_add(sep_len)?;
-    let mut total_utf16 = total_bytes;
-    for row in rows {
-        let mut row_bytes = 2usize;
-        let mut row_utf16 = 2usize;
-        for (column, &width) in widths.iter().enumerate() {
-            let cell = row.get(column).map_or("", String::as_str);
-            let missing = width.saturating_sub(cell.width());
-            let pad_frame = missing.checked_add(3)?;
-            row_bytes = row_bytes.checked_add(pad_frame)?.checked_add(cell.len())?;
-            row_utf16 = row_utf16.checked_add(pad_frame)?.checked_add(utf16(cell))?;
-        }
-        total_bytes = total_bytes.checked_add(row_bytes)?;
-        total_utf16 = total_utf16.checked_add(row_utf16)?;
-    }
+    // 7 accounts for "```\n" (4) + "```" (3); each row and the separator share
+    // the base frame/padding width `sep_len`, adjusted only for present cells.
+    let base = rows
+        .len()
+        .checked_add(1)?
+        .checked_mul(sep_len)?
+        .checked_add(7)?;
+    let total_bytes = base.checked_sub(less_bytes)?.checked_add(extra_bytes)?;
     let exceeded = match budget {
         TableBudget::Bytes(max) => total_bytes > max,
-        TableBudget::Utf16(max) => total_utf16 > max,
+        TableBudget::Utf16(max) => {
+            let total_utf16 = base.checked_sub(less_utf16)?.checked_add(extra_utf16)?;
+            total_utf16 > max
+        }
     };
     if exceeded {
         return None;

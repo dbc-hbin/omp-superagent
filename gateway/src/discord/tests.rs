@@ -1023,6 +1023,17 @@ async fn card_only_progress_and_long_initial_status_edit_in_one_message() {
     assert_eq!(card_posted["content"], "⏳");
     assert_eq!(card_posted["embeds"], json!([{"title":"Progress"}]));
 
+    // Preserving four-space fence indentation after the ⏳ newline keeps a following card visible.
+    let indented_status = hub
+        .effect("send", &[json!({"id":"indented-fence-1","route":route,"status":true,
+            "text":format!("⏳\n    ```not-a-fence\n```card\n{card}\n```")})])
+        .await
+        .unwrap();
+    assert_eq!(indented_status, "700");
+    let indented_posted = received(&mut observed, "/channels/99/messages").await;
+    assert_eq!(indented_posted["content"], "⏳\n    ```not-a-fence");
+    assert_eq!(indented_posted["embeds"], json!([{"title":"Progress"}]));
+
     // A >2000 char initial status falls back to a single text attachment so a
     // subsequent short edit replaces the entire status in place with zero chunks left.
     let long_status = format!("⏳ {}", "a".repeat(2500));

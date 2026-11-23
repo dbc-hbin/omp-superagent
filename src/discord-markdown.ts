@@ -98,31 +98,32 @@ function formatTable(
   budget: { kind: "bytes" | "utf16"; max: number },
 ): { lines: string[]; bytes: number; utf16: number } | null {
   const widths = aligns.map(() => 3);
+  let extraBytes = 0;
+  let lessBytes = 0;
+  let extraUtf16 = 0;
+  let lessUtf16 = 0;
   for (const row of rows) {
     for (let column = 0; column < row.length; column++) {
-      widths[column] = Math.max(widths[column] ?? 3, Bun.stringWidth(row[column]!));
+      const cell = row[column]!;
+      const width = Bun.stringWidth(cell);
+      widths[column] = Math.max(widths[column] ?? 3, width);
+      const cellBytes = Buffer.byteLength(cell, "utf8");
+      if (cellBytes >= width) extraBytes += cellBytes - width;
+      else lessBytes += width - cellBytes;
+      const cellUtf16 = cell.length;
+      if (cellUtf16 >= width) extraUtf16 += cellUtf16 - width;
+      else lessUtf16 += width - cellUtf16;
     }
   }
   const alignOf = (column: number): Align => aligns[column] ?? "left";
   const fence = "```";
   const widthSum = widths.reduce((sum, width) => sum + width, 0);
-  // 7 accounts for "```\n" (4) + "```" (3); separator line has "| " + " | " + " |\n".
+  // 7 accounts for "```\n" (4) + "```" (3); separator and base rows share `sepLen`.
   const sepLen = 2 + 3 * widths.length + widthSum;
-  let bytes = 7 + sepLen;
-  let utf16 = bytes;
-  for (const row of rows) {
-    let rowBytes = 2;
-    let rowUtf16 = 2;
-    for (let column = 0; column < widths.length; column++) {
-      const cell = row[column] ?? "";
-      const missing = Math.max(0, widths[column]! - Bun.stringWidth(cell));
-      const padFrame = missing + 3;
-      rowBytes += padFrame + Buffer.byteLength(cell, "utf8");
-      rowUtf16 += padFrame + cell.length;
-    }
-    bytes += rowBytes;
-    utf16 += rowUtf16;
-  }
+  const base = 7 + (rows.length + 1) * sepLen;
+  const bytes = base - lessBytes + extraBytes;
+  const utf16 = base - lessUtf16 + extraUtf16;
+  if (!Number.isSafeInteger(bytes) || !Number.isSafeInteger(utf16)) return null;
   if ((budget.kind === "bytes" ? bytes : utf16) > budget.max) return null;
   const line = (cells: string[]) =>
     `| ${widths.map((width, column) => pad(cells[column] ?? "", width, alignOf(column))).join(" | ")} |`;

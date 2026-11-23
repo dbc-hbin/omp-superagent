@@ -155,3 +155,42 @@ fn split_refuses_more_than_the_allowed_parts() {
     assert!(split(&text, 40, 5).is_none());
     assert!(split(&text, 200, 5).is_some_and(|chunks| chunks.len() <= 5));
 }
+
+#[test]
+fn ragged_table_budgets_match_rendered_size_without_expanding_missing_cells() {
+    let source = [
+        "| 이름 | 값 | 비고 |",
+        "| --- | --- | --- |",
+        "| 가 |",
+        "| 긴항목이름 | 22 | 메모 | 끝 |",
+    ]
+    .join("\n");
+    let rendered = render(&source, usize::MAX);
+    assert_ne!(rendered.as_ref(), source);
+    let exact_bytes = rendered.len();
+    assert_eq!(render(&source, exact_bytes).as_ref(), rendered.as_ref());
+    assert!(matches!(render(&source, exact_bytes - 1), Cow::Borrowed(original) if original == source));
+
+    let rows = vec![
+        vec!["이름".to_owned(), "값".to_owned(), "비고".to_owned()],
+        vec!["가".to_owned()],
+        vec!["긴항목이름".to_owned(), "22".to_owned(), "메모".to_owned(), "끝".to_owned()],
+    ];
+    let aligns = vec![Align::Left; 3];
+    let utf16_rendered = table_utf16(&rows, &aligns, usize::MAX).unwrap();
+    let exact_utf16 = utf16(&utf16_rendered);
+    assert_eq!(table_utf16(&rows, &aligns, exact_utf16).as_deref(), Some(utf16_rendered.as_str()));
+    assert!(table_utf16(&rows, &aligns, exact_utf16 - 1).is_none());
+
+    let wide_row = format!("| {} |", (0..4_000).map(|i| format!("c{i}")).collect::<Vec<_>>().join(" | "));
+    let ragged = [
+        "| a | b |".to_owned(),
+        "|---|---|".to_owned(),
+        wide_row,
+    ]
+    .into_iter()
+    .chain(std::iter::repeat_n("| 1 |".to_owned(), 4_000))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(matches!(render(&ragged, ragged.len()), Cow::Borrowed(original) if original == ragged));
+}

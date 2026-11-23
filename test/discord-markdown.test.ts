@@ -170,6 +170,24 @@ describe("Discord markdown table rendering", () => {
     const source = ["| a | b |", "|---|---|", ...Array(150_000).fill("| 1 | 2 |")].join("\n");
     expect(renderDiscordMarkdown(source, Buffer.byteLength(source, "utf8"))).toBe(source);
   });
+
+  test("accounts ragged tables by present cells and rejects over-budget grids cleanly", () => {
+    const source = [
+      "| 이름 | 값 | 비고 |",
+      "| --- | --- | --- |",
+      "| 가 |",
+      "| 긴항목이름 | 22 | 메모 | 끝 |",
+    ].join("\n");
+    const rendered = renderDiscordMarkdown(source, Infinity);
+    expect(rendered).not.toBe(source);
+    const exactBytes = Buffer.byteLength(rendered, "utf8");
+    expect(renderDiscordMarkdown(source, exactBytes)).toBe(rendered);
+    expect(renderDiscordMarkdown(source, exactBytes - 1)).toBe(source);
+
+    const wideRow = `| ${Array.from({ length: 4_000 }, (_, i) => `c${i}`).join(" | ")} |`;
+    const ragged = ["| a | b |", "|---|---|", wideRow, ...Array(4_000).fill("| 1 |")].join("\n");
+    expect(renderDiscordMarkdown(ragged, Buffer.byteLength(ragged, "utf8"))).toBe(ragged);
+  });
 });
 
 describe("Discord card fences", () => {
