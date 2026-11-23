@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
-  HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
+  DEFERRED_ROUTING_META, HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
   type ActiveInputState, type KickoffHold, type OutputRecord, type Route, type StorePort, type WorkflowActivation,
   type HeadModelChange, type HeadRecoveryAttempt, type HeadRecoveryEffect,
 } from "./contracts.ts";
@@ -173,6 +173,21 @@ function inboundIdentity(input: Inbound) {
     }).sort((left, right) => left.id.localeCompare(right.id)),
   };
 }
+
+/** Verify immutable inbound identity and return updated attachment URLs if refreshed, or null when unchanged. */
+export function reconcileInboundRedelivery(existing: Inbound, incoming: Inbound): Inbound | null {
+  if (isDeepStrictEqual(inboundData(existing), inboundData(incoming))) return null;
+  if (!isDeepStrictEqual(inboundIdentity(existing), inboundIdentity(incoming))) {
+    throw new Error(`Inbound identity conflict: ${incoming.id}`);
+  }
+  const urls = new Map(incoming.attachments.map(file => [file.id, file.url]));
+  const attachments = existing.attachments.map(file => {
+    const url = urls.get(file.id)!;
+    return file.url === url ? file : { ...file, url };
+  });
+  if (!attachments.some((file, index) => file !== existing.attachments[index])) return null;
+  return { ...existing, attachments };
+}
 const approvalIdentity = (approval: Approval) => ({
   id: approval.id, target: approval.target, generation: approval.generation,
   requestId: approval.requestId, route: approval.route, request: approval.request,
@@ -278,22 +293,12 @@ export class Store implements StorePort {
       const existing = this.input(input.id);
       if (existing) {
         if (!isDeepStrictEqual(existing.workflow, workflow)) throw new Error(`Workflow identity conflict: ${input.id}`);
-        if (isDeepStrictEqual(inboundData(existing), inboundData(input))) return false;
-        if (!isDeepStrictEqual(inboundIdentity(existing), inboundIdentity(input))) {
-          throw new Error(`Inbound identity conflict: ${input.id}`);
-        }
-        if (existing.state === "pending") {
-          const urls = new Map(input.attachments.map(file => [file.id, file.url]));
-          const attachments = existing.attachments.map(file => {
-            const url = urls.get(file.id)!;
-            return file.url === url ? file : { ...file, url };
-          });
-          if (attachments.some((file, index) => file !== existing.attachments[index])) {
-            // Refresh only URLs. In particular, do not rewrite the original
-            // activation in a pre-rename input as a side effect of redelivery.
-            this.db.query("UPDATE inputs SET data = json_set(data, '$.attachments', json(?)) WHERE id = ? AND state = 'pending'")
-              .run(JSON.stringify(attachments), input.id);
-          }
+        const refreshed = reconcileInboundRedelivery(existing, input);
+        if (existing.state === "pending" && refreshed) {
+          // Refresh only URLs. In particular, do not rewrite the original
+          // activation in a pre-rename input as a side effect of redelivery.
+          this.db.query("UPDATE inputs SET data = json_set(data, '$.attachments', json(?)) WHERE id = ? AND state = 'pending'")
+            .run(JSON.stringify(refreshed.attachments), input.id);
         }
         return false; // A replay never changes its current assignment or state.
       }
@@ -390,14 +395,21 @@ export class Store implements StorePort {
   hasPendingTopicChoice(input: InputRecord, deadline: number): boolean {
     const { platform, accountId, authorityId, guildId, channelId, threadId } = input.route;
     if (platform !== "discord" || guildId === null || threadId === null) return false;
+    // An input already ACKed to Gateway but still awaiting deferred topic routing
+    // has no head receipt yet either; it fences the choice like a pending ledger row.
+    const deferred = (JSON.parse(this.getMeta(DEFERRED_ROUTING_META) ?? "[]") as Inbound[]).filter(item => !item.pickerSelection
+      && (typeof item.messageId === "string" || typeof item.interactionId === "string")
+      && Number.isSafeInteger(item.receivedAt) && item.receivedAt >= input.receivedAt && item.receivedAt <= deadline
+      && item.id !== input.id && physicalRouteKey(item.route) === physicalRouteKey(input.route))
+      .map(item => ({ id: item.id, text: item.text, messageId: item.messageId, replyId: item.reply?.messageId ?? null, authoredAt: item.receivedAt }));
     // Gateway creates the shared ingress ledger; standalone Store use has none.
-    if (!this.db.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_events'").get()) return false;
+    const ledger = this.db.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_events'").get() !== null;
     const questionId = `${input.id}:workspace`;
     const choices: readonly { readonly cwd: string }[] = JSON.parse(this.getMeta(`topic-history:${input.id}`) ?? "[]");
     // The Gateway pending index skips delivered history, including terminal rejections.
     // Unresolved rows stay pending. The durable insert, not its wall-clock timestamp,
     // fences a timely-authored choice even when transport-delayed.
-    const rows = this.db.query<{
+    const rows = ledger ? this.db.query<{
       readonly id: string; readonly text: string; readonly messageId: string | null;
       readonly replyId: string | null; readonly authoredAt: number;
     }, [number, number, string, string, string, string, string, string, string]>(`
@@ -420,8 +432,9 @@ export class Store implements StorePort {
         AND json_extract(data, '$.input.route.guildId') = ?
         AND json_extract(data, '$.input.route.channelId') = ?
         AND json_extract(data, '$.input.route.threadId') = ?
-    `).iterate(input.receivedAt, deadline, input.id, platform, accountId, authorityId, guildId, channelId, threadId);
-    for (const row of rows) {
+    `) : null;
+    const pending = rows?.iterate(input.receivedAt, deadline, input.id, platform, accountId, authorityId, guildId, channelId, threadId) ?? [];
+    for (const row of [...deferred, ...pending]) {
       if (row.messageId !== null && row.id.startsWith(`discord:${accountId}:${row.messageId}:edit:`)) continue;
       const questionReply = row.replyId !== null && this.sentOutputForMessage(input.route, row.replyId)?.id === questionId;
       const scopedReply = questionReply || row.replyId !== null && row.replyId === input.messageId;

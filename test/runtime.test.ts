@@ -392,6 +392,7 @@ const pickerClick = (output: OutputRecord, group: number, option: number): Inbou
 });
 async function admit(runtime: Superagent, input: Inbound): Promise<void> {
   await runtime.receive(input);
+  await runtime.routingSettled();
   await runtime.kick();
 }
 
@@ -1637,7 +1638,7 @@ test("legacy shell cron jobs cannot run, become model prompts, or send queued sh
 
   await runtime.start();
   await main.whenPrompts(1);
-  expect(main.prompts[0]?.command.message).toEndWith("Check the fixture");
+  expect(main.prompts[0]?.command.message).toEndWith("\nCheck the fixture\n```");
   main.complete("Ordinary scheduled result");
   const jobs = JSON.parse(store.getMeta("cron:jobs")!).jobs;
   const ordinary = jobs.find((job: { id: string }) => job.id === ordinaryId);
@@ -1700,7 +1701,7 @@ test("changing only the schedule preserves literal quotation marks in an ordinar
   await admit(runtime, message("332", origin, `/cron edit ${id} "every 3h"`));
   await admit(runtime, message("333", origin, `/cron run ${id}`));
   await main.whenPrompts(1);
-  expect(main.prompts[0]?.command.message).toEndWith(literal);
+  expect(main.prompts[0]?.command.message).toEndWith("\n" + literal + "\n```");
 });
 
 test("pausing a cron job while HEAD is busy cancels its pending execution without interrupting HEAD", async () => {
@@ -10868,23 +10869,25 @@ const historicalNow = Date.parse("2026-11-18T12:00:00.000Z");
 const historicalRequest = "지난주 로그인 버그 보던 데서 계속해줘";
 const historicalTask = (detail: string) => `로그인 버그 조사: ${detail} 문제를 확인해줘`;
 
-function historyFixture(recall: "available" | "unavailable" = "available") {
+function historyFixture(recall: "available" | "unavailable" = "available", searchGate?: Promise<void>) {
   const searches: string[] = [];
-  const f = fixture(3, undefined, { topicMemory: {
+  const topicMemory: RuntimeAdapters["topicMemory"] = {
     status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: true }),
     search: async query => {
       searches.push(query);
+      await searchGate;
       if (recall === "unavailable") throw new Error("private-provider-diagnostic");
       return { backend: "mnemopi", query, items: [], count: 0 };
     },
-  } });
+  };
+  const f = fixture(3, undefined, { topicMemory });
   if (!f.config.discord) throw new Error("Missing Discord fixture config");
   f.config.discord.allowedChannelIds.push("5");
   const destination = route("53", { channelId: "5" });
   const current = savedLane(f.store, f.config, "current", destination, process.pid);
   const worker = new HostTransport(current.sessionFile, "session-current");
   f.hosts.set(current.socketPath, worker);
-  return { ...f, current, destination, worker, searches };
+  return { ...f, current, destination, worker, searches, topicMemory };
 }
 
 function writeHistoricalTurn(lane: Lane, detail: string, at = "2026-11-11T12:00:00.000Z"): void {
@@ -10914,6 +10917,417 @@ function historicalAnswer(question: OutputRecord | null, lane: Lane): { number: 
   if (!number) throw new Error(`Missing offered entry for ${lane.id}`);
   return { number, reply: { messageId: question.remoteId, authorId: null, text: "quoted text is not authoritative" } };
 }
+
+describe("deferred historical topic routing", () => {
+  test("Gateway receipt does not wait for the history search, and later inputs keep conversation order", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current, worker, searches } = historyFixture("available", search.promise);
+    await runtime.start();
+    const first = { ...message("710", destination, historicalRequest), receivedAt: historicalNow };
+    const second = { ...message("711", destination, "Also check the session cookie flags."), receivedAt: historicalNow + 1 };
+    const elsewhere = headMessage("712", route("13"));
+
+    // Each receive resolves (the Gateway receipt) while the search is still blocked.
+    await runtime.receive(first);
+    await runtime.receive(first);
+    await runtime.receive(second);
+    await runtime.receive(elsewhere);
+    expect(searches).toEqual([historicalRequest]);
+    expect(store.input(first.id)).toBeNull();
+    // The same conversation must not overtake the pending routing; another one is not held.
+    expect(store.input(second.id)).toBeNull();
+    expect(store.input(elsewhere.id)).toMatchObject({ target: "main" });
+
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+    expect(searches).toEqual([historicalRequest]);
+    expect(store.getMeta("intake:deferred-routing")).toBe("[]");
+    expect(store.input(`handoff:${first.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
+    // The follow-up reaches the lane only after the request routed first.
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([
+      expect.stringContaining(`Request ID: handoff:${first.id}:${current.id}`),
+      expect.stringContaining(`Request ID: handoff:${second.id}:${current.id}`),
+    ]);
+  });
+
+  test("routing still pending at shutdown is admitted after restart without a new Gateway delivery", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, config, directory, destination, current, hosts, errors, topicMemory } = historyFixture("available", search.promise);
+    await runtime.start();
+    const first = { ...message("720", destination, historicalRequest), receivedAt: historicalNow };
+    await runtime.receive(first);
+    const stopping = runtime.stop();
+    search.resolve();
+    await stopping;
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    expect(JSON.parse(reopened.getMeta("intake:deferred-routing") ?? "[]")).toEqual([first]);
+    expect(reopened.input(first.id)).toBeNull();
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
+    const worker = new HostTransport(current.sessionFile, "session-current");
+    hosts.set(current.socketPath, worker);
+    const restarted = new Superagent(config, reopened, new MessengerTransport(), join(directory, "extension.ts"), error => errors.push(error), {
+      topicMemory, connect: async path => path === hostPaths(config, "main").socketPath ? head : hosts.get(path)!,
+    });
+    fixtures.find(entry => entry.runtime === runtime)!.runtime = restarted;
+    await restarted.start();
+    await restarted.routingSettled();
+    await restarted.kick();
+    expect(reopened.getMeta("intake:deferred-routing")).toBe("[]");
+    expect(reopened.input(`handoff:${first.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(first.text)]);
+  });
+
+  test("global /stop head covers receipt order across deferred routing without cancelling post-stop or lane work", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current, worker, main, messenger } = historyFixture("available", search.promise);
+    await runtime.start();
+    const first = { ...message("730", destination, historicalRequest), receivedAt: historicalNow };
+    const preStopHead = { ...headMessage("731", destination, "Pre-stop HEAD work in A"), receivedAt: historicalNow + 1 };
+    const stopFromB = message("732", route("13"), "/stop head");
+    const postStopHead = { ...headMessage("733", destination, "Post-stop HEAD work in A"), receivedAt: historicalNow + 2 };
+
+    await runtime.receive(first);
+    await runtime.receive(preStopHead);
+    // /stop head from conversation B finishes while conversation A is still queued.
+    await runtime.receive(stopFromB);
+    await messenger.whenSent(1);
+    expect(store.output("732:head-control")?.text).toContain("HEAD stop confirmed");
+
+    // A request received in A after /stop head must NOT be cancelled.
+    await runtime.receive(postStopHead);
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+
+    // Independent lane work (first -> current) proceeds; pre-stop HEAD work is cancelled; post-stop HEAD work runs.
+    expect(store.input(preStopHead.id)?.state).toBe("cancelled");
+    expect(store.input(`handoff:${first.id}:${current.id}`)?.state).toBe("submitted");
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(first.text)]);
+    expect(main.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining("Post-stop HEAD work in A")]);
+  });
+
+  test("recovery controls in the same conversation bypass a persistently failing first deferred admission", async () => {
+    const { runtime, config, store, requests, handoff } = restartFixture();
+    const destination = route("53", { channelId: "4" });
+    if (!config.discord) throw new Error("Missing Discord config");
+    config.discord.allowedChannelIds.push("5");
+    const origReceive = store.receive.bind(store);
+    store.receive = (input, target, metadata, workflow) => {
+      if (input.id === "740") throw new Error("Transient store failure for first admission");
+      return origReceive(input, target, metadata, workflow);
+    };
+    handoff.respond = async request => ({
+      ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main",
+      sessionFile: hostPaths(config, "main").sessionFile, state: "accepted",
+    });
+    await runtime.start();
+    const failing = { ...message("740", destination, historicalRequest), receivedAt: historicalNow };
+    await runtime.receive(failing);
+    await runtime.routingSettled();
+    expect(store.input(failing.id)).toBeNull();
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]")).toHaveLength(1);
+
+    // /stop head in the same conversation is not trapped behind the failing first admission.
+    await runtime.receive(message("741", destination, "/stop head"));
+    await Bun.sleep(30);
+    expect(store.output("741:head-control")?.text).toContain("HEAD stop confirmed");
+
+    // /restart in the same conversation also bypasses the failed admission and hands off.
+    await runtime.receive(message("742", destination, "/restart"));
+    await Bun.sleep(30);
+    expect(store.output("742:restart-ack")?.state).toBe("sent");
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id)).toEqual([failing.id]);
+  });
+
+  test("deferred routing shares immutable-payload conflict detection and signed URL refresh reconciliation", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination } = historyFixture("available", search.promise);
+    await runtime.start();
+    const oldUrl = "https://cdn.discordapp.com/attachments/4/5/file.txt?ex=111&is=111&hm=old";
+    const refreshedUrl = "https://cdn.discordapp.com/attachments/4/5/file.txt?ex=222&is=222&hm=new";
+    const attachment = { id: "att-1", name: "file.txt", url: oldUrl, size: 12, contentType: "text/plain" };
+    const first = { ...message("750", destination, historicalRequest), receivedAt: historicalNow, attachments: [attachment] };
+
+    await runtime.receive(first);
+    await expect(runtime.receive({ ...first, text: "mutated payload" })).rejects.toThrow("Inbound identity conflict");
+    await runtime.receive({ ...first, attachments: [{ ...attachment, url: refreshedUrl }] });
+
+    const queued = JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]") as Inbound[];
+    expect(queued[0]?.attachments[0]?.url).toBe(refreshedUrl);
+
+    search.resolve();
+    await runtime.routingSettled();
+    expect(store.input(`handoff:${first.id}:current`) ?? store.input(first.id)).not.toBeNull();
+    expect(store.input(first.id)?.attachments[0]?.url).toBe(refreshedUrl);
+  });
+
+  test("an older deferred /resume cannot undo a confirmed lane stop, while a later /resume still works", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current } = historyFixture("available", search.promise);
+    await runtime.start();
+    await runtime.pause(current.id);
+    expect(store.lane(current.id)?.workState).toBe("paused");
+
+    const first = { ...message("760", destination, historicalRequest), receivedAt: historicalNow };
+    const earlierResume = { ...message("761", destination, "/resume"), receivedAt: historicalNow + 1 };
+    const stopLane = message("762", route("13"), `/stop ${current.id}`);
+
+    await runtime.receive(first);
+    await runtime.receive(earlierResume);
+    expect(store.input(earlierResume.id)).toBeNull();
+
+    // A lane stop from another conversation snapshots earlier deferred inputs before drain.
+    await runtime.receive(stopLane);
+    for (let i = 0; i < 100 && !store.output("762:head-control"); i++) await Bun.sleep(20);
+    expect(store.output("762:head-control")?.text).toContain("paused");
+
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+
+    expect(store.input(earlierResume.id)?.state).toBe("cancelled");
+    expect(store.output(`${earlierResume.id}:control`)).toBeNull();
+    expect(store.lane(current.id)?.workState).toBe("paused");
+
+    // A resume received after the confirmed lane stop still opens the lane.
+    const laterResume = { ...message("763", destination, "/resume"), receivedAt: historicalNow + 2 };
+    await admit(runtime, laterResume);
+    for (let i = 0; i < 100 && store.input(laterResume.id)?.state !== "done"; i++) await Bun.sleep(20);
+    expect(store.input(laterResume.id)?.state).toBe("done");
+    expect(store.lane(current.id)?.workState).toBe("open");
+    expect(store.output(`${laterResume.id}:control`)?.text).toContain("해제");
+  });
+
+  test("a queued bare /stop is promoted when head admission fails while ordinary waiting items stay ordered", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current } = historyFixture("available", search.promise);
+    const origReceive = store.receive.bind(store);
+    store.receive = (input, target, metadata, workflow) => {
+      if (input.id === "770") throw new Error("Transient store failure for first admission");
+      return origReceive(input, target, metadata, workflow);
+    };
+    await runtime.start();
+
+    const first = { ...message("770", destination, historicalRequest), receivedAt: historicalNow };
+    const ordinary1 = { ...message("771", destination, "Ordinary follow-up before stop"), receivedAt: historicalNow + 1 };
+    const bareStop = { ...message("772", destination, "/stop"), receivedAt: historicalNow + 2 };
+    const ordinary2 = { ...message("773", destination, "Ordinary follow-up after stop"), receivedAt: historicalNow + 3 };
+
+    await runtime.receive(first);
+    await runtime.receive(ordinary1);
+    await runtime.receive(bareStop);
+    await runtime.receive(ordinary2);
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id))
+      .toEqual(["770", "771", "772", "773"]);
+    expect(store.input(bareStop.id)).toBeNull();
+
+    search.resolve();
+    await runtime.routingSettled();
+    for (let i = 0; i < 100 && !store.output("772:head-control"); i++) await Bun.sleep(20);
+
+    expect(store.output("772:head-control")?.text).toContain("paused");
+    expect(store.lane(current.id)?.workState).toBe("paused");
+    expect(store.input(first.id)).toBeNull();
+    expect(store.input(ordinary1.id)).toBeNull();
+    expect(store.input(ordinary2.id)).toBeNull();
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id))
+      .toEqual(["770", "771", "773"]);
+  });
+
+  test("a bare DM stop waits for a queued /main rather than pausing the previously selected topic", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, config, store } = historyFixture("available", search.promise);
+    const dm = route(null, { guildId: null });
+    await runtime.start();
+    await admit(runtime, message("774", dm, "/new"));
+    const originalTopic = store.input("774")!.route;
+    const oldLane = savedLane(store, config, "old-dm-topic", originalTopic);
+    const first = { ...message("775", dm, historicalRequest), receivedAt: historicalNow };
+    const main = message("776", dm, "/main");
+    const stop = message("777", dm, "/stop");
+    const receive = store.receive.bind(store);
+    let failing = true;
+    store.receive = (input, target, metadata, workflow) => {
+      if (input.id === first.id && failing) throw new Error("Transient history admission failure");
+      return receive(input, target, metadata, workflow);
+    };
+
+    try {
+      await runtime.receive(first);
+      await runtime.receive(main);
+      await runtime.receive(stop);
+    } finally { search.resolve(); }
+    await runtime.routingSettled();
+    expect(store.input(main.id)).toBeNull();
+    expect(store.input(stop.id)).toBeNull();
+    expect(store.lane(oldLane.id)?.workState).toBe("open");
+
+    failing = false;
+    for (let i = 0; i < 100 && !store.input(stop.id); i++) await Bun.sleep(20);
+    await runtime.routingSettled();
+    expect(store.input(main.id)?.route).toEqual(dm);
+    expect(store.input(stop.id)?.route).toEqual(dm);
+    expect(store.lane(oldLane.id)?.workState).toBe("open");
+  });
+
+  test("a named lane stop bypasses active history and orders cleanup before a later resume from the lane", async () => {
+    const search = Promise.withResolvers<void>();
+    const cleanup = Promise.withResolvers<void>();
+    const { runtime, store, current, destination, worker, messenger } = historyFixture("available", search.promise);
+    const origin = route("13");
+    const first = { ...message("778", origin, historicalRequest), receivedAt: historicalNow };
+    const stop = message("779", origin, `/stop ${current.id}`);
+    const resume = message("781", destination, "/resume");
+    await runtime.start();
+    worker.beforeAbort = () => cleanup.promise;
+
+    try {
+      await runtime.receive(first);
+      await runtime.receive(stop);
+      await runtime.receive(stop); // Redelivery does not launch another stop.
+      await runtime.receive(resume);
+      await runtime.kick();
+      expect(store.input(first.id)).toBeNull();
+      expect(store.input(stop.id)?.state).toBe("submitted");
+      expect(store.input(resume.id)?.state).toBe("pending");
+      expect(store.lane(current.id)?.workState).toBe("paused");
+
+      cleanup.resolve();
+      await messenger.whenSent(2);
+      expect(store.input(resume.id)?.state).toBe("done");
+      expect(store.lane(current.id)?.workState).toBe("open");
+      expect(messenger.sent.filter(output => output.id === `${stop.id}:head-control`)).toHaveLength(1);
+    } finally {
+      cleanup.resolve();
+      search.resolve();
+    }
+  });
+
+  test("restart keeps a durably admitted later resume behind an exact stop still in deferred routing", async () => {
+    const search = Promise.withResolvers<void>();
+    const afterRestartSearch = Promise.withResolvers<void>();
+    const { runtime, config, directory, store, current, destination, hosts, errors, topicMemory } =
+      historyFixture("available", search.promise);
+    const origin = route("13");
+    const first = { ...message("783", origin, historicalRequest), receivedAt: historicalNow };
+    const stop = message("784", origin, `/stop ${current.id}`);
+    const resume = message("785", destination, "/resume");
+    const failed = Promise.withResolvers<void>();
+    const receive = store.receive.bind(store);
+    store.receive = (input, target, metadata, workflow) => {
+      if (input.id === stop.id) {
+        failed.resolve();
+        throw new Error("Transient named stop admission failure");
+      }
+      return receive(input, target, metadata, workflow);
+    };
+    // A previous runtime can leave the explicit stop in the deferred FIFO.
+    store.setMeta("intake:deferred-routing", JSON.stringify([first, stop]));
+    try {
+      await runtime.start();
+      // The history read remains blocked; a queued exact stop still gets priority.
+      await failed.promise;
+      await runtime.receive(resume);
+      await runtime.kick();
+      expect(store.input(resume.id)?.state).toBe("pending");
+      expect(store.input(stop.id)).toBeNull();
+    } finally {
+      const stopping = runtime.stop();
+      search.resolve();
+      await stopping;
+    }
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    expect(reopened.input(resume.id)?.state).toBe("pending");
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
+    const worker = new HostTransport(current.sessionFile, "session-current");
+    hosts.set(current.socketPath, worker);
+    const messenger = new MessengerTransport();
+    const restarted = new Superagent(config, reopened, messenger, join(directory, "extension.ts"), error => errors.push(error), {
+      topicMemory: { ...topicMemory!, search: async query => {
+        await afterRestartSearch.promise;
+        return topicMemory!.search(query);
+      } },
+      connect: async path => path === hostPaths(config, "main").socketPath ? head : hosts.get(path)!,
+    });
+    fixtures.find(entry => entry.runtime === runtime)!.runtime = restarted;
+    try {
+      await restarted.start();
+      await messenger.whenSent(2);
+      expect(reopened.input(first.id)).toBeNull();
+      expect(reopened.output(`${stop.id}:head-control`)?.text).toContain("paused");
+      expect(reopened.input(resume.id)?.state).toBe("done");
+      expect(reopened.lane(current.id)?.workState).toBe("open");
+    } finally { afterRestartSearch.resolve(); }
+  });
+
+  test("control-looking edits cannot bypass deferred routing to overtake their original message", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current, worker } = historyFixture("available", search.promise);
+    await runtime.start();
+
+    const original = {
+      ...message(`discord:${destination.accountId}:780`, destination, historicalRequest),
+      messageId: "780",
+      receivedAt: historicalNow,
+    };
+    const restartEdit = {
+      ...original,
+      id: `discord:${destination.accountId}:780:edit:1750000001`,
+      text: "/restart",
+      receivedAt: historicalNow + 1,
+    };
+    const stopHeadEdit = {
+      ...original,
+      id: `discord:${destination.accountId}:780:edit:1750000002`,
+      text: "/stop head",
+      receivedAt: historicalNow + 2,
+    };
+
+    const stopLaneEdit = {
+      ...original,
+      id: `discord:${destination.accountId}:780:edit:1750000003`,
+      text: `/stop ${current.id}`,
+      receivedAt: historicalNow + 3,
+    };
+
+    await runtime.receive(original);
+    await runtime.receive(restartEdit);
+    await runtime.receive(stopHeadEdit);
+    await runtime.receive(stopLaneEdit);
+
+    expect(store.input(original.id)).toBeNull();
+    expect(store.input(restartEdit.id)).toBeNull();
+    expect(store.input(stopHeadEdit.id)).toBeNull();
+    expect(store.input(stopLaneEdit.id)).toBeNull();
+    expect(store.firstAdmittedMessage(destination, "780")).toBeNull();
+    expect(store.getMeta("head:restart-fence")).toBeFalsy();
+    expect(store.getMeta("head:stop-boundary")).toBeNull();
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id))
+      .toEqual([original.id, restartEdit.id, stopHeadEdit.id, stopLaneEdit.id]);
+
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+
+    expect(store.firstAdmittedMessage(destination, "780")?.id).toBe(original.id);
+    expect(store.getMeta(`dm:control-edit:${original.id}`)).toBeNull();
+    expect(store.input(`handoff:${original.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(original.text)]);
+    expect(store.input(restartEdit.id)?.state).toBe("cancelled");
+    expect(store.getMeta(`dm:control-edit:${restartEdit.id}`)).toBe("command");
+    expect(store.input(stopHeadEdit.id)?.state).toBe("cancelled");
+    expect(store.getMeta(`dm:control-edit:${stopHeadEdit.id}`)).toBe("command");
+    expect(store.input(stopLaneEdit.id)?.state).toBe("cancelled");
+    expect(store.getMeta(`dm:control-edit:${stopLaneEdit.id}`)).toBe("command");
+    expect(store.lane(current.id)?.workState).toBe("open");
+    expect(store.getMeta("head:restart-fence")).toBeFalsy();
+    expect(store.getMeta("head:stop-boundary")).toBeNull();
+  });
+});
 
 describe("historical continuation in an existing Discord work thread", () => {
   test.each(["unique match", "lookup miss", "lookup outage"] as const)("%s dispatches only in the current session", async outcome => {

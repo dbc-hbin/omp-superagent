@@ -140,6 +140,27 @@ barrier or selected priority owner controls (`/restart`, `/stop`, `/stop head`);
 ordinary intake keeps its order. After the first approval barrier, a head outage
 does not close Gateway admission. Reconnecting does not replay already submitted work.
 
+The head receipt does not wait for a [historical topic search](#topic-routing-and-controls),
+which may read large native journals. An input that needs one is appended to a
+durable deferred-routing queue in the coordination store (`intake:deferred-routing`),
+receipted, and then searched and admitted in the background. Until it is admitted,
+later ordinary inputs of the same physical channel or DM (including its threads
+and logical topics) queue behind it; other conversations are not held. A
+redelivery of a queued input shares the store's immutable-payload and signed
+attachment URL reconciliation. Fresh `/restart`, `/stop head`, and
+`/stop <exact authorized lane-id>` bypass deferred waiting, including after
+restart. A bare `/stop` bypasses failing admission only if it is not a reply and
+comes from an already-bound physical Discord work thread. Bare DM and
+reply-relative stops wait for earlier routing, rather than choosing today's
+apparent target; edits cannot acquire priority. Global HEAD stops and
+lane-specific stops snapshot receipt order across both queues. A later resume
+waits for an older deferred stop of that exact lane without being cancelled by
+it; other lanes' work is independent. A pending queued
+choice fences the automatic history choice like an unreceipted Gateway event. A
+failed admission stays first in its conversation and is retried with bounded
+backoff; a permanent denial is dropped. The queue survives a restart and resumes
+in order once intake is ready.
+
 Telegram persists its per-bot offset after admission and acknowledges it with the
 next `getUpdates`. There is no Bot API history fetch; recovery cannot exceed its
 24-hour update retention. Omit the previous offset after 24 hours of inactivity,
