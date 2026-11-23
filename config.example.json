@@ -11,7 +11,8 @@
     "ownerId": "REPLACE_WITH_OWNER_USER_ID",
     "allowedGuildIds": ["REPLACE_WITH_GUILD_ID"],
     "allowedChannelIds": ["REPLACE_WITH_PARENT_CHANNEL_ID"],
-    "requireAddressing": false
+    "requireAddressing": false,
+    "editProgressInPlace": false
   },
   "telegram": {
     "tokenEnv": "TELEGRAM_BOT_TOKEN",

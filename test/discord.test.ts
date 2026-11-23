@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationCommandOptionType, Attachment as DiscordAttachment, AttachmentBuilder, ChannelType, Collection, Events, MessageFlags, MessageFlagsBitField, type Client, type Message, type MessageCreateOptions } from "discord.js";
+import { ApplicationCommandOptionType, Attachment as DiscordAttachment, AttachmentBuilder, ChannelType, Collection, Events, MessageFlags, MessageFlagsBitField, PermissionFlagsBits, type Client, type Message, type MessageCreateOptions } from "discord.js";
 import { DiscordMessenger, deliveryError, discordAttachmentAllowed, discordNonce, parseDiscordControl, type DiscordMessengerOptions } from "./oracles/bun-gateway/discord.ts";
 import { VOICE_DRAFT_HEADER } from "./oracles/bun-gateway/discord-voice-draft";
 import { DeliveryError } from "../src/delivery.ts";
@@ -77,6 +77,10 @@ class Channel {
     const message = this.remote.get(query);
     if (!message) throw Object.assign(new Error("Unknown message"), { code: 10008, status: 404 });
     return message;
+  }, edit: async (id: string, payload: MessageCreateOptions) => {
+    const message = this.remote.get(id);
+    if (!message) throw Object.assign(new Error("Unknown message"), { code: 10008, status: 404 });
+    return message.edit(payload);
   } };
   threads = { create: async (_options: unknown) => new Channel("created-thread", this.guildId, this.id) };
 }
@@ -905,6 +909,67 @@ describe("Discord output delivery", () => {
       expect(channel.sent[0]?.nonce).toBe(discordNonce("ordinary-answer", route));
       expect(channel.sent[0]?.enforceNonce).toBe(true);
     } finally { store.close(); await messenger.stop(); }
+  });
+
+  test("guild card-only output stays readable without Embed Links, including an in-place edit", async () => {
+    const { messenger, channel } = await fixture();
+    const card = ['~~~card', JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: "Status" } } } }), '~~~'].join("\n");
+    const prior = new RemoteMessage("700", channel.id, channel.guildId, {});
+    channel.remote.set(prior.id, prior);
+    try {
+      Object.assign(channel, { permissionsFor: () => ({ has: () => false }) });
+      await messenger.send(output(card));
+      expect(channel.sent).toHaveLength(1);
+      expect(channel.sent[0]).toMatchObject({ content: card, embeds: [] });
+      await messenger.send({ ...output(card), editOf: { route, messageId: prior.id } });
+      expect(prior.edits).toHaveLength(1);
+      expect(prior.edits[0]).toMatchObject({ content: card, embeds: [] });
+      expect(channel.sent).toHaveLength(1);
+    } finally { await messenger.stop(); }
+  });
+
+  test("card fences become embeds and status updates edit their message without reposting", async () => {
+    const { messenger, channel } = await fixture();
+    Object.assign(channel, { permissionsFor: () => ({ has: (bit: bigint) => bit === PermissionFlagsBits.EmbedLinks }) });
+    const card = JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: "Status" } } } });
+    await messenger.send({ ...output(`⏳\n\`\`\`card\n${card}\n\`\`\``), status: true });
+    expect(channel.sent[0]).toMatchObject({ content: "⏳", embeds: [{ title: "Status" }] });
+    const status = new RemoteMessage("700", channel.id, channel.guildId, {});
+    channel.remote.set(status.id, status);
+    expect(await messenger.send({ ...output("⏳ still working"), editOf: { route, messageId: "700" } })).toBe("700");
+    expect(status.edits).toEqual([expect.objectContaining({ content: "⏳ still working", embeds: [], attachments: [] })]);
+
+    // A >2000 char initial status posts one attachment message that a short edit replaces in place.
+    const originalSend = channel.send.bind(channel);
+    channel.send = async payload => {
+      const msg = await originalSend(payload);
+      if (channel.sent.length === 2) {
+        const numeric = new RemoteMessage("702", channel.id, channel.guildId, payload);
+        channel.remote.set("702", numeric);
+        return numeric;
+      }
+      return msg;
+    };
+    const longReceipt = await messenger.send({ ...output(`⏳ ${"a".repeat(2500)}`), id: "long-status", status: true });
+    expect(longReceipt).toBe("702");
+    expect(channel.sent).toHaveLength(2);
+    expect(channel.sent[1]!.files).toHaveLength(1);
+    expect(await messenger.send({ ...output("⏳ done"), id: "long-status-edit", editOf: { route, messageId: longReceipt } })).toBe(longReceipt);
+    expect(channel.remote.get(longReceipt)?.edits).toEqual([
+      expect.objectContaining({ content: "⏳ done", embeds: [], attachments: [], files: [] }),
+    ]);
+
+    await expect(messenger.send({ ...output("⏳ gone"), editOf: { route, messageId: "701" } })).rejects.toMatchObject({ certainty: "rejected" });
+    await expect(messenger.send({ ...output("⏳ moved"), editOf: { route: { ...route, channelId: "foreign" }, messageId: "700" } }))
+      .rejects.toMatchObject({ certainty: "rejected" });
+    await expect(messenger.send({ ...output("⏳ tg", { ...route, platform: "telegram" }), status: true }))
+      .rejects.toMatchObject({ certainty: "rejected" });
+    await expect(messenger.send({ ...output("⏳ picker"), status: true, picker: {
+      kind: "model", sessionId: "s", generation: 0, expiresAt: 2, groups: [{ label: "M", options: ["fixture/a"] }],
+    } })).rejects.toMatchObject({ certainty: "rejected" });
+    expect(channel.sent).toHaveLength(2);
+    expect(status.edits).toHaveLength(1);
+    await messenger.stop();
   });
 
   test("deleted original messages can send unlinked in one native attempt without fetching or retrying", async () => {

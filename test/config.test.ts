@@ -61,6 +61,21 @@ describe("operator execution limits", () => {
     await expect(loadConfig(await config({ discord: { ...voiceDiscord, requireAddressing } })))
       .rejects.toThrow("discord.requireAddressing must be a boolean");
   });
+  test.each([[undefined, false], [false, false], [true, true]] as const)(
+    "passes Discord editProgressInPlace %p to the Gateway as %p", async (editProgressInPlace, expected) => {
+      const file = await config({ discord: { ...voiceDiscord, editProgressInPlace } });
+      const child = Bun.spawn([process.execPath, "--no-env-file", "--no-install",
+        join(import.meta.dir, "../src/gateway-config.ts"), file], {
+        env: { PATH: process.env.PATH }, stdin: "ignore", stdout: "pipe", stderr: "inherit", timeout: 10_000,
+      });
+      const [stdout, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout)).toMatchObject({ config: { discord: { editProgressInPlace: expected } } });
+    });
+  test.each(["true", 1, null])("rejects non-boolean Discord editProgressInPlace %p", async editProgressInPlace => {
+    await expect(loadConfig(await config({ discord: { ...voiceDiscord, editProgressInPlace } })))
+      .rejects.toThrow("discord.editProgressInPlace must be a boolean");
+  });
   test.each(["implicit", "explicit"])("bounds API voice and isolates its provider credential with %s auth", async mode => {
     const voice = { ...paidVoice, ...(mode === "explicit" ? { auth: "api" as const } : {}) };
     const loaded = await loadConfig(await config({ discord: { ...voiceDiscord, voice } }));

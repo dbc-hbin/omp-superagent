@@ -504,6 +504,37 @@ approval.
   retrying uncertain sends. Routes wake as soon as outputs become pending
   without waiting behind an unrelated command tail; restart checkpoints still
   wait for all in-flight route deliveries to settle before lifecycle handoff.
+- In-place editing of Discord progress reports is opt-in via
+  `discord.editProgressInPlace` (default `false`). By default, every progress
+  update and HEAD lane progress summary posts as an ordinary new message so
+  progress history stays visible. When enabled on Discord, nonterminal progress
+  for one request—including direct HEAD progress, direct topic progress, and
+  HEAD summaries of non-topic lane progress keyed by the original lane input—uses
+  a single `⏳` status message edited in place (`⏳\n` when the body begins
+  with a code fence so card fences remain intact). Each update stays its own
+  immutable output with `status: true`; initial long status messages use the
+  single-message text attachment fallback instead of splitting across multiple
+  posts so later edits replace that single message cleanly. When an update is
+  claimed for delivery, the controller fixes `editOf` to the physical message of
+  the stream's first confirmed post and persists it with the output, so a
+  redelivery edits that same message. An uncertain post never becomes an edit
+  target. A rejected edit fails only that update and is never reposted; it
+  releases the target so a later update posts a fresh status message. An
+  ambiguous edit stays uncertain. Final answers and lane completion reports are
+  still separate new messages. Telegram and Slack always post ordinary progress
+  messages; the Gateway rejects `editOf` and `status: true` outside Discord.
+- Discord turns a fenced ```` ```card ```` [json-render](https://github.com/vercel-labs/json-render)
+  spec (`{"root", "elements"}`, root `Card`; `Card`, `Section`, `Text`,
+  `Fields`, `Field`, `Table`, `Divider`, `Image`) into an embed at delivery.
+  Table content becomes an aligned code block in the embed description. In a
+  guild or thread, only use embeds when the bot has verified Embed Links
+  permission at the parent channel; otherwise send the original fence as text.
+  An Image needs a valid HTTPS URL. A spec that is
+  invalid, uses another component, reuses an element or exceeds Discord's embed
+  limits stays verbatim as its code block, which is also what Telegram and Slack
+  show. The [Rust renderer](../../gateway/src/discord/embeds.rs) and
+  [`extractDiscordCards`](../../src/discord-markdown.ts) share one
+  [fixture](../../test/fixtures/discord-cards.json).
 
 ## Discord voice
 

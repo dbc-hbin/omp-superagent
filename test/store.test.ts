@@ -5,9 +5,10 @@ import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { Client, Collection, type ClientUser, type Message } from "discord.js";
-import { physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
+import { extractDiscordCards } from "../src/discord-markdown.ts";
 import { Store } from "../src/store.ts";
 import { lanePlacement, readLaneRows } from "../src/lane-rows";
 import { TOPIC_CHOICE_WAIT_MS } from "../src/topic-request";
@@ -465,6 +466,176 @@ describe("durable coordination store", () => {
     expect(store.progress("head-progress", 0, "native-head", "event", "Meaningful milestone")).toBe(false);
     expect(store.outputs()).toEqual([]);
     expect(store.output(outputId)?.state).toBe("uncertain");
+  });
+
+  test("Discord head progress edits one confirmed status message in place and keeps its physical id on redelivery", () => {
+    const { store, path } = fixture();
+    const source = inbound("status-source");
+    store.receive(source, "main");
+    store.setMeta("main:sessionId", "native-head");
+    store.submit(source.id, "request", 0);
+    const update = (event: string, text: string) => {
+      expect(store.progress(source.id, 0, "native-head", event, text, true)).toBe(true);
+      const id = `progress:${source.id}:${event}`;
+      expect(store.claimOutput(id, true)).toBe(true);
+      return id;
+    };
+    const first = update("one", "Reading the code");
+    expect(store.output(first)).toMatchObject({ text: "⏳ Reading the code", state: "sending", status: true });
+    expect(store.output(first)?.editOf).toBeUndefined();
+    store.finishOutput(first, "sent", "900");
+
+    const target = { route: physicalRoute(source.route), messageId: "900" };
+    const second = update("two", "Running tests");
+    expect(store.output(second)?.editOf).toEqual(target);
+    // An ambiguous edit is not retried by itself; an explicit redelivery keeps the target.
+    store.finishOutput(second, "uncertain");
+    expect(store.outputs()).toEqual([]);
+    store.finishOutput(second, "pending");
+    store.close();
+    const reopened = open(path);
+    expect(reopened.claimOutput(second, true)).toBe(true);
+    expect(reopened.output(second)?.editOf).toEqual(target);
+    reopened.finishOutput(second, "sent", "900");
+    // Reply lookups still resolve the edited message to the output that created it.
+    expect(reopened.sentOutputForMessage(source.route, "900")?.id).toBe(first);
+
+    expect(reopened.progress(source.id, 0, "native-head", "three", "Fixing", true)).toBe(true);
+    const third = `progress:${source.id}:three`;
+    expect(reopened.claimOutput(third, true)).toBe(true);
+    expect(reopened.output(third)?.editOf).toEqual(target);
+    // A rejected edit fails that update only; it is never requeued as a new post.
+    reopened.finishOutput(third, "failed", undefined, "Messenger rejected delivery");
+    expect(reopened.outputs()).toEqual([]);
+    expect(reopened.output(third)).toMatchObject({ state: "failed", editOf: target });
+
+    expect(reopened.progress(source.id, 0, "native-head", "four", "Almost done", true)).toBe(true);
+    const fourth = `progress:${source.id}:four`;
+    expect(reopened.claimOutput(fourth, true)).toBe(true);
+    expect(reopened.output(fourth)?.editOf).toBeUndefined();
+    reopened.finishOutput(fourth, "sent", "901");
+    expect(reopened.progress(source.id, 0, "native-head", "five", "Done soon", true)).toBe(true);
+    const fifth = `progress:${source.id}:five`;
+    expect(reopened.claimOutput(fifth, true)).toBe(true);
+    expect(reopened.output(fifth)?.editOf).toEqual({ ...target, messageId: "901" });
+  });
+
+  test("an uncertain status post is never edited, and non-Discord progress keeps posting plain messages", () => {
+    const { store } = fixture();
+    const source = inbound("uncertain-status");
+    store.receive(source, "main");
+    store.setMeta("main:sessionId", "native-head");
+    store.submit(source.id, "request", 0);
+    store.progress(source.id, 0, "native-head", "one", "First", true);
+    expect(store.claimOutput(`progress:${source.id}:one`, true)).toBe(true);
+    store.finishOutput(`progress:${source.id}:one`, "uncertain");
+    store.progress(source.id, 0, "native-head", "two", "Second", true);
+    expect(store.claimOutput(`progress:${source.id}:two`, true)).toBe(true);
+    expect(store.output(`progress:${source.id}:two`)?.editOf).toBeUndefined();
+
+    const telegram = route({ platform: "telegram", accountId: "bot", authorityId: "owner", guildId: null, channelId: "42", threadId: null });
+    const plain = inbound("telegram-status", telegram);
+    store.receive(plain, "main");
+    store.submit(plain.id, "request-telegram", 0);
+    for (const event of ["one", "two"]) {
+      store.progress(plain.id, 0, "native-head", event, `Update ${event}`, true);
+      const id = `progress:${plain.id}:${event}`;
+      expect(store.claimOutput(id, true)).toBe(true);
+      expect(store.output(id)).toMatchObject({ text: `Update ${event}`, state: "sending" });
+      expect(store.output(id)?.editOf).toBeUndefined();
+      store.finishOutput(id, "sent", `telegram-${event}`);
+    }
+  });
+
+  test("Discord progress posts separate plain messages by default and shares status streams across HEAD lane summaries when enabled", () => {
+    const { store } = fixture();
+    const defaultHead = inbound("default-progress");
+    store.receive(defaultHead, "main");
+    store.setMeta("main:sessionId", "native-head");
+    store.submit(defaultHead.id, "req-default", 0);
+    expect(store.progress(defaultHead.id, 0, "native-head", "p1", "Step 1")).toBe(true);
+    expect(store.claimOutput(`progress:${defaultHead.id}:p1`)).toBe(true);
+    expect(store.output(`progress:${defaultHead.id}:p1`)).toMatchObject({ text: "Step 1" });
+    expect(store.output(`progress:${defaultHead.id}:p1`)?.status).toBeUndefined();
+    store.finishOutput(`progress:${defaultHead.id}:p1`, "sent", "800");
+    expect(store.progress(defaultHead.id, 0, "native-head", "p2", "Step 2")).toBe(true);
+    expect(store.claimOutput(`progress:${defaultHead.id}:p2`)).toBe(true);
+    expect(store.output(`progress:${defaultHead.id}:p2`)).toMatchObject({ text: "Step 2" });
+    expect(store.output(`progress:${defaultHead.id}:p2`)?.editOf).toBeUndefined();
+
+    // Card-only update places the marker on its own line so the fence stays intact,
+    // and preserving original indentation prevents 4-space fences from hiding following cards.
+    const cardHead = inbound("card-progress");
+    store.receive(cardHead, "main");
+    store.submit(cardHead.id, "req-card", 0);
+    const cardFence = "```card\n{\"root\":\"c\",\"elements\":{\"c\":{\"type\":\"Card\",\"props\":{\"title\":\"T\"}}}}\n```";
+    expect(store.progress(cardHead.id, 0, "native-head", "c1", cardFence, true)).toBe(true);
+    expect(store.output(`progress:${cardHead.id}:c1`)).toMatchObject({ text: `⏳\n${cardFence}`, status: true });
+    const indentedAndCard = "    ```not-a-fence\n```card\n{\"root\":\"c\",\"elements\":{\"c\":{\"type\":\"Card\",\"props\":{\"title\":\"Visible\"}}}}\n```";
+    expect(store.progress(cardHead.id, 0, "native-head", "c2", indentedAndCard, true)).toBe(true);
+    const c2Text = store.output(`progress:${cardHead.id}:c2`)?.text;
+    expect(c2Text).toBe(`⏳\n${indentedAndCard}`);
+    expect(extractDiscordCards(c2Text!)).toEqual({
+      text: "⏳\n    ```not-a-fence",
+      embeds: [{ title: "Visible" }],
+    });
+    const indentedLiteralCard = "    ```card\n{\"root\":\"c\",\"elements\":{\"c\":{\"type\":\"Card\",\"props\":{\"title\":\"Literal\"}}}}\n```";
+    expect(store.progress(cardHead.id, 0, "native-head", "c3", indentedLiteralCard, true)).toBe(true);
+    const c3Text = store.output(`progress:${cardHead.id}:c3`)?.text;
+    expect(c3Text).toBe(`⏳\n${indentedLiteralCard}`);
+    expect(extractDiscordCards(c3Text!)).toEqual({ text: c3Text!, embeds: [] });
+
+    // Non-topic lane progress summarized by HEAD shares one stream per lane input across both
+    // intermediate HEAD commentary and settled summaries, while keeping receipt ownership intact.
+    const selected = admitLane(store, "lane-summary");
+    store.updateLane(selected.id, 0, { sessionId: "native-lane" });
+    const laneInput = "source-lane-summary";
+    store.submit(laneInput, "lane-req", 0);
+    expect(store.progress(laneInput, 0, "native-lane", "u1", "Working 1", true)).toBe(true);
+    const p1Id = `progress:${laneInput}:u1`;
+    store.submit(p1Id, "head-sum-1", 0);
+    expect(store.progress(p1Id, 0, "native-head", "h1", "Checking worker...", true)).toBe(true);
+    const h1OutId = `progress:${p1Id}:h1`;
+    expect(store.claimOutput(h1OutId, true)).toBe(true);
+    expect(store.output(h1OutId)).toMatchObject({ sourceId: p1Id, text: "⏳ Checking worker...", status: true });
+    expect(store.output(h1OutId)?.editOf).toBeUndefined();
+    store.finishOutput(h1OutId, "sent", "910");
+
+    expect(store.settle(p1Id, "done", { id: `${p1Id}:answer`, text: "Summary 1" }, undefined, true)).toBe(true);
+    expect(store.claimOutput(`${p1Id}:answer`, true)).toBe(true);
+    expect(store.output(`${p1Id}:answer`)).toMatchObject({
+      sourceId: p1Id, text: "⏳ Summary 1", status: true, editOf: { route: physicalRoute(selected.route), messageId: "910" },
+    });
+    store.finishOutput(`${p1Id}:answer`, "sent", "910");
+    expect(store.sentOutputForMessage(selected.route, "910")?.id).toBe(h1OutId);
+
+    expect(store.progress(laneInput, 0, "native-lane", "u2", "Working 2", true)).toBe(true);
+    const p2Id = `progress:${laneInput}:u2`;
+    store.submit(p2Id, "head-sum-2", 0);
+    expect(store.progress(p2Id, 0, "native-head", "h2", "Checking worker 2...", true)).toBe(true);
+    const h2OutId = `progress:${p2Id}:h2`;
+    expect(store.claimOutput(h2OutId, true)).toBe(true);
+    expect(store.output(h2OutId)).toMatchObject({
+      sourceId: p2Id, text: "⏳ Checking worker 2...", status: true, editOf: { route: physicalRoute(selected.route), messageId: "910" },
+    });
+    store.finishOutput(h2OutId, "sent", "910");
+    expect(store.settle(p2Id, "done", { id: `${p2Id}:answer`, text: "Summary 2" }, undefined, true)).toBe(true);
+    expect(store.claimOutput(`${p2Id}:answer`, true)).toBe(true);
+    expect(store.output(`${p2Id}:answer`)).toMatchObject({
+      sourceId: p2Id, text: "⏳ Summary 2", status: true, editOf: { route: physicalRoute(selected.route), messageId: "910" },
+    });
+    store.finishOutput(`${p2Id}:answer`, "sent", "910");
+    expect(store.sentOutputForMessage(selected.route, "910")?.id).toBe(h1OutId);
+
+    // Final lane completion report settles separately with no status marker or editOf.
+    expect(store.settle(laneInput, "done", { id: "lane-done", text: "Final lane text" }, undefined, true)).toBe(true);
+    const reportId = `report:${laneInput}`;
+    store.submit(reportId, "head-report", 0);
+    expect(store.settle(reportId, "done", { id: `${reportId}:answer`, text: "Final answer" }, undefined, true)).toBe(true);
+    expect(store.claimOutput(`${reportId}:answer`, true)).toBe(true);
+    expect(store.output(`${reportId}:answer`)?.text).toBe("Final answer");
+    expect(store.output(`${reportId}:answer`)?.editOf).toBeUndefined();
+    expect(store.output(`${reportId}:answer`)?.status).toBeUndefined();
   });
 
   test("Slack invocation origins survive handoffs, reports, and reopen without a source timestamp", () => {
@@ -1302,6 +1473,18 @@ describe("durable coordination store", () => {
     store.finishOutput("legacy-answer", "failed");
     store.finishOutput("legacy-answer", "pending");
     expect(store.output("legacy-answer")?.replyTo).toBeUndefined();
+    expect(store.output("legacy-answer")?.status).toBeUndefined();
+    expect(store.queueOutput({ id: "status-after-upgrade", sourceId: source.id, route: source.route, text: "⏳ ok", status: true })).toBe(true);
+    store.close();
+    const reopened = open(path);
+    expect(reopened.output("status-after-upgrade")?.status).toBe(true);
+    expect(() => reopened.queueOutput({
+      id: "status-telegram",
+      sourceId: "tg",
+      route: route({ platform: "telegram", accountId: "bot", authorityId: "owner", guildId: null, channelId: "42", threadId: null }),
+      text: "⏳ bad",
+      status: true,
+    })).toThrow("Status delivery requires a plain Discord message");
   });
 
   test("lane settlement and its full head report commit atomically without an external output", () => {

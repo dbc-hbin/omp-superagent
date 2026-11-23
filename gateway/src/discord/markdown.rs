@@ -116,13 +116,13 @@ fn fence(line: &str) -> Option<(u8, usize, &str)> {
     (count >= 3).then(|| (ch, count, &line[count..]))
 }
 
-fn opens(line: &str) -> Option<(u8, usize, &str)> {
+pub(super) fn opens(line: &str) -> Option<(u8, usize, &str)> {
     // A backtick fence's info string cannot contain backticks. In particular,
     // a line that starts and ends with the same backtick run is inline code.
     fence(line).filter(|(ch, _, rest)| *ch != b'`' || !rest.contains('`'))
 }
 
-fn closes(line: &str, ch: u8, length: usize) -> bool {
+pub(super) fn closes(line: &str, ch: u8, length: usize) -> bool {
     fence(line).is_some_and(|(kind, count, rest)| {
         kind == ch && count >= length && rest.trim_matches([' ', '\t', '\r']).is_empty()
     })
@@ -154,12 +154,12 @@ fn block_start(line: &str) -> bool {
         || list_marker(line).is_some()
 }
 
-fn relative_line(line: &str, margin: usize) -> Option<&str> {
+pub(super) fn relative_line(line: &str, margin: usize) -> Option<&str> {
     let indent = line.len() - line.trim_start_matches(' ').len();
     (indent >= margin).then(|| &line[margin..])
 }
 
-fn indent_columns(line: &str) -> usize {
+pub(super) fn indent_columns(line: &str) -> usize {
     line.bytes()
         .take_while(|byte| matches!(byte, b' ' | b'\t'))
         .fold(0, |column, byte| {
@@ -171,7 +171,7 @@ fn indent_columns(line: &str) -> usize {
         })
 }
 
-fn list_margin(line: &str) -> Option<usize> {
+pub(super) fn list_margin(line: &str) -> Option<usize> {
     let item = unindent(line)?;
     if let Some(&marker @ (b'-' | b'*')) = item.as_bytes().first()
         && item.bytes().filter(|&byte| byte == marker).count() >= 3

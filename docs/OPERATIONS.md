@@ -300,7 +300,7 @@ Git 추적 파일에 쓰지 않는다. 아래 셋업은 별도 소유자 전용 
    Bot 설정의 **Privileged Gateway Intents → Message Content Intent**를 켠다.
    서버 메시지 본문을 수신하려면 코드의 intent 요청과 포털 설정이 모두 필요하다.
 2. 운영할 서버에 `bot`과 `applications.commands` 범위로 초대한다. 필요한 채널에 View Channel, Read Message History,
-   Send Messages, Send Messages in Threads, Create Public Threads, Attach Files, Add Reactions 권한을 부여한다.
+   Send Messages, Send Messages in Threads, Create Public Threads, Attach Files, Add Reactions 권한을 부여한다. 카드 표시에는 선택적으로 Embed Links 권한도 부여한다. 이 권한이 없거나 확인되지 않으면 카드가 코드 블록으로 전송된다.
    비공개 스레드 등은 봇이 실제로 접근할 수 있어야 한다. 관리자 권한은 요구하지 않는다.
 3. Discord 개발자 모드로 소유자 **사용자 ID**, 서버 ID, 허용할 **부모 채널 ID**를 복사한다.
    이름·멘션 문자열이 아니라 숫자로 된 ID 문자열을 설정한다.
@@ -713,6 +713,7 @@ high/middle/low는 명시적 `start`의 전용 초기 설정 턴에서 기존 �
 | `model` | 선택 항목. 헤드 시작에 사용할 OMP 모델 식별자. 생략 시 기존 OMP 설정을 따른다. 모든 새 레인의 기본값이 아니며 새 레인은 `lane_start`의 model 또는 preset으로 각각 선택한다. 재개는 저장된 레인 선택을 유지한다. |
 | `discord` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedGuildIds`, `allowedChannelIds` 모두 필수. |
 | `discord.requireAddressing` | 선택 불리언, 기본값 `false`. `true`이면 허용된 서버의 부모 채널과 이 봇이 만들지 않은 스레드에서 이 봇의 실제 멘션 또는 이 봇이 보낸 메시지에 대한 답장이 포함된 소유자의 일반 메시지만 접수한다. |
+| `discord.editProgressInPlace` | 선택 불리언, 기본값 `false`. `true`이면 Discord에서 한 요청의 중간 진행 보고를 새 메시지로 쌓지 않고 하나의 `⏳` 상태 메시지로 제자리 수정한다. |
 | `telegram` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedChatIds` 모두 필수. 그룹 chat ID의 음수 부호를 보존한다. |
 | `slack` | 선택 블록. 존재하면 `botTokenEnv`, `appTokenEnv`, `ownerId`, `teamId`, `allowedChannelIds` 모두 필수. |
 | `groupRooms` | 선택 목록. 등록한 방과 사용자에게만 아래 그룹 모드를 열며, 해당 방에서는 운영자도 일반 그룹 권한만 갖는다. 기본값은 빈 목록이다. |
