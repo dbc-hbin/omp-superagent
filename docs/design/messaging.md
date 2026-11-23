@@ -146,7 +146,11 @@ durable deferred-routing queue in the coordination store (`intake:deferred-routi
 receipted, and then searched and admitted in the background. Until it is admitted,
 every later input of the same physical channel or DM (including its threads and
 logical topics) is queued behind it, so none overtakes it; other conversations are
-not held. A redelivery of a queued input is deduplicated by its ID. A pending queued
+not held. A redelivery of a queued input shares the store's immutable-payload
+and signed attachment URL reconciliation. Recovery controls (`/restart`,
+`/stop head`) bypass deferred waiting so a failed admission cannot trap them,
+and a global HEAD stop snapshots receipt order across both queues without
+cancelling later requests or independent lane work. A pending queued
 choice fences the automatic history choice like an unreceipted Gateway event. A
 failed admission stays first in its conversation and is retried with bounded
 backoff; a permanent denial is dropped. The queue survives a restart and resumes

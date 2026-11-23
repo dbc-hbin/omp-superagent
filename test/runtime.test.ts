@@ -10330,6 +10330,91 @@ describe("deferred historical topic routing", () => {
     expect(reopened.input(`handoff:${first.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
     expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(first.text)]);
   });
+
+  test("global /stop head covers receipt order across deferred routing without cancelling post-stop or lane work", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current, worker, main, messenger } = historyFixture("available", search.promise);
+    await runtime.start();
+    const first = { ...message("730", destination, historicalRequest), receivedAt: historicalNow };
+    const preStopHead = { ...headMessage("731", destination, "Pre-stop HEAD work in A"), receivedAt: historicalNow + 1 };
+    const stopFromB = message("732", route("13"), "/stop head");
+    const postStopHead = { ...headMessage("733", destination, "Post-stop HEAD work in A"), receivedAt: historicalNow + 2 };
+
+    await runtime.receive(first);
+    await runtime.receive(preStopHead);
+    // /stop head from conversation B finishes while conversation A is still queued.
+    await runtime.receive(stopFromB);
+    await messenger.whenSent(1);
+    expect(store.output("732:head-control")?.text).toContain("HEAD stop confirmed");
+
+    // A request received in A after /stop head must NOT be cancelled.
+    await runtime.receive(postStopHead);
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+
+    // Independent lane work (first -> current) proceeds; pre-stop HEAD work is cancelled; post-stop HEAD work runs.
+    expect(store.input(preStopHead.id)?.state).toBe("cancelled");
+    expect(store.input(`handoff:${first.id}:${current.id}`)?.state).toBe("submitted");
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(first.text)]);
+    expect(main.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining("Post-stop HEAD work in A")]);
+  });
+
+  test("recovery controls in the same conversation bypass a persistently failing first deferred admission", async () => {
+    const { runtime, config, store, requests, handoff } = restartFixture();
+    const destination = route("53", { channelId: "4" });
+    if (!config.discord) throw new Error("Missing Discord config");
+    config.discord.allowedChannelIds.push("5");
+    const origReceive = store.receive.bind(store);
+    store.receive = (input, target, metadata, workflow) => {
+      if (input.id === "740") throw new Error("Transient store failure for first admission");
+      return origReceive(input, target, metadata, workflow);
+    };
+    handoff.respond = async request => ({
+      ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main",
+      sessionFile: hostPaths(config, "main").sessionFile, state: "accepted",
+    });
+    await runtime.start();
+    const failing = { ...message("740", destination, historicalRequest), receivedAt: historicalNow };
+    await runtime.receive(failing);
+    await runtime.routingSettled();
+    expect(store.input(failing.id)).toBeNull();
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]")).toHaveLength(1);
+
+    // /stop head in the same conversation is not trapped behind the failing first admission.
+    await runtime.receive(message("741", destination, "/stop head"));
+    await Bun.sleep(30);
+    expect(store.output("741:head-control")?.text).toContain("HEAD stop confirmed");
+
+    // /restart in the same conversation also bypasses the failed admission and hands off.
+    await runtime.receive(message("742", destination, "/restart"));
+    await Bun.sleep(30);
+    expect(store.output("742:restart-ack")?.state).toBe("sent");
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id)).toEqual([failing.id]);
+  });
+
+  test("deferred routing shares immutable-payload conflict detection and signed URL refresh reconciliation", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination } = historyFixture("available", search.promise);
+    await runtime.start();
+    const oldUrl = "https://cdn.discordapp.com/attachments/4/5/file.txt?ex=111&is=111&hm=old";
+    const refreshedUrl = "https://cdn.discordapp.com/attachments/4/5/file.txt?ex=222&is=222&hm=new";
+    const attachment = { id: "att-1", name: "file.txt", url: oldUrl, size: 12, contentType: "text/plain" };
+    const first = { ...message("750", destination, historicalRequest), receivedAt: historicalNow, attachments: [attachment] };
+
+    await runtime.receive(first);
+    await expect(runtime.receive({ ...first, text: "mutated payload" })).rejects.toThrow("Inbound identity conflict");
+    await runtime.receive({ ...first, attachments: [{ ...attachment, url: refreshedUrl }] });
+
+    const queued = JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]") as Inbound[];
+    expect(queued[0]?.attachments[0]?.url).toBe(refreshedUrl);
+
+    search.resolve();
+    await runtime.routingSettled();
+    expect(store.input(`handoff:${first.id}:current`) ?? store.input(first.id)).not.toBeNull();
+    expect(store.input(first.id)?.attachments[0]?.url).toBe(refreshedUrl);
+  });
 });
 
 describe("historical continuation in an existing Discord work thread", () => {

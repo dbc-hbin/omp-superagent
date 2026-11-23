@@ -166,6 +166,21 @@ function inboundIdentity(input: Inbound) {
     }).sort((left, right) => left.id.localeCompare(right.id)),
   };
 }
+
+/** Verify immutable inbound identity and return updated attachment URLs if refreshed, or null when unchanged. */
+export function reconcileInboundRedelivery(existing: Inbound, incoming: Inbound): Inbound | null {
+  if (isDeepStrictEqual(inboundData(existing), inboundData(incoming))) return null;
+  if (!isDeepStrictEqual(inboundIdentity(existing), inboundIdentity(incoming))) {
+    throw new Error(`Inbound identity conflict: ${incoming.id}`);
+  }
+  const urls = new Map(incoming.attachments.map(file => [file.id, file.url]));
+  const attachments = existing.attachments.map(file => {
+    const url = urls.get(file.id)!;
+    return file.url === url ? file : { ...file, url };
+  });
+  if (!attachments.some((file, index) => file !== existing.attachments[index])) return null;
+  return { ...existing, attachments };
+}
 const approvalIdentity = (approval: Approval) => ({
   id: approval.id, target: approval.target, generation: approval.generation,
   requestId: approval.requestId, route: approval.route, request: approval.request,
@@ -233,22 +248,12 @@ export class Store implements StorePort {
       const existing = this.input(input.id);
       if (existing) {
         if (!isDeepStrictEqual(existing.workflow, workflow)) throw new Error(`Workflow identity conflict: ${input.id}`);
-        if (isDeepStrictEqual(inboundData(existing), inboundData(input))) return false;
-        if (!isDeepStrictEqual(inboundIdentity(existing), inboundIdentity(input))) {
-          throw new Error(`Inbound identity conflict: ${input.id}`);
-        }
-        if (existing.state === "pending") {
-          const urls = new Map(input.attachments.map(file => [file.id, file.url]));
-          const attachments = existing.attachments.map(file => {
-            const url = urls.get(file.id)!;
-            return file.url === url ? file : { ...file, url };
-          });
-          if (attachments.some((file, index) => file !== existing.attachments[index])) {
-            // Refresh only URLs. In particular, do not rewrite the original
-            // activation in a pre-rename input as a side effect of redelivery.
-            this.db.query("UPDATE inputs SET data = json_set(data, '$.attachments', json(?)) WHERE id = ? AND state = 'pending'")
-              .run(JSON.stringify(attachments), input.id);
-          }
+        const refreshed = reconcileInboundRedelivery(existing, input);
+        if (existing.state === "pending" && refreshed) {
+          // Refresh only URLs. In particular, do not rewrite the original
+          // activation in a pre-rename input as a side effect of redelivery.
+          this.db.query("UPDATE inputs SET data = json_set(data, '$.attachments', json(?)) WHERE id = ? AND state = 'pending'")
+            .run(JSON.stringify(refreshed.attachments), input.id);
         }
         return false; // A replay never changes its current assignment or state.
       }
