@@ -7444,9 +7444,10 @@ describe("real Store runtime coordination", () => {
     expect(launched).toEqual([]);
   });
 
-  test.each(["Discord thread", "DM", "Slack question thread"] as const)("%s held at an old implicit workspace question retains its exact source without replay", async kind => {
+  test.each(["Discord thread", "steering in a Discord thread", "DM", "Slack question thread"] as const)("%s held at an old implicit workspace question retains its exact source without replay", async kind => {
     const { runtime, store, main, launched, config, messenger } = fixture();
     const slack = kind === "Slack question thread";
+    const steering = kind === "steering in a Discord thread";
     if (slack) config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
     const thread = slack ? route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" })
       : kind === "DM" ? route(null, { guildId: null, topicId: "old-work" }) : route("50");
@@ -7464,15 +7465,18 @@ describe("real Store runtime coordination", () => {
     const question = store.output("158:workspace");
     if (!question?.remoteId) throw new Error("Missing original workspace question");
     const destination = slack ? { ...thread, threadId: question.remoteId } : thread;
+    if (steering) await admit(runtime, headMessage("157", destination, "Review the release."));
     const followup = { ...message("159", kind === "DM" ? route(null, { guildId: null }) : destination, "Use @current.txt."),
       messageId: slack ? "1750000002.000003" : "159",
-      ...(kind === "Discord thread" ? { reply: { messageId: question.remoteId, text: "", authorId: thread.accountId } } : {}) };
+      ...(kind === "Discord thread" || steering ? { reply: { messageId: question.remoteId, text: "", authorId: thread.accountId } } : {}) };
     await admit(runtime, followup);
     await admit(runtime, followup);
-    expect(main.prompts).toHaveLength(1);
-    expect(main.prompts[0]?.command.message).toContain("Inspect \\u0040previous.txt before release.");
-    expect(main.prompts[0]?.command.message).not.toContain("@previous.txt");
-    expect(main.prompts[0]?.command.message).toContain(followup.text);
+    expect(main.prompts).toHaveLength(steering ? 2 : 1);
+    const prompt = main.prompts.at(-1)?.command;
+    expect(prompt?.streamingBehavior).toBe(steering ? "steer" : undefined);
+    expect(prompt?.message).toContain("Inspect \\u0040previous.txt before release.");
+    expect(prompt?.message).not.toContain("@previous.txt");
+    expect(prompt?.message).toContain(followup.text);
     expect(store.input(followup.id)).toMatchObject({ target: "main", route: destination, state: "submitted" });
     expect(store.input(original.id)).toMatchObject({ state: "pending", requestId: null });
     expect(store.output("159:workspace")).toBeNull();
@@ -7508,26 +7512,22 @@ describe("real Store runtime coordination", () => {
     expect(turn).not.toContain("candidateCount");
   });
 
-  test("an expired steering lookup cannot skip an earlier standalone HEAD request", async () => {
+  test("a steer whose run ends during native preflight cannot skip an earlier standalone HEAD request", async () => {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    const { runtime, config, store, main, hosts, messenger } = fixture(3, undefined, { topicMemory: {
-      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: false }),
-      search: async query => {
-        entered.resolve(); await release.promise;
-        return { backend: "mnemopi", query, items: [], count: 0 };
-      },
-    } });
-    const lane = savedLane(store, config, "context", route("55"), process.pid);
-    hosts.set(lane.socketPath, new HostTransport(lane.sessionFile, "session-context"));
+    const { runtime, store, main } = fixture();
     await runtime.start();
     await admit(runtime, headMessage("100", route("51"), "Original HEAD task"));
     await admit(runtime, headMessage("101", route("52"), "Queued first in another thread"));
+    main.beforeState = async () => {
+      main.beforeState = undefined;
+      entered.resolve();
+      await release.promise;
+    };
     await runtime.receive(message("102", route("51"), "Check the login parser."));
     try {
       await entered.promise;
       main.complete("First task finished");
-      await messenger.whenSent(1);
-      await runtime.kick();
+      expect(store.input("102")?.state).toBe("pending");
     } finally { release.resolve(); }
     await main.whenPrompts(2);
     expect(main.prompts[1]?.command.message).toContain("Queued first in another thread");
@@ -7535,6 +7535,29 @@ describe("real Store runtime coordination", () => {
     await main.whenPrompts(3);
     expect(main.prompts[2]?.command.message).toContain("Check the login parser.");
     expect(main.prompts[2]?.command.streamingBehavior).toBeUndefined();
+  });
+
+  test("an acknowledged approval wakes a pending steer in the same active HEAD run", async () => {
+    const { runtime, store, main, messenger } = fixture();
+    const destination = route("51");
+    await runtime.start();
+    await admit(runtime, headMessage("100", destination, "Review the proposed change."));
+    const frame = { type: "extension_ui_request", id: "steering-confirm", method: "confirm", title: "Proceed?", message: "Continue reviewing?" };
+    main.state.pendingUiRequests = [frame];
+    main.emit(frame);
+    await messenger.whenApproval();
+    const [card] = messenger.shown.values();
+    if (!card || !messenger.handlers) throw new Error("HEAD did not surface its approval");
+    await messenger.handlers.message(message("101", destination, "Recheck the parser before continuing."));
+    await runtime.kick();
+    expect(store.input("101")?.state).toBe("pending");
+
+    await messenger.handlers.answer(card.id, { confirmed: true }, card.route);
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(store.input("100")?.state).toBe("submitted");
+    expect(store.input("101")?.state).toBe("submitted");
+    expect(main.prompts[1]?.command.streamingBehavior).toBe("steer");
   });
 
   test("a slow HEAD routing lookup does not delay an existing thread or reorder HEAD work", async () => {

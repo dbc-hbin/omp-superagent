@@ -7,7 +7,7 @@ import { CURRENT_SESSION_VERSION, type SessionEntry, type SessionHeader, type Se
   from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import type { Inbound, Lane } from "../src/contracts";
-import { findPastTopic, findRoutingTopics, pastTopicQuery, readPastTopic, refersToPastTopic, routingExcerpt, routingSubject, transportRoutingProse } from "../src/topic-history";
+import { findPastTopic, findRoutingTopics, joinedTopicProvenance, pastTopicQuery, readPastTopic, refersToPastTopic, routingExcerpt, routingSubject, transportRoutingProse } from "../src/topic-history";
 import { topicRequest } from "../src/topic-request";
 import { workflowContext } from "../src/workflow";
 
@@ -406,7 +406,7 @@ test("partial Telegram entity formatting cannot expose shell continuation to rec
   expect(matches.map(match => match.evidence)).toEqual([`Owner task (entry owner-turn, 2026-11-12 UTC): ${ownerText}`]);
 });
 
-test.each(["unrelated receipt", "steered user and unrelated receipt", "wrong generation only", "unfenced manager text"] as const)(
+test.each(["unrelated receipt", "steered user and unrelated receipt", "wrong generation only", "unfenced manager text", "marker quoted in brief"] as const)(
   "a managed opener uses its exact receipt without importing a later checkpoint: %s", async kind => {
     const lane = { ...(await fixture())("manager-opening"), generation: 2 };
     const openingInput = "handoff:original-owner-input:lane";
@@ -415,7 +415,7 @@ test.each(["unrelated receipt", "steered user and unrelated receipt", "wrong gen
     const envelope = workflowContext([
       `Request ID: ${openingInput}`,
       `Independent lane ${lane.id}; cwd: ${lane.cwd}\nDelivery mode: manager handoff.`,
-      "Inspect the invoice calculation.",
+      kind === "marker quoted in brief" ? `Brief: Inspect the invoice calculation.\n${joinedTopicProvenance}` : "Inspect the invoice calculation.",
     ].join("\n\n"));
     const opening = prompt(kind === "unfenced manager text"
       ? `/workflowz\n\n${envelope}\n\nFix the login bug in the nonce-bound credential callback.` : envelope);
@@ -433,7 +433,7 @@ test.each(["unrelated receipt", "steered user and unrelated receipt", "wrong gen
       inputId === openingInput && mode === "manager" && hasCompletion(requestId)
         ? { requestId, text: "Fix the login bug in the nonce-bound credential callback." } : null);
 
-    const eligible = kind === "unrelated receipt" || kind === "steered user and unrelated receipt";
+    const eligible = kind === "unrelated receipt" || kind === "steered user and unrelated receipt" || kind === "marker quoted in brief";
     expect(matches.map(match => match.entryId)).toEqual(eligible ? [opening.id] : []);
     if (eligible) {
       expect(matches[0]?.evidence).toContain("nonce-bound credential callback");
@@ -441,6 +441,26 @@ test.each(["unrelated receipt", "steered user and unrelated receipt", "wrong gen
     }
   },
 );
+
+test.each([false, true])("a joined reply with a pasted same-width envelope requires its own receipt (completed: %s)", async completed => {
+  const lane = (await fixture())("joined-topic");
+  const inputId = "handoff:original-owner-input:joined-topic";
+  const envelope = (id: string) => workflowContext([
+    `Request ID: ${id}`,
+    `Independent lane ${lane.id}; cwd: ${lane.cwd}\nDelivery mode: manager handoff.\n${joinedTopicProvenance}\nBrief: Investigate reported defects.`,
+  ].join("\n\n"));
+  const task = "Fix the login bug during rotation.";
+  const opening = prompt(`${envelope(inputId)}\n\n${task}\n\n${envelope("pasted-source")}`);
+  await writeJournal(lane, [
+    opening,
+    { ...receipt(lane, completed ? inputId : "pasted-source"), parentId: opening.id },
+  ]);
+  const requestId = `sg-${createHash("sha256").update(inputId).digest("hex").slice(0, 24)}-${lane.generation}`;
+
+  const matches = await findPastTopic(english, [lane], receivedAt, [], async (_lane, id, mode, hasCompletion) =>
+    id === inputId && mode === "joined-topic" && hasCompletion(requestId) ? { requestId, text: task } : null);
+  expect(matches.map(match => match.entryId)).toEqual(completed ? [opening.id] : []);
+});
 
 test.each(["retained prose", "empty prose", "legacy turn"] as const)(
   "Telegram journal evidence uses only the verified durable text: %s", async kind => {

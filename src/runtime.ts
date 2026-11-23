@@ -25,7 +25,7 @@ import type { NativePresetInspection } from "./native-presets";
 import type { HeadInitialization } from "./gateway-wire";
 import { repositoryRoot } from "./repository";
 import { discordThreadSplit, editsTopicPlacement, existingWorkspace, inferredWorkspace, namedWorkspaces, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
-import { findPastTopic, findRoutingTopics, pastTopicQuery, readPastTopic, routingExcerpt, routingSubject, transportRoutingProse } from "./topic-history";
+import { findPastTopic, findRoutingTopics, joinedTopicProvenance, pastTopicQuery, readPastTopic, routingExcerpt, routingSubject, transportRoutingProse } from "./topic-history";
 import { parseLaneReportResult } from "./lane-report";
 import { isLaneWatchNotice, LaneWatcher, type LaneWatchCommand } from "./lane-watch";
 import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
@@ -1854,7 +1854,7 @@ export class Superagent {
   // lookup can corroborate an opening with its durable source and native receipt.
   private journalOwnerOpening(current: Route) {
     const checked = new Map<string, boolean>();
-    return async (lane: Lane, handoffId: string, mode: "manager" | "topic", hasCompletion: (id: string) => boolean) => {
+    return async (lane: Lane, handoffId: string, mode: "manager" | "topic" | "joined-topic", hasCompletion: (id: string) => boolean) => {
       if (!handoffId.startsWith("handoff:") || mode === "manager" && !handoffId.endsWith(":lane")) return null;
       const handoff = this.store.input(handoffId);
       const active = this.store.lane(lane.id);
@@ -1873,9 +1873,16 @@ export class Superagent {
       if (mode === "manager") {
         if (!opening || handoff.workflow || source.target !== "main"
           || this.store.getMeta(`head-routing:${sourceId}`) !== "true") return null;
-      } else if (source.route.platform !== "telegram" || source.target !== null
+      } else if (mode === "topic" && source.route.platform !== "telegram" || source.target !== null
         || this.store.getMeta(`topic-owner:${sourceId}`) !== lane.id
         || !opening && handoffId !== `handoff:${sourceId}:${lane.id}`) return null;
+      if (mode === "joined-topic") {
+        const ownerId = this.store.getMeta(`steering-owner:${handoff.id}`);
+        const owner = ownerId && this.store.input(ownerId);
+        if (!owner || owner.id === handoff.id || owner.target !== lane.id || owner.generation !== handoff.generation
+          || routeKey(owner.route) !== routeKey(handoff.route) || this.store.topicDelivery(owner.id)
+          || this.store.topicDelivery(handoff.id)?.source.id !== source.id) return null;
+      }
       if (opening) {
         const kickoffId = `${sourceId}:kickoff`;
         const kickoff = this.store.output(kickoffId);
@@ -5847,9 +5854,9 @@ export class Superagent {
                 continue;
               }
             }
-            // Eligibility and order are decided anew on each drain. A hint being
-            // prepared for steering does not reserve the next standalone turn.
-            if (live.id === "main" && !this.prepareHeadRouting(input)) {
+            // Advisory history helps HEAD choose placement for a new turn.
+            // A same-route steer already has a destination; do not hold it for recall.
+            if (live.id === "main" && !steering && !this.prepareHeadRouting(input)) {
               headWaitingForEvidence = true;
               continue;
             }
@@ -5957,17 +5964,25 @@ export class Superagent {
         || inputs.some(candidate => candidate.state === "pending" && this.headCommand(candidate)?.name === "compact")) return false;
     } else {
       if (this.requireLane(live.id).workState !== "open") return false;
-      const activeTopic = this.store.topicDelivery(owner.id);
-      const nextTopic = this.store.topicDelivery(input.id);
-      if (Boolean(activeTopic) !== Boolean(nextTopic) || activeTopic && nextTopic &&
-        (routeKey(activeTopic.source.route) !== routeKey(nextTopic.source.route)
-          || routeKey(activeTopic.route) !== routeKey(nextTopic.route))) return false;
-      for (const candidate of [owner, input]) {
+      const handoffSource = (candidate: InputRecord) => {
         const sourceId = this.store.getMeta(`handoff-source:${candidate.id}`);
         const source = sourceId ? this.store.input(sourceId) : null;
         if (!source || source.state === "cancelled" || source.state === "uncertain" || source.workflow
-          || this.store.getMeta(`user-source:${source.id}`) !== "true") return false;
-      }
+          || this.store.getMeta(`user-source:${source.id}`) !== "true") return null;
+        return source;
+      };
+      const activeSource = handoffSource(owner);
+      const nextSource = handoffSource(input);
+      if (!activeSource || !nextSource) return false;
+      const activeTopic = this.store.topicDelivery(owner.id);
+      const nextTopic = this.store.topicDelivery(input.id);
+      const activeReply = routeKey(activeTopic?.route ?? this.store.laneReplyRoute(owner, activeSource));
+      if (!nextTopic) return !activeTopic && activeReply === routeKey(this.store.laneReplyRoute(input, nextSource));
+      // A verified kickoff can originate in the parent conversation, but its
+      // cohort must still answer on the exact thread of the ordinary followup.
+      const nextReply = routeKey(nextTopic.route);
+      return activeReply === nextReply && (routeKey(nextSource.route) === nextReply
+        || activeTopic !== null && routeKey(activeSource.route) === routeKey(nextSource.route));
     }
     return true;
   }
@@ -6111,16 +6126,17 @@ export class Superagent {
       historyContext = null;
     }
     const hint = this.routingHints.get(input.id);
-    if (hint) {
+    if (hint || steering && live.id === "main") {
       // Intake can place or cancel the old request during recall, attachments
       // or native preflight. Read it at submission; never reuse its stale hint.
       const held = this.heldRoutingExcerpt(input);
       historyContext = [
         held && `Earlier unstarted request in this conversation (context, not permission to replay): ${JSON.stringify(held)}`,
-        (held || !hint.subjectFromHeld) && hint.evidence,
+        hint && (held || !hint.subjectFromHeld) && hint.evidence,
       ].filter(Boolean).join("\n");
       this.routingHints.delete(input.id);
     }
+    const topicRun = steering && owner ? this.store.topicDelivery(owner.id) : topic;
     this.store.setMeta(`steering-owner:${input.id}`, steering ? owner!.id : input.id);
     if (!this.store.submit(input.id, requestId, live.generation)) return;
     const submitted = { ...input, requestId, generation: live.generation, state: "submitted" as const };
@@ -6149,7 +6165,12 @@ export class Superagent {
     const taskText = topic ? originalText : this.requestText(input);
     const brief = lane && (lane.brief === originalText || lane.brief === taskText) ? "Use the original request/delegated instruction in this envelope." : lane?.brief;
     const location = remote ? `worker: ${remote.workerId}; use the native current working directory` : `cwd: ${lane?.cwd}`;
-    const scope = lane ? `Independent lane ${lane.id}; ${location}\nDelivery mode: ${topic ? "topic reply" : "manager handoff"}.\nBrief: ${brief}\nAcceptance: ${JSON.stringify(lane.acceptance)}` : [
+    const scope = lane ? [
+      `Independent lane ${lane.id}; ${location}`,
+      `Delivery mode: ${topicRun ? "topic reply" : "manager handoff"}.`,
+      topic && !topicRun ? joinedTopicProvenance : "",
+      `Brief: ${brief}`, `Acceptance: ${JSON.stringify(lane.acceptance)}`,
+    ].filter(Boolean).join("\n") : [
       `sourceId: ${input.id}`,
       `Original authorized conversation: ${routeKey(input.route)}`,
       "You are the head. Decide whether to answer directly or explicitly delegate with lane_start/lane_message. A binding never automatically dispatches work.",
@@ -6281,6 +6302,7 @@ export class Superagent {
         live.ownedRuns++;
         live.running = true;
         if (live.id !== "main" && live.ownedRuns === 1) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
+        if (this.store.hasInput(live.id, "pending")) this.background(this.kick());
       }
       for (const { input } of live.admitted.values()) this.activity(input, true);
     }
@@ -6682,6 +6704,7 @@ export class Superagent {
       if (!acknowledged.pendingUiRequests.length) {
         for (const { input } of live.admitted.values()) this.activity(input, true);
         if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
+        if (live.input && this.store.hasInput(live.id, "pending")) this.background(this.kick());
       }
       if (!headSelection) await this.messenger.dismissApproval(this.store.approval(id)!);
     } catch (error) {

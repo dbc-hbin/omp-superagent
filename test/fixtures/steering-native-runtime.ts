@@ -251,8 +251,8 @@ export async function nativeSteeringRuntime(): Promise<void> {
       isSettled: true, settingsScope: "session", model: steeringModel });
     await runtime.start();
 
-    const first = headInput("101", route, "First head request [native-barrier:head-live]");
-    const follow = headInput("102", route, "Ordinary same-route followup [native-follow]");
+    const first = inbound("101", route, "First head request [native-barrier:head-live]");
+    const follow = inbound("102", route, "Ordinary same-route followup [native-follow]");
     const cross = headInput("103", otherRoute, "Independent cross-topic request [native-cross]");
     await messenger.deliver(first);
     const firstGate = await gate("head-live");
@@ -309,7 +309,7 @@ export async function nativeSteeringRuntime(): Promise<void> {
       { requestId: first.id, sourceId: first.id }, { requestId: follow.id, sourceId: follow.id }, { requestId: cross.id, sourceId: cross.id },
     ]);
 
-    const sourceOne = headInput("201", route, "[native-delegate] Topic one [native-barrier:lane-one]");
+    const sourceOne = inbound("201", route, "[native-delegate] Topic one [native-barrier:lane-one]");
     const sourceTwo = headInput("202", route, "[native-delegate] Topic two [native-barrier:lane-two]");
     await messenger.deliver(sourceOne);
     await wait(() => done(sourceOne.id), "first explicit lane source reaches head");
@@ -338,17 +338,13 @@ export async function nativeSteeringRuntime(): Promise<void> {
     const laneConnectionTwo = await HostConnection.connect(laneStateTwo.socketPath);
     connections.add(laneConnectionOne);
     connections.add(laneConnectionTwo);
-    const laneFollow = headInput("203", laneStateOne.route, "[native-delegate] Explicitly send an update to running topic one");
+    const laneFollow = inbound("203", laneStateOne.route, "Use the archive checksum delimiter [native-follow]");
     await messenger.deliver(laneFollow);
-    await wait(() => done(laneFollow.id) && messenger.sent.some(output => output.sourceId === laneFollow.id),
-      "bound-route ordinary message is acknowledged by head, not automatically dispatched");
-    expect(messenger.sent.filter(output => output.sourceId === laneFollow.id)).toEqual([
-      expect.objectContaining({ route: laneStateOne.route, text: `Native dispatch acknowledged ${laneFollow.id}; awaiting explicit lane coordination.` }),
-    ]);
-    expect((await laneConnectionOne.client.getState()).queuedMessageCount).toBe(0);
-    await runtime.messageLane(laneOne.id, "Explicit running-lane followup [native-follow]", laneFollow.id);
     const laneOwner = `handoff:${sourceOne.id}:lane`;
     const laneJoined = `handoff:${laneFollow.id}:${laneOne.id}`;
+    await runtime.kick();
+    expect(store.input(laneFollow.id)).toMatchObject({ target: null, state: "done", route: laneStateOne.route });
+    expect(store.input(laneJoined)).toMatchObject({ target: laneOne.id, state: "submitted", route: laneStateOne.route });
     await checkpoint(laneConnectionOne, 1);
     await wait(() => admissions.some(value => value.id === store.input(laneJoined)?.requestId), "real lane steer admission");
     expect((await laneConnectionTwo.client.getState()).queuedMessageCount).toBe(0);
@@ -383,6 +379,12 @@ export async function nativeSteeringRuntime(): Promise<void> {
     expect(await laneConnectionOne.client.getSubagents()).toEqual([]);
     expect(await laneConnectionTwo.client.getSubagents()).toEqual([]);
 
+    const historyLookup = inbound("204", route, "Inspect the archive checksum delimiter.");
+    await messenger.deliver(historyLookup);
+    await wait(() => done(historyLookup.id), "HEAD lookup for owner text introduced only by the joined reply");
+    const lookup = admissions.find(value => value.id === store.input(historyLookup.id)?.requestId);
+    expect(lookup?.command.message).toContain(`"candidateCount":1,"candidates":[{"laneId":"${laneOne.id}"`);
+
     // Detach/restart the controller, keeping the actual native hosts and durable ledger.
     await runtime.stop();
     expect(messenger.handlers).toBeUndefined();
@@ -399,7 +401,7 @@ export async function nativeSteeringRuntime(): Promise<void> {
     await messenger.deliver(follow);
     await messenger.deliver(sourceOne);
     expect((await runtime.startLane(selection(sourceOne.id, 0))).id).toBe(laneOne.id);
-    await runtime.messageLane(laneOne.id, "Explicit running-lane followup [native-follow]", laneFollow.id);
+    await messenger.deliver(laneFollow);
     await runtime.kick();
     expect(messenger.creations).toHaveLength(2);
     expect(messenger.sent).toHaveLength(beforeReplay.sent);

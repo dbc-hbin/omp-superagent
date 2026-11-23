@@ -664,9 +664,22 @@ export class Store implements StorePort {
       if (lane && (lane.generation !== generation || lane.workState !== "open")) return false;
       const submitted = this.db.query(`UPDATE inputs SET state = 'submitted', request_id = ?, generation = ?
         WHERE id = ? AND state = 'pending'`).run(requestId, generation, id).changes === 1;
+      const ownerId = submitted && lane ? this.getMeta(`steering-owner:${id}`) : null;
+      if (ownerId && ownerId !== id) {
+        const topic = this.topicDelivery(id);
+        if (topic && !this.topicDelivery(ownerId)) {
+          const owner = this.input(ownerId);
+          const source = owner && this.ownerSource(owner.id);
+          if (!owner || !source || owner.state !== "submitted" || owner.target !== input.target || owner.generation !== generation
+            || routeKey(owner.route) !== routeKey(input.route) || routeKey(this.laneReplyRoute(owner, source)) !== routeKey(topic.route)) {
+            throw new Error(`Steering reply route differs from the current lane run: ${id}`);
+          }
+          // A later lane_start of the manager source must not redirect this cohort.
+          this.setMeta(`steering-topic-reply:${owner.id}`, JSON.stringify(topic.route));
+        }
+      }
       if (submitted && lane?.route.platform === "discord" && lane.route.guildId && lane.route.threadId) {
-        const owner = this.getMeta(`steering-owner:${id}`);
-        if (owner === null || owner === id) this.setMeta(`lane-latest-run:${lane.id}`, id);
+        if (ownerId === null || ownerId === id) this.setMeta(`lane-latest-run:${lane.id}`, id);
       }
       return submitted;
     }).immediate();
@@ -720,7 +733,7 @@ export class Store implements StorePort {
       const previous = this.getMeta(pendingKey);
       if (previous) this.db.query("UPDATE inputs SET state = 'cancelled' WHERE id = ? AND state = 'pending'").run(previous);
       this.receive({
-        id: receiptId, route: this.deliveryRoute(source), messageId: source.messageId,
+        id: receiptId, route: this.laneReplyRoute(input, source), messageId: source.messageId,
         receivedAt: source.receivedAt, attachments: [],
         ...(source.interactionId === undefined ? {} : { interactionId: source.interactionId }),
         ...(source.invocationId === undefined ? {} : { invocationId: source.invocationId }),
@@ -847,7 +860,7 @@ export class Store implements StorePort {
         const receiptId = input.state === "uncertain" ? `${reportId}:${state}` : reportId;
         this.receive({
           id: receiptId,
-          route: this.deliveryRoute(source), messageId: source.messageId, receivedAt: source.receivedAt, attachments: [],
+          route: this.laneReplyRoute(input, source), messageId: source.messageId, receivedAt: source.receivedAt, attachments: [],
           ...(source.interactionId === undefined ? {} : { interactionId: source.interactionId }),
           ...(source.invocationId === undefined ? {} : { invocationId: source.invocationId }),
           text: [
@@ -975,6 +988,11 @@ export class Store implements StorePort {
       this.setMeta(`head:recovery:${expected.inputId}`, JSON.stringify(decided));
       return true;
     }).immediate();
+  }
+
+  laneReplyRoute(input: InputRecord, source: InputRecord): Route {
+    const pinned = this.getMeta(`steering-topic-reply:${input.id}`);
+    return pinned ? JSON.parse(pinned) : this.deliveryRoute(source);
   }
 
   private deliveryRoute(source: InputRecord, expectedLane?: string | null): Route {

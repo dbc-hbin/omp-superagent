@@ -310,6 +310,8 @@ export interface StorePort {
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   ownerSource(id: string): InputRecord | null;
+  /** Manager handoff's verified reply route, pinned if a bound reply joined its run. */
+  laneReplyRoute(input: InputRecord, source: InputRecord): Route;
   /** Exact original owner and authorized delivery route for a topic-owned lane input. */
   topicDelivery(id: string): { readonly source: InputRecord; readonly route: Route; readonly outputSourceId: string } | null;
   /** Whether an unowned dialog could belong to a durable topic admission on this native generation. */
