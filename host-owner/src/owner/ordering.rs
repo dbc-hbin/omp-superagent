@@ -206,6 +206,7 @@ async fn stock_state_cannot_advertise_an_unattested_journal_cursor() {
                 generation: None,
                 instance_key: None,
                 worker_attempt: None,
+                pr_review_only: false,
                 journal_cursor: false,
             })
             .is_ok()
@@ -253,6 +254,7 @@ async fn journal_cursor_waits_for_durable_observations_and_validates_its_owner()
                 generation: Some(json!(2)),
                 instance_key: Some(json!("instance")),
                 worker_attempt: None,
+                pr_review_only: false,
                 journal_cursor: true,
             })
             .is_ok()

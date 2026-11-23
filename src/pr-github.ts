@@ -43,12 +43,12 @@ export function prKey(ref: PrRef): string {
   return `${parsed.owner}/${parsed.repo}#${parsed.number}`;
 }
 
-async function api<T extends TSchema>(endpoint: string, schema: T, signal: AbortSignal): Promise<Static<T>> {
+async function api<T extends TSchema>(endpoint: string, schema: T, signal: AbortSignal, env?: NodeJS.ProcessEnv): Promise<Static<T>> {
   if (signal.aborted) throw new PrReadError("aborted");
   const output = await new Promise<string>((resolve, reject) => {
     execFile("gh", ["api", "--hostname", "github.com", "--method", "GET", "--paginate", "--slurp",
       "--header", "Accept: application/vnd.github+json", endpoint],
-    { encoding: "utf8", timeout: 30_000, maxBuffer: 16 * 1024 * 1024, signal }, (error, stdout) => {
+    { encoding: "utf8", timeout: 30_000, maxBuffer: 16 * 1024 * 1024, signal, env }, (error, stdout) => {
       if (error) reject(new PrReadError(signal.aborted ? "aborted" : "request"));
       else resolve(stdout);
     });
@@ -56,6 +56,8 @@ async function api<T extends TSchema>(endpoint: string, schema: T, signal: Abort
   if (signal.aborted) throw new PrReadError("aborted");
   return parseWire(schema, output);
 }
+
+export { api as readGitHubApi };
 
 function fingerprint(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 24);

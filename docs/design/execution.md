@@ -360,6 +360,28 @@ discarding custom commands or enabling disabled extensions.
   run, not interrupt submitted or uncertain work. Delivery uses the normal
   head outbox. See the [operator reference](../OPERATIONS.md#예약-작업-cron)
   for schedule syntax and controls.
+- [Repository PR intake](../../src/cron-pr-intake.ts) is a typed cron job, not
+  an executable prompt. Only original configured-owner Discord guild parent
+  controls enroll a repository. Discovery pins the authenticated GitHub owner
+  and repository, filters old/self-authored PRs, and records each offer before
+  delivery. The separately authenticated registration/mode action sets a bounded
+  unattended ceiling: review/comment, safe fix, or protected merge. The confirmed
+  bot offer's Discord snowflake identifies the one thread for that PR. A
+  noninteractive controller receipt admits an exact SHA to a tool-less native
+  lane; it is not owner input and cannot serve as a source for manager tools.
+  No ordinary scheduled prompt, observed PR text or model answer grants authority.
+  Older discovery-only registrations remain manual until the owner opts in.
+  [Review control](../../src/pr-intake-review.ts) binds subsequent actions to
+  that lane, route, enrollment epoch, review input, delivered answer and SHA.
+  Static review uses a trusted workspace without a contributor checkout. Unlike
+  ordinary coding lanes, this restricted local Host must attest a tool-less
+  session on a supported native provider before the controller submits patch
+  data. It does not need manager, coordination, shell or editing tools. Fix
+  proposals and merge verdicts are data, not standing write authority. Each
+  effect checks the enrolled repository, original route and policy revision;
+  higher stages require an explicit policy or a fresh SHA-bound owner command.
+  An uncertain write permits read-only reconciliation, not resubmission. See [operator commands
+  and supported GitHub protections](../OPERATIONS.md#새-외부-pr-검토-cron-pr-add).
 - [PR watch](../../src/pr-watch.ts) reads only explicitly registered GitHub PRs
   through existing `gh` authentication and GETs. Establish a quiet baseline,
   then record changed observations and their cursor together. Work only while
