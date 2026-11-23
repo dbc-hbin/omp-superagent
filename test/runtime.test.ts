@@ -2435,6 +2435,129 @@ describe("same-HEAD evidence recovery", () => {
     } finally { clock.mockRestore(); }
   });
 
+  const refusalRun = { hostPid: process.pid, runOrdinal: 1, instanceKey: "fixture-refusal-instance" };
+  const refusalError = { provider: executionModel.provider, model: executionModel.id, retryable: false,
+    message: "Refusal (reasoning_extraction): blocked by provider policy" };
+  async function failHeadRun(instance: ReturnType<typeof fixture>, beforeRefusal: unknown[] = []) {
+    const { main } = instance;
+    const original = main.prompts.at(-1);
+    if (!original) throw new Error("Original HEAD request was not admitted");
+    const frame = { type: "prompt_result", id: original.id, status: "error", agentInvoked: true, sessionSettled: true,
+      error: refusalError };
+    const start = main.entries.findIndex(entry => (entry as { id?: string }).id === `start-${original.id}`);
+    main.entries[start] = nativeEntry(main, `start-${original.id}`, "rpc_agent_start", refusalRun);
+    main.entries.push(...beforeRefusal,
+      { id: "provider-refusal", type: "custom", customType: "provider_refusal",
+        data: { provider: refusalError.provider, model: refusalError.model, stopType: "refusal", category: "reasoning_extraction" } },
+      { type: "model_usage", id: "refusal-usage", provider: refusalError.provider, model: refusalError.model },
+      nativeEntry(main, "refusal-receipt", "rpc_prompt_result", { ...refusalRun, frame }),
+    );
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit(frame);
+    main.emit({ type: "session_settled" });
+    return original;
+  }
+
+  test("a settled tool-free provider refusal closes as failed and later HEAD work proceeds", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("refused", route("refused-route")));
+    const original = await failHeadRun(instance);
+    await messenger.whenSent(1);
+    expect(store.input("refused")?.state).toBe("cancelled");
+    expect(messenger.sent[0]).toMatchObject({ sourceId: "refused", route: route("refused-route") });
+    expect(messenger.sent[0]!.text).toContain("다음 요청은 계속 처리합니다");
+    expect(messenger.sent[0]!.text).not.toContain("/resolve");
+
+    await admit(runtime, headMessage("after-refusal", route("later-route")));
+    await main.whenPrompts(2);
+    const later = store.input("after-refusal");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id, later?.requestId ?? "missing"]);
+    main.complete("Later work answered");
+    await messenger.whenSent(2);
+    await runtime.kick();
+    expect(store.input("after-refusal")?.state).toBe("done");
+    expect(messenger.sent.at(-1)).toMatchObject({ sourceId: "after-refusal", text: "Later work answered" });
+  });
+
+  test("a provider failure after a started tool stays uncertain, names /resolve and notices the hold once", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("tool-then-refusal", route("refused-route")));
+    await failHeadRun(instance, [
+      { id: "tool-call", type: "message", message: { role: "assistant", stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "started-tool", name: "bash", arguments: {} }] } },
+      { id: "tool-start", type: "custom", customType: "tool_execution_start", data: { toolCallId: "started-tool", toolName: "bash" } },
+      { id: "tool-result", type: "message", message: { role: "toolResult", toolCallId: "started-tool" } },
+    ]);
+    await messenger.whenSent(1);
+    expect(store.input("tool-then-refusal")?.state).toBe("uncertain");
+    expect(messenger.sent[0]).toMatchObject({ sourceId: "tool-then-refusal" });
+    expect(messenger.sent[0]!.text).toContain("/resolve tool-then-refusal");
+
+    await admit(runtime, headMessage("held-first", route("later-route")));
+    await messenger.whenSent(2);
+    expect(messenger.sent[1]).toMatchObject({ id: "held-first:head-held", sourceId: "held-first", route: route("later-route") });
+    expect(messenger.sent[1]!.text).toContain("/resolve tool-then-refusal");
+    await admit(runtime, headMessage("held-second", route("later-route")));
+    await runtime.kick();
+    // The queue pass records a notice synchronously; a later held message gets none.
+    expect(store.output("held-second:head-held")).toBeNull();
+    expect(messenger.sent.filter(output => output.id.endsWith(":head-held"))).toHaveLength(1);
+    expect(store.input("held-first")?.state).toBe("pending");
+    expect(store.input("held-second")?.state).toBe("pending");
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  function heldRefusal(instance: ReturnType<typeof fixture>, afterReceipt: unknown[]) {
+    const { main, store } = instance;
+    const id = saved(instance, "held-refusal");
+    main.entries = [
+      nativeEntry(main, "refusal-start", "rpc_agent_start", refusalRun),
+      { id: "refusal-user", type: "message", message: { role: "user", content: "Original authorized work" } },
+      { id: "provider-refusal", type: "custom", customType: "provider_refusal", data: { stopType: "refusal" } },
+      nativeEntry(main, "refusal-receipt", "rpc_prompt_result", { ...refusalRun,
+        frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error: refusalError } }),
+      // A restart appends native lifecycle and extension state records after the settled receipt.
+      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal" } },
+      { id: "restart-context", type: "custom_message", customType: "extension-state-context", content: "state" },
+      ...afterReceipt,
+    ];
+    store.settle(id, "uncertain");
+    return id;
+  }
+
+  test("a restart closes an already held tool-free failure from the exact native journal", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    const id = heldRefusal(instance, []);
+    await runtime.start();
+    await admit(runtime, headMessage("after-restart"));
+    await main.whenPrompts(1);
+    expect(store.input(id)?.state).toBe("cancelled");
+    expect(messenger.sent.find(output => output.id === `${id}:tool-free-failure`)).toMatchObject({ sourceId: id });
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([store.input("after-restart")?.requestId ?? "missing"]);
+  });
+
+  test.each([
+    ["an unattributed assistant message", { id: "late-assistant", type: "message", message: { role: "assistant", stopReason: "aborted", content: [] } }],
+    ["a later tool start", { id: "late-tool", type: "custom", customType: "tool_execution_start", data: { toolCallId: "late" } }],
+  ] as const)("%s after the settled receipt keeps a restarted refusal on hold", async (_, late) => {
+    const instance = fixture();
+    const { runtime, main, store } = instance;
+    const id = heldRefusal(instance, [late]);
+    await runtime.start();
+    await admit(runtime, headMessage("after-unproven-restart"));
+    expect(store.input(id)?.state).toBe("uncertain");
+    expect(store.input("after-unproven-restart")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+  });
+
   test.each(["prior tool execution", "foreign native PID", "foreign native instance", "different native run"] as const)(
     "%s keeps a later Codex quota failure on manual hold", async scenario => {
     const now = Date.now();
