@@ -1485,21 +1485,207 @@ describe("source-bound Discord topic management", () => {
     expect(messenger.threads).toEqual([]);
   });
 
-  function managedThread(instance: ReturnType<typeof fixture>) {
+  function managedThread(instance: ReturnType<typeof fixture>, title = "Original", pid: number | null = null) {
     const { store, config, messenger } = instance;
-    const lane = savedLane(store, config, "managed-thread", route("123"));
-    let current: ThreadInfo = { route: lane.route, title: "Original", archived: false,
+    const lane = savedLane(store, config, "managed-thread", route("123"), pid);
+    let current: ThreadInfo = { route: lane.route, title, archived: false,
       requiresTag: false, availableTags: [{ id: "101", name: "Work", moderated: false }], appliedTags: ["101"] };
     const edits: ThreadUpdate[] = [];
+    const titleWaiters = new Map<string, () => void>();
     messenger.inspectThread = async () => structuredClone(current);
     messenger.updateThread = async (destination, changes) => {
       edits.push(changes);
       current = { ...current, route: destination, ...changes };
+      titleWaiters.get(current.title)?.();
+      titleWaiters.delete(current.title);
       return structuredClone(current);
     };
     const source = (id: string) => store.receive(message(id, lane.route), "main", { [`user-source:${id}`]: "true" });
-    return { lane, source, edits, current: () => current };
+    const whenTitle = (expected: string) => {
+      if (current.title === expected) return Promise.resolve();
+      const reached = Promise.withResolvers<void>();
+      titleWaiters.set(expected, reached.resolve);
+      return reached.promise;
+    };
+    return { lane, source, edits, current: () => current, whenTitle };
   }
+
+  test("a delivered lane report checks off the working title without closing the lane, and a follow-up marks it again", async () => {
+    const instance = fixture();
+    const { runtime, store, main, hosts, messenger } = instance;
+    const f = managedThread(instance);
+    const source = message("1750000000000000401", f.lane.route, "Implement the usage reset.");
+    await runtime.start();
+    await delegate(runtime, source);
+    await f.whenTitle("⏳ Original");
+    const worker = hosts.get(f.lane.socketPath);
+    if (!worker) throw new Error("The lane must own a native transport");
+    worker.complete("Usage reset verified.");
+    await main.whenPrompts(1);
+    expect(f.current().title).toBe("⏳ Original");
+    main.complete("Verified the usage reset.");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]).toMatchObject({ route: f.lane.route, sourceId: `report:handoff:${source.id}:${f.lane.id}` });
+    await f.whenTitle("✅ Original");
+    expect(f.current()).toMatchObject({ title: "✅ Original", archived: false, appliedTags: ["101"] });
+    expect(store.lane(f.lane.id)).toMatchObject({ workState: "open", runtimeState: "idle", result: null });
+
+    const followup = message("1750000000000000402", f.lane.route, "Check the follow-up.");
+    await admit(runtime, followup);
+    await worker.whenPrompts(2);
+    await f.whenTitle("⏳ Original");
+    const request = { type: "extension_ui_request", id: "owner-check", method: "confirm", title: "Confirm", message: "Proceed?" };
+    worker.state.pendingUiRequests = [request];
+    worker.emit(request);
+    await messenger.whenApproval();
+    worker.emit({ type: "agent_end", isTerminal: false });
+    await admit(runtime, applicationCommand("1750000000000000403", f.lane.route));
+    expect(f.current().title).toBe("⏳ Original");
+    const followupAnswer = messenger.whenSent(messenger.sent.length + 1);
+    worker.complete("Follow-up verified.");
+    await followupAnswer;
+    expect(messenger.sent.at(-1)).toMatchObject({ route: f.lane.route });
+    expect(f.current().title).toBe("⏳ Original");
+    const approval = [...messenger.shown.values()][0];
+    if (!approval || !messenger.handlers) throw new Error("The approval must be reachable on the original route");
+    await messenger.handlers.answer(approval.id, { confirmed: true }, approval.route);
+    await f.whenTitle("✅ Original");
+    expect(f.edits).toEqual([
+      { title: "⏳ Original" }, { title: "✅ Original" },
+      { title: "⏳ Original" }, { title: "✅ Original" },
+    ]);
+  });
+
+  for (const scenario of ["sent", "rate-limited", "recovered", "failed", "prior-uncertain", "older-admitted-last"] as const) {
+    test(`startup reconciles stale titles from saved ${scenario} delivery without restarting work`, async () => {
+      const instance = fixture();
+      const { runtime, store, main, launched, messenger } = instance;
+      const f = managedThread(instance, scenario === "prior-uncertain" ? "✅ Original"
+        : scenario === "recovered" ? "Original" : "⏳ Original");
+      const earlier = message("1750000000000000410", f.lane.route);
+      if (scenario === "prior-uncertain" || scenario === "older-admitted-last") store.receive(earlier, f.lane.id);
+      if (scenario === "prior-uncertain") {
+        store.submit(earlier.id, "earlier-run", f.lane.generation);
+        store.settle(earlier.id, "done", { id: `${earlier.id}:answer`, text: "Earlier native result." });
+        const report = `report:${earlier.id}`;
+        const answer = `${report}:answer`;
+        store.settle(report, "done", { id: answer, text: "Earlier result." });
+        store.claimOutput(answer);
+        store.finishOutput(answer, "uncertain");
+      }
+      const saved = message("1750000000000000411", f.lane.route);
+      const joined = message("1750000000000000412", f.lane.route);
+      store.receive(saved, f.lane.id);
+      store.submit(saved.id, "original-run", f.lane.generation);
+      store.receive(joined, f.lane.id, { [`steering-owner:${joined.id}`]: saved.id });
+      store.submit(joined.id, "joined-run", f.lane.generation);
+      store.settle(joined.id, "done");
+      const originalReport = `report:${saved.id}`;
+      if (scenario === "recovered") {
+        store.settle(saved.id, "uncertain", { id: `${saved.id}:admission`, text: "Acknowledgement lost." });
+        const notice = `${originalReport}:answer`;
+        store.settle(originalReport, "done", { id: notice, text: "The request outcome is unknown." });
+        store.claimOutput(notice);
+        store.finishOutput(notice, "sent", "uncertainty-notice");
+      }
+      store.settle(saved.id, "done", { id: `${saved.id}:answer`, text: "Original native result." });
+      const report = scenario === "recovered" ? `${originalReport}:done` : originalReport;
+      const answer = `${report}:answer`;
+      if (scenario !== "recovered") {
+        store.settle(report, "done", { id: answer, text: "Verified result." });
+        store.claimOutput(answer);
+        if (scenario === "failed") store.finishOutput(answer, "failed");
+        else store.finishOutput(answer, "sent", "existing-remote-message");
+      }
+      if (scenario === "older-admitted-last") {
+        store.submit(earlier.id, "last-admitted-run", f.lane.generation);
+        store.settle(earlier.id, "cancelled");
+      }
+      if (scenario === "rate-limited") {
+        const apply = messenger.updateThread;
+        if (!apply) throw new Error("Missing fixture thread editor");
+        messenger.updateThread = async (destination, changes) => {
+          messenger.updateThread = apply;
+          throw new DeliveryError("Discord REST request rejected (429)", "rejected", 1);
+        };
+      }
+      const title = scenario === "prior-uncertain" ? "⏳ Original"
+        : scenario === "failed" || scenario === "older-admitted-last" ? "Original" : "✅ Original";
+      await runtime.start();
+      if (scenario === "recovered") {
+        await main.whenPrompts(1);
+        await f.whenTitle("⏳ Original");
+        expect(f.current().title).toBe("⏳ Original");
+        main.complete("The recovered request succeeded.");
+        await messenger.whenSent(1);
+        expect(messenger.sent[0]?.id).toBe(answer);
+      }
+      await f.whenTitle(title);
+      expect(f.current()).toMatchObject({ title, archived: false, appliedTags: ["101"] });
+      expect(launched).toEqual([]);
+      expect(main.prompts).toHaveLength(scenario === "recovered" ? 1 : 0);
+    });
+  }
+
+  test("an answered approval still awaiting native confirmation holds the title on startup", async () => {
+    const instance = fixture();
+    const { runtime, store, hosts, messenger } = instance;
+    const f = managedThread(instance, "✅ Original", process.pid);
+    const host = new HostTransport(f.lane.sessionFile, `session-${f.lane.id}`);
+    hosts.set(f.lane.socketPath, host);
+    const saved = message("1750000000000000413", f.lane.route);
+    store.receive(saved, f.lane.id);
+    store.submit(saved.id, "earlier-completed-run", f.lane.generation);
+    store.settle(saved.id, "done", { id: `${saved.id}:answer`, text: "Completed work." });
+    const report = `report:${saved.id}`;
+    const output = `${report}:answer`;
+    store.settle(report, "done", { id: output, text: "Completed work." });
+    store.claimOutput(output);
+    store.finishOutput(output, "sent", "completed-result");
+    const frame = { type: "extension_ui_request", method: "confirm", id: "native-dialog", title: "Allow?" };
+    const approval = `a-${createHash("sha256").update(`${f.lane.id}:0:${frame.id}`).digest("hex").slice(0, 24)}`;
+    store.putApproval({ id: approval, target: f.lane.id, generation: 0, requestId: frame.id, route: f.lane.route,
+      request: frame, state: "pending", remoteId: "previous-card" });
+    store.resolveApproval(approval, 0, "answered");
+    host.state.pendingUiRequests = [frame];
+
+    await runtime.start();
+    await f.whenTitle("⏳ Original");
+    const reconcileAnswer = messenger.handlers?.reconcileAnswer;
+    if (!reconcileAnswer) throw new Error("Missing approval reconciliation handler");
+    expect(await reconcileAnswer(approval, f.lane.route)).toBe("unresolved");
+    expect(f.current().title).toBe("⏳ Original");
+    host.state.pendingUiRequests = [];
+    expect(await reconcileAnswer(approval, f.lane.route)).toBe("accepted");
+    await f.whenTitle("✅ Original");
+    expect(f.edits).toEqual([{ title: "⏳ Original" }, { title: "✅ Original" }]);
+    expect(host.responses).toEqual([]);
+  });
+
+  test("resolving an uncertain request does not clear the working marker of a queued follow-up", async () => {
+    const instance = fixture();
+    const { runtime, store, hosts, main } = instance;
+    const f = managedThread(instance, "⏳ Original");
+    const held = message("1750000000000000421", f.lane.route);
+    store.receive(held, f.lane.id);
+    store.submit(held.id, "lost-natively", f.lane.generation);
+    await runtime.start(); // Recovery quarantines the original attempt; it does not replay it.
+    const followup = message("1750000000000000422", f.lane.route, "Check the next request.");
+    await admit(runtime, followup);
+    await admit(runtime, applicationCommand("1750000000000000423", f.lane.route));
+    expect(delegated(store, followup.id)?.state).toBe("pending");
+    expect(f.current().title).toBe("⏳ Original");
+    await admit(runtime, message("1750000000000000424", f.lane.route, `/resolve --lane ${held.id}`));
+    const worker = hosts.get(f.lane.socketPath);
+    if (!worker) throw new Error("Resolving the hold must admit the queued request");
+    expect(worker.prompts).toHaveLength(1);
+    expect(worker.prompts[0]?.command.message).toContain(followup.text);
+    expect(store.input(held.id)?.state).toBe("cancelled");
+    worker.complete("Queued request verified.");
+    await f.whenTitle("✅ Original");
+    expect(f.edits).toEqual([{ title: "✅ Original" }]);
+    expect(main.prompts).toHaveLength(1); // Recovery report only; not a replay or a follow-up dispatch.
+  });
 
   test("pausing a work thread clears its marker even when the working edit lands late", async () => {
     const instance = fixture();

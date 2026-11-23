@@ -362,6 +362,8 @@ export class Superagent {
   private readonly activeReactions = new Map<string, string>();
   private readonly reactionQueues = new Map<string, Promise<void>>();
   private readonly threadEditQueues = new Map<string, Promise<unknown>>();
+  private readonly threadTitleRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  private reconcileSavedThreadTitles = true;
   private priorityTail: Promise<void> = Promise.resolve();
   private headCompaction?: { id: string; cancelled: boolean };
   private headUsageResetActive = false;
@@ -932,6 +934,7 @@ export class Superagent {
           outcome: release ? latest.outcome : undefined,
         };
         if (!this.store.commitHeadRecovery(latest, settled)) return;
+        if (settled.outcome && latest.inputId.startsWith("report:")) this.syncLaneThreadAfterResult(latest.inputId);
       } else if (resolved) {
         this.store.setMeta(`head:recovery:${active.inputId}`, JSON.stringify({
           ...latest, state: "held", abandonedByOwner: true,
@@ -2568,6 +2571,10 @@ export class Superagent {
         }
       }
       const cancelled = ids.filter(id => this.store.input(id)?.state === "pending" && this.store.settle(id, "cancelled"));
+      const lane = bound === undefined ? this.boundLane(input.route) : bound;
+      if (lane && cancelled.some(id => this.store.getMeta(`topic-owner:${id}`) === lane.id)) {
+        this.background(this.syncLaneThreadTitle(lane));
+      }
       this.store.settle(input.id, cancelled.length ? "done" : "cancelled", { id: `${input.id}:control`, text: cancelled.length
         ? "이 주제의 작업 배정을 취소했습니다. 전역 헤드나 다른 주제는 중단하지 않았으며, 이미 전송된 메시지는 되돌리지 않습니다."
         : "중단할 요청을 특정할 수 없습니다. 원래 작업이나 경로 질문에 /stop으로 답장하거나 /stop <lane-id> 또는 /stop head로 대상을 명시해 주세요. 아무 작업도 중단하지 않았습니다." });
@@ -3052,6 +3059,7 @@ export class Superagent {
       workState: "open", runtimeState: "unloaded", sessionFile: paths.sessionFile, sessionId: null,
       socketPath: paths.socketPath, generation: 0, pid: null, createdAt: now, lastActivityAt: now, result: null,
     }, source.id);
+    this.background(this.syncLaneThreadTitle(lane));
     this.placingWorkers.delete(original.id);
     if (this.store.getMeta(nativeKey) === "true") {
       const decision = { source: original.route, destination: lane.route, laneId: lane.id };
@@ -3113,7 +3121,7 @@ export class Superagent {
       throw new Error("Workflow selection requires an original authorized user source, not internal data");
     }
     const handoffId = `handoff:${sourceId}:${id}`;
-    this.store.receive({
+    const queued = this.store.receive({
       id: handoffId, route: lane.route, messageId: original.messageId,
       ...(original.interactionId === undefined ? {} : { interactionId: original.interactionId }),
       ...(original.invocationId === undefined ? {} : { invocationId: original.invocationId }),
@@ -3122,6 +3130,7 @@ export class Superagent {
       text, receivedAt: original.receivedAt,
       attachments: original.attachments,
     }, id, { [`handoff-source:${handoffId}`]: sourceId }, workflow);
+    if (queued) this.background(this.syncLaneThreadTitle(lane));
     return handoffId;
   }
 
@@ -3407,23 +3416,46 @@ export class Superagent {
     finally { if (this.threadEditQueues.get(key) === operation) this.threadEditQueues.delete(key); }
   }
 
-  private async syncLaneThreadTitle(lane: Lane, state: Lane["workState"]): Promise<void> {
+  private async syncLaneThreadTitle(lane: Lane): Promise<void> {
     const { messenger } = this;
     const route = physicalRoute(lane.route);
     if (route.platform !== "discord" || !route.guildId || !route.threadId || !messenger.inspectThread || !messenger.updateThread) return;
     const inspect = messenger.inspectThread.bind(messenger);
     const update = messenger.updateThread.bind(messenger);
-    const current = () => !this.stopped && !this.restartFence() && this.store.lane(lane.id)?.workState === state;
+    const active = () => {
+      if (this.stopped || this.threadTitleRetries.has(lane.id)) return false;
+      if (this.restartFence() || this.headRotationHeld()) {
+        this.reconcileSavedThreadTitles = true;
+        return false;
+      }
+      return true;
+    };
     await this.editThreadInOrder(route, async () => {
-      if (!current()) return;
+      if (!active()) return;
       this.authorized(route);
       const thread = await inspect(route);
       if (physicalRouteKey(thread.route) !== physicalRouteKey(route))
         throw new DeliveryError("Work thread title lookup returned a different destination", "rejected");
-      if (thread.archived !== false || !current()) return;
+      if (thread.archived !== false || !active()) return;
+      // Re-read after the Discord lookup so an older settle cannot clear a
+      // newer run or a surviving input/approval hold. Open is not active.
+      let current = this.store.lane(lane.id);
+      if (!current) return;
+      let prefix = this.laneThreadPrefix(current);
+      const live = this.live.get(lane.id);
+      if (current.workState === "open" && !live && current.runtimeState === "idle") prefix = "⏳ ";
+      if (current.workState === "open" && prefix !== null && prefix !== "⏳ " && live) {
+        // The ledger flags a dialog answered before native acknowledgement.
+        // A resident Host must also confirm absence of a pending native dialog.
+        const version = live.nativeVersion;
+        const state = await this.state(live);
+        current = this.store.lane(lane.id);
+        if (!current || !active() || version !== live.nativeVersion) return;
+        prefix = this.laneThreadPrefix(current);
+        if (current.workState === "open" && (!state.isSettled || state.pendingUiRequests?.length)) prefix = "⏳ ";
+      }
       const base = thread.title.replace(/^(?:⏳|✅) /u, "");
-      if (!base.trim() || state === "paused" && !thread.title.startsWith("⏳ ")) return;
-      const prefix = state === "open" ? "⏳ " : state === "completed" ? "✅ " : "";
+      if (prefix === null || !base.trim()) return;
       // Keep the title within Discord's name limit without splitting a surrogate pair.
       const title = (prefix + base).slice(0, 100).replace(/[\uD800-\uDBFF]$/, "").trimEnd();
       if (title === thread.title) return;
@@ -3433,13 +3465,52 @@ export class Superagent {
         if (physicalRouteKey(result.route) !== physicalRouteKey(route) || result.title !== title)
           throw new DeliveryError("Work thread title update could not be confirmed", "uncertain");
       } finally { this.laneMutations--; }
+    }).catch(error => {
+      if (!(error instanceof DeliveryError && error.certainty === "rejected" && error.retryAfterMs !== undefined)) throw error;
+      if (!active()) return;
+      // Retry only a confirmed rate-limit rejection; recompute the desired
+      // prefix when Discord permits a new change, never replay a stale write.
+      const retry = setTimeout(() => {
+        this.threadTitleRetries.delete(lane.id);
+        this.background(this.syncLaneThreadTitle(lane));
+      }, error.retryAfterMs);
+      retry.unref?.();
+      this.threadTitleRetries.set(lane.id, retry);
     });
+  }
+
+  private laneThreadPrefix(lane: Lane): "⏳ " | "✅ " | "" | null {
+    if (lane.workState === "completed") return "✅ ";
+    if (lane.workState !== "open") return "";
+    if (lane.runtimeState === "starting" || lane.runtimeState === "running" || this.live.get(lane.id)?.busy
+      || this.store.inputs(lane.id).length || this.store.approvals(lane.id).length
+      || this.store.hasPendingLaneResult(lane.id) || this.store.hasPendingLanePlacement(lane.id)) return "⏳ ";
+    if (lane.runtimeState === "interrupted") return null;
+    const run = this.store.latestLaneRun(lane.id);
+    if (run?.state !== "done") return "";
+    // A late native receipt may replace an earlier uncertainty notice. Only
+    // the recovered final report/answer can check off that run.
+    const report = this.store.input(`report:${run.id}:done`) ?? this.store.input(`report:${run.id}`);
+    if (report?.state === "pending" || report?.state === "submitted" || report?.state === "uncertain") return "⏳ ";
+    if (report?.state === "cancelled") return "";
+    const answerId = `${report?.id ?? run.id}:answer`;
+    const answer = this.store.output(`${answerId}:done`) ?? this.store.output(answerId);
+    if (answer?.state === "sent" && answer.remoteId) return "✅ ";
+    if (answer?.state === "pending" || answer?.state === "sending" || answer?.state === "uncertain") return "⏳ ";
+    return "";
+  }
+
+  private syncLaneThreadAfterResult(inputId: string): void {
+    const run = this.store.input(inputId.startsWith("report:")
+      ? inputId.slice("report:".length).replace(/:done$/, "") : inputId);
+    const lane = run?.target && run.target !== "main" ? this.store.lane(run.target) : null;
+    if (lane) this.background(this.syncLaneThreadTitle(lane));
   }
 
   private holdLanePause(lane: Lane): void {
     this.pauseRevisions.set(lane.id, (this.pauseRevisions.get(lane.id) ?? 0) + 1);
     if (lane.workState === "open" && this.store.updateLane(lane.id, lane.generation, { workState: "paused" }))
-      this.background(this.syncLaneThreadTitle(lane, "paused"));
+      this.background(this.syncLaneThreadTitle(lane));
   }
 
   async pause(id: string): Promise<void> {
@@ -3667,7 +3738,7 @@ export class Superagent {
           this.modelHolds.delete(id);
         }
       }
-      if (current.workState !== outcome) this.background(this.syncLaneThreadTitle(lane, outcome));
+      if (current.workState !== outcome) this.background(this.syncLaneThreadTitle(lane));
       if (live) await this.release(live, true);
     } finally { this.laneMutations--; }
   }
@@ -4743,7 +4814,9 @@ export class Superagent {
       const previousBoundary = JSON.parse(this.store.getMeta("head:stop-boundary") ?? "{\"cancelledInputIds\":[]}") as { cancelledInputIds: string[] };
       this.store.setMeta("head:stop-boundary", JSON.stringify({ inputId: input.id, cancelledInputIds: [...new Set([...previousBoundary.cancelledInputIds, ...cancelledInputIds])] }));
     }
-    for (const id of cancelledInputIds) this.store.settle(id, "cancelled");
+    for (const id of cancelledInputIds) {
+      if (this.store.settle(id, "cancelled") && id.startsWith("report:")) this.syncLaneThreadAfterResult(id);
+    }
     const head = this.live.get("main");
     if (head) for (const [requestId, admitted] of head.admitted) {
       if (cancelledInputIds.includes(admitted.input.id)) {
@@ -4898,6 +4971,7 @@ export class Superagent {
       this.controlReply(input, `Uncertain input ${JSON.stringify(selected.id)} could not be resolved; its state changed or already completed. Nothing was replayed.`, "uncertain");
       return;
     }
+    if (selected.id.startsWith("report:")) this.syncLaneThreadAfterResult(selected.id);
     acknowledge(selected);
   }
 
@@ -4923,6 +4997,7 @@ export class Superagent {
     }
     const live = this.live.get(lane.id);
     if (live) this.background(this.finish(live));
+    this.background(this.syncLaneThreadTitle(lane));
     this.background(this.kick().catch(this.report));
   }
 
@@ -5314,6 +5389,18 @@ export class Superagent {
     await this.priorityTail.catch(this.report);
     await this.headStopTail.catch(this.report);
     if (!this.ready || this.stopped || this.headRotationHeld()) return;
+    if (this.reconcileSavedThreadTitles && !this.restartFence()) {
+      this.reconcileSavedThreadTitles = false;
+      this.background((async () => {
+        for (const lane of this.store.lanes()) {
+          if (this.stopped) return;
+          if (lane.route.platform === "discord" && lane.route.guildId && lane.route.threadId) {
+            await this.syncLaneThreadTitle(lane).catch(this.report);
+          }
+          if (this.restartFence()) { this.reconcileSavedThreadTitles = true; return; }
+        }
+      })());
+    }
     if (this.pumping) { this.repeat = true; return this.pumping; }
     // Intake can arrive while pump's final output flush is still awaiting I/O,
     // after its inner repeat condition was already evaluated. Keep that wake in
@@ -5434,6 +5521,7 @@ export class Superagent {
           : saved ? "설명에 맞는 이전 작업을 확인하지 못했습니다. 작업 단서를 더 넣어 다시 요청하거나, 새 작업으로 시작하려면 작업 디렉터리의 절대 경로로 답해 주세요."
           : "어느 저장소에서 작업할까요? 이 대화에서 사용한 저장소 이름이나 작업 디렉터리의 절대 경로로 답하면 원래 요청을 시작합니다.";
         this.store.queueOutput({ id: `${input.id}:workspace`, sourceId: input.id, route: input.route, text: question });
+        if (lane) this.background(this.syncLaneThreadTitle(lane));
       }
       const deadline = choosingHere ? this.store.getMeta(`topic-choice-deadline:${input.id}`) : null;
       if (!lane || deadline === null || Date.now() < Number(deadline) || this.store.hasPendingTopicChoice(input, Number(deadline))) return;
@@ -5635,7 +5723,12 @@ export class Superagent {
             if (owner && !resumingLanes.has(owner)) {
               await this.placeTopic(input, owner);
               // A handoff created here was not in this iteration's queue snapshot.
-              if (this.store.input(input.id)?.state !== "pending") this.repeat = true;
+              const placed = this.store.input(input.id)?.state;
+              if (placed !== "pending") this.repeat = true;
+              if (placed === "cancelled" || placed === "uncertain") {
+                const lane = this.store.lane(owner);
+                if (lane) this.background(this.syncLaneThreadTitle(lane));
+              }
             }
             continue;
           }
@@ -5824,6 +5917,8 @@ export class Superagent {
     try { await this.dispatchPrepared(live, input, steering, owner); }
     finally {
       live.preparing--;
+      if (this.current(live) && live.id !== "main" && this.store.input(input.id)?.state === "cancelled")
+        this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
       if (this.current(live) && live.input) {
         if (live.input.id === input.id && live.result?.agentInvoked === false) await this.finish(live);
         else this.background(this.finish(live));
@@ -6122,7 +6217,7 @@ export class Superagent {
       if (live.input) {
         live.ownedRuns++;
         live.running = true;
-        if (live.id !== "main" && live.ownedRuns === 1) this.background(this.syncLaneThreadTitle(this.requireLane(live.id), "open"));
+        if (live.id !== "main" && live.ownedRuns === 1) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
       }
       for (const { input } of live.admitted.values()) this.activity(input, true);
     }
@@ -6244,6 +6339,7 @@ export class Superagent {
       }
       this.recoverNativeOutcome(live, entries, state);
     }
+    const wasBusy = live.busy;
     live.busy = false;
     live.running = false;
     live.lastActivity = Date.now();
@@ -6309,6 +6405,9 @@ export class Superagent {
         if (approval?.state === "pending" && !approval.remoteId && lane) this.background(this.frame(lane, approval.request));
       }
     }
+    if (live.id !== "main" && (wasBusy || input && !live.input))
+      this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
+    else if (input?.id.startsWith("report:") && !live.input) this.syncLaneThreadAfterResult(input.id);
     await this.flushOutputs();
     void this.kick().catch(this.report);
   }
@@ -6341,8 +6440,10 @@ export class Superagent {
     if (live.id === "main" && this.headRecoveryActive()) return;
     if (frame.method === "cancel") {
       const approval = this.store.approvals(live.id).find(approval => approval.generation === live.generation && approval.requestId === frame.targetId);
-      if (approval && this.store.resolveApproval(approval.id, live.generation, "cancelled")
-        && !groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
+      if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
+      if (approval && this.store.resolveApproval(approval.id, live.generation, "cancelled")) {
+        if (!groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
+      }
       return;
     }
     if (!dialogs.has(String(frame.method)) || typeof frame.id !== "string") return;
@@ -6397,6 +6498,7 @@ export class Superagent {
     };
     for (const { input } of live.admitted.values()) this.activity(input, false);
     this.store.putApproval(approval, topic ? live.input?.id : undefined);
+    if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
     const laneDecision = live.id === "main" || this.store.getMeta(`topic-approval:${id}`) ? undefined : approval.decision;
     const reviewId = laneDecision ? `${laneDecisionReview}${approval.id}` : null;
     if (reviewId && laneDecision && !approval.remoteId) {
@@ -6438,6 +6540,7 @@ export class Superagent {
     } catch {
       this.store.resolveApproval(id, live.generation, "cancelled");
       live.connection.uiResponse(approval.requestId, { cancelled: true });
+      if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
       this.report(new Error(`Approval ${id} could not be presented; native request cancelled`));
     } finally { this.cards.delete(id); }
   }
@@ -6466,6 +6569,7 @@ export class Superagent {
       if (approval.state === "answered") {
         if (pending) return "unresolved";
         acknowledgeDecision(this.store, approval, live.sessionId);
+        if (live.id !== "main") this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
         return "accepted";
       }
       if (!pending || !isDeepStrictEqual(pending, approval.request)) return "rejected";
@@ -6510,6 +6614,7 @@ export class Superagent {
       acknowledgeDecision(this.store, this.store.approval(id)!, live.sessionId);
       if (!acknowledged.pendingUiRequests.length) {
         for (const { input } of live.admitted.values()) this.activity(input, true);
+        if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
       }
       if (!headSelection) await this.messenger.dismissApproval(this.store.approval(id)!);
     } catch (error) {
@@ -6564,6 +6669,7 @@ export class Superagent {
               }
             }
             if (this.stopped || !this.store.claimOutput(output.id)) continue;
+            const resultInputId = /^(.+):answer(?::done)?$/.exec(output.id)?.[1];
             let remoteId: string;
             try {
               if (isLaneWatchNotice(output.id)) {
@@ -6590,11 +6696,13 @@ export class Superagent {
             catch (error) {
               const rejected = error instanceof DeliveryError && error.certainty === "rejected";
               this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
+              if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
               this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
               continue;
             }
             // Persist a successful remote send without reinterpreting a local failure.
             this.store.finishOutput(output.id, "sent", remoteId);
+            if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
             delivered = true;
           }
         }
@@ -6617,6 +6725,8 @@ export class Superagent {
     this.ready = false;
     this.intakeReady.reject(new Error("Controller stopped before intake readiness"));
     if (this.timer) clearInterval(this.timer);
+    for (const retry of this.threadTitleRetries.values()) clearTimeout(retry);
+    this.threadTitleRetries.clear();
     this.discordCatchupRetries.clear();
     this.stopSignal.abort();
     for (const live of this.live.values()) {

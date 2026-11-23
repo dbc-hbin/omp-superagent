@@ -56,6 +56,8 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS inputs_active_order ON inputs(sequence) WHERE ${ACTIVE_INPUTS};
   CREATE INDEX IF NOT EXISTS inputs_target_active_order ON inputs(target, sequence) WHERE ${ACTIVE_INPUTS};
   CREATE INDEX IF NOT EXISTS inputs_state_active_order ON inputs(state, sequence) WHERE ${ACTIVE_INPUTS};
+  CREATE INDEX IF NOT EXISTS inputs_lane_run_order ON inputs(target, sequence)
+    WHERE request_id IS NOT NULL AND target <> 'main';
   CREATE INDEX IF NOT EXISTS inputs_message_id ON inputs(json_extract(data, '$.messageId'))
     WHERE json_type(data, '$.messageId') = 'text';
   CREATE TABLE IF NOT EXISTS lane_sources (
@@ -428,6 +430,42 @@ export class Store implements StorePort {
     return this.db.query("SELECT 1 FROM inputs WHERE target = ? AND state = ? LIMIT 1").get(target, state) !== null;
   }
 
+  latestLaneRun(target: string): InputRecord | null {
+    const admitted = this.getMeta(`lane-latest-run:${target}`);
+    if (admitted) return this.input(admitted);
+    // Exclude joined inputs because they have no separate answer. A legacy
+    // goal resume could overtake an older queued input in the same generation.
+    const row = this.db.query<InputRow, [string]>(`SELECT latest.* FROM (SELECT inputs.* FROM inputs
+      LEFT JOIN metadata ON metadata.key = 'steering-owner:' || inputs.id
+      WHERE inputs.target = ? AND inputs.target <> 'main' AND inputs.request_id IS NOT NULL
+        AND (metadata.value IS NULL OR metadata.value = inputs.id)
+      ORDER BY inputs.sequence DESC LIMIT 1) AS latest
+      WHERE latest.id NOT LIKE 'resume:%' OR NOT EXISTS (
+        SELECT 1 FROM inputs AS earlier WHERE earlier.target = latest.target
+          AND earlier.generation = latest.generation AND earlier.request_id IS NOT NULL
+          AND earlier.sequence < latest.sequence)`).get(target);
+    return row ? toInput(row) : null;
+  }
+
+  hasPendingLaneResult(target: string): boolean {
+    return this.db.query(`SELECT 1 FROM inputs AS run
+      LEFT JOIN inputs AS report ON report.id = 'report:' || run.id
+      LEFT JOIN inputs AS recovered ON recovered.id = 'report:' || run.id || ':done'
+      LEFT JOIN outputs AS answer ON answer.id = COALESCE(recovered.id, report.id, run.id) || ':answer'
+      LEFT JOIN outputs AS final ON final.id = COALESCE(recovered.id, report.id, run.id) || ':answer:done'
+      WHERE run.target = ? AND run.target <> 'main' AND run.request_id IS NOT NULL AND run.state = 'done'
+        AND (COALESCE(recovered.state, report.state) IN ('pending','submitted','uncertain')
+          OR COALESCE(final.state, answer.state) IN ('pending','sending','uncertain'))
+      LIMIT 1`).get(target) !== null;
+  }
+
+  hasPendingLanePlacement(target: string): boolean {
+    return this.db.query(`SELECT 1 FROM inputs
+      JOIN metadata ON metadata.key = 'topic-owner:' || inputs.id
+      WHERE inputs.target IS NULL AND inputs.state IN ('pending','uncertain') AND metadata.value = ?
+      LIMIT 1`).get(target) !== null;
+  }
+
   hasHeadRecoveryInput(): boolean {
     return this.db.query(`SELECT 1 FROM inputs
       JOIN metadata ON metadata.key = 'head-native-owner:' || inputs.id AND metadata.value <> ''
@@ -624,8 +662,13 @@ export class Store implements StorePort {
       if (!Number.isSafeInteger(generation) || generation < 0) throw new Error("Invalid generation");
       const lane = this.lane(input.target);
       if (lane && (lane.generation !== generation || lane.workState !== "open")) return false;
-      return this.db.query(`UPDATE inputs SET state = 'submitted', request_id = ?, generation = ?
+      const submitted = this.db.query(`UPDATE inputs SET state = 'submitted', request_id = ?, generation = ?
         WHERE id = ? AND state = 'pending'`).run(requestId, generation, id).changes === 1;
+      if (submitted && lane?.route.platform === "discord" && lane.route.guildId && lane.route.threadId) {
+        const owner = this.getMeta(`steering-owner:${id}`);
+        if (owner === null || owner === id) this.setMeta(`lane-latest-run:${lane.id}`, id);
+      }
+      return submitted;
     }).immediate();
   }
 
