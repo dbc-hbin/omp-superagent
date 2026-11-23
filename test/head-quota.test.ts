@@ -3,6 +3,7 @@ import { mkdtempDisposable } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { UsageReport } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgRetryUsageReservePct } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -19,11 +20,16 @@ test.each([
     permitted: true, reportedFraction: 1, expected: false },
   { reason: "newer report is inside the reserve", reportAge: 0, failureAge: 1_000, allowed: true,
     permitted: true, reportedFraction: 0.99, reserve: 10, expected: false },
+  { reason: "newer report is exactly at the reserve", reportAge: 0, failureAge: 1_000, allowed: true,
+    permitted: true, reportedFraction: 0.3, reserve: 70, expected: false },
   { reason: "healthy account is outside the discovered model roster", reportAge: 0, failureAge: 1_000,
     allowed: true, permitted: true, modelAccount: "other-codex-account", expected: false },
   { reason: "healthy account is in the discovered model roster", reportAge: 0, failureAge: 1_000,
     allowed: true, permitted: true, modelAccount: "fixture-codex-account", expected: true },
-])("native Codex usage recovery: $reason", async ({ reportAge, failureAge, allowed, permitted, reportedFraction, reserve, modelAccount, expected }) => {
+  { reason: "new discovery excludes the account in the older session model", reportAge: 0, failureAge: 1_000,
+    allowed: true, permitted: true, modelAccount: "fixture-codex-account", registryAccount: "other-codex-account", expected: false },
+])("native Codex usage recovery: $reason", async scenario => {
+  const { reportAge, failureAge, allowed, permitted, reportedFraction, reserve, modelAccount, registryAccount, expected } = scenario;
   await using root = await mkdtempDisposable(join(tmpdir(), "head-quota-"));
   const provider = "openai-codex";
   const model = { provider, id: "gpt-6.2-astra", baseUrl: "https://quota-fixture.invalid",
@@ -49,6 +55,9 @@ test.each([
     });
     if (reportedFraction !== undefined) spyOn(auth.usage, "reports").mockResolvedValue([report(reportedFraction)]);
     const modelRegistry = new ModelRegistry(auth, join(root.path, "models.yml"), { ignoreLocalModelConfig: true, settings });
+    if (registryAccount !== undefined) {
+      spyOn(modelRegistry, "find").mockReturnValue({ ...createMockModel(model), accountAccess: { [registryAccount]: {} } });
+    }
     expect(await readHeadQuota({ model, modelRegistry, sessionId, settings },
       { model: { provider, id: model.id }, failedAt: now - failureAge }, AbortSignal.timeout(2_000))).toBe(expected);
   } finally { auth.close(); }

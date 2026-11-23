@@ -22,7 +22,7 @@ export async function readHeadQuota(
   if (typeof health?.model !== "function" || typeof usage?.reports !== "function"
     || typeof sessions?.permits !== "function" || typeof oauth?.accounts !== "function"
     || typeof oauth?.policy !== "function") return false;
-  const { provider, id, baseUrl, accountAccess } = model;
+  const { provider, id, baseUrl } = model;
   // Native health supplies model scope, entitlement, reserves and credential
   // blocks, but can use a stale last-good report after a failed usage read.
   const availability = await health.model(provider, { modelId: id, baseUrl, sessionId, signal,
@@ -35,6 +35,9 @@ export async function readHeadQuota(
   if (signal.aborted || session.sessionId !== sessionId || session.model !== model) return false;
   const now = Date.now();
   const accounts = oauth.accounts(provider, sessionId);
+  // Request auth looks up the current discovery roster, which can change
+  // without replacing the session's model object.
+  const accountAccess = session.modelRegistry.find(provider, id)?.accountAccess ?? model.accountAccess;
   const spark = quotaTierFor(provider, id) === "spark";
   const windowPrefix = spark ? `${provider}:spark:` : `${provider}:`;
   return reports?.some(report => {
@@ -66,10 +69,12 @@ export async function readHeadQuota(
     const accountKey = account.accountId ?? account.email ?? account.projectId;
     if (accountAccess && (!accountKey || !Object.hasOwn(accountAccess, accountKey))) return false;
     const reservePct = oauth.policy(provider, account)?.reservePct ?? cfgRetryUsageReservePct.get(session.settings);
-    const usableFraction = 1 - Math.max(0, Math.min(100, reservePct)) / 100;
+    const reserveFraction = Math.max(0, Math.min(100, reservePct)) / 100;
     return limits.length > 0 && limits.every(limit => {
       const used = limit.amount.usedFraction;
-      return limit.status !== "exhausted" && typeof used === "number" && used >= 0 && used < usableFraction;
+      // Match native isWithinUsageReserve's float slack at the boundary.
+      return limit.status !== "exhausted" && typeof used === "number" && used >= 0
+        && 1 - used > reserveFraction + 1e-9;
     });
   }) ?? false;
 }
