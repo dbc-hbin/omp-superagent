@@ -38,12 +38,13 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
   const agent = join(root, "agent");
   const cwd = join(root, "empty");
   const builtinCanary = join(root, "bash-executed");
+  const writeCanary = join(root, "write-executed");
   const ambientCanary = join(root, "ambient-loaded");
   const resource = join(root, "secret.txt");
   const resourceContents = "FILE_CONTENT_MUST_NOT_ENTER_PR_REVIEW_PROMPT";
   const wire: Record<string, unknown>[] = [];
-  let solicitBash = false;
-  let sentBash = false;
+  let solicit: "bash" | "write" | null = null;
+  const unsolicited: string[] = [];
   const shell = `printf canary > ${builtinCanary}`;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/chat/completions")
@@ -51,10 +52,12 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
     const input: unknown = await request.json();
     if (!input || typeof input !== "object" || Array.isArray(input)) return new Response("Bad payload", { status: 400 });
     wire.push(input as Record<string, unknown>);
-    if (solicitBash && !sentBash) {
-      sentBash = true;
-      return completion({ tool_calls: [{ index: 0, id: "pr-bash", type: "function", function: {
-        name: "bash", arguments: JSON.stringify({ command: shell }),
+    if (solicit !== null) {
+      const name = solicit;
+      solicit = null;
+      unsolicited.push(name);
+      return completion({ tool_calls: [{ index: 0, id: `pr-${name}`, type: "function", function: {
+        name, arguments: JSON.stringify(name === "bash" ? { command: shell } : { path: writeCanary, content: "canary" }),
       } }] }, "tool_calls");
     }
     return completion({ content: verdict }, "stop");
@@ -116,9 +119,11 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
     const restored = await connection.client.getState();
     expect(restored.sessionId).toBe(initial.sessionId);
     await connection.assertPrReviewOnly(cwd);
-    solicitBash = true;
+    solicit = "bash";
     await review(connection, "pr-round-two", data("Second static review round."));
-    expect(sentBash).toBe(true);
+    solicit = "write";
+    await review(connection, "pr-round-three", data("Third static review round."));
+    expect(unsolicited).toEqual(["bash", "write"]);
     expect(wire[0]?.model).toBe("local");
     expect(wire.some(input => JSON.stringify(input.messages).includes("Second static review round."))).toBe(true);
     for (const request of wire) {
@@ -126,6 +131,7 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
       expect(JSON.stringify(request.messages)).not.toContain(resourceContents);
     }
     await expect(fs.lstat(builtinCanary)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(writeCanary)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.lstat(ambientCanary)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readFile(join(agent, "config.yml"), "utf8")).toBe(config);
     expect(await connection.request({ type: "shutdown_host" })).toMatchObject({ success: true });

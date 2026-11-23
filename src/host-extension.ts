@@ -36,10 +36,10 @@ const serviceOwner = ({ agent, sessionManager }: ExtensionContext) => {
 const reviewInferenceApis = new Set(["openai-completions", "openai-responses", "openai-codex-responses",
   "azure-openai-responses", "anthropic-messages"]);
 const stockAutoresearchTools = ["init_experiment", "run_experiment", "log_experiment", "update_notes"] as const;
-// OMP 19.1 additionally registers these stock resolution/QA devices with
-// --no-tools. They must remain unreachable: no active tools, mounts or RPC
-// controls, and every native tool dispatch is blocked.
-const stockInactiveTools = new Set(["resolve", "reject", "propose", "report_issue"]);
+// --no-tools can still leave builtins in the registration catalogue: write
+// on stock 19.0, resolution/QA devices on 19.1. None may be enabled, mounted,
+// presented to the provider, or executed by the restricted session.
+const stockInactiveTools = new Set(["write", "resolve", "reject", "propose", "report_issue"]);
 const reviewSettingValues = {
   "memory.backend": "off", "goal.enabled": false, "compaction.enabled": false, "advisor.enabled": false, "autolearn.enabled": false,
   "skills.enabled": false, "skills.enableSkillCommands": false, "mcp.enableProjectConfig": false,
