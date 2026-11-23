@@ -151,12 +151,22 @@ impl Hub {
     }
 }
 
+/// A reply, status message, or in-place status edit belongs to a plain Discord
+/// route in the exact physical conversation; other platforms reject them.
 fn validate_reply(output: &Value) -> WireResult<()> {
     let output = object(output)?;
-    if let Some(reply) = output.get("replyTo") {
+    let destination = object(output.get("route").unwrap_or(&Value::Null))?;
+    if let Some(status) = output.get("status") {
+        let Some(enabled) = status.as_bool() else {
+            return Err(rejected("Discord status flag must be a boolean"));
+        };
+        if enabled && destination.get("platform").and_then(Value::as_str) != Some("discord") {
+            return Err(rejected("Discord status delivery requires a Discord route"));
+        }
+    }
+    for reply in ["replyTo", "editOf"].into_iter().filter_map(|key| output.get(key)) {
         let reply = object(reply)?;
         let source = object(reply.get("route").unwrap_or(&Value::Null))?;
-        let destination = object(output.get("route").unwrap_or(&Value::Null))?;
         if destination.get("platform").and_then(Value::as_str) != Some("discord")
             || !reply
                 .get("messageId")

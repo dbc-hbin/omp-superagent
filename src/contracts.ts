@@ -246,6 +246,10 @@ export interface OutputRecord {
   route: Route;
   /** Durable original owner message, only in the same physical conversation. */
   replyTo?: MessageReference;
+  /** Discord status message replaced in place; fixed when the output is claimed. */
+  readonly editOf?: MessageReference;
+  /** Initial Discord status message; overflow falls back to one attachment instead of multi-message split. */
+  readonly status?: boolean;
   readonly picker?: HeadPicker;
   readonly resultAttachment?: StagedResultAttachment;
   text: string;
@@ -359,19 +363,19 @@ export interface StorePort {
   bindInput(id: string, target: string): void;
   submit(id: string, requestId: string, generation: number): boolean;
   /** Nonterminal native assistant observation; never settles or dispatches its owner. */
-  progress(id: string, generation: number, sessionId: string, eventId: string, text: string): boolean;
+  progress(id: string, generation: number, sessionId: string, eventId: string, text: string, editInPlace?: boolean): boolean;
   recordLaneReport(id: string, generation: number, sessionId: string, eventId: string, report: LaneReport, observedAt?: number): boolean;
   resolveLaneWaiting(id: string, generation: number, sessionId: string, kind: "tool" | "approval", nativeId: string): boolean;
-  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange): boolean;
+  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange, editInPlace?: boolean): boolean;
   settleCronControl(inputId: string, update: CronUpdate): boolean;
   resolveLaneInput(controlId: string, laneId: string, inputId: string, output: { readonly id: string; readonly text: string }): boolean;
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[];
   prepareHeadRecovery(attempt: HeadRecoveryAttempt): boolean;
   commitHeadRecovery(expected: HeadRecoveryAttempt, decided: HeadRecoveryAttempt): boolean;
-  queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error">): boolean;
+  queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean;
   output(id: string): OutputRecord | null;
   outputs(physicalRoute?: string): OutputRecord[];
-  claimOutput(id: string): boolean;
+  claimOutput(id: string, editInPlace?: boolean): boolean;
   finishOutput(id: string, state: "sent" | "uncertain" | "failed" | "pending", remoteId?: string, error?: string): void;
   createLane(lane: Lane & { model: LaneModel; modelReason: string }, sourceId: string): Lane;
   lane(id: string): Lane | null;

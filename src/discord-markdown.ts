@@ -185,3 +185,215 @@ export function renderDiscordMarkdown(text: string, maxBytes: number): string {
   }
   return out.join("\n");
 }
+
+export interface DiscordEmbedField { name: string; value: string; inline: boolean }
+export interface DiscordEmbed {
+  title?: string;
+  description?: string;
+  color?: number;
+  fields?: DiscordEmbedField[];
+  image?: { url: string };
+}
+
+/** Discord's documented embed limits, counted in UTF-16 units like message text. */
+const EMBEDS_PER_MESSAGE = 10;
+const EMBED_TOTAL = 6000;
+const EMBED_TITLE = 256;
+const EMBED_DESCRIPTION = 4096;
+const EMBED_FIELDS = 25;
+const FIELD_NAME = 256;
+const FIELD_VALUE = 1024;
+const IMAGE_URL = 2048;
+const CARD_DEPTH = 16;
+const DIVIDER = "\u2500".repeat(16);
+const CARD_OPEN = /^ {0,3}(`{3,}|~{3,})[ \t]*card[ \t\r]*$/;
+
+class InvalidCard extends Error {}
+
+function object(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function text(props: Record<string, unknown>, key: string, required: boolean): string | undefined {
+  const value = props[key];
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new InvalidCard();
+  return value;
+}
+
+function embedSize(embed: DiscordEmbed): number {
+  return (embed.title?.length ?? 0) + (embed.description?.length ?? 0)
+    + (embed.fields ?? []).reduce((sum, field) => sum + field.name.length + field.value.length, 0);
+}
+
+/**
+ * Convert one json-render spec (`{ root, elements }`) whose root is a Card.
+ * Any structural error, unknown component, reuse/cycle or Discord limit makes
+ * the whole spec invalid; the caller then keeps the original fence as text.
+ */
+function cardEmbed(source: string): DiscordEmbed {
+  let spec: unknown;
+  try { spec = JSON.parse(source); } catch { throw new InvalidCard(); }
+  const root = object(spec);
+  const elements = root && object(root.elements);
+  if (!root || !elements || typeof root.root !== "string") throw new InvalidCard();
+  const parts: string[] = [];
+  const fields: DiscordEmbedField[] = [];
+  const embed: DiscordEmbed = {};
+  const seen = new Set<string>();
+  const visit = (id: unknown, depth: number, parent: string): void => {
+    if (typeof id !== "string" || depth > CARD_DEPTH || seen.has(id) || !Object.hasOwn(elements, id)) throw new InvalidCard();
+    seen.add(id);
+    const element = object(elements[id]);
+    if (!element) throw new InvalidCard();
+    const props = element.props === undefined ? {} : object(element.props);
+    const children = element.children === undefined ? [] : element.children;
+    if (!props || !Array.isArray(children)) throw new InvalidCard();
+    const type = element.type;
+    if (depth === 0 ? type !== "Card" : parent === "Fields" ? type !== "Field" : false) throw new InvalidCard();
+    switch (type) {
+      case "Card":
+      case "Section": {
+        const title = text(props, "title", false);
+        if (depth === 0) {
+          if (title !== undefined) embed.title = title;
+          const color = props.color;
+          if (typeof color === "number" && Number.isSafeInteger(color) && color >= 0 && color <= 0xffffff) embed.color = color;
+          else if (typeof color === "string" && /^#[0-9a-fA-F]{6}$/.test(color)) embed.color = Number.parseInt(color.slice(1), 16);
+          else if (color !== undefined) throw new InvalidCard();
+        } else if (title !== undefined) parts.push(`**${title}**`);
+        const description = type === "Card" ? text(props, "description", false) : undefined;
+        if (description !== undefined) parts.push(description);
+        break;
+      }
+      case "Text": parts.push(text(props, "text", true)!); break;
+      case "Fields": break;
+      case "Field": {
+        const inline = props.inline === undefined ? false : props.inline;
+        if (typeof inline !== "boolean") throw new InvalidCard();
+        fields.push({ name: text(props, "label", true)!, value: text(props, "value", true)!, inline });
+        break;
+      }
+      case "Table": {
+        const columns = props.columns;
+        const rows = props.rows;
+        if (!Array.isArray(columns) || columns.length === 0 || !columns.every(cell => typeof cell === "string")
+          || !Array.isArray(rows) || !rows.every(row => Array.isArray(row) && row.length === columns.length
+            && row.every(cell => typeof cell === "string"))) throw new InvalidCard();
+        const used = parts.reduce((sum, part) => sum + part.length, 0) + parts.length;
+        const table = cardTable([columns as string[], ...rows as string[][]], EMBED_DESCRIPTION - used);
+        if (!table) throw new InvalidCard();
+        parts.push(table);
+        break;
+      }
+      case "Divider": parts.push(DIVIDER); break;
+      case "Image": {
+        const url = text(props, "url", true)!;
+        if (embed.image || !url.startsWith("https://") || /\s/.test(url) || url.length > IMAGE_URL || !URL.canParse(url)) throw new InvalidCard();
+        embed.image = { url };
+        break;
+      }
+      default: throw new InvalidCard();
+    }
+    if (children.length > 0 && !["Card", "Section", "Fields"].includes(type)) throw new InvalidCard();
+    for (const child of children) visit(child, depth + 1, type);
+  };
+  visit(root.root, 0, "");
+  if (parts.length > 0) embed.description = parts.join("\n");
+  if (fields.length > 0) embed.fields = fields;
+  if ((embed.title?.length ?? 0) > EMBED_TITLE || (embed.description?.length ?? 0) > EMBED_DESCRIPTION
+    || fields.length > EMBED_FIELDS || fields.some(field => field.name.length > FIELD_NAME || field.value.length > FIELD_VALUE)
+    || embedSize(embed) > EMBED_TOTAL || !embed.title && !embed.description && !embed.fields && !embed.image) throw new InvalidCard();
+  return embed;
+}
+
+function cardTable(rows: string[][], budget: number): string | null {
+  const widths = rows[0]!.map(() => 3);
+  let delta = 0;
+  for (const row of rows) {
+    for (const [i, cell] of row.entries()) {
+      const columns = Bun.stringWidth(cell);
+      widths[i] = Math.max(widths[i]!, columns);
+      delta += cell.length - columns;
+    }
+  }
+  const rowLength = 2 + 3 * widths.length + widths.reduce((sum, width) => sum + width, 0);
+  if (7 + (rows.length + 1) * rowLength + delta > budget) return null;
+  const lines = ["```"];
+  for (const [i, row] of rows.entries()) {
+    lines.push("| " + row.map((cell, column) => cell + " ".repeat(widths[column]! - Bun.stringWidth(cell))).join(" | ") + " |");
+    if (i === 0) lines.push("| " + widths.map(width => "-".repeat(width)).join(" | ") + " |");
+  }
+  lines.push("```");
+  return lines.join("\n");
+}
+
+/**
+ * Move valid ```card fences out of the text and into Discord embeds.
+ *
+ * Fences nested in another code block are content, not cards. A spec that is
+ * invalid, or would exceed the message's 10 embeds or 6000 embed characters,
+ * stays verbatim as its original code block, which is also what Telegram and
+ * Slack show because they never call this.
+ */
+export function extractDiscordCards(source: string): { text: string; embeds: DiscordEmbed[] } {
+  if (!source.includes("card")) return { text: source, embeds: [] };
+  const lines = source.split("\n");
+  const out: string[] = [];
+  const embeds: DiscordEmbed[] = [];
+  let total = 0;
+  const margins: number[] = [];
+  let fence: { marker: string; margin: number } | undefined;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    const columns = indentColumns(line);
+    if (fence && columns < fence.margin && line.trim()) fence = undefined;
+    if (fence) {
+      const close = columns >= fence.margin && columns < fence.margin + 4
+        ? FENCE_CLOSE.exec(line.replace(/^[ \t]*/, ""))?.[1] : undefined;
+      if (close && close[0] === fence.marker[0] && close.length >= fence.marker.length) fence = undefined;
+      out.push(line);
+      continue;
+    }
+    if (line.trim()) {
+      while (margins.length && relativeLine(line, margins.at(-1)!) === undefined) margins.pop();
+    }
+    const margin = margins.at(-1) ?? 0;
+    const scoped = relativeLine(line, margin) ?? line;
+    const card = margin === 0 ? CARD_OPEN.exec(scoped)?.[1] : undefined;
+    if (card) {
+      let end = index + 1;
+      for (; end < lines.length; end++) {
+        const close = FENCE_CLOSE.exec(lines[end]!)?.[1];
+        if (close && close[0] === card[0] && close.length >= card.length) break;
+      }
+      if (end < lines.length && embeds.length < EMBEDS_PER_MESSAGE) {
+        try {
+          const embed = cardEmbed(lines.slice(index + 1, end).join("\n"));
+          if (total + embedSize(embed) <= EMBED_TOTAL) {
+            embeds.push(embed);
+            total += embedSize(embed);
+            index = end;
+            continue;
+          }
+        } catch (error) { if (!(error instanceof InvalidCard)) throw error; }
+      }
+    }
+    const marker = opensFence(scoped);
+    if (marker) fence = { marker, margin };
+    else {
+      const indent = listMargin(scoped);
+      if (indent !== undefined) {
+        const itemMargin = margin + indent;
+        margins.push(itemMargin);
+        const itemFence = opensFence(scoped.slice(indent));
+        if (itemFence) fence = { marker: itemFence, margin: itemMargin };
+      }
+    }
+    out.push(line);
+  }
+  if (embeds.length === 0) return { text: source, embeds };
+  const occupied = (line: string) => !/^[ \t\r]*$/.test(line);
+  const start = out.findIndex(occupied);
+  return { text: start < 0 ? "" : out.slice(start, out.findLastIndex(occupied) + 1).join("\n"), embeds };
+}

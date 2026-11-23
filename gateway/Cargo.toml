@@ -30,6 +30,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 url = "2"
 unicase = "2"
+unicode-width = { version = "0.2", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 webrtc = "0.17.1"
 zeroize = "1"

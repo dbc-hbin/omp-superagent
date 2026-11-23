@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
 use super::model::{RemoteMessage, Route, hash, snowflake};
-use super::outputs::{Payload, nonce};
+use super::outputs::{OUTPUT_SEND_BUDGET, nonce};
 use super::rest::{Lookup, Rest, broken, no_mentions};
 use super::{Effect, EffectError, State, cards, dialogs::Dialog};
 
@@ -145,7 +145,7 @@ impl State {
                         &approval.route,
                         approval.remote_id.as_deref(),
                         &token,
-                        Payload::new(&notice, &delivery_id, Some(json!([])))?,
+                        &notice, json!([]),
                         &delivery_id,
                     )
                     .await?;
@@ -179,7 +179,7 @@ impl State {
                 &pending.approval.route,
                 remote.as_deref(),
                 &pending.token,
-                Payload::new(&text, &delivery_id, Some(controls))?,
+                &text, controls,
                 &delivery_id,
             )
             .await?;
@@ -198,10 +198,14 @@ impl State {
         route: &Route,
         remote: Option<&str>,
         token: &str,
-        mut payload: Payload,
+        text: &str,
+        controls: Value,
         nonce: &str,
     ) -> Effect<String> {
         let channel = self.destination(route).await?;
+        let mut payload = self.control_payload(
+            route, text, nonce, controls, tokio::time::Instant::now() + OUTPUT_SEND_BUDGET,
+        ).await?;
         if let Some(id) = remote {
             let path = remote_path(route, id)?;
             let message: RemoteMessage = self.rest.get(&path).await?;
@@ -248,7 +252,7 @@ impl State {
             &pending.approval.route,
             Some(&pending.message_id),
             &pending.token,
-            Payload::new(&text, &nonce, Some(controls))?,
+            &text, controls,
             &nonce,
         )
         .await

@@ -330,6 +330,10 @@ export class GatewayServer {
       const messenger = this.options.messenger;
       if (operation === "send") {
         const output = record(args[0]);
+        if (output.status !== undefined && (typeof output.status !== "boolean"
+          || output.status && record(output.route).platform !== "discord")) {
+          throw new DeliveryError("Discord status requires a plain Discord message", "rejected");
+        }
         if (output.replyTo !== undefined) {
           const reply = record(output.replyTo);
           const source = record(reply.route);

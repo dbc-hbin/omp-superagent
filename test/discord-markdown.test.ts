@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { renderDiscordMarkdown } from "../src/discord-markdown.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "../src/discord-markdown.ts";
 
 describe("Discord markdown table rendering", () => {
   test("renders labeled rows with blank boundaries next to prose", () => {
@@ -207,5 +209,72 @@ describe("Discord markdown table rendering", () => {
     const source = `| a | b |\n|---|---|${"\n| 1 | 2 |".repeat(150_000)}`;
     const rendered = `${"- a: 1\n  - b: 2\n\n".repeat(149_999)}- a: 1\n  - b: 2`;
     expect(renderDiscordMarkdown(source, Buffer.byteLength(rendered, "utf8"))).toBe(rendered);
+  });
+
+  test("accounts ragged tables by present cells and rejects over-budget grids cleanly", () => {
+    const source = [
+      "| 이름 | 값 | 비고 |",
+      "| --- | --- | --- |",
+      "| 가 |",
+      "| 긴항목이름 | 22 | 메모 | 끝 |",
+    ].join("\n");
+    const rendered = renderDiscordMarkdown(source, Infinity);
+    expect(rendered).not.toBe(source);
+    const exactBytes = Buffer.byteLength(rendered, "utf8");
+    expect(renderDiscordMarkdown(source, exactBytes)).toBe(rendered);
+    expect(renderDiscordMarkdown(source, exactBytes - 1)).toBe(source);
+
+    const wideRow = `| ${Array.from({ length: 4_000 }, (_, i) => `c${i}`).join(" | ")} |`;
+    const ragged = ["| a | b |", "|---|---|", wideRow, ...Array(4_000).fill("| 1 |")].join("\n");
+    expect(renderDiscordMarkdown(ragged, Buffer.byteLength(ragged, "utf8"))).toBe(ragged);
+  });
+});
+
+describe("Discord card fences", () => {
+  // The Rust Gateway's embeds.rs test reads this same fixture.
+  const cases = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "discord-cards.json"), "utf8")) as
+    Array<{ name: string; text: string; content: string; embeds: DiscordEmbed[] }>;
+
+  for (const fixture of cases) {
+    test(fixture.name, () => {
+      expect(extractDiscordCards(fixture.text)).toEqual({ text: fixture.content, embeds: fixture.embeds });
+    });
+  }
+
+  test("more than ten valid cards keep the overflow as text", () => {
+    const card = (index: number) => ["```card", JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: `#${index}` } } } }), "```"].join("\n");
+    const source = Array.from({ length: 11 }, (_, index) => card(index)).join("\n");
+    const result = extractDiscordCards(source);
+    expect(result.embeds.map(embed => embed.title)).toEqual(Array.from({ length: 10 }, (_, index) => `#${index}`));
+    expect(result.text).toBe(card(10));
+  });
+
+  test("overflowing or sparse card tables fail pre-allocation and preserve original card fences", () => {
+    const spec = {
+      root: "card",
+      elements: {
+        card: { type: "Card", children: ["tbl"] },
+        tbl: {
+          type: "Table",
+          props: {
+            columns: ["a", "b"],
+            rows: [["x".repeat(10_000), "y"], ...Array.from({ length: 1_000 }, () => ["1", "2"])],
+          },
+        },
+      },
+    };
+    const source = ["```card", JSON.stringify(spec), "```"].join("\n");
+    expect(extractDiscordCards(source)).toEqual({ text: source, embeds: [] });
+
+    const cjkLimit = {
+      root: "card",
+      elements: {
+        card: { type: "Card", children: ["note", "tbl"] },
+        note: { type: "Text", props: { text: "z".repeat(4050) } },
+        tbl: { type: "Table", props: { columns: ["이름", "값"], rows: [["가", "1"]] } },
+      },
+    };
+    const overSource = ["```card", JSON.stringify(cjkLimit), "```"].join("\n");
+    expect(extractDiscordCards(overSource)).toEqual({ text: overSource, embeds: [] });
   });
 });

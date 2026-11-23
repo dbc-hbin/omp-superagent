@@ -10,6 +10,7 @@ export interface DiscordConfig {
   allowedGuildIds: string[];
   allowedChannelIds: string[];
   readonly requireAddressing?: boolean;
+  readonly editProgressInPlace?: boolean;
   voice?: DiscordVoiceConfig;
 }
 
@@ -216,6 +217,9 @@ export function parseConfig(value: unknown, path: string): Config {
   const requireAddressing = discord?.requireAddressing;
   if (requireAddressing !== undefined && typeof requireAddressing !== "boolean")
     throw new Error("discord.requireAddressing must be a boolean");
+  const editProgressInPlace = discord?.editProgressInPlace;
+  if (editProgressInPlace !== undefined && typeof editProgressInPlace !== "boolean")
+    throw new Error("discord.editProgressInPlace must be a boolean");
   const voice = discord?.voice === undefined ? undefined : record(discord.voice, "discord.voice");
   let voiceConfig: DiscordVoiceConfig | undefined;
   if (voice) {
@@ -265,6 +269,7 @@ export function parseConfig(value: unknown, path: string): Config {
       allowedGuildIds: ids(discord.allowedGuildIds, "discord.allowedGuildIds"),
       allowedChannelIds: discordChannels,
       requireAddressing: requireAddressing ?? false,
+      editProgressInPlace: editProgressInPlace ?? false,
       ...(voiceConfig ? { voice: voiceConfig } : {}),
     } } : {}),
     ...(telegram ? { telegram: {

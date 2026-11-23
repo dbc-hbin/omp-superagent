@@ -8,6 +8,7 @@ use super::{Effect, EffectError, State, model::Channel};
 const ADMINISTRATOR: u64 = 1 << 3;
 pub(super) const VIEW_CHANNEL: u64 = 1 << 10;
 pub(super) const SEND_MESSAGES: u64 = 1 << 11;
+pub(super) const EMBED_LINKS: u64 = 1 << 14;
 pub(super) const READ_HISTORY: u64 = 1 << 16;
 pub(super) const MANAGE_THREADS: u64 = 1 << 34;
 pub(super) const CREATE_PUBLIC_THREADS: u64 = 1 << 35;

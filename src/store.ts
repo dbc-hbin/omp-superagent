@@ -71,7 +71,8 @@ const SCHEMA = `
     source_id TEXT NOT NULL, route TEXT NOT NULL, physical_route TEXT, text TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending'
       CHECK(state IN ('pending','sending','sent','uncertain','failed')),
-    remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT, result_attachment TEXT
+    remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT, result_attachment TEXT, edit_of TEXT,
+    status INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS outputs_queue ON outputs(state, sequence);
   CREATE INDEX IF NOT EXISTS outputs_sent_message ON outputs(remote_id) WHERE state = 'sent' AND remote_id IS NOT NULL;
@@ -108,6 +109,8 @@ interface OutputRow {
   reply_to: string | null;
   picker: string | null;
   result_attachment: string | null;
+  edit_of: string | null;
+  status: number;
   text: string;
   state: OutputRecord["state"];
   remote_id: string | null;
@@ -123,6 +126,8 @@ const toInput = (row: InputRow): InputRecord => {
 const toOutput = (row: OutputRow): OutputRecord => ({
   id: row.id, sourceId: row.source_id, route: JSON.parse(row.route) as Route,
   ...(row.reply_to === null ? {} : { replyTo: JSON.parse(row.reply_to) as NonNullable<OutputRecord["replyTo"]> }),
+  ...(row.edit_of === null ? {} : { editOf: JSON.parse(row.edit_of) as NonNullable<OutputRecord["editOf"]> }),
+  ...(row.status ? { status: true } : {}),
   ...(row.picker === null ? {} : { picker: JSON.parse(row.picker) as NonNullable<OutputRecord["picker"]> }),
   ...(row.result_attachment === null ? {} : { resultAttachment: JSON.parse(row.result_attachment) as NonNullable<OutputRecord["resultAttachment"]> }),
   text: row.text, state: row.state, remoteId: row.remote_id, error: row.error,
@@ -222,6 +227,8 @@ export class Store implements StorePort {
       if (!outputColumns.some(column => column.name === "reply_to")) db.run("ALTER TABLE outputs ADD COLUMN reply_to TEXT");
       if (!outputColumns.some(column => column.name === "picker")) db.run("ALTER TABLE outputs ADD COLUMN picker TEXT");
       if (!outputColumns.some(column => column.name === "result_attachment")) db.run("ALTER TABLE outputs ADD COLUMN result_attachment TEXT");
+      if (!outputColumns.some(column => column.name === "edit_of")) db.run("ALTER TABLE outputs ADD COLUMN edit_of TEXT");
+      if (!outputColumns.some(column => column.name === "status")) db.run("ALTER TABLE outputs ADD COLUMN status INTEGER NOT NULL DEFAULT 0");
       if (!outputColumns.some(column => column.name === "physical_route")) db.run("ALTER TABLE outputs ADD COLUMN physical_route TEXT");
       db.run("CREATE INDEX IF NOT EXISTS outputs_route_queue ON outputs(state, physical_route, sequence)");
       const missingPhysical = db.query<{ id: string; route: string }, []>("SELECT id, route FROM outputs WHERE physical_route IS NULL").all();
@@ -569,7 +576,9 @@ export class Store implements StorePort {
     const rows = this.db.query<OutputRow, [string, string | null]>(
       "SELECT * FROM outputs WHERE (state = 'sent' AND remote_id = ?) OR id = ?",
     ).all(messageId, part);
-    return rows.map(toOutput).filter(output => physicalRouteKey(output.route) === physicalRouteKey(route));
+    // An in-place status edit shares its message with the output that created it.
+    return rows.map(toOutput).filter(output => physicalRouteKey(output.route) === physicalRouteKey(route)
+      && output.editOf?.messageId !== messageId);
   }
 
   repliedParentTopic(route: Route, messageId: string): Lane | "unverified" | null {
@@ -752,7 +761,37 @@ export class Store implements StorePort {
     return !!lane && lane.workState === "open" && lane.generation === context.generation && lane.sessionId === context.sessionId;
   }
 
-  progress(id: string, generation: number, sessionId: string, eventId: string, text: string): boolean {
+  private progressStream(id: string): string {
+    let current = id;
+    const seen = new Set<string>([current]);
+    while (true) {
+      const parent = this.getMeta(`progress-source:${current}`);
+      if (!parent) return current;
+      const { inputId } = JSON.parse(parent) as { inputId: string };
+      if (seen.has(inputId)) return current;
+      seen.add(inputId);
+      current = inputId;
+    }
+  }
+
+  /**
+   * When opted in on Discord (`editInPlace`), nonterminal progress uses one
+   * `⏳` status message edited in place. Each update stays its own immutable
+   * output; `claimOutput` decides whether it edits that message. By default (or
+   * on other platforms), every update posts as an ordinary new message.
+   */
+  private queueStatus(
+    output: Pick<OutputRecord, "id" | "sourceId" | "route" | "text">,
+    stream: string,
+    editInPlace = false,
+  ): boolean {
+    if (!editInPlace || output.route.platform !== "discord") return this.queueOutput(output);
+    this.setMeta(`status-stream:${output.id}`, stream);
+    const text = /^(?:`{3,}|~{3,})/.test(output.text.trimStart()) ? `⏳\n${output.text}` : `⏳ ${output.text}`;
+    return this.queueOutput({ ...output, text, status: true });
+  }
+
+  progress(id: string, generation: number, sessionId: string, eventId: string, text: string, editInPlace = false): boolean {
     if (!text.trim()) return false;
     return this.db.transaction(() => {
       const context = { inputId: id, generation, sessionId };
@@ -765,7 +804,7 @@ export class Store implements StorePort {
       this.setMeta(seen, "true");
       if (input.target === "main") {
         this.setMeta(`progress-output:${receiptId}`, JSON.stringify(context));
-        return this.queueOutput({ id: receiptId, sourceId: id, route: input.route, text });
+        return this.queueStatus({ id: receiptId, sourceId: id, route: input.route, text }, this.progressStream(id), editInPlace);
       }
       const topic = this.topicDelivery(id);
       if (topic) {
@@ -776,7 +815,7 @@ export class Store implements StorePort {
           .run("Nonterminal progress superseded", previous);
         this.setMeta(pendingKey, receiptId);
         this.setMeta(`progress-output:${receiptId}`, JSON.stringify(context));
-        return this.queueOutput({ id: receiptId, sourceId: topic.outputSourceId, route: topic.route, text });
+        return this.queueStatus({ id: receiptId, sourceId: topic.outputSourceId, route: topic.route, text }, id, editInPlace);
       }
       const lane = this.requireLane(input.target!);
       const sourceId = this.getMeta(`handoff-source:${id}`);
@@ -886,7 +925,7 @@ export class Store implements StorePort {
     }).immediate();
   }
 
-  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange): boolean {
+  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange, editInPlace = false): boolean {
     return this.db.transaction(() => {
       const input = this.input(id);
       if (!input || input.state === "done" || input.state === "cancelled" || input.state === state) return false;
@@ -928,8 +967,16 @@ export class Store implements StorePort {
           ].join("\n\n"),
         }, "main", { [`activity-source:${receiptId}`]: source.id });
       } else if (output) {
-        if (progress) this.setMeta(`progress-output:${output.id}`, progress);
-        this.queueOutput({ ...output, sourceId: id, route: input.route });
+        if (progress) {
+          this.setMeta(`progress-output:${output.id}`, progress);
+          if (!output.picker) {
+            this.queueStatus({ ...output, sourceId: id, route: input.route }, this.progressStream(id), editInPlace);
+          } else {
+            this.queueOutput({ ...output, sourceId: id, route: input.route });
+          }
+        } else {
+          this.queueOutput({ ...output, sourceId: id, route: input.route });
+        }
       }
       this.db.query("UPDATE inputs SET state = ? WHERE id = ?").run(state, id);
       if (headModel && state === "done" && input.state === "submitted" && input.target === "main") {
@@ -1065,12 +1112,16 @@ export class Store implements StorePort {
     return decision.destination;
   }
 
-  queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error">): boolean {
+  queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean {
+    if (output.status && (output.route.platform !== "discord" || output.picker || output.resultAttachment)) {
+      throw new Error(`Status delivery requires a plain Discord message: ${output.id}`);
+    }
     return this.db.transaction(() => {
       const existing = this.output(output.id);
       if (existing) {
         if (existing.sourceId !== output.sourceId || routeKey(existing.route) !== routeKey(output.route)
-          || existing.text !== output.text || !isDeepStrictEqual(existing.picker, output.picker)
+          || existing.text !== output.text || Boolean(existing.status) !== Boolean(output.status)
+          || !isDeepStrictEqual(existing.picker, output.picker)
           || !isDeepStrictEqual(existing.resultAttachment, output.resultAttachment)
           || output.replyTo !== undefined && (!existing.replyTo
             || existing.replyTo.messageId !== output.replyTo.messageId
@@ -1112,9 +1163,9 @@ export class Store implements StorePort {
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(replyTo.route))) {
         throw new Error(`Output reply differs from its source: ${output.id}`);
       }
-      return this.db.query("INSERT INTO outputs(id, source_id, route, physical_route, text, reply_to, picker, result_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      return this.db.query("INSERT INTO outputs(id, source_id, route, physical_route, text, reply_to, picker, result_attachment, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .run(output.id, output.sourceId, JSON.stringify(output.route), physicalRouteKey(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
-          output.picker ? JSON.stringify(output.picker) : null, attachment ? JSON.stringify(attachment) : null).changes === 1;
+          output.picker ? JSON.stringify(output.picker) : null, attachment ? JSON.stringify(attachment) : null, output.status ? 1 : 0).changes === 1;
     }).immediate();
   }
 
@@ -1134,14 +1185,30 @@ export class Store implements StorePort {
         (inputs.target IS NULL OR inputs.target = 'main') LIMIT 1`).get() !== null;
   }
 
-  claimOutput(id: string): boolean {
-    const progress = this.getMeta(`progress-output:${id}`);
-    if (progress && !this.progressOpen(JSON.parse(progress))) {
-      this.db.query("UPDATE outputs SET state = 'failed', error = 'Nonterminal progress superseded or no longer authorized' WHERE id = ? AND state = 'pending'").run(id);
-      return false;
-    }
-    return this.db.query("UPDATE outputs SET state = 'sending' WHERE id = ? AND state = 'pending'")
-      .run(id).changes === 1;
+  /**
+   * A Discord status update edits the stream's message only after that message's
+   * creation was confirmed. The edit target is persisted with the claim, so a
+   * redelivery of this output keeps the same physical message.
+   */
+  claimOutput(id: string, editInPlace = false): boolean {
+    return this.db.transaction(() => {
+      const progress = this.getMeta(`progress-output:${id}`);
+      if (progress && !this.progressOpen(JSON.parse(progress))) {
+        this.db.query("UPDATE outputs SET state = 'failed', error = 'Nonterminal progress superseded or no longer authorized' WHERE id = ? AND state = 'pending'").run(id);
+        return false;
+      }
+      const output = this.output(id);
+      if (output?.state !== "pending") return false;
+      const stream = editInPlace ? this.getMeta(`status-stream:${id}`) : null;
+      const anchorId = stream && !output.editOf ? this.getMeta(`status-anchor:${stream}`) : null;
+      const anchor = anchorId ? this.output(anchorId) : null;
+      if (anchor?.state === "sent" && anchor.remoteId && physicalRouteKey(anchor.route) === physicalRouteKey(output.route)) {
+        this.db.query("UPDATE outputs SET edit_of = ? WHERE id = ?")
+          .run(JSON.stringify({ route: physicalRoute(output.route), messageId: anchor.remoteId }), id);
+      }
+      return this.db.query("UPDATE outputs SET state = 'sending' WHERE id = ? AND state = 'pending'")
+        .run(id).changes === 1;
+    }).immediate();
   }
 
   finishOutput(id: string, state: "sent" | "uncertain" | "failed" | "pending", remoteId?: string, error?: string): void {
@@ -1162,6 +1229,18 @@ export class Store implements StorePort {
       }
       this.db.query("UPDATE outputs SET state = ?, remote_id = ?, error = ? WHERE id = ?")
         .run(state, state === "pending" ? null : remoteId ?? output.remoteId, error ?? null, id);
+      const stream = this.getMeta(`status-stream:${id}`);
+      if (stream) {
+        const anchorKey = `status-anchor:${stream}`;
+        const anchor = this.getMeta(anchorKey);
+        // Only a confirmed new post becomes the message later updates edit;
+        // an uncertain post never does. A rejected edit (for example, the
+        // owner deleted the message) releases it so the next update posts anew.
+        if (state === "sent" && !output.editOf && !anchor) this.setMeta(anchorKey, id);
+        if (state === "failed" && output.editOf && anchor && this.output(anchor)?.remoteId === output.editOf.messageId) {
+          this.db.query("DELETE FROM metadata WHERE key = ?").run(anchorKey);
+        }
+      }
       // Start the owner's response window with the durable question receipt,
       // never with input admission or an unconfirmed send attempt.
       if (state === "sent" && id === `${output.sourceId}:workspace`

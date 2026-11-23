@@ -7185,7 +7185,7 @@ export class Superagent {
         && (live.id !== "main" || this.headStopping === 0)) {
         const eventId = key(JSON.stringify([live.sessionId, live.generation, progress.identity]));
         try {
-          if (this.store.progress(live.input.id, live.generation, live.sessionId, eventId, progress.text)) {
+          if (this.store.progress(live.input.id, live.generation, live.sessionId, eventId, progress.text, this.config.discord?.editProgressInPlace === true)) {
             this.wakeOutputs();
             this.background(this.kick());
           }
@@ -7324,7 +7324,7 @@ export class Superagent {
         catch (error) { this.report(error); }
       }
       this.store.settle(input.id, state, !reviewingLaneDecision && (text || live.id !== "main")
-        ? { id: `${input.id}:answer`, text } : undefined, headModel);
+        ? { id: `${input.id}:answer`, text } : undefined, headModel, this.config.discord?.editProgressInPlace === true);
       if (live.input === input) {
         live.admitted.clear();
         live.input = undefined;
@@ -7669,12 +7669,12 @@ export class Superagent {
           }
           if (verification === "deferred") { deferredLaneNotices.add(output.id); continue; }
           if (verification === "held") {
-            if (!this.stopped && this.store.claimOutput(output.id))
+            if (!this.stopped && this.store.claimOutput(output.id, this.config.discord?.editProgressInPlace === true))
               this.store.finishOutput(output.id, "failed", undefined, "Lane watch notice is held or no longer tracked");
             continue;
           }
         }
-        if (this.stopped || !this.store.claimOutput(output.id)) continue;
+        if (this.stopped || !this.store.claimOutput(output.id, this.config.discord?.editProgressInPlace === true)) continue;
         const resultInputId = /^(.+):answer(?::done)?$/.exec(output.id)?.[1];
         let remoteId: string;
         try {
@@ -7699,7 +7699,8 @@ export class Superagent {
             try { this.authorizeResultOwner(output.route); }
             catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }
           }
-          remoteId = await this.messenger.send(output);
+          // The claim may have fixed an in-place status edit target.
+          remoteId = await this.messenger.send(this.store.output(output.id)!);
         }
         catch (error) {
           const rejected = error instanceof DeliveryError && error.certainty === "rejected";

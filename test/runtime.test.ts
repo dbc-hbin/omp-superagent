@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { basename, delimiter, dirname, join } from "node:path";
 import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
-import { physicalRouteKey, routeKey } from "../src/contracts";
+import { physicalRoute, physicalRouteKey, routeKey } from "../src/contracts";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { type Config, hostPaths } from "../src/config";
 import type { HostOptions } from "../src/host";
@@ -2946,6 +2946,76 @@ describe("event-driven nonterminal progress", () => {
     await messenger.whenSent(beforeProgress + 2);
     expect(messenger.sent.at(-1)).toMatchObject({ sourceId: finalId, route: lane.route, text: "Verified work is complete." });
     expect(worker.prompts).toHaveLength(1);
+  });
+
+  test("Discord in-place progress editing is opt-in and edits HEAD and lane summaries in place only when enabled", async () => {
+    const f = fixture();
+    f.config.discord = { ...f.config.discord!, editProgressInPlace: true };
+    await f.runtime.start();
+
+    const headOriginal = headMessage("head-in-place", route("topic-head"));
+    await admit(f.runtime, headOriginal);
+    const step = (text: string) => ({
+      role: "assistant",
+      stopReason: "toolUse",
+      content: [
+        { type: "text", text },
+        { type: "toolCall", id: `call-${text}`, name: "read", arguments: {} },
+      ],
+    });
+    f.main.emit({ type: "message_end", message: step("Step 1") });
+    await f.messenger.whenSent(1);
+    f.main.emit({ type: "message_end", message: step("Step 2") });
+    await f.messenger.whenSent(2);
+    f.main.complete("HEAD final answer.");
+    await f.messenger.whenSent(3);
+    expect(f.messenger.sent[0]).toMatchObject({ text: "⏳ Step 1", status: true });
+    expect(f.messenger.sent[0]?.editOf).toBeUndefined();
+    expect(f.messenger.sent[1]).toMatchObject({
+      text: "⏳ Step 2",
+      status: true,
+      editOf: { route: physicalRoute(headOriginal.route), messageId: `remote-${f.messenger.sent[0]!.id}` },
+    });
+    expect(f.messenger.sent[2]).toMatchObject({ text: "HEAD final answer." });
+    expect(f.messenger.sent[2]?.editOf).toBeUndefined();
+    expect(f.messenger.sent[2]?.status).toBeUndefined();
+
+    // Non-topic lane progress summarized by HEAD also uses one status stream when enabled, while the final report stays separate.
+    const laneRoute = route("lane-in-place");
+    const lane = savedLane(f.store, f.config, "lane-edit", laneRoute);
+    await delegate(f.runtime, message("lane-source", laneRoute));
+    const worker = f.hosts.get(lane.socketPath)!;
+    worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Worker step 1" }] } });
+    await f.main.whenPrompts(2);
+    f.main.emit({ type: "message_end", message: step("HEAD reviewing worker step 1") });
+    await f.messenger.whenSent(4);
+    f.main.complete("Lane summary 1");
+    await f.messenger.whenSent(5);
+    worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Worker step 2" }] } });
+    await f.main.whenPrompts(3);
+    f.main.complete("Lane summary 2");
+    await f.messenger.whenSent(6);
+    worker.complete("Worker finished");
+    await f.main.whenPrompts(4);
+    f.main.complete("Final lane answer");
+    await f.messenger.whenSent(7);
+
+    expect(f.messenger.sent[3]).toMatchObject({ text: "⏳ HEAD reviewing worker step 1", status: true });
+    expect(f.messenger.sent[3]?.editOf).toBeUndefined();
+    const laneAnchor = `remote-${f.messenger.sent[3]!.id}`;
+    expect(f.messenger.sent[4]).toMatchObject({
+      text: "⏳ Lane summary 1",
+      status: true,
+      editOf: { route: physicalRoute(laneRoute), messageId: laneAnchor },
+    });
+    expect(f.messenger.sent[5]).toMatchObject({
+      text: "⏳ Lane summary 2",
+      status: true,
+      editOf: { route: physicalRoute(laneRoute), messageId: laneAnchor },
+    });
+    expect(f.messenger.sent[6]).toMatchObject({ text: "Final lane answer" });
+    expect(f.messenger.sent[6]?.editOf).toBeUndefined();
+    expect(f.messenger.sent[6]?.status).toBeUndefined();
   });
 
   test("busy HEAD coalesces lane progress to the latest meaningful observation without steering or redispatch", async () => {
