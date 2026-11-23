@@ -37,7 +37,7 @@ async function promptExtension(revision: string, defect = "none"): Promise<strin
   return source.replace('const defect: string = "none";', `const defect: string = ${JSON.stringify(defect)};`)
     + `\nexport const revision = ${JSON.stringify(revision)};\n`;
 }
-async function fixture(packageName = "omp-ulw") {
+async function fixture(packageName = "omp-ulw", layout: "legacy" | "super" = "legacy") {
   const root = await mkdtemp(join(await realpath("/tmp"), "omu-"));
   const starting: ReturnType<typeof startHost>[] = [];
   let closing = false;
@@ -67,9 +67,18 @@ async function fixture(packageName = "omp-ulw") {
   await command(["git", "config", "user.name", "Managed ULW fixture"], remote);
   await mkdir(join(remote, "skills/fixture"), { recursive: true });
   await writeFile(join(remote, "skills/fixture/SKILL.md"), "---\nname: ulw-local-fixture\ndescription: Local git install fixture.\n---\nRead only fixture.\n");
-  for (const id of ["ultrawork", "ulw-plan", "ulw-execute", "ulw-loop", "mass-ulw", "ulw-research"]) {
+  // The SUPER layout keeps the legacy IDs as alias skills next to the canonical bodies.
+  const canonical = { ultrawork: "super", "ulw-plan": "super-plan", "ulw-execute": "super-run", "ulw-loop": "super-loop",
+    "mass-ulw": "super-graph", "ulw-research": "super-research" } as const;
+  for (const [legacy, superId] of Object.entries(canonical)) {
+    if (layout === "super") {
+      await mkdir(join(remote, "skills", legacy));
+      await writeFile(join(remote, "skills", legacy, "SKILL.md"),
+        `---\nname: ${legacy}\ndescription: Legacy skill name for ${superId}.\n---\nRead the canonical [skill](../${superId}/SKILL.md).\n`);
+    }
+    const id = layout === "super" ? superId : legacy;
     await mkdir(join(remote, "skills", id));
-    const body = id === "ultrawork" ? `<ultrawork-mode>
+    const body = id === "ultrawork" || id === "super" ? `<ultrawork-mode>
 The current session is in SUPER mode.
 Carry the explicitly requested objective through the authorized work. Establish
 concrete completion criteria, inspect the implementation, and resolve dependent
@@ -406,6 +415,14 @@ test("real preparation CLI accepts reworded policy, preserves provenance and ski
   expect(provenance.revision).toBe(f.first);
   expect(await readFile(join(f.remote, "index.ts"), "utf8")).toBe(original);
   expect(await command(["git", "status", "--porcelain"], f.remote)).toBe("");
+}, 60_000);
+
+test("real preparation CLI accepts the SUPER skill layout with legacy alias skills", async () => {
+  const f = await fixture("omp-superkit", "super");
+  const output = JSON.parse(await f.cli());
+  expect(output.revision).toBe(f.first);
+  expect(output.error).toBeNull();
+  expect(activeManagedUlw(f.options)).toBe(join(f.managed, "revisions", f.first, "package"));
 }, 60_000);
 
 test("changed remote activates atomically; unchanged remote and failed updates retain current immutable files", async () => {

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -15,7 +15,9 @@ const workflows = [
   ["super-plan", "ulw-plan"], ["super-run", "ulw-execute"], ["super-loop", "ulw-loop"],
   ["super-graph", "mass-ulw"], ["super-research", "ulw-research"],
 ] as const;
-const installed = readFileSync(new URL("./skills/ultrawork/SKILL.md", import.meta.url), "utf8");
+// SUPER-era packages ship the directive and workflow bodies under canonical skills.
+const canonical = existsSync(new URL("./skills/super/SKILL.md", import.meta.url));
+const installed = readFileSync(new URL(`./skills/${canonical ? "super" : "ultrawork"}/SKILL.md`, import.meta.url), "utf8");
 const directive = /<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>/.exec(installed)?.[0];
 const policy = `<omp-ulw-policy>\n${defect === "mismatched-policy"
   ? directive?.replace("Carry the explicitly requested objective", "Replace the explicitly requested objective") : directive}\n</omp-ulw-policy>`;
@@ -57,7 +59,7 @@ export default function compatiblePromptFixture(pi: ExtensionAPI): void {
     }
     if (!selected) return { systemPrompt: blocks };
     const [command, id] = selected;
-    const path = fileURLToPath(new URL(`./skills/${id}/SKILL.md`, import.meta.url));
+    const path = fileURLToPath(new URL(`./skills/${canonical ? command : id}/SKILL.md`, import.meta.url));
     return { systemPrompt: blocks, message: { customType: "omo-ultrawork:directive", display: false,
       content: `<omp-${id}-pointer>Read ${path} for ${command}.</omp-${id}-pointer>` } };
   });

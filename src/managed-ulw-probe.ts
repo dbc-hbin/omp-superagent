@@ -1,6 +1,6 @@
 // Finite native prompt-composition gate, not a model turn or workflow execution.
 import assert from "node:assert/strict";
-import { mkdir, readFile, realpath } from "node:fs/promises";
+import { access, mkdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { getBundledModel, getBundledProviders } from "@oh-my-pi/pi-catalog";
 import { ModelRegistry, Settings, AuthStorage, SessionManager, createAgentSession } from "@oh-my-pi/pi-coding-agent";
@@ -33,8 +33,14 @@ const workflows = [
   ["super-research", "ulw-research"],
 ] as const;
 const skillPath = (id: string) => join(packagePath, "skills", id, "SKILL.md");
-const directive = /<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>/.exec(await readFile(skillPath("ultrawork"), "utf8"))?.[1];
-assert(directive?.trim(), "Managed Superkit must ship a directive in its installed ultrawork skill");
+// Superkit's SUPER rebrand moved the directive and workflow bodies to the
+// canonical skills (super, super-plan, ...); legacy IDs remain as aliases.
+// Older packages ship them only under ultrawork and the ulw-* IDs.
+const canonicalSkills = await access(skillPath("super")).then(() => true, () => false);
+const directiveSkill = canonicalSkills ? "super" : "ultrawork";
+const workflowSkill = ([command, legacy]: typeof workflows[number]) => canonicalSkills ? command : legacy;
+const directive = /<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>/.exec(await readFile(skillPath(directiveSkill), "utf8"))?.[1];
+assert(directive?.trim(), `Managed Superkit must ship a directive in its installed ${directiveSkill} skill`);
 
 const modules = await listPackageExtensionModules([packagePath], process.cwd(), { plugins: false });
 assert.deepEqual(await Promise.all(modules.map(module => realpath(module.path))), extensionFiles,
@@ -113,7 +119,7 @@ try {
       if (workflow) {
         const policy = /<omp-ulw-policy>\s*<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>\s*<\/omp-ulw-policy>/.exec(text)?.[1];
         assert(policy && policy.trim().length > 200, "Activated SUPER policy must contain the workflow directive");
-        assert.equal(policy, directive, "Activated SUPER policy must use the installed ultrawork directive");
+        assert.equal(policy, directive, `Activated SUPER policy must use the installed ${directiveSkill} directive`);
         assert(!nativeBase.join("\n\n").includes(policy), "Workflow policy must come from the candidate hook");
       }
       assert.deepEqual(errors, [], "Managed Superkit native hooks failed");
@@ -129,9 +135,11 @@ try {
         typeof message === "object" && "customType" in message && message.customType === "omo-ultrawork:directive" ? [message] : []);
       assert.equal(pointers.length, selected ? 1 : 0, "Only an explicitly selected specialized SUPER invocation may add a workflow directive");
       if (selected) {
-        const [command, skill] = selected;
+        const [command, legacy] = selected;
+        const skill = workflowSkill(selected);
         const content = pointers[0]?.content;
-        assert(typeof content === "string" && content.startsWith(`<omp-${skill}-pointer>`) && content.endsWith(`</omp-${skill}-pointer>`)
+        // The pointer tag keeps the legacy journal protocol name.
+        assert(typeof content === "string" && content.startsWith(`<omp-${legacy}-pointer>`) && content.endsWith(`</omp-${legacy}-pointer>`)
           && content.includes(command) && content.includes(skillPath(skill)),
           `SUPER command /${command} must point to its installed ${skill} skill`);
       }
@@ -191,7 +199,7 @@ try {
       assert(resources.getEnabledToolNames().includes("read"), "Native read must remain available");
       assert(resources.getEnabledToolNames().includes("task"), "Native task must remain available");
       const skills = resources.skills.filter(skill => skill.filePath.startsWith(packagePath + "/"));
-      for (const id of ["ultrawork", ...workflows.map(([, skill]) => skill)]) {
+      for (const id of new Set(["ultrawork", directiveSkill, ...workflows.flatMap(selection => [selection[1], workflowSkill(selection)])])) {
         assert.equal(skills.find(skill => skill.name === id)?.filePath, skillPath(id),
           `Native Superkit skill discovery must retain skill://${id} and its installed path`);
       }
