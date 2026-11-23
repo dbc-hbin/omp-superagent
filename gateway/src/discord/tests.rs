@@ -939,6 +939,53 @@ async fn group_thread_accepts_only_live_member_text_and_replies_without_owner_ef
 }
 
 #[tokio::test]
+async fn guild_thread_cards_fall_back_to_text_without_verified_embed_links() {
+    let temporary = Temp::new();
+    let store = Arc::new(Store::open(&temporary.0).unwrap());
+    let (hub, ws, mut observed, _, server, responses, _) =
+        discord_fixture_with_store(json!({"discord":{}}), &store).await;
+    let (started, _socket) = time::timeout(Duration::from_secs(5), async {
+        tokio::join!(hub.start(), identify(&ws, false))
+    }).await.unwrap();
+    started.unwrap();
+    hub.ready.send_replace(true);
+
+    let card = "~~~card\n{\"root\":\"c\",\"elements\":{\"c\":{\"type\":\"Card\",\"props\":{\"title\":\"Status\"}}}}\n~~~";
+    let route = json!({"platform":"discord","accountId":"71","authorityId":"42",
+        "guildId":"77","channelId":"88","threadId":"90"});
+    responses.lock().unwrap().extend([
+        ("/guilds/77".into(), (StatusCode::OK, json!({"id":"77","owner_id":"42"}))),
+        ("/guilds/77/members/71".into(), (StatusCode::OK, json!({"user":{"id":"71"},"roles":[]}))),
+        ("/guilds/77/roles".into(), (StatusCode::OK, json!([{"id":"77","permissions":permissions::EMBED_LINKS.to_string()}]))),
+    ]);
+    // Parent channel denies the permission, then allows it; unresolved permissions
+    // must also use the plain-text path before sending.
+    for (i, allowed) in [false, true, false].into_iter().enumerate() {
+        if i == 0 {
+            responses.lock().unwrap().insert("/channels/88".into(), (StatusCode::OK,
+                json!({"id":"88","guild_id":"77","type":0,"permission_overwrites":[
+                    {"type":0,"id":"77","allow":"0","deny":permissions::EMBED_LINKS.to_string()}]})));
+        } else if i == 1 {
+            responses.lock().unwrap().remove("/channels/88");
+        } else {
+            responses.lock().unwrap().remove("/guilds/77/roles");
+        }
+        hub.effect("send", &[json!({"id":format!("card-{i}"),"route":route,"text":card})]).await.unwrap();
+        let sent = received(&mut observed, "/channels/90/messages").await;
+        if allowed {
+            assert_eq!(sent["embeds"], json!([{"title":"Status"}]));
+            assert_eq!(sent["content"], "");
+        } else {
+            assert!(sent.get("embeds").is_none());
+            assert_eq!(sent["content"], card);
+        }
+        assert!(observed.try_recv().is_err(), "one external message, never retry a send");
+    }
+    hub.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn status_edits_replace_their_message_and_cards_become_embeds() {
     let (_temporary, store, hub, ws, mut observed, _, server) =
         discord_fixture(json!({"discord":{}})).await;

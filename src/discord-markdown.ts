@@ -274,7 +274,7 @@ function cardEmbed(source: string): DiscordEmbed {
       case "Text": parts.push(text(props, "text", true)!); break;
       case "Fields": break;
       case "Field": {
-        const inline = props.inline ?? false;
+        const inline = props.inline === undefined ? false : props.inline;
         if (typeof inline !== "boolean") throw new InvalidCard();
         fields.push({ name: text(props, "label", true)!, value: text(props, "value", true)!, inline });
         break;
@@ -295,7 +295,7 @@ function cardEmbed(source: string): DiscordEmbed {
       case "Divider": parts.push(DIVIDER); break;
       case "Image": {
         const url = text(props, "url", true)!;
-        if (embed.image || !url.startsWith("https://") || /\s/.test(url) || url.length > IMAGE_URL) throw new InvalidCard();
+        if (embed.image || !url.startsWith("https://") || /\s/.test(url) || url.length > IMAGE_URL || !URL.canParse(url)) throw new InvalidCard();
         embed.image = { url };
         break;
       }

@@ -19,7 +19,7 @@ const MESSAGE_LIMIT: usize = 2_000;
 /// More parts than this are sent as one text attachment instead.
 const MESSAGE_PARTS: usize = 5;
 // Leave time to persist and return the receipt before the head's 30 s IPC timeout.
-const OUTPUT_SEND_BUDGET: Duration = Duration::from_secs(25);
+pub(super) const OUTPUT_SEND_BUDGET: Duration = Duration::from_secs(25);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,9 +101,8 @@ impl Payload {
     /// One payload per Discord message, in order: up to `parts` text messages,
     /// or one text attachment named after `nonce` when the text needs more.
     /// Valid ```card fences become embeds on the last payload.
-    fn split(text: &str, nonce: &str, parts: usize) -> Effect<Vec<Self>> {
-        let (text, cards) = embeds::extract(text);
-        let rendered = markdown::render(&text, FILE_LIMIT);
+    fn split(text: &str, cards: Vec<Value>, nonce: &str, parts: usize) -> Effect<Vec<Self>> {
+        let rendered = markdown::render(text, FILE_LIMIT);
         if rendered.len() > FILE_LIMIT {
             return Err(EffectError::rejected(
                 "Discord text attachment exceeds the safe 8 MiB upload limit",
@@ -138,14 +137,6 @@ impl Payload {
         payload
     }
 
-    pub fn new(text: &str, nonce: &str, components: Option<Value>) -> Effect<Self> {
-        let mut payload = Self::split(text, nonce, 1)?.remove(0);
-        if let Some(components) = components {
-            payload.body["components"] = components;
-        }
-        Ok(payload)
-    }
-
     pub fn create(&mut self, nonce: &str) {
         self.body["nonce"] = json!(nonce);
         self.body["enforce_nonce"] = json!(true);
@@ -177,6 +168,35 @@ impl Payload {
 }
 
 impl State {
+    async fn output_payloads(
+        &self, route: &Route, text: &str, nonce: &str, parts: usize, deadline: Instant,
+    ) -> Effect<Vec<Payload>> {
+        let (content, cards) = embeds::extract(text);
+        if !cards.is_empty() && route.guild_id.is_some() {
+            // Thread permissions come from its parent. Unverified permission keeps
+            // the original text; never try a second post after an external send.
+            let permission = async {
+                let parent = self.channel_by_id(&route.channel_id, true).await?;
+                if parent.guild_id != route.guild_id || parent.is_thread() { return Ok(false); }
+                self.permissions(&parent).await.map(|bits| super::permissions::has(bits, super::permissions::EMBED_LINKS))
+            };
+            // Reserve time for the text send even if permission lookup stalls.
+            let lookup_budget = deadline.saturating_duration_since(Instant::now()) / 2;
+            if !matches!(tokio::time::timeout(lookup_budget, permission).await, Ok(Ok(true))) {
+                return Payload::split(text, Vec::new(), nonce, parts);
+            }
+        }
+        Payload::split(&content, cards, nonce, parts)
+    }
+
+    pub(super) async fn control_payload(
+        &self, route: &Route, text: &str, nonce: &str, components: Value, deadline: Instant,
+    ) -> Effect<Payload> {
+        let mut payload = self.output_payloads(route, text, nonce, 1, deadline).await?.remove(0);
+        payload.body["components"] = components;
+        Ok(payload)
+    }
+
     pub(super) async fn send(&self, output: &Output) -> Effect<String> {
         let deadline = Instant::now() + OUTPUT_SEND_BUDGET;
         if let Some(target) = &output.edit_of {
@@ -245,14 +265,13 @@ impl State {
             None => None,
         };
         let payloads = match &opening {
-            Some(card) => vec![Payload::new(
-                &card.menu.text, &first_nonce, Some(picker_components(&card.menu)),
-            )?],
-            None => Payload::split(
-                &output.text,
-                &first_nonce,
-                if output.status { 1 } else { MESSAGE_PARTS },
-            )?,
+            Some(card) => vec![self.control_payload(
+                &output.route, &card.menu.text, &first_nonce, picker_components(&card.menu), deadline,
+            ).await?],
+            None => self.output_payloads(
+                &output.route, &output.text, &first_nonce,
+                if output.status { 1 } else { MESSAGE_PARTS }, deadline,
+            ).await?,
         };
         let mut sent_ids = Vec::with_capacity(payloads.len());
         for (part, mut payload) in payloads.into_iter().enumerate() {
@@ -346,8 +365,9 @@ impl State {
         let channel = timeout_at(deadline, self.destination(&output.route))
             .await
             .map_err(|_| not_started())??;
-        let mut payload =
-            Payload::split(&output.text, &nonce(&output.id, &output.route, 0), 1)?.remove(0);
+        let mut payload = self.output_payloads(
+            &output.route, &output.text, &nonce(&output.id, &output.route, 0), 1, deadline,
+        ).await?.remove(0);
         payload.edit();
         let request = payload.apply(self.rest.request(
             Method::PATCH,

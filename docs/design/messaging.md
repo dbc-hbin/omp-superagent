@@ -520,7 +520,10 @@ approval.
 - Discord turns a fenced ```` ```card ```` [json-render](https://github.com/vercel-labs/json-render)
   spec (`{"root", "elements"}`, root `Card`; `Card`, `Section`, `Text`,
   `Fields`, `Field`, `Table`, `Divider`, `Image`) into an embed at delivery.
-  Tables become aligned code blocks in the embed description. A spec that is
+  Table content becomes an aligned code block in the embed description. In a
+  guild or thread, only use embeds when the bot has verified Embed Links
+  permission at the parent channel; otherwise send the original fence as text.
+  An Image needs a valid HTTPS URL. A spec that is
   invalid, uses another component, reuses an element or exceeds Discord's embed
   limits stays verbatim as its code block, which is also what Telegram and Slack
   show. The [Rust renderer](../../gateway/src/discord/embeds.rs) and

@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationCommandOptionType, Attachment as DiscordAttachment, AttachmentBuilder, ChannelType, Collection, Events, MessageFlags, MessageFlagsBitField, type Client, type Message, type MessageCreateOptions } from "discord.js";
+import { ApplicationCommandOptionType, Attachment as DiscordAttachment, AttachmentBuilder, ChannelType, Collection, Events, MessageFlags, MessageFlagsBitField, PermissionFlagsBits, type Client, type Message, type MessageCreateOptions } from "discord.js";
 import { DiscordMessenger, deliveryError, discordAttachmentAllowed, discordNonce, parseDiscordControl, type DiscordMessengerOptions } from "./oracles/bun-gateway/discord.ts";
 import { VOICE_DRAFT_HEADER } from "./oracles/bun-gateway/discord-voice-draft";
 import { DeliveryError } from "../src/delivery.ts";
@@ -911,8 +911,26 @@ describe("Discord output delivery", () => {
     } finally { store.close(); await messenger.stop(); }
   });
 
+  test("guild card-only output stays readable without Embed Links, including an in-place edit", async () => {
+    const { messenger, channel } = await fixture();
+    const card = ['~~~card', JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: "Status" } } } }), '~~~'].join("\n");
+    const prior = new RemoteMessage("700", channel.id, channel.guildId, {});
+    channel.remote.set(prior.id, prior);
+    try {
+      Object.assign(channel, { permissionsFor: () => ({ has: () => false }) });
+      await messenger.send(output(card));
+      expect(channel.sent).toHaveLength(1);
+      expect(channel.sent[0]).toMatchObject({ content: card, embeds: [] });
+      await messenger.send({ ...output(card), editOf: { route, messageId: prior.id } });
+      expect(prior.edits).toHaveLength(1);
+      expect(prior.edits[0]).toMatchObject({ content: card, embeds: [] });
+      expect(channel.sent).toHaveLength(1);
+    } finally { await messenger.stop(); }
+  });
+
   test("card fences become embeds and status updates edit their message without reposting", async () => {
     const { messenger, channel } = await fixture();
+    Object.assign(channel, { permissionsFor: () => ({ has: (bit: bigint) => bit === PermissionFlagsBits.EmbedLinks }) });
     const card = JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: "Status" } } } });
     await messenger.send({ ...output(`⏳\n\`\`\`card\n${card}\n\`\`\``), status: true });
     expect(channel.sent[0]).toMatchObject({ content: "⏳", embeds: [{ title: "Status" }] });

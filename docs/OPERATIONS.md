@@ -300,7 +300,7 @@ Git 추적 파일에 쓰지 않는다. 아래 셋업은 별도 소유자 전용 
    Bot 설정의 **Privileged Gateway Intents → Message Content Intent**를 켠다.
    서버 메시지 본문을 수신하려면 코드의 intent 요청과 포털 설정이 모두 필요하다.
 2. 운영할 서버에 `bot`과 `applications.commands` 범위로 초대한다. 필요한 채널에 View Channel, Read Message History,
-   Send Messages, Send Messages in Threads, Create Public Threads, Attach Files, Add Reactions 권한을 부여한다.
+   Send Messages, Send Messages in Threads, Create Public Threads, Attach Files, Add Reactions 권한을 부여한다. 카드 표시에는 선택적으로 Embed Links 권한도 부여한다. 이 권한이 없거나 확인되지 않으면 카드가 코드 블록으로 전송된다.
    비공개 스레드 등은 봇이 실제로 접근할 수 있어야 한다. 관리자 권한은 요구하지 않는다.
 3. Discord 개발자 모드로 소유자 **사용자 ID**, 서버 ID, 허용할 **부모 채널 ID**를 복사한다.
    이름·멘션 문자열이 아니라 숫자로 된 ID 문자열을 설정한다.

@@ -195,6 +195,7 @@ impl<'a> Walk<'a> {
                     || !url.starts_with("https://")
                     || url.chars().any(char::is_whitespace)
                     || utf16(&url) > IMAGE_URL
+                    || reqwest::Url::parse(&url).is_err()
                 {
                     return Err(Invalid);
                 }

@@ -413,11 +413,12 @@ export class DiscordMessenger implements Messenger {
     }
   }
 
-  private payload(text: string, nonce: string, components?: Controls): MessageCreateOptions & { embeds: DiscordEmbed[] } {
-    // Discord renders no markdown tables, so outbound tables become aligned fences,
-    // and valid ```card specs become embeds.
-    // The stored OutputRecord text is never modified; only this payload changes.
-    const cards = extractDiscordCards(text);
+  private payload(text: string, nonce: string, channel: Awaited<ReturnType<DiscordMessenger["destination"]>>, components?: Controls): MessageCreateOptions & { embeds: DiscordEmbed[] } {
+    let cards = extractDiscordCards(text);
+    if (cards.embeds.length && channel.type !== ChannelType.DM && (!("permissionsFor" in channel)
+      || !this.client.user || !channel.permissionsFor(this.client.user)?.has(PermissionFlagsBits.EmbedLinks))) {
+      cards = { text, embeds: [] };
+    }
     const content = renderDiscordMarkdown(cards.text, FILE_LIMIT);
     if (Buffer.byteLength(content, "utf8") > FILE_LIMIT) throw new DeliveryError("Discord text attachment exceeds the safe 8 MiB upload limit", "rejected");
     return {
@@ -444,7 +445,7 @@ export class DiscordMessenger implements Messenger {
           throw new DeliveryError("Discord status edit requires a plain message in the exact destination conversation", "rejected");
         }
         const channel = await this.destination(output.route);
-        const payload = this.payload(output.text, discordNonce(output.id, output.route));
+        const payload = this.payload(output.text, discordNonce(output.id, output.route), channel);
         const message = await channel.messages.edit(output.editOf.messageId, {
           content: payload.content ?? "", embeds: payload.embeds, files: payload.files ?? [], attachments: [], allowedMentions: NO_MENTIONS,
         });
@@ -458,7 +459,7 @@ export class DiscordMessenger implements Messenger {
       }
       const channel = await this.destination(output.route);
       const message = await channel.send({
-        ...this.payload(output.text, discordNonce(output.id, output.route)),
+        ...this.payload(output.text, discordNonce(output.id, output.route), channel),
         // Discord may omit a deleted reference in this same send. Never retry
         // without a reference: an ambiguous first attempt may already exist.
         ...(output.replyTo ? { reply: { messageReference: output.replyTo.messageId, failIfNotExists: false } } : {}),
@@ -564,11 +565,11 @@ export class DiscordMessenger implements Messenger {
       const notice = `Request cancelled: ${error instanceof Error ? error.message : "Unsupported dialog."}`;
       let message: Message;
       try {
-        const payload = this.payload(notice, discordNonce(`approval-cancel:${token}`, approval.route));
+        const payload = this.payload(notice, discordNonce(`approval-cancel:${token}`, approval.route), channel);
         if (approval.remoteId) {
           message = await channel.messages.fetch(approval.remoteId);
           this.assertApprovalMessage(message, approval, token);
-          await message.edit({ content: payload.content, files: payload.files, attachments: [], components: [], allowedMentions: NO_MENTIONS });
+          await message.edit({ content: payload.content, embeds: payload.embeds, files: payload.files, attachments: [], components: [], allowedMentions: NO_MENTIONS });
         } else message = await channel.send(payload);
       }
       catch (failure) { throw deliveryError(failure); }
@@ -580,12 +581,12 @@ export class DiscordMessenger implements Messenger {
     this.pending.set(token, pending);
     try {
       const channel = await this.destination(approval.route);
-      const payload = this.payload(view.content, discordNonce(`approval:${token}`, approval.route), view.components);
+      const payload = this.payload(view.content, discordNonce(`approval:${token}`, approval.route), channel, view.components);
       let message: Message;
       if (approval.remoteId) {
         message = await channel.messages.fetch(approval.remoteId);
         this.assertApprovalMessage(message, approval, token);
-        await message.edit({ content: payload.content, files: payload.files, attachments: [], components: view.components, allowedMentions: NO_MENTIONS });
+        await message.edit({ content: payload.content, embeds: payload.embeds, files: payload.files, attachments: [], components: view.components, allowedMentions: NO_MENTIONS });
       } else message = await channel.send(payload);
       pending.messageId = message.id;
       pending.active = true;
@@ -618,8 +619,8 @@ export class DiscordMessenger implements Messenger {
     const message = await channel.messages.fetch(pending.messageId);
     this.assertApprovalMessage(message, pending.approval, pending.token);
     const view = this.view(pending, selectPage);
-    const payload = this.payload(view.content, discordNonce(`approval:${pending.token}`, pending.approval.route), view.components);
-    await message.edit({ content: payload.content, files: payload.files, attachments: [], components: view.components, allowedMentions: NO_MENTIONS });
+    const payload = this.payload(view.content, discordNonce(`approval:${pending.token}`, pending.approval.route), channel, view.components);
+    await message.edit({ content: payload.content, embeds: payload.embeds, files: payload.files, attachments: [], components: view.components, allowedMentions: NO_MENTIONS });
   }
 
   async dismissApproval(approval: Approval): Promise<void> {
