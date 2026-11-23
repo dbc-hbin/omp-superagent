@@ -147,10 +147,13 @@ receipted, and then searched and admitted in the background. Until it is admitte
 every later input of the same physical channel or DM (including its threads and
 logical topics) is queued behind it, so none overtakes it; other conversations are
 not held. A redelivery of a queued input shares the store's immutable-payload
-and signed attachment URL reconciliation. Recovery controls (`/restart`,
-`/stop head`) bypass deferred waiting so a failed admission cannot trap them,
-and a global HEAD stop snapshots receipt order across both queues without
-cancelling later requests or independent lane work. A pending queued
+and signed attachment URL reconciliation. Fresh recovery controls (`/restart`,
+`/stop head`, never edited revisions) bypass deferred waiting so a failed
+admission cannot trap them, and a queued bare `/stop` is promoted ahead of
+ordinary waiting items if the head admission becomes unresolved while ordinary
+items remain ordered. Both global HEAD stops and lane-specific stops snapshot
+receipt order across both queues without cancelling later requests, later lane
+resumes, or independent lane work. A pending queued
 choice fences the automatic history choice like an unreceipted Gateway event. A
 failed admission stays first in its conversation and is retried with bounded
 backoff; a permanent denial is dropped. The queue survives a restart and resumes

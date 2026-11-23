@@ -10415,6 +10415,131 @@ describe("deferred historical topic routing", () => {
     expect(store.input(`handoff:${first.id}:current`) ?? store.input(first.id)).not.toBeNull();
     expect(store.input(first.id)?.attachments[0]?.url).toBe(refreshedUrl);
   });
+
+  test("an older deferred /resume cannot undo a confirmed lane stop, while a later /resume still works", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current } = historyFixture("available", search.promise);
+    await runtime.start();
+    await runtime.pause(current.id);
+    expect(store.lane(current.id)?.workState).toBe("paused");
+
+    const first = { ...message("760", destination, historicalRequest), receivedAt: historicalNow };
+    const earlierResume = { ...message("761", destination, "/resume"), receivedAt: historicalNow + 1 };
+    const stopLane = message("762", route("13"), `/stop ${current.id}`);
+
+    await runtime.receive(first);
+    await runtime.receive(earlierResume);
+    expect(store.input(earlierResume.id)).toBeNull();
+
+    // A lane stop from another conversation snapshots earlier deferred inputs before drain.
+    await runtime.receive(stopLane);
+    for (let i = 0; i < 100 && !store.output("762:head-control"); i++) await Bun.sleep(20);
+    expect(store.output("762:head-control")?.text).toContain("paused");
+
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+
+    expect(store.input(earlierResume.id)?.state).toBe("cancelled");
+    expect(store.output(`${earlierResume.id}:control`)).toBeNull();
+    expect(store.lane(current.id)?.workState).toBe("paused");
+
+    // A resume received after the confirmed lane stop still opens the lane.
+    const laterResume = { ...message("763", destination, "/resume"), receivedAt: historicalNow + 2 };
+    await admit(runtime, laterResume);
+    for (let i = 0; i < 100 && store.input(laterResume.id)?.state !== "done"; i++) await Bun.sleep(20);
+    expect(store.input(laterResume.id)?.state).toBe("done");
+    expect(store.lane(current.id)?.workState).toBe("open");
+    expect(store.output(`${laterResume.id}:control`)?.text).toContain("해제");
+  });
+
+  test("a queued bare /stop is promoted when head admission fails while ordinary waiting items stay ordered", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current } = historyFixture("available", search.promise);
+    const origReceive = store.receive.bind(store);
+    store.receive = (input, target, metadata, workflow) => {
+      if (input.id === "770") throw new Error("Transient store failure for first admission");
+      return origReceive(input, target, metadata, workflow);
+    };
+    await runtime.start();
+
+    const first = { ...message("770", destination, historicalRequest), receivedAt: historicalNow };
+    const ordinary1 = { ...message("771", destination, "Ordinary follow-up before stop"), receivedAt: historicalNow + 1 };
+    const bareStop = { ...message("772", destination, "/stop"), receivedAt: historicalNow + 2 };
+    const ordinary2 = { ...message("773", destination, "Ordinary follow-up after stop"), receivedAt: historicalNow + 3 };
+
+    await runtime.receive(first);
+    await runtime.receive(ordinary1);
+    await runtime.receive(bareStop);
+    await runtime.receive(ordinary2);
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id))
+      .toEqual(["770", "771", "772", "773"]);
+    expect(store.input(bareStop.id)).toBeNull();
+
+    search.resolve();
+    await runtime.routingSettled();
+    for (let i = 0; i < 100 && !store.output("772:head-control"); i++) await Bun.sleep(20);
+
+    expect(store.output("772:head-control")?.text).toContain("paused");
+    expect(store.lane(current.id)?.workState).toBe("paused");
+    expect(store.input(first.id)).toBeNull();
+    expect(store.input(ordinary1.id)).toBeNull();
+    expect(store.input(ordinary2.id)).toBeNull();
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id))
+      .toEqual(["770", "771", "773"]);
+  });
+
+  test("control-looking edits cannot bypass deferred routing to overtake their original message", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current, worker } = historyFixture("available", search.promise);
+    await runtime.start();
+
+    const original = {
+      ...message(`discord:${destination.accountId}:780`, destination, historicalRequest),
+      messageId: "780",
+      receivedAt: historicalNow,
+    };
+    const restartEdit = {
+      ...original,
+      id: `discord:${destination.accountId}:780:edit:1750000001`,
+      text: "/restart",
+      receivedAt: historicalNow + 1,
+    };
+    const stopHeadEdit = {
+      ...original,
+      id: `discord:${destination.accountId}:780:edit:1750000002`,
+      text: "/stop head",
+      receivedAt: historicalNow + 2,
+    };
+
+    await runtime.receive(original);
+    await runtime.receive(restartEdit);
+    await runtime.receive(stopHeadEdit);
+
+    expect(store.input(original.id)).toBeNull();
+    expect(store.input(restartEdit.id)).toBeNull();
+    expect(store.input(stopHeadEdit.id)).toBeNull();
+    expect(store.firstAdmittedMessage(destination, "780")).toBeNull();
+    expect(store.getMeta("head:restart-fence")).toBeFalsy();
+    expect(store.getMeta("head:stop-boundary")).toBeNull();
+    expect(JSON.parse(store.getMeta("intake:deferred-routing") ?? "[]").map((item: Inbound) => item.id))
+      .toEqual([original.id, restartEdit.id, stopHeadEdit.id]);
+
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+
+    expect(store.firstAdmittedMessage(destination, "780")?.id).toBe(original.id);
+    expect(store.getMeta(`dm:control-edit:${original.id}`)).toBeNull();
+    expect(store.input(`handoff:${original.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(original.text)]);
+    expect(store.input(restartEdit.id)?.state).toBe("cancelled");
+    expect(store.getMeta(`dm:control-edit:${restartEdit.id}`)).toBe("command");
+    expect(store.input(stopHeadEdit.id)?.state).toBe("cancelled");
+    expect(store.getMeta(`dm:control-edit:${stopHeadEdit.id}`)).toBe("command");
+    expect(store.getMeta("head:restart-fence")).toBeFalsy();
+    expect(store.getMeta("head:stop-boundary")).toBeNull();
+  });
 });
 
 describe("historical continuation in an existing Discord work thread", () => {

@@ -525,6 +525,9 @@ export class Superagent {
           }
         }
       }
+      for (const pending of this.store.inputs("main", "pending")) {
+        if (this.deferredLaneResumeStopped(pending)) this.store.settle(pending.id, "cancelled");
+      }
       for (const input of this.store.inputs(undefined, "submitted")) {
         if (recovered.has(input.id)) continue;
         const owner = this.store.getMeta(`steering-owner:${input.id}`);
@@ -2058,10 +2061,7 @@ export class Superagent {
     }
     const conversation = routingConversation(input.route);
     const waiting = queue.some(item => routingConversation(item.route) === conversation);
-    const control = headControlPattern.exec(intake.text.trim());
-    const arg = (control?.[2] ?? "").trim();
-    const recoveryControl = control !== null && (control[1] === "restart" && !arg
-      || control[1] === "stop" && (arg === "head" || !arg && this.routingRetry.has(conversation)));
+    const recoveryControl = this.isDeferredRecoveryControl(intake, queue, this.routingRetry.has(conversation));
     if (waiting ? this.store.input(input.id) !== null || recoveryControl : this.routingIntent(intake).query === null) {
       await this.admit(input);
       return;
@@ -2075,13 +2075,61 @@ export class Superagent {
     return JSON.parse(this.store.getMeta(DEFERRED_ROUTING_META) ?? "[]");
   }
 
+  private isDeferredRecoveryControl(
+    input: Inbound,
+    queue: readonly Inbound[],
+    includeBareStop: boolean,
+  ): boolean {
+    if (input.pickerSelection || messengerEdit(input)) return false;
+    if (input.messageId !== null) {
+      if (this.store.firstAdmittedMessage(input.route, input.messageId)) return false;
+      const route = physicalRouteKey(input.route);
+      for (const item of queue) {
+        if (item.id === input.id) break;
+        if (item.messageId === input.messageId && physicalRouteKey(item.route) === route) return false;
+      }
+    }
+    const control = headControlPattern.exec(input.text.trim());
+    if (!control) return false;
+    const arg = (control[2] ?? "").trim();
+    return control[1] === "restart" && !arg
+      || control[1] === "stop" && (arg === "head" || !arg && includeBareStop);
+  }
+
+  private nextDeferredInput(
+    conversation: string,
+    queue: readonly Inbound[],
+    now: number,
+    failed: ReadonlySet<string>,
+  ): { readonly input: Inbound; readonly isHead: boolean } | null {
+    const items = queue.filter(item => routingConversation(item.route) === conversation);
+    const head = items[0];
+    if (!head) return null;
+    const retry = this.routingRetry.get(conversation);
+    if ((!retry || retry.at <= now) && !failed.has(head.id)) return { input: head, isHead: true };
+    if (!retry) return null;
+    const recovery = items.slice(1).find(item => !failed.has(item.id) && this.isDeferredRecoveryControl(item, queue, true));
+    return recovery ? { input: recovery, isHead: false } : null;
+  }
+
+  private deferredIdsBefore(inputId: string): string[] {
+    const queue = this.deferredRouting();
+    const index = queue.findIndex(item => item.id === inputId);
+    return (index === -1 ? queue : queue.slice(0, index)).map(item => item.id);
+  }
+
   /** Admit queued inputs of each conversation in order; resumes after restart and after a failed admission's backoff. */
   private resumeRouting(): void {
     if (this.stopped || this.restartFence()) return;
     const now = Date.now();
-    for (const item of this.deferredRouting()) {
+    const queue = this.deferredRouting();
+    for (const item of queue) {
       const conversation = routingConversation(item.route);
-      if ((this.routingRetry.get(conversation)?.at ?? 0) <= now) this.drainRouting(conversation);
+      const retry = this.routingRetry.get(conversation);
+      if ((retry?.at ?? 0) <= now
+        || retry !== undefined && this.isDeferredRecoveryControl(item, queue, true)) {
+        this.drainRouting(conversation);
+      }
     }
   }
 
@@ -2090,25 +2138,30 @@ export class Superagent {
     // Start after registration, and unregister synchronously with the final queue
     // read, so an input queued meanwhile always finds or starts a drain.
     const drain = Promise.resolve().then(async () => {
+      const failed = new Set<string>();
       try {
         for (;;) {
           if (this.stopped || this.restartFence()) return;
-          const next = this.deferredRouting().find(item => routingConversation(item.route) === conversation);
+          const queue = this.deferredRouting();
+          const next = this.nextDeferredInput(conversation, queue, Date.now(), failed);
           if (!next) return;
           try {
-            await this.intake(() => this.admit(next));
+            await this.intake(() => this.admit(next.input));
           } catch (error) {
             if (this.stopped) return;
             this.report(error);
             if (!(error instanceof DeliveryError && error.certainty === "rejected")) {
-              // Like an unresolved Gateway receipt: keep it first in its conversation and retry with backoff.
-              const delay = Math.min((this.routingRetry.get(conversation)?.delay ?? 125) * 2, 30_000);
-              this.routingRetry.set(conversation, { at: Date.now() + delay, delay });
-              return;
+              failed.add(next.input.id);
+              if (next.isHead) {
+                // Like an unresolved Gateway receipt: keep it first in its conversation and retry with backoff.
+                const delay = Math.min((this.routingRetry.get(conversation)?.delay ?? 125) * 2, 30_000);
+                this.routingRetry.set(conversation, { at: Date.now() + delay, delay });
+              }
+              continue;
             }
           }
-          this.routingRetry.delete(conversation);
-          this.store.setMeta(DEFERRED_ROUTING_META, JSON.stringify(this.deferredRouting().filter(item => item.id !== next.id)));
+          if (next.isHead) this.routingRetry.delete(conversation);
+          this.store.setMeta(DEFERRED_ROUTING_META, JSON.stringify(this.deferredRouting().filter(item => item.id !== next.input.id)));
         }
       } finally {
         this.routingDrains.delete(conversation);
@@ -2219,7 +2272,9 @@ export class Superagent {
       // Resolve redelivery using its immutable original binding, not today's DM topic.
       const replay = { ...input, route: existing.route };
       this.store.receive(replay, existing.target, {}, existing.workflow);
-      if (existing.state === "pending" && this.deferredStoppedByBoundary(existing.id) && this.shouldCancelDeferredHead(existing)) {
+      if (existing.state === "pending"
+        && (this.deferredStoppedByBoundary(existing.id) && this.shouldCancelDeferredHead(existing)
+          || this.deferredLaneResumeStopped(existing))) {
         this.store.settle(existing.id, "cancelled");
       }
       this.remember(replay);
@@ -2471,13 +2526,12 @@ export class Superagent {
     if (!this.store.receive(input, target, { ...metadata, [`user-source:${input.id}`]: "true" }, workflow ? {
       name: workflow, reason: "Original authorized user's leading workflow invocation", sourceId: input.id, provenance: "user",
     } : null)) return;
-    if (this.deferredStoppedByBoundary(input.id)) {
-      const admitted = this.store.input(input.id);
-      if (admitted && this.shouldCancelDeferredHead(admitted)) {
-        this.store.settle(admitted.id, "cancelled");
-        this.remember(input);
-        return;
-      }
+    const admitted = this.store.input(input.id);
+    if (admitted && (this.deferredStoppedByBoundary(admitted.id) && this.shouldCancelDeferredHead(admitted)
+      || this.deferredLaneResumeStopped(admitted))) {
+      this.store.settle(admitted.id, "cancelled");
+      this.remember(input);
+      return;
     }
     this.remember(input);
     if (this.settleTopicControl(input, bound)) { this.background(this.kick()); return; }
@@ -4981,6 +5035,15 @@ export class Superagent {
     return boundary.deferredStoppedIds?.includes(id) === true;
   }
 
+  private deferredLaneResumeStopped(input: InputRecord): boolean {
+    const laneId = this.laneResumeOwner(input);
+    if (!laneId) return false;
+    const raw = this.store.getMeta(`lane:stop-boundary:${laneId}`);
+    if (!raw) return false;
+    const stoppedIds = JSON.parse(raw) as string[];
+    return stoppedIds.includes(input.id);
+  }
+
   private admitStop(input: InputRecord, target: string | null, selected?: readonly string[]): void {
     this.store.setMeta(`head:stop-target:${input.id}`, JSON.stringify(target));
     if (target !== "main") {
@@ -4994,6 +5057,12 @@ export class Superagent {
           && this.store.getMeta(`topic-resume-generation:${candidate.id}`) === String(lane.generation)) {
           this.store.settle(candidate.id, "cancelled");
         }
+      }
+      const deferredStoppedIds = this.deferredIdsBefore(input.id);
+      if (deferredStoppedIds.length) {
+        const boundaryKey = `lane:stop-boundary:${lane.id}`;
+        const previous = JSON.parse(this.store.getMeta(boundaryKey) ?? "[]") as string[];
+        this.store.setMeta(boundaryKey, JSON.stringify([...new Set([...previous, ...deferredStoppedIds])]));
       }
       return;
     }
@@ -5019,7 +5088,7 @@ export class Superagent {
       // Recovery reapplies this explicit boundary before submitted -> uncertain.
       // Cover already-receipted deferred inputs so pre-stop HEAD work cannot
       // execute after drain, while never cancelling later requests or lane work.
-      const deferredStoppedIds = this.deferredRouting().map(item => item.id).filter(id => id !== input.id);
+      const deferredStoppedIds = this.deferredIdsBefore(input.id);
       const previousBoundary = JSON.parse(this.store.getMeta("head:stop-boundary") ?? "{\"cancelledInputIds\":[]}") as {
         cancelledInputIds: string[];
         deferredStoppedIds?: string[];
