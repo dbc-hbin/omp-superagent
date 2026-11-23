@@ -483,7 +483,9 @@ approval.
 - Pending outbox delivery runs concurrently across distinct physical routes
   (platform, account, authority, guild, channel, thread) while preserving
   strict sequence order within each physical route and never automatically
-  retrying uncertain sends.
+  retrying uncertain sends. Routes wake as soon as outputs become pending
+  without waiting behind an unrelated command tail; restart checkpoints still
+  wait for all in-flight route deliveries to settle before lifecycle handoff.
 
 ## Discord voice
 

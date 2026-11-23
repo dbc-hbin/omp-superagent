@@ -66,7 +66,7 @@ const SCHEMA = `
   );
   CREATE TABLE IF NOT EXISTS outputs (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-    source_id TEXT NOT NULL, route TEXT NOT NULL, text TEXT NOT NULL,
+    source_id TEXT NOT NULL, route TEXT NOT NULL, physical_route TEXT, text TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending'
       CHECK(state IN ('pending','sending','sent','uncertain','failed')),
     remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT, result_attachment TEXT
@@ -205,6 +205,15 @@ export class Store implements StorePort {
       if (!outputColumns.some(column => column.name === "reply_to")) db.run("ALTER TABLE outputs ADD COLUMN reply_to TEXT");
       if (!outputColumns.some(column => column.name === "picker")) db.run("ALTER TABLE outputs ADD COLUMN picker TEXT");
       if (!outputColumns.some(column => column.name === "result_attachment")) db.run("ALTER TABLE outputs ADD COLUMN result_attachment TEXT");
+      if (!outputColumns.some(column => column.name === "physical_route")) db.run("ALTER TABLE outputs ADD COLUMN physical_route TEXT");
+      db.run("CREATE INDEX IF NOT EXISTS outputs_route_queue ON outputs(state, physical_route, sequence)");
+      const missingPhysical = db.query<{ id: string; route: string }, []>("SELECT id, route FROM outputs WHERE physical_route IS NULL").all();
+      if (missingPhysical.length) {
+        const update = db.query("UPDATE outputs SET physical_route = ? WHERE id = ?");
+        db.transaction(() => {
+          for (const row of missingPhysical) update.run(physicalRouteKey(JSON.parse(row.route) as Route), row.id);
+        })();
+      }
       this.db = db;
       this.writerLock = lock;
     } catch (error) {
@@ -1038,13 +1047,17 @@ export class Store implements StorePort {
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(replyTo.route))) {
         throw new Error(`Output reply differs from its source: ${output.id}`);
       }
-      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to, picker, result_attachment) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .run(output.id, output.sourceId, JSON.stringify(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
+      return this.db.query("INSERT INTO outputs(id, source_id, route, physical_route, text, reply_to, picker, result_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(output.id, output.sourceId, JSON.stringify(output.route), physicalRouteKey(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
           output.picker ? JSON.stringify(output.picker) : null, attachment ? JSON.stringify(attachment) : null).changes === 1;
     }).immediate();
   }
 
-  outputs(): OutputRecord[] {
+  outputs(physicalRoute?: string): OutputRecord[] {
+    if (physicalRoute !== undefined) {
+      return (this.db.query("SELECT * FROM outputs WHERE state = 'pending' AND physical_route = ? ORDER BY sequence")
+        .all(physicalRoute) as OutputRow[]).map(toOutput);
+    }
     return (this.db.query("SELECT * FROM outputs WHERE state = 'pending' ORDER BY sequence")
       .all() as OutputRow[]).map(toOutput);
   }

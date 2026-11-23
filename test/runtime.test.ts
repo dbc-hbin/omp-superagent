@@ -11186,4 +11186,109 @@ describe("per-route outbox flushing", () => {
     expect(store.output("9213:head-control")?.state).toBe("sent");
     expect(errors.length).toBe(1);
   });
+
+  test("restart on route B delivers its ACK immediately while route A is sending, then waits for A before handoff", async () => {
+    const { runtime, config, store, messenger, requests, handoff } = restartFixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5"] };
+    const routeA = route("10", { channelId: "4" });
+    const routeB = route(null, { channelId: "5" });
+    await runtime.start();
+    store.receive(message("restart-a-source", routeA), "main");
+    store.settle("restart-a-source", "done");
+    store.queueOutput({ id: "route-a-inflight", sourceId: "restart-a-source", route: routeA, text: "Inflight on A" });
+    const startedA = Promise.withResolvers<void>();
+    const releaseA = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => {
+      if (output.id === "route-a-inflight") {
+        startedA.resolve();
+        await releaseA.promise;
+      }
+    };
+    handoff.respond = async request => ({
+      ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main",
+      sessionFile: hostPaths(config, "main").sessionFile, state: "accepted",
+    });
+    const draining = runtime.kick();
+    try {
+      await startedA.promise;
+      expect(store.output("route-a-inflight")?.state).toBe("sending");
+
+      await runtime.receive(message("restart-b", routeB, "/restart"));
+      await messenger.whenSent(1);
+      await Bun.sleep(20);
+      expect(store.output("restart-b:restart-ack")?.state).toBe("sent");
+      expect(store.output("route-a-inflight")?.state).toBe("sending");
+      expect(requests).toEqual([]);
+    } finally {
+      releaseA.resolve();
+    }
+    await draining;
+    await runtime.kick();
+    await Bun.sleep(20);
+    expect(store.output("route-a-inflight")?.state).toBe("sent");
+    expect(requests).toHaveLength(1);
+  });
+
+  test("mixed commands wake a newly pending route even while another route holds priorityTail", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5"] };
+    const routeA = route("10", { channelId: "4" });
+    const dmB: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: null, channelId: "dm-b", threadId: null };
+    const statusStarted = Promise.withResolvers<void>();
+    const releaseStatus = Promise.withResolvers<void>();
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      if (output.id === "9221:head-control") {
+        statusStarted.resolve();
+        await releaseStatus.promise;
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    try {
+      await runtime.receive(message("9221", routeA, "/status"));
+      await statusStarted.promise;
+      expect(store.output("9221:head-control")?.state).toBe("sending");
+
+      // /main on DM B settles via settleTopicControl (without awaiting priorityTail) and wakes route B directly.
+      await runtime.receive(message("9222", dmB, "/main"));
+      await messenger.whenSent(1);
+      await Bun.sleep(20);
+      expect(store.output("9222:topic")?.state).toBe("sent");
+      expect(store.output("9221:head-control")?.state).toBe("sending");
+    } finally {
+      releaseStatus.resolve();
+    }
+    await messenger.whenSent(2);
+    await Bun.sleep(20);
+    expect(store.output("9221:head-control")?.state).toBe("sent");
+  });
+
+  test("flushing across many routes partitions once without rescanning the full pending outbox per worker", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5", "6", "7", "8", "9", "10", "11"] };
+    await runtime.start();
+    const routes = ["4", "5", "6", "7", "8", "9", "10", "11"].map(ch => route(null, { channelId: ch }));
+    for (const [index, dest] of routes.entries()) {
+      const id = `batch-src-${index}`;
+      store.receive(message(id, dest), "main");
+      store.settle(id, "done");
+      store.queueOutput({ id: `batch-out-${index}`, sourceId: id, route: dest, text: `msg-${index}` });
+    }
+    const outputsSpy = spyOn(store, "outputs");
+    try {
+      await runtime.kick();
+      await messenger.whenSent(8);
+      await Bun.sleep(20);
+      const calls = outputsSpy.mock.calls.map(([arg]) => arg);
+      // Partitioning does not scale linearly with the number of pending routes;
+      // route workers query only their own physical route on subsequent loops.
+      const unfilteredCalls = calls.filter(arg => arg === undefined);
+      const filteredCalls = calls.filter((arg): arg is string => typeof arg === "string");
+      expect(unfilteredCalls.length).toBeLessThanOrEqual(2);
+      expect(new Set(filteredCalls).size).toBe(8);
+    } finally {
+      outputsSpy.mockRestore();
+    }
+  });
 });
