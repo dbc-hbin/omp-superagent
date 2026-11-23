@@ -15,7 +15,7 @@ import { requireHostOwner } from "./host-owner-path";
 import { inspectInstalledOmp, resolveOmpCommand } from "./installed-omp";
 import type { DialogResponse, LanePresetSnapshot } from "./contracts";
 import type { WorkerHostProfile } from "./worker-profile";
-import { activeManagedUlw, managedUlwLaunchExtensions, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
+import { activeManagedUlw, managedUlwLaunch, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
 
 const CONNECT_TIMEOUT_MS = 5_000;
 const START_TIMEOUT_MS = 30_000;
@@ -477,31 +477,30 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
       throw new Error("Host log must be a private regular file owned by this user");
     }
     const manifestPath = path.join(launchDirectory, "owner.json");
-    const composition = managedUlwPath === undefined ? { extensionPaths: [], noExtensions: true, memoryWriteDir: null }
-      : await managedUlwLaunchExtensions({ cwd: options.cwd, managedUlwPath, configPath,
-      extensionPaths: [fileURLToPath(new URL("../", import.meta.url)), managedUlwPath, options.extensionPath,
-        fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
-        fileURLToPath(new URL("./host-extension.ts", import.meta.url))],
-      parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
-      ...(options.worker ? { worker: { extensionPaths: options.worker.extensionPaths } } : {}),
-      launchArgs: [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
-      env: options.env, bunCommand: [bun, "--no-env-file"] });
     const { env: _inheritedEnvironment, worker: _workerProfile, ...launchOptions } = options;
     const helperPath = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
-    const manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath, memoryWriteDir: composition.memoryWriteDir,
-      processBackend, helperPath, nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
-    // Preparation used to run inside the owner; it shares the same startup budget.
-    const deadline = Date.now() + START_TIMEOUT_MS;
-    // The SDK helper is the first operation that can create or publish this
-    // session. A worker must persist its launch fence before spawning it.
-    beforeSessionPrepare?.();
-    const prepare = Bun.spawn([bun, "--no-env-file", helperPath, "prepare"], {
-      cwd: options.worker ? launchDirectory : options.cwd, env: options.env, stdin: new Blob([JSON.stringify(manifest)]), stdout: "pipe", stderr: log.fd,
-      timeout: START_TIMEOUT_MS, killSignal: "SIGKILL",
+    let manifest: Record<string, unknown> | undefined;
+    const extensionPaths = managedUlwPath === undefined ? [] : [fileURLToPath(new URL("../", import.meta.url)),
+      managedUlwPath, options.extensionPath, fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
+      fileURLToPath(new URL("./host-extension.ts", import.meta.url))];
+    // The same helper discovers composition and then prepares the session.
+    // The worker launch fence is committed only immediately before the manifest
+    // is sent. Preparation and owner startup share the same deadline.
+    const { prepared, deadline } = await managedUlwLaunch({ cwd: options.cwd, managedUlwPath,
+      extensionPaths, configPath, parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
+      ...(options.worker ? { worker: { extensionPaths: options.worker.extensionPaths } } : {}),
+      launchArgs: managedUlwPath === undefined ? [] : [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
+      env: options.env, bunCommand: [bun, "--no-env-file"] }, {
+      stderr: log.fd, timeoutMs: START_TIMEOUT_MS, beforeManifest: beforeSessionPrepare,
+      manifest: async composition => {
+        manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath,
+          memoryWriteDir: composition.memoryWriteDir, processBackend, helperPath,
+          nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
+        return manifest;
+      },
     });
-    const [prepared, code] = await Promise.all([new Response(prepare.stdout).text(), prepare.exited]);
-    if (Date.now() >= deadline) throw new Error("Native session preparation timed out");
-    if (code !== 0) throw new Error("Native session preparation failed");
+    if (deadline === undefined || prepared === undefined) throw new Error("Native session preparation did not confirm tool selection");
+    if (performance.now() >= deadline) throw new Error("Native session preparation timed out");
     const flags = JSON.parse(prepared);
     if (typeof flags?.toolsExplicitlySelected !== "boolean" || typeof flags.noTools !== "boolean")
       throw new Error("Native session preparation did not confirm tool selection");
@@ -509,7 +508,7 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
       throw new Error("Native launch did not resolve the stock no-tools selection");
     await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, toolsExplicitlySelected: flags.toolsExplicitlySelected,
       noTools: flags.noTools, inventory: flags.inventory }), { flag: "wx", mode: 0o600 });
-    if (Date.now() >= deadline) throw new Error("Native Host startup timed out before launch");
+    if (performance.now() >= deadline) throw new Error("Native Host startup timed out before launch");
     child = spawn(hostOwnerExecutable, [manifestPath], {
       cwd: options.cwd, env: options.env,
       detached: true, stdio: ["ignore", log.fd, log.fd], shell: false,
@@ -523,7 +522,7 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
     await log.close();
     log = undefined;
     let startingSocket: Stats | undefined;
-    while (Date.now() < deadline) {
+    while (performance.now() < deadline) {
       if (failure) throw failure;
       let observed: Stats;
       try {
@@ -548,7 +547,7 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
         await Bun.sleep(50);
         continue;
       }
-      const { connection, identity, state } = await HostConnection.open(options.socketPath, Math.max(1, deadline - Date.now()));
+      const { connection, identity, state } = await HostConnection.open(options.socketPath, Math.max(1, deadline - performance.now()));
       try {
         if (identity.dev !== startingSocket.dev || identity.ino !== startingSocket.ino) {
           throw new Error("Launched RPC socket identity changed while connecting");

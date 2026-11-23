@@ -189,8 +189,7 @@ async function probe(packagePath: string, stage: string, manifest: UlwManifest):
     home, manifest.probeTimeoutMs, env);
 }
 
-/** Snapshot native discovery in the exact environment the installed CLI will use. */
-export async function managedUlwLaunchExtensions(options: {
+export type ManagedUlwLaunchInput = {
   cwd: string;
   managedUlwPath: string;
   extensionPaths: string[];
@@ -200,26 +199,144 @@ export async function managedUlwLaunchExtensions(options: {
   commandArgs: string[];
   /** Exact native OMP argv, including the original command's flags and generated Host args; no executable prefix. */
   launchArgs: string[];
+  worker?: Pick<WorkerHostProfile, "extensionPaths">;
+};
+type ManagedUlwLaunchOptions = Omit<ManagedUlwLaunchInput, "managedUlwPath"> & {
+  managedUlwPath?: string;
   env: Record<string, string | undefined>;
   bunCommand: string[];
-  worker?: Pick<WorkerHostProfile, "extensionPaths">;
-}): Promise<{ extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null }> {
-  if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
-  const { env, bunCommand, ...input } = options;
-  const output = await run([...bunCommand, ...(input.worker ? ["--no-install"] : []), fileURLToPath(import.meta.url),
-    input.worker ? "--worker-launch-extensions" : "--launch-extensions", JSON.stringify(input)],
-    input.worker ? dirname(options.configPath) : options.cwd, 30_000,
-    Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)));
-  const result = output.split("\n").findLast(line => line.startsWith("MANAGED_ULW_LAUNCH "));
-  if (!result) throw new Error("Stock OMP discovery did not return a launch composition");
-  return JSON.parse(result.slice("MANAGED_ULW_LAUNCH ".length));
+  discoveryTimeoutMs?: number;
+};
+export type ManagedUlwLaunchComposition = { extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null };
+
+const LAUNCH_DISCOVERY_TIMEOUT_MS = 30_000;
+const LAUNCH_OUTPUT_LIMIT = 16 * 1024 * 1024; // Same bound as the Rust Gateway.
+const LAUNCH_MARKER = "MANAGED_ULW_LAUNCH ";
+const LAUNCH_ERROR_MARKER = "MANAGED_ULW_LAUNCH_ERROR ";
+
+async function launchPhase<T>(deadline: number, message: string, run: (assertActive: () => void) => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const assertActive = () => {
+    if (timedOut || performance.now() >= deadline) throw new Error(message);
+  };
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // Once reported, timeout is final even if a caller observes the clock
+        // before the absolute deadline (timer granularity or rounding).
+        timedOut = true;
+        reject(new Error(message));
+      }, Math.max(0, Math.ceil(deadline - performance.now())));
+    });
+    const result = await Promise.race([timeout, run(assertActive)]);
+    assertActive();
+    return result;
+  } finally { clearTimeout(timer); }
 }
 
-if (import.meta.main && process.argv[2] === "--worker-launch-extensions") {
-  const input: {
-    cwd: string; managedUlwPath: string; extensionPaths: string[]; launchArgs: string[];
-    worker: Pick<WorkerHostProfile, "extensionPaths">;
-  } = JSON.parse(process.argv[3] ?? "");
+/** Snapshot native discovery in the exact environment the installed CLI will use. */
+export async function managedUlwLaunchExtensions(options: ManagedUlwLaunchOptions & { managedUlwPath: string }): Promise<ManagedUlwLaunchComposition> {
+  return (await managedUlwLaunch(options)).composition;
+}
+
+/**
+ * Run native launch discovery in the Host SDK helper. With `prepare`, the same
+ * helper process then prepares the native session from the manifest the caller
+ * builds after seeing the composition, so one launch costs one helper spawn.
+ * The helper prepares nothing until that manifest arrives on its stdin.
+ */
+export async function managedUlwLaunch(options: ManagedUlwLaunchOptions, prepare?: {
+  /** Native stderr destination; preparation output may contain session data. */
+  stderr: number;
+  timeoutMs: number;
+  beforeManifest?: () => void;
+  manifest: (composition: ManagedUlwLaunchComposition) => unknown;
+}): Promise<{ composition: ManagedUlwLaunchComposition; prepared?: string; deadline?: number }> {
+  if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
+  const { env, bunCommand, discoveryTimeoutMs = LAUNCH_DISCOVERY_TIMEOUT_MS, ...input } = options;
+  const helper = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
+  const child = Bun.spawn([...bunCommand, ...(input.worker ? ["--no-install"] : []), helper, "launch"], {
+    cwd: input.worker ? dirname(options.configPath) : options.cwd,
+    env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)),
+    stdin: "pipe", stdout: "pipe", stderr: prepare?.stderr ?? "ignore",
+  });
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  let bytes = 0;
+  const read = async () => {
+    const chunk = await reader.read();
+    if (chunk.done) return false;
+    bytes += chunk.value.byteLength;
+    if (bytes > LAUNCH_OUTPUT_LIMIT) throw new Error("Host SDK launch output exceeded its bound");
+    output += decoder.decode(chunk.value, { stream: true });
+    return true;
+  };
+  try {
+    const discoveryDeadline = performance.now() + Math.max(1, discoveryTimeoutMs);
+    const composition = await launchPhase(discoveryDeadline, "Stock OMP discovery timed out", async () => {
+      child.stdin.write(JSON.stringify(input.managedUlwPath === undefined ? null : input) + "\n");
+      child.stdin.flush();
+      let scan = 0;
+      for (;;) {
+        const newline = output.indexOf("\n", scan);
+        if (newline < 0) {
+          scan = output.length;
+          if (await read()) continue;
+          throw new Error("Stock OMP discovery did not return a launch composition");
+        }
+        const line = output.slice(0, newline);
+        output = output.slice(newline + 1);
+        scan = 0;
+        if (line.startsWith(LAUNCH_ERROR_MARKER)) throw new Error(JSON.parse(line.slice(LAUNCH_ERROR_MARKER.length)));
+        if (line.startsWith(LAUNCH_MARKER)) {
+          const result: ManagedUlwLaunchComposition = JSON.parse(line.slice(LAUNCH_MARKER.length));
+          if (!prepare) {
+            child.stdin.end();
+            // Discovery-only mode has no further output to consume.
+            if (await child.exited !== 0) throw new Error("Stock OMP discovery failed");
+          }
+          return result;
+        }
+      }
+    });
+    if (!prepare) return { composition };
+
+    const deadline = performance.now() + Math.max(1, prepare.timeoutMs);
+    const timeout = "Native session preparation timed out";
+    bytes = Buffer.byteLength(output);
+    const prepared = await launchPhase(deadline, timeout, async assertActive => {
+      const payload = JSON.stringify(await prepare.manifest(composition));
+      // A timed-out manifest builder must never cross the worker launch fence.
+      assertActive();
+      prepare.beforeManifest?.();
+      child.stdin.write(payload);
+      child.stdin.end();
+      while (await read()) {}
+      if (await child.exited !== 0) throw new Error("Native session preparation failed");
+      return output + decoder.decode();
+    });
+    return { composition, prepared, deadline };
+  } finally {
+    // A descendant can hold a pipe open after the helper exits. Stop observing
+    // its stdout rather than waiting on it (or stderr) past a phase deadline.
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill("SIGKILL"); } catch {} // The child may have just exited.
+    }
+    void reader.cancel().catch(() => {});
+  }
+}
+
+/**
+ * Native discovery for one launch, run inside the short-lived Host SDK helper
+ * process: it imports SDK modules and mutates process-global discovery state.
+ */
+export async function managedUlwLaunchComposition(input: ManagedUlwLaunchInput): Promise<ManagedUlwLaunchComposition> {
+  return input.worker ? workerLaunchComposition({ ...input, worker: input.worker }) : launchComposition(input);
+}
+
+async function workerLaunchComposition(input: ManagedUlwLaunchInput & { worker: Pick<WorkerHostProfile, "extensionPaths"> }): Promise<ManagedUlwLaunchComposition> {
   const { assertWorkerWorkspaceStartup } = await import("./worker-profile");
   const { homedir } = await import("node:os");
   assertWorkerWorkspaceStartup(input.cwd, homedir());
@@ -236,14 +353,10 @@ if (import.meta.main && process.argv[2] === "--worker-launch-extensions") {
   // opt-in modules as files, while managed packages retain their own resources.
   const managed = validateManagedUlwPackage(input.managedUlwPath);
   const extensionPaths = [...new Set([...input.extensionPaths, managed, ...input.worker.extensionPaths])];
-  console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ extensionPaths, noExtensions: true, memoryWriteDir: null })}`);
+  return { extensionPaths, noExtensions: true, memoryWriteDir: null };
 }
 
-if (import.meta.main && process.argv[2] === "--launch-extensions") {
-  const input = JSON.parse(process.argv[3]!) as {
-    cwd: string; managedUlwPath: string; extensionPaths: string[]; parentConfigPath?: string;
-    commandArgs: string[]; launchArgs: string[];
-  };
+async function launchComposition(input: ManagedUlwLaunchInput): Promise<ManagedUlwLaunchComposition> {
   const { parseNativeLaunch } = await import("./native-launch-profile");
   const parsed = await parseNativeLaunch(input.launchArgs);
   const { extractProfileFlags } = await import("@oh-my-pi/pi-coding-agent/cli/profile-bootstrap");
@@ -399,7 +512,7 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
   const current = await readNativeSettings(settings).catch(() => { throw new Error(memoryBlockReason({ status: "unknown" })); });
   const { memory } = await ensureManagedMemory(current, memoryWriteDir);
   if (memory.status !== "enabled") throw new Error(memoryBlockReason(memory));
-  console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ ...composition, memoryWriteDir })}`);
+  return { ...composition, memoryWriteDir };
 }
 
 /** Serialized source preparation only. No Gateway, account adapter, or Host starts here. */
