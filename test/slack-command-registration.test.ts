@@ -173,6 +173,7 @@ describe("Slack supported command surface", () => {
       expect(parseSlackCommand(name, "")).toBeNull();
     }
     expect(parseSlackCommand("/superagent-model", "  --global provider/model  ")).toBe("/model --global provider/model");
+    expect(parseSlackCommand("/superagent-usage", " reset ")).toBe("/usage reset");
     expect(parseSlackCommand("/superagent-compact", "  first line\nsecond line  ")).toBe("/compact first line\nsecond line");
     expect(parseSlackCommand("/superagent-new", "start\nwith context")).toBe("/new start\nwith context");
     expect(parseSlackCommand("/superagent-stop", "actual-lane-id")).toBe("/stop actual-lane-id");

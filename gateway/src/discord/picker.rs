@@ -8,20 +8,25 @@ use super::rest::no_mentions;
 use super::{Effect, State};
 
 pub(super) fn components(menu: &Menu) -> Value {
-    let options = menu
-        .options
-        .iter()
-        .map(|item| json!({"label": item.label, "value": item.value}))
-        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(2);
+    if !menu.options.is_empty() {
+        let options = menu
+            .options
+            .iter()
+            .map(|item| json!({"label": item.label, "value": item.value}))
+            .collect::<Vec<_>>();
+        rows.push(json!({
+            "type": 1,
+            "components": [{"type": 3, "custom_id": menu.select_id, "options": options}],
+        }));
+    }
     let buttons = menu
         .buttons
         .iter()
         .map(|item| json!({"type": 2, "style": 2, "label": item.label, "custom_id": item.control}))
         .collect::<Vec<_>>();
-    json!([
-        {"type": 1, "components": [{"type": 3, "custom_id": menu.select_id, "options": options}]},
-        {"type": 1, "components": buttons}
-    ])
+    rows.push(json!({"type": 1, "components": buttons}));
+    Value::Array(rows)
 }
 
 impl State {

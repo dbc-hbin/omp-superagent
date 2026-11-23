@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
 import { physicalRouteKey, routeKey } from "../src/contracts";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
@@ -23,6 +23,8 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../src/contracts
 import { headRecoveryEvidence } from "../src/head-recovery";
 import { decisionId } from "../src/decisions";
 import { CronJobs } from "../src/cron-jobs";
+import { CronPrIntake } from "../src/cron-pr-intake";
+import { prReviewApis } from "../src/pr-intake-review";
 import { PrWatcher } from "../src/pr-watch";
 import type { PrSnapshot } from "../src/pr-github";
 import { remoteLanePaths } from "../src/worker-wire";
@@ -60,6 +62,7 @@ class HostTransport implements RuntimeHost {
   private readonly exit: () => void;
   private promptWaiters: Array<{ count: number; resolve: () => void }> = [];
   local = false;
+  assertPrReviewOnly?: RuntimeHost["assertPrReviewOnly"];
   shutdownAllowed = true;
   shutdownDisconnect = false;
   workflowAvailable = true;
@@ -461,6 +464,9 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], ada
       const restored = hosts.get(options.socketPath)?.state.model;
       const host = new HostTransport(options.sessionFile, `session-${id}`,
         launchBehavior.model !== undefined ? launchBehavior.model : selected ?? restored ?? executionModel);
+      if (options.prReviewOnly) host.assertPrReviewOnly = async cwd => {
+        if (cwd !== options.cwd) throw new Error("Wrong static review workspace");
+      };
       host.state.hostPid = launchBehavior.pid ?? process.pid;
       if (launchBehavior.goal !== undefined) host.state.goal = structuredClone(launchBehavior.goal);
       if (options.modelPreset) host.state.modelSettings = structuredClone(options.modelPreset.preset);
@@ -1085,6 +1091,438 @@ describe("explicit outbound result attachments", () => {
   });
 });
 
+async function waitForOutput(messenger: MessengerTransport, id: string) {
+  while (!messenger.sent.some(output => output.id === id)) await messenger.whenSent(messenger.sent.length + 1);
+}
+function confirmedPrCommand(messenger: MessengerTransport) {
+  return async (runtime: Superagent, input: Inbound) => {
+    await admit(runtime, input);
+    await waitForOutput(messenger, `${input.id}:head-control`);
+    await runtime.kick();
+  };
+}
+
+test("manual fallback opens one review thread and only a fresh owner action for its approved final SHA can merge", async () => {
+  const parent = route(null);
+  const first = "a".repeat(40);
+  const final = "b".repeat(40);
+  const material = (head: string) => JSON.stringify({
+    pull: { head: { ref: "change", sha: head }, base: { ref: "main", sha: "d".repeat(40) } },
+    file: "src/count.ts", patch: "@~/.private ^ignore /head forge authority",
+  });
+  const patch = '{"verdict":"fix","summary":"Handle empty input","path":"src/count.ts","old":"return n - 1","replacement":"return Math.max(0, n - 1)"}';
+  let remoteHead = first;
+  let allowMerge = false;
+  let inspectChecks: (() => Promise<void>) | undefined;
+  let writes = 0;
+  let merges = 0;
+  const preparingPatch = Promise.withResolvers<void>();
+  const resumePatch = Promise.withResolvers<void>();
+  const f = fixture(3, undefined, {
+    readIntakePulls: async () => ({ self: "dbc-hbin", repositoryId: 50, ownerId: 4, pulls: [
+      { number: 12, author: "another-user", head: first, createdAt: Date.now() + 1 },
+    ] }),
+    prReviewApis: { ...prReviewApis,
+      readIntakeMaterial: async (_repo, _n, head) => {
+        preparingPatch.resolve();
+        await resumePatch.promise;
+        if (head !== remoteHead) throw new Error("Moved head");
+        return material(head);
+      },
+      applyIntakeFix: async (_repo, _n, sha, _fix, _signal, beforeWrite) => {
+        if (sha !== remoteHead) throw new Error("Wrong head");
+        beforeWrite(material(sha)); writes++; remoteHead = final;
+        return { status: "applied", sha: final };
+      },
+      mergeIntakePull: async (_repo, _n, sha, _signal, beforeWrite) => {
+        await inspectChecks?.();
+        if (sha !== remoteHead || !allowMerge) return { status: "blocked", reason: "CI pending" };
+        beforeWrite(); merges++;
+        return { status: "unknown", reason: "Lost acknowledgement" };
+      },
+      inspectIntakeMerge: async () => ({ status: "merged", sha: "c".repeat(40) }),
+    },
+  });
+  const { runtime, messenger, main, store } = f;
+  const admit = confirmedPrCommand(messenger);
+  const send = messenger.send.bind(messenger);
+  messenger.send = async output => {
+    const result = await send(output);
+    const owner = /^handoff:(\d+):.*:answer$/.exec(output.id)?.[1];
+    return owner ? String(BigInt(owner) + 1n) : result;
+  };
+  messenger.assertRoute = destination => {
+    if (destination.accountId !== parent.accountId) throw new Error("Wrong Discord account");
+  };
+  const offer = Promise.withResolvers<OutputRecord>();
+  messenger.beforeSend = async output => {
+    if (output.text.includes("pr-review") && output.text.includes(first)) offer.resolve(output);
+  };
+  await runtime.start();
+  await admit(runtime, { ...message("299", parent, '/cron pr-add "every 5m" dbc-hbin/project'), discordOriginalText: "/voice confirm" });
+  expect(store.input("299")?.state).toBe("cancelled");
+  await admit(runtime, message("300", parent, '/cron pr-add "every 5m" dbc-hbin/project'));
+  const job = store.output("300:head-control")?.text.match(/[a-f0-9-]{36}/)?.[0];
+  if (!job) throw new Error(`Missing enrollment: ${store.output("300:head-control")?.text}`);
+  await admit(runtime, message("301", parent, `/cron run ${job}`));
+  const notice = await offer.promise;
+  expect(notice.route).toEqual(parent);
+  expect(messenger.threads).toEqual([]);
+  expect(store.lanes()).toEqual([]);
+  expect(main.prompts).toEqual([]);
+  await expect(runtime.startLane({ ...selection, sourceId: notice.sourceId, cwd: f.directory, title: "invalid", kickoff: "invalid" }))
+    .rejects.toThrow();
+  const review = `/cron pr-review ${job} 12 ${first}`;
+  await admit(runtime, message("302", route("999"), review));
+  await admit(runtime, message("303", parent, `/cron pr-review ${job} 12 ${final}`));
+  expect(messenger.threads).toEqual([]);
+  const startingReview = admit(runtime, message("304", parent, review));
+  await preparingPatch.promise;
+  const lane = store.lanes()[0];
+  if (!lane) throw new Error(`Missing lane: ${store.output("304:head-control")?.text}`);
+  const host = f.hosts.get(lane.socketPath);
+  if (!host) throw new Error(`Missing review Host: ${f.errors.join("; ")}; ${store.input("handoff:304:lane")?.state}`);
+  const idleMs = f.config.idleMs;
+  try {
+    f.config.idleMs = 0;
+    await runtime.kick();
+    expect(host.commands.filter(cmd => cmd.type === "shutdown_host")).toEqual([]);
+  } finally { f.config.idleMs = idleMs; resumePatch.resolve(); }
+  await startingReview;
+  expect(messenger.threads).toEqual([lane.route]);
+  expect(messenger.threadSources).toEqual(["304"]);
+  expect(f.launched.at(-1)?.prReviewOnly).toBe(true);
+  await host.whenPrompts(1);
+  expect(host.prompts).toHaveLength(1);
+  expect(host.prompts[0]?.command.message).not.toContain("@~/.private");
+  await admit(runtime, message("305", parent, review));
+  const count = messenger.sent.length;
+  host.complete(patch);
+  await messenger.whenSent(count + 1);
+  await admit(runtime, message("306", lane.route, `/cron pr-status ${job} 12`));
+  const fix = store.output("306:head-control")?.text.match(/\/cron pr-fix .+$/)?.[0];
+  if (!fix) throw new Error(`Missing source-bound fix: ${store.output("306:head-control")?.text}`);
+  await admit(runtime, message("307", lane.route, `/cron pr-merge ${job} 12 ${first}`));
+  await admit(runtime, message("308", route("999"), fix));
+  await admit(runtime, message("309", lane.route, fix.replace(/[a-f0-9]{64}$/, "0".repeat(64))));
+  expect([writes, merges]).toEqual([0, 0]);
+  await admit(runtime, message("310", lane.route, fix));
+  await admit(runtime, message("310", lane.route, fix));
+  expect(writes).toBe(1);
+  await admit(runtime, message("311", lane.route, `/cron pr-merge ${job} 12 ${first}`));
+  expect(merges).toBe(0);
+  await admit(runtime, message("312", lane.route, `/cron pr-review ${job} 12 ${final}`));
+  await host.whenPrompts(2);
+  expect(host.prompts).toHaveLength(2);
+  expect(messenger.threads).toEqual([lane.route]);
+  const merge = `/cron pr-merge ${job} 12 ${final}`;
+  const atProbe = Promise.withResolvers<void>();
+  const letThrough = Promise.withResolvers<void>();
+  messenger.assertRoute = async () => { atProbe.resolve(); await letThrough.promise; };
+  allowMerge = true;
+  const premature = admit(runtime, message("322", lane.route, merge));
+  await atProbe.promise;
+  host.complete('{"verdict":"approve","summary":"Empty input handled"}');
+  await waitForOutput(messenger, `handoff:312:${lane.id}:answer`);
+  letThrough.resolve();
+  await premature;
+  expect(merges).toBe(0);
+  expect(store.input("322")?.state).toBe("cancelled");
+  allowMerge = false;
+  await admit(runtime, message("323", lane.route, merge));
+  expect(merges).toBe(0);
+  allowMerge = true;
+  const checking = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  inspectChecks = () => { checking.resolve(); return release.promise; };
+  const inFlight = admit(runtime, message("317", lane.route, merge));
+  await checking.promise;
+  // Pause and resume while this exact old owner command awaits GitHub. Opening
+  // the schedule again must not revive its previous review or publication.
+  await runtime.receive(message("318", parent, `/cron pause ${job}`));
+  await runtime.receive(message("319", parent, `/cron resume ${job}`));
+  release.resolve();
+  await inFlight;
+  inspectChecks = undefined;
+  expect(merges).toBe(0);
+  await admit(runtime, message("320", lane.route, merge));
+  expect(merges).toBe(0);
+  await admit(runtime, message("321", lane.route, `/cron pr-review ${job} 12 ${final}`));
+  await host.whenPrompts(3);
+  const beforeRenewal = messenger.sent.length;
+  host.complete('{"verdict":"approve","summary":"Reviewed current commit again"}');
+  await messenger.whenSent(beforeRenewal + 1);
+  await admit(runtime, message("2999", lane.route, merge));
+  await admit(runtime, message("3000", lane.route, merge));
+  await admit(runtime, message("3001", lane.route, `/cron pr-status ${job} 12`));
+  expect(store.output("3001:head-control")?.text).toContain("c".repeat(40));
+  expect([writes, merges]).toEqual([1, 1]);
+  expect(main.prompts).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test.each([
+  ["review", null],
+  ["fix", "무인으로 리뷰 후 수정커밋까지"],
+  ["merge", "무인으로 수정커밋후 머지까지"],
+  ["downgrade", "무인으로 수정커밋후 머지까지"],
+  ["thread-refused", null],
+  ["review-refused", null],
+] as const)("unattended %s uses a confirmed bot thread, never impersonates an owner, and stops at its selected stage", async (mode, command) => {
+  const parent = route(null);
+  const repository = mode === "thread-refused" ? `owner/${"r".repeat(100)}` : "owner/project";
+  const original = "a".repeat(40);
+  const corrected = "b".repeat(40);
+  const base = "d".repeat(40);
+  const material = (sha: string) => JSON.stringify({
+    pull: { base: { ref: "main", sha: base }, head: { ref: "change", sha } }, patch: "src/count.ts changed",
+  });
+  let head = original;
+  let ci = false;
+  const effects: string[] = [];
+  const firstReview = Promise.withResolvers<void>();
+  const atWrite = Promise.withResolvers<void>();
+  const resumeWrite = Promise.withResolvers<void>();
+  const f = fixture(3, undefined, {
+    readIntakePulls: async () => ({ repositoryId: 50, ownerId: 4, self: "owner",
+      pulls: [{ number: 7, createdAt: Date.now() + 1, author: "contributor", head }] }),
+    prReviewApis: { ...prReviewApis,
+      readIntakeMaterial: async (_repo, _number, sha) => {
+        if (sha !== head) throw new Error("stale PR");
+        firstReview.resolve();
+        if (mode === "review-refused") throw new Error("Fixture: unsupported static material");
+        return material(sha);
+      },
+      publishIntakeComment: async (_repo, _number, sha, summary, _signal, claim) => {
+        expect(sha).toBe(head); expect(summary).not.toContain('"replacement"'); claim();
+        effects.push(`comment:${sha}`); return { status: "posted", id: `review-${sha}` };
+      },
+      inspectIntakeComment: async () => ({ status: "unknown", reason: "No ambiguous fixture comment" }),
+      reconcileIntakeFix: async () => ({ status: "unknown", reason: "No ambiguous fixture fix" }),
+      applyIntakeFix: async (_repo, _number, sha, _fix, _signal, claim) => {
+        expect(sha).toBe(original); claim(material(sha));
+        effects.push(`fix:${sha}`); head = corrected; return { status: "applied", sha: corrected };
+      },
+      inspectIntakeMerge: async () => ci ? { status: "ready" } : { status: "blocked", reason: "CI pending" },
+      mergeIntakePull: async (_repo, _number, sha, _signal, claim) => {
+        if (!ci) return { status: "blocked", reason: "CI pending" };
+        if (mode === "downgrade") { atWrite.resolve(); await resumeWrite.promise; }
+        expect(sha).toBe(corrected); claim(); effects.push(`merge:${sha}`); return { status: "merged", sha: "c".repeat(40) };
+      },
+    },
+  });
+  const { runtime, store, messenger } = f;
+  const send = messenger.send.bind(messenger);
+  let physical = 1000;
+  messenger.send = async output => { await send(output); return `${++physical}`; };
+  messenger.assertRoute = () => {};
+  messenger.canCreateThread = async () => true;
+  messenger.createThread = async (parent, title, source) => {
+    if (!source) throw new Error("Missing confirmed starter");
+    messenger.threadSources.push(source);
+    expect(title.length).toBeLessThanOrEqual(100);
+    if (mode === "thread-refused" && messenger.threadSources.length === 1) throw new DeliveryError("HTTP 429", "rejected");
+    const thread = { ...parent, threadId: source };
+    messenger.threads.push(thread);
+    if (mode === "fix") throw new Error("Thread created; Discord response lost");
+    return thread;
+  };
+  messenger.inspectThread = async route => {
+    expect(route).toEqual(messenger.threads[0]!);
+    return { route, archived: false, title: "owner/project #7", availableTags: [], appliedTags: [], requiresTag: false };
+  };
+  await runtime.start();
+  const owner = confirmedPrCommand(messenger);
+  await owner(runtime, message("801", parent, `/cron pr-add "every 5m" ${repository}`));
+  const job = store.output("801:head-control")?.text.match(/[a-f0-9-]{36}/)?.[0];
+  if (!job) throw new Error("No registration");
+  if (command) {
+    await owner(runtime, message("802", parent, command));
+    expect(store.output("802:head-control")?.text).toContain(mode === "downgrade" ? "merge" : mode);
+  }
+  const jobs = new CronJobs(store, f.config);
+  let when = Date.now();
+  let settled = Promise.withResolvers<void>();
+  const set = store.setMeta.bind(store);
+  spyOn(store, "setMeta").mockImplementation((key, value) => {
+    set(key, value);
+    if (key === `pr-intake-status:${job}:7`) settled.resolve();
+  });
+  // Move the actual schedule clock, not an owner "/cron run" per PR or phase.
+  const tick = async () => {
+    settled = Promise.withResolvers<void>();
+    jobs.poll(when += 300_100);
+    await runtime.kick(); await settled.promise; await runtime.kick();
+  };
+  await tick();
+  if (mode === "thread-refused") {
+    expect(messenger.threads).toEqual([]);
+    expect(store.getMeta(`pr-intake-status:${job}:7`)).toContain("/cron pr-review");
+    await owner(runtime, message("10005", parent, `/cron pr-review ${job} 7 ${original}`));
+    expect(store.lanes()).toHaveLength(1);
+    expect(messenger.threads).toHaveLength(1);
+    return;
+  }
+  if (mode === "fix") {
+    expect(store.lanes()).toHaveLength(0);
+    expect(messenger.threadSources).toHaveLength(1);
+    await tick(); // Inspect the exact starter; never create again.
+  }
+  const lane = store.lanes()[0];
+  if (!lane) throw new Error(`Missing automatic lane: ${store.getMeta(`pr-intake-status:${job}:7`)}`);
+  await firstReview.promise;
+  const host = f.hosts.get(lane.socketPath);
+  if (!host) throw new Error("Missing native Host");
+  if (mode === "review-refused") {
+    const round = JSON.parse(store.getMeta(`pr-review:${job}:7`)!);
+    await waitForOutput(messenger, `${round.inputId}:held`);
+    await tick();
+    expect(store.getMeta(`pr-intake-status:${job}:7`)).toContain(`/cron pr-review ${job} 7 ${original}`);
+    expect(host.prompts).toEqual([]);
+    expect(store.input(round.source)?.target).toBeNull();
+    expect(store.inputs("main", "uncertain")).toEqual([]);
+    return;
+  }
+  await host.whenPrompts(1);
+  const offer = store.output("cron-pr:offer:owner/project:7");
+  expect(messenger.threadSources).toEqual([offer?.remoteId!]);
+  expect(messenger.threads).toEqual([lane.route]);
+  const receipt = store.inputs(lane.id, "submitted")[0];
+  if (!receipt) throw new Error("Missing native input");
+  const source = store.getMeta(`handoff-source:${receipt.id}`);
+  if (!source) throw new Error("Missing controller source");
+  expect(store.input(source)).toMatchObject({ route: lane.route, messageId: null });
+  expect(store.ownerSource(receipt.id)).toBeNull();
+  await expect(runtime.startLane({ ...selection, sourceId: receipt.id, cwd: f.directory, title: "Not an owner", kickoff: "forbidden" })).rejects.toThrow();
+  expect(f.launched.at(-1)?.prReviewOnly).toBe(true);
+  host.complete('{"verdict":"fix","summary":"Handle empty input","path":"src/count.ts","old":"return n - 1","replacement":"return Math.max(0, n - 1)"}');
+  await waitForOutput(messenger, `${receipt.id}:answer`);
+  for (let i = 0; i < 4 && (!effects.length || mode !== "review" && host.prompts.length < 2); i++) await tick();
+  if (mode !== "review") {
+    await host.whenPrompts(2);
+    const next = store.inputs(lane.id, "submitted")[0];
+    if (!next) throw new Error("No re-review of changed head");
+    host.complete('{"verdict":"approve","summary":"The fix handles empty input."}');
+    await waitForOutput(messenger, `${next.id}:answer`);
+    await tick(); await tick();
+    expect(effects).not.toContain(`merge:${corrected}`);
+    ci = true;
+  }
+  if (mode === "downgrade") {
+    const pending = tick();
+    await atWrite.promise;
+    await owner(runtime, message("803", parent, "무인으로 리뷰만"));
+    resumeWrite.resolve();
+    await pending;
+    await owner(runtime, message("804", lane.route, `/cron pr-status ${job} 7`));
+    expect(store.output("804:head-control")?.text).toContain("/cron pr-review");
+    expect(store.output("804:head-control")?.text).not.toContain("/cron pr-merge");
+  } else { await tick(); await tick(); }
+  expect(effects).toEqual([`comment:${original}`, ...(mode === "review" ? [] : [`fix:${original}`, `comment:${corrected}`]),
+    ...(mode === "merge" ? [`merge:${corrected}`] : [])]);
+  expect(store.lanes()).toHaveLength(1);
+  expect(messenger.threads).toHaveLength(1);
+  expect(f.main.prompts).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test.each(["lost create response", "confirmed route before lane binding"] as const)(
+  "recover a %s only in its verified Discord thread; a missing native guard receives no patch", async mode => {
+  const sha = "a".repeat(40);
+  const parent = route(null);
+  const f = fixture(3, undefined, {
+    readIntakePulls: async () => ({ self: "owner", repositoryId: 42, ownerId: 9,
+      pulls: [{ number: 7, author: "contributor", createdAt: Date.now() + 1, head: sha }] }),
+    prReviewApis: { ...prReviewApis, readIntakeMaterial: async () => {
+      const host = f.hosts.get(f.launched.at(-1)?.socketPath ?? "");
+      if (!host) throw new Error("Expected a verified lane Host");
+      host.assertPrReviewOnly = undefined; // An old attached Host without the new policy capability.
+      return JSON.stringify({ pull: { head: { ref: "topic", sha }, base: { ref: "main", sha: "b".repeat(40) } }, patch: "PRIVATE REVIEW FIXTURE DATA" });
+    } },
+  });
+  const { runtime, messenger, store, main } = f;
+  const admit = confirmedPrCommand(messenger);
+  const anchored = mode === "lost create response";
+  const nativeThread = route(anchored ? "403" : "902");
+  const offer = Promise.withResolvers<void>();
+  messenger.beforeSend = async output => { if (output.text.includes(sha)) offer.resolve(); };
+  messenger.assertRoute = () => {};
+  messenger.createThread = async (parent, _title, source) => {
+    expect(source).toBe(anchored ? "403" : undefined);
+    const result = { ...parent, threadId: nativeThread.threadId };
+    messenger.threads.push(result);
+    if (anchored) throw new Error("Lost create receipt");
+    return result;
+  };
+  messenger.inspectThread = async destination => {
+    if (routeKey(destination) !== routeKey(messenger.threads[0]!)) throw new Error("Unknown Discord thread");
+    return { route: destination, title: "owner/project #7", archived: false, availableTags: [], appliedTags: [], requiresTag: false };
+  };
+  await runtime.start();
+  await admit(runtime, message("401", parent, '/cron pr-add "every 5m" owner/project'));
+  const job = store.output("401:head-control")?.text.match(/[a-f0-9-]{36}/)?.[0];
+  if (!job) throw new Error("Missing registration");
+  await admit(runtime, message("402", parent, `/cron run ${job}`));
+  await offer.promise;
+  const review = `/cron pr-review ${job} 7 ${sha}`;
+  const creation = anchored ? message("403", parent, review) : applicationCommand("403", parent, review);
+  if (!anchored) {
+    const persist = store.setMeta.bind(store);
+    spyOn(store, "setMeta").mockImplementation((key, value) => {
+      persist(key, value);
+      if (key === `handoff-route:${creation.id}` && value !== "uncertain") throw new Error("Interrupted before lane binding");
+    });
+  }
+  await admit(runtime, creation);
+  await admit(runtime, message("404", parent, review));
+  await admit(runtime, message("405", route("777"), review));
+  expect(store.lanes()).toEqual([]);
+  expect(messenger.threads).toEqual([nativeThread]);
+  await admit(runtime, message("406", nativeThread, review));
+  const [lane] = store.lanes();
+  expect(lane?.route).toEqual(nativeThread);
+  expect(messenger.threads).toEqual([nativeThread]);
+  await waitForOutput(messenger, "handoff:406:lane:held");
+  expect(store.input("handoff:406:lane")?.state).toBe("cancelled");
+  expect([...f.hosts.values()].flatMap(host => host.prompts)).toEqual([]);
+  expect(main.prompts).toEqual([]);
+  expect(f.errors).toEqual([]);
+});
+
+test("a pending discovery offer survives a transient restart fence without sending through it", async () => {
+  const { runtime, config, store, messenger } = fixture(2, undefined, {
+    readIntakePulls: async () => { throw new Error("No additional PR scan is due"); },
+    requestRestart: async () => { throw new Error("A refused restart acknowledgement must not reach the Gateway"); },
+  });
+  const parent = route(null);
+  await runtime.start();
+  await admit(runtime, message("501", parent, '/cron pr-add "every 30m" owner/project'));
+  // Recovery boundary: a scan committed the offer, but the outbox has not
+  // sent anything from it when an authenticated restart fences dispatch.
+  const jobs = new CronJobs(store, config);
+  jobs.poll(Date.now() + 3_600_000);
+  const run = store.inputs("main", "pending").find(input => jobs.isPrIntakeRun(input));
+  if (!run) throw new Error("Missing discovery receipt");
+  await new CronPrIntake(store, jobs, async () => ({ repositoryId: 2, ownerId: 3, self: "owner",
+    pulls: [{ number: 9, head: "a".repeat(40), author: "someone", createdAt: Date.now() + 1 }],
+  })).consume(run, new AbortController().signal);
+  const [offer] = store.outputs();
+  if (!offer) throw new Error("Missing pending PR offer");
+  const beforeAck = Promise.withResolvers<string>();
+  messenger.beforeSend = async output => {
+    if (output.id === "502:restart-ack") {
+      beforeAck.resolve(store.output(offer.id)?.state ?? "missing");
+      throw new DeliveryError("Offline restart refused", "rejected");
+    }
+  };
+  await runtime.receive(message("502", parent, "/restart"));
+  expect(await beforeAck.promise).toBe("pending");
+  await waitForOutput(messenger, offer.id);
+  await runtime.kick();
+  expect(store.output(offer.id)?.state).toBe("sent");
+  expect(messenger.sent.filter(output => output.id === offer.id)).toHaveLength(1);
+});
+
 test("cron controls scope job management to the original thread and send one HEAD result after route verification", async () => {
   const { runtime, messenger, main, store, errors, directory } = fixture();
   const origin = route("11");
@@ -1485,21 +1923,207 @@ describe("source-bound Discord topic management", () => {
     expect(messenger.threads).toEqual([]);
   });
 
-  function managedThread(instance: ReturnType<typeof fixture>) {
+  function managedThread(instance: ReturnType<typeof fixture>, title = "Original", pid: number | null = null) {
     const { store, config, messenger } = instance;
-    const lane = savedLane(store, config, "managed-thread", route("123"));
-    let current: ThreadInfo = { route: lane.route, title: "Original", archived: false,
+    const lane = savedLane(store, config, "managed-thread", route("123"), pid);
+    let current: ThreadInfo = { route: lane.route, title, archived: false,
       requiresTag: false, availableTags: [{ id: "101", name: "Work", moderated: false }], appliedTags: ["101"] };
     const edits: ThreadUpdate[] = [];
+    const titleWaiters = new Map<string, () => void>();
     messenger.inspectThread = async () => structuredClone(current);
     messenger.updateThread = async (destination, changes) => {
       edits.push(changes);
       current = { ...current, route: destination, ...changes };
+      titleWaiters.get(current.title)?.();
+      titleWaiters.delete(current.title);
       return structuredClone(current);
     };
     const source = (id: string) => store.receive(message(id, lane.route), "main", { [`user-source:${id}`]: "true" });
-    return { lane, source, edits, current: () => current };
+    const whenTitle = (expected: string) => {
+      if (current.title === expected) return Promise.resolve();
+      const reached = Promise.withResolvers<void>();
+      titleWaiters.set(expected, reached.resolve);
+      return reached.promise;
+    };
+    return { lane, source, edits, current: () => current, whenTitle };
   }
+
+  test("a delivered lane report checks off the working title without closing the lane, and a follow-up marks it again", async () => {
+    const instance = fixture();
+    const { runtime, store, main, hosts, messenger } = instance;
+    const f = managedThread(instance);
+    const source = message("1750000000000000401", f.lane.route, "Implement the usage reset.");
+    await runtime.start();
+    await delegate(runtime, source);
+    await f.whenTitle("⏳ Original");
+    const worker = hosts.get(f.lane.socketPath);
+    if (!worker) throw new Error("The lane must own a native transport");
+    worker.complete("Usage reset verified.");
+    await main.whenPrompts(1);
+    expect(f.current().title).toBe("⏳ Original");
+    main.complete("Verified the usage reset.");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]).toMatchObject({ route: f.lane.route, sourceId: `report:handoff:${source.id}:${f.lane.id}` });
+    await f.whenTitle("✅ Original");
+    expect(f.current()).toMatchObject({ title: "✅ Original", archived: false, appliedTags: ["101"] });
+    expect(store.lane(f.lane.id)).toMatchObject({ workState: "open", runtimeState: "idle", result: null });
+
+    const followup = message("1750000000000000402", f.lane.route, "Check the follow-up.");
+    await admit(runtime, followup);
+    await worker.whenPrompts(2);
+    await f.whenTitle("⏳ Original");
+    const request = { type: "extension_ui_request", id: "owner-check", method: "confirm", title: "Confirm", message: "Proceed?" };
+    worker.state.pendingUiRequests = [request];
+    worker.emit(request);
+    await messenger.whenApproval();
+    worker.emit({ type: "agent_end", isTerminal: false });
+    await admit(runtime, applicationCommand("1750000000000000403", f.lane.route));
+    expect(f.current().title).toBe("⏳ Original");
+    const followupAnswer = messenger.whenSent(messenger.sent.length + 1);
+    worker.complete("Follow-up verified.");
+    await followupAnswer;
+    expect(messenger.sent.at(-1)).toMatchObject({ route: f.lane.route });
+    expect(f.current().title).toBe("⏳ Original");
+    const approval = [...messenger.shown.values()][0];
+    if (!approval || !messenger.handlers) throw new Error("The approval must be reachable on the original route");
+    await messenger.handlers.answer(approval.id, { confirmed: true }, approval.route);
+    await f.whenTitle("✅ Original");
+    expect(f.edits).toEqual([
+      { title: "⏳ Original" }, { title: "✅ Original" },
+      { title: "⏳ Original" }, { title: "✅ Original" },
+    ]);
+  });
+
+  for (const scenario of ["sent", "rate-limited", "recovered", "failed", "prior-uncertain", "older-admitted-last"] as const) {
+    test(`startup reconciles stale titles from saved ${scenario} delivery without restarting work`, async () => {
+      const instance = fixture();
+      const { runtime, store, main, launched, messenger } = instance;
+      const f = managedThread(instance, scenario === "prior-uncertain" ? "✅ Original"
+        : scenario === "recovered" ? "Original" : "⏳ Original");
+      const earlier = message("1750000000000000410", f.lane.route);
+      if (scenario === "prior-uncertain" || scenario === "older-admitted-last") store.receive(earlier, f.lane.id);
+      if (scenario === "prior-uncertain") {
+        store.submit(earlier.id, "earlier-run", f.lane.generation);
+        store.settle(earlier.id, "done", { id: `${earlier.id}:answer`, text: "Earlier native result." });
+        const report = `report:${earlier.id}`;
+        const answer = `${report}:answer`;
+        store.settle(report, "done", { id: answer, text: "Earlier result." });
+        store.claimOutput(answer);
+        store.finishOutput(answer, "uncertain");
+      }
+      const saved = message("1750000000000000411", f.lane.route);
+      const joined = message("1750000000000000412", f.lane.route);
+      store.receive(saved, f.lane.id);
+      store.submit(saved.id, "original-run", f.lane.generation);
+      store.receive(joined, f.lane.id, { [`steering-owner:${joined.id}`]: saved.id });
+      store.submit(joined.id, "joined-run", f.lane.generation);
+      store.settle(joined.id, "done");
+      const originalReport = `report:${saved.id}`;
+      if (scenario === "recovered") {
+        store.settle(saved.id, "uncertain", { id: `${saved.id}:admission`, text: "Acknowledgement lost." });
+        const notice = `${originalReport}:answer`;
+        store.settle(originalReport, "done", { id: notice, text: "The request outcome is unknown." });
+        store.claimOutput(notice);
+        store.finishOutput(notice, "sent", "uncertainty-notice");
+      }
+      store.settle(saved.id, "done", { id: `${saved.id}:answer`, text: "Original native result." });
+      const report = scenario === "recovered" ? `${originalReport}:done` : originalReport;
+      const answer = `${report}:answer`;
+      if (scenario !== "recovered") {
+        store.settle(report, "done", { id: answer, text: "Verified result." });
+        store.claimOutput(answer);
+        if (scenario === "failed") store.finishOutput(answer, "failed");
+        else store.finishOutput(answer, "sent", "existing-remote-message");
+      }
+      if (scenario === "older-admitted-last") {
+        store.submit(earlier.id, "last-admitted-run", f.lane.generation);
+        store.settle(earlier.id, "cancelled");
+      }
+      if (scenario === "rate-limited") {
+        const apply = messenger.updateThread;
+        if (!apply) throw new Error("Missing fixture thread editor");
+        messenger.updateThread = async (destination, changes) => {
+          messenger.updateThread = apply;
+          throw new DeliveryError("Discord REST request rejected (429)", "rejected", 1);
+        };
+      }
+      const title = scenario === "prior-uncertain" ? "⏳ Original"
+        : scenario === "failed" || scenario === "older-admitted-last" ? "Original" : "✅ Original";
+      await runtime.start();
+      if (scenario === "recovered") {
+        await main.whenPrompts(1);
+        await f.whenTitle("⏳ Original");
+        expect(f.current().title).toBe("⏳ Original");
+        main.complete("The recovered request succeeded.");
+        await messenger.whenSent(1);
+        expect(messenger.sent[0]?.id).toBe(answer);
+      }
+      await f.whenTitle(title);
+      expect(f.current()).toMatchObject({ title, archived: false, appliedTags: ["101"] });
+      expect(launched).toEqual([]);
+      expect(main.prompts).toHaveLength(scenario === "recovered" ? 1 : 0);
+    });
+  }
+
+  test("an answered approval still awaiting native confirmation holds the title on startup", async () => {
+    const instance = fixture();
+    const { runtime, store, hosts, messenger } = instance;
+    const f = managedThread(instance, "✅ Original", process.pid);
+    const host = new HostTransport(f.lane.sessionFile, `session-${f.lane.id}`);
+    hosts.set(f.lane.socketPath, host);
+    const saved = message("1750000000000000413", f.lane.route);
+    store.receive(saved, f.lane.id);
+    store.submit(saved.id, "earlier-completed-run", f.lane.generation);
+    store.settle(saved.id, "done", { id: `${saved.id}:answer`, text: "Completed work." });
+    const report = `report:${saved.id}`;
+    const output = `${report}:answer`;
+    store.settle(report, "done", { id: output, text: "Completed work." });
+    store.claimOutput(output);
+    store.finishOutput(output, "sent", "completed-result");
+    const frame = { type: "extension_ui_request", method: "confirm", id: "native-dialog", title: "Allow?" };
+    const approval = `a-${createHash("sha256").update(`${f.lane.id}:0:${frame.id}`).digest("hex").slice(0, 24)}`;
+    store.putApproval({ id: approval, target: f.lane.id, generation: 0, requestId: frame.id, route: f.lane.route,
+      request: frame, state: "pending", remoteId: "previous-card" });
+    store.resolveApproval(approval, 0, "answered");
+    host.state.pendingUiRequests = [frame];
+
+    await runtime.start();
+    await f.whenTitle("⏳ Original");
+    const reconcileAnswer = messenger.handlers?.reconcileAnswer;
+    if (!reconcileAnswer) throw new Error("Missing approval reconciliation handler");
+    expect(await reconcileAnswer(approval, f.lane.route)).toBe("unresolved");
+    expect(f.current().title).toBe("⏳ Original");
+    host.state.pendingUiRequests = [];
+    expect(await reconcileAnswer(approval, f.lane.route)).toBe("accepted");
+    await f.whenTitle("✅ Original");
+    expect(f.edits).toEqual([{ title: "⏳ Original" }, { title: "✅ Original" }]);
+    expect(host.responses).toEqual([]);
+  });
+
+  test("resolving an uncertain request does not clear the working marker of a queued follow-up", async () => {
+    const instance = fixture();
+    const { runtime, store, hosts, main } = instance;
+    const f = managedThread(instance, "⏳ Original");
+    const held = message("1750000000000000421", f.lane.route);
+    store.receive(held, f.lane.id);
+    store.submit(held.id, "lost-natively", f.lane.generation);
+    await runtime.start(); // Recovery quarantines the original attempt; it does not replay it.
+    const followup = message("1750000000000000422", f.lane.route, "Check the next request.");
+    await admit(runtime, followup);
+    await admit(runtime, applicationCommand("1750000000000000423", f.lane.route));
+    expect(delegated(store, followup.id)?.state).toBe("pending");
+    expect(f.current().title).toBe("⏳ Original");
+    await admit(runtime, message("1750000000000000424", f.lane.route, `/resolve --lane ${held.id}`));
+    const worker = hosts.get(f.lane.socketPath);
+    if (!worker) throw new Error("Resolving the hold must admit the queued request");
+    expect(worker.prompts).toHaveLength(1);
+    expect(worker.prompts[0]?.command.message).toContain(followup.text);
+    expect(store.input(held.id)?.state).toBe("cancelled");
+    worker.complete("Queued request verified.");
+    await f.whenTitle("✅ Original");
+    expect(f.edits).toEqual([{ title: "✅ Original" }]);
+    expect(main.prompts).toHaveLength(1); // Recovery report only; not a replay or a follow-up dispatch.
+  });
 
   test("pausing a work thread clears its marker even when the working edit lands late", async () => {
     const instance = fixture();
@@ -1637,6 +2261,127 @@ describe("same-HEAD evidence recovery", () => {
     instance.main.emit({ type: "prompt_result", id: value.recoveryRequestId, status: "aborted", agentInvoked: true });
     instance.main.emit({ type: "session_settled" });
   }
+
+  const quotaError = { provider: "openai-codex", model: "gpt-6.2-astra", retryable: false,
+    message: "Codex error event: The usage limit has been reached (code=usage_limit_reached)" };
+  const quotaRun = { hostPid: process.pid, runOrdinal: 1, instanceKey: "fixture-quota-instance" };
+
+  test.each([
+    quotaError.message,
+    "Codex response failed: The usage limit has been reached (code=usage_limit_reached, status=failed)",
+  ])("a settled native quota refusal automatically releases later HEAD work after recovery (%s)", async errorMessage => {
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const checked = Promise.withResolvers<void>();
+    let recovered = false;
+    const { runtime, main, store, messenger } = fixture(3, undefined, {
+      readHeadQuota: async () => { checked.resolve(); return recovered; },
+    });
+    main.state.model = { provider: quotaError.provider, id: quotaError.model };
+    main.journalLeaf = true;
+    try {
+      await runtime.start();
+      await admit(runtime, headMessage("quota-refusal", route("failed-route")));
+      const original = main.prompts[0];
+      if (!original) throw new Error("Original HEAD request was not admitted");
+      const error = { ...quotaError, message: errorMessage };
+      const frame = { type: "prompt_result", id: original.id, status: "error", agentInvoked: true, sessionSettled: true, error };
+      main.entries[0] = nativeEntry(main, "quota-start", "rpc_agent_start", quotaRun);
+      main.entries.push(
+        { id: "quota-error", type: "message", message: { role: "assistant", provider: error.provider,
+          model: error.model, stopReason: "error", content: [] } },
+        { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { ...quotaRun, frame }), timestamp: new Date(now - 1).toISOString() },
+      );
+      main.state.isStreaming = false;
+      main.state.isSettled = true;
+      main.emit(frame);
+      await messenger.whenSent(1);
+      await admit(runtime, headMessage("after-quota", route("later-route")));
+      await checked.promise;
+      expect(store.input("quota-refusal")?.state).toBe("uncertain");
+      expect(store.input("after-quota")?.state).toBe("pending");
+      expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id]);
+
+      recovered = true;
+      clock.mockReturnValue(now + 10 * 60_000);
+      await runtime.kick();
+      await main.whenPrompts(2);
+      expect(store.input("quota-refusal")?.state).toBe("cancelled");
+      const later = store.input("after-quota");
+      expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id, later?.requestId ?? "missing"]);
+      expect(later?.state).toBe("submitted");
+      main.complete("Later work answered");
+      await messenger.whenSent(3);
+      await runtime.kick();
+      expect(store.input("after-quota")?.state).toBe("done");
+      expect(messenger.sent.at(-1)).toMatchObject({ sourceId: "after-quota", route: route("later-route"), text: "Later work answered" });
+    } finally { clock.mockRestore(); }
+  });
+
+  test.each(["prior tool execution", "foreign native PID", "foreign native instance", "different native run"] as const)(
+    "%s keeps a later Codex quota failure on manual hold", async scenario => {
+    const now = Date.now();
+    const instance = fixture(3, undefined, { readHeadQuota: async () => true });
+    const { runtime, main, store } = instance;
+    const error = quotaError;
+    main.state.model = { provider: error.provider, id: error.model };
+    const id = saved(instance, "quota-after-tool");
+    const receiptRun = scenario === "foreign native PID" ? { ...quotaRun, hostPid: quotaRun.hostPid + 1 }
+      : scenario === "foreign native instance" ? { ...quotaRun, instanceKey: "other-instance" }
+        : scenario === "different native run" ? { ...quotaRun, runOrdinal: quotaRun.runOrdinal + 1 } : quotaRun;
+    main.entries[0] = nativeEntry(main, "quota-start", "rpc_agent_start", quotaRun);
+    main.entries.splice(2, 2,
+      ...(scenario === "prior tool execution" ? [{ id: "tool-attempt", type: "message", message: { role: "assistant", stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "previous-tool", name: "write", arguments: {} }] } },
+      { id: "tool-result", type: "message", message: { role: "toolResult", toolCallId: "previous-tool" } }] : []),
+      { id: "quota-error", type: "message", message: { role: "assistant", provider: error.provider,
+        model: error.model, stopReason: "error", content: [] } },
+      { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", {
+        ...receiptRun,
+        frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error },
+      }), timestamp: new Date(now - 1).toISOString() },
+    );
+    await runtime.start();
+    await admit(runtime, headMessage("after-unsafe-quota"));
+    expect(store.input(id)?.state).toBe("uncertain");
+    expect(store.input("after-unsafe-quota")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("an unbroadcast native receipt during quota lookup invalidates auto-release", async () => {
+    const readStarted = Promise.withResolvers<void>();
+    const quotaReply = Promise.withResolvers<boolean>();
+    const journalRead = Promise.withResolvers<void>();
+    const instance = fixture(3, undefined, { readHeadQuota: () => { readStarted.resolve(); return quotaReply.promise; } });
+    const { runtime, main, store } = instance;
+    main.state.model = { provider: quotaError.provider, id: quotaError.model };
+    const id = saved(instance, "quota-before-foreign-receipt");
+    main.entries[0] = nativeEntry(main, "quota-start", "rpc_agent_start", quotaRun);
+    main.entries.splice(2, 2,
+      { id: "quota-error", type: "message", message: { role: "assistant", provider: quotaError.provider,
+        model: quotaError.model, stopReason: "error", content: [] } },
+      { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { ...quotaRun,
+        frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error: quotaError },
+      }), timestamp: new Date(Date.now() - 1).toISOString() },
+    );
+    try {
+      await runtime.start();
+      await admit(runtime, headMessage("after-foreign-receipt"));
+      await readStarted.promise;
+      main.entries.push(nativeEntry(main, "unbroadcast-receipt", "rpc_prompt_result", {
+        ...quotaRun, frame: { id: "unrelated-no-agent", status: "completed", agentInvoked: false, sessionSettled: true },
+      }));
+      main.afterEntries = async () => { journalRead.resolve(); };
+      quotaReply.resolve(true);
+      await journalRead.promise;
+      const status = applicationCommand("1550450500000000001");
+      await admit(runtime, status);
+      expect(store.input(status.id)?.state).toBe("done");
+      expect(store.input(id)?.state).toBe("uncertain");
+      expect(store.input("after-foreign-receipt")?.state).toBe("pending");
+      expect(main.prompts).toEqual([]);
+    } finally { quotaReply.resolve(false); }
+  });
 
   test("actual prompt acknowledgement loss uses durable receipts once, fences queued work, and notifies only the original route", async () => {
     const instance = fixture();
@@ -4718,14 +5463,213 @@ describe("messenger head session controls", () => {
 });
 
 describe("priority native head commands", () => {
-  test("usage shows each provider account's remaining quota and resets only in the requesting thread", async () => {
+  test("restart cannot hand off while a confirmed OMP reset is spending", async () => {
+    const { runtime, config, store, messenger, directory, requests, handoff } = restartFixture();
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const readingBalance = Promise.withResolvers<void>();
+    const releaseBalance = Promise.withResolvers<void>();
+    const attemptedHandoff = Promise.withResolvers<void>();
+    handoff.respond = async () => {
+      attemptedHandoff.resolve();
+      throw new Error("Unexpected handoff while the reset still owns its effect");
+    };
+    const provider = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      async fetch(request) {
+        if (new URL(request.url).pathname === "/balance") {
+          readingBalance.resolve();
+          await releaseBalance.promise;
+          return Response.json({ accounts: [] });
+        }
+        started.resolve();
+        await release.promise;
+        return new Response("Reset applied for synthetic account (Codex) — your rate-limit window has been refreshed.\n");
+      },
+    });
+    const executable = join(directory, "omp-reset-in-progress");
+    config.command = [executable];
+    writeFileSync(executable, `#!/bin/sh
+case "$*" in
+  "usage --help") printf '%s\\n' 'omp usage [ACTION] [TARGET]' 'omp usage reset codex/3' ;;
+  "usage reset --json")
+    if [ -f spent ]; then
+      exec curl -fsS --noproxy '*' --max-time 10 "${new URL("/balance", provider.url)}"
+    fi
+    echo '{"accounts":[{"provider":"openai-codex","credentialId":7,"email":"sy*","availableCount":1,"redeemableCount":1,"credits":[{"id":"synthetic"}]}]}' ;;
+  "usage reset openai-codex/7 --redact")
+    touch spent; exec curl -fsS --noproxy '*' --max-time 10 "${provider.url}" ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o700 });
+    try {
+      await runtime.start();
+      await admit(runtime, message("reset-before-restart", route(), "/usage reset"));
+      const card = messenger.sent.find(output => output.sourceId === "reset-before-restart");
+      if (!card?.picker) throw new Error("Expected a sent reset picker");
+      const click = pickerClick(card, 0, 0);
+      if (!click.pickerSelection) throw new Error("Expected a card interaction");
+      await runtime.receive({ ...click, pickerSelection: { ...click.pickerSelection, confirmed: true } });
+      const settlement = runtime.kick();
+      await Promise.race([started.promise, settlement.then(() => { throw new Error("The reset command did not reach the loopback provider"); })]);
+      expect(store.input(click.id)?.state).toBe("submitted");
+      const checkpointResult = messenger.whenSent(messenger.sent.length + 2);
+      await runtime.receive(message("restart-during-reset", route(), "/restart"));
+      await Promise.race([checkpointResult, attemptedHandoff.promise]);
+      expect(requests).toEqual([]);
+      expect(store.output("restart-during-reset:restart-result")?.text).toContain("checkpoint is held");
+      release.resolve();
+      await Promise.race([readingBalance.promise, settlement.then(() => { throw new Error("No balance read followed the confirmed reset"); })]);
+      expect(store.input(click.id)?.state).toBe("done");
+      expect(store.output(`${click.id}:head-control`)?.text).toContain("리셋권 1개 사용을 확인했습니다");
+    } finally {
+      release.resolve();
+      releaseBalance.resolve();
+      await provider.stop();
+      await runtime.kick();
+    }
+  });
+
+  test.each(["reset", "unconfirmed", "refused", "fenced", "no longer usable", "changed offer"] as const)("confirmation handles %s without repeating or changing the selected account", async outcome => {
+    const { runtime, config, main, store, messenger, directory } = fixture();
+    const executable = join(directory, "omp-reset-fixture");
+    config.command = [executable, "--profile", "work", "--no-extensions", "--hook", "provider-extension.ts"];
+    if (outcome === "unconfirmed") config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP",
+      ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
+    const alpha = { provider: "openai-codex", credentialId: 7, email: "alpha-private@test", credits: [{ id: "private-codex-credit" }],
+      availableCount: 3, redeemableCount: 2 };
+    const beta = { provider: "anthropic", credentialId: 9, email: "Beta-private@test",
+      ...(outcome === "unconfirmed" ? {} : { accountId: "beta-private-id" }),
+      credits: [{ id: "private-claude-credit" }],
+      availableCount: 1, redeemableCount: 1 };
+    const rows = [alpha, beta, { ...alpha, credentialId: 21, availableCount: 0, redeemableCount: 0 },
+      { ...beta, credentialId: 27, error: "provider secret failure" },
+      { ...beta, credentialId: 28, email: undefined, orgName: "Beta private organization",
+        accountId: "third-private-id", availableCount: 2, redeemableCount: 0 }];
+    writeFileSync(executable, `#!/bin/sh
+case "$*" in
+  "--profile=work usage --help")
+    printf '%s\\n' 'omp usage [ACTION] [TARGET]' 'omp usage reset codex/3' ;;
+  "--profile=work usage reset --json --no-extensions --extension=provider-extension.ts")
+    if [ -f spent ]; then
+      echo '${JSON.stringify({ accounts: [alpha, { ...beta, credentialId: 13, email: "different-private@test" },
+        { ...beta, availableCount: 0, redeemableCount: 0 }, ...rows.slice(2)] })}'
+    elif [ -f changed ]; then
+      echo '${JSON.stringify({ accounts: [alpha, { ...beta, credits: [{ id: "different-credit" }] }, ...rows.slice(2)] })}'
+    elif [ -f relogin ]; then
+      echo '${JSON.stringify({ accounts: [alpha, { ...beta, credentialId: 12, accountId: "new-private-id", orgId: "new-private-org" }, ...rows.slice(2)] })}'
+    else
+      echo '${JSON.stringify({ accounts: rows })}'
+    fi ;;
+  "--profile=work usage reset anthropic/9 --redact --no-extensions --extension=provider-extension.ts")
+    printf '%s\\n' 'anthropic/9' >> attempts
+    ${outcome === "reset" ? "touch spent; printf '%s\\n' 'Reset applied for beta-private-id (Claude) — your rate-limit window has been refreshed.'"
+      : outcome === "refused" ? `echo "be* (Claude): nothing to reset right now — your covered limits aren't constrained, so no credit was spent." >&2; exit 1`
+      : outcome === "fenced" ? `echo 'be* (Claude): another omp process spent a saved reset on this account 1s ago, so this one was not spent. Check \`omp usage\` before spending another.' >&2; exit 1`
+      : outcome === "no longer usable" ? "echo 'be* [Claude]: no saved resets usable right now (private reason).' >&2; exit 1"
+      : `echo 'be* (Claude): couldn’t confirm whether the reset applied — check /usage before trying again — provider-private (Claude): that reset was already redeemed.' >&2; exit 1`} ;;
+  *"usage reset "*)
+    printf '%s\\n' "$*" >> attempts
+    exit 2 ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o700 });
+    await runtime.start();
+    const slackRoute = route("1750000000.000001", { platform: "slack", accountId: "TTEAM:UBOT",
+      authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" });
+    const open = outcome === "unconfirmed" ? message("1750000000.000010", slackRoute, "/usage reset")
+      : applicationCommand("1750000000000000041", route("12"), "/usage reset");
+    await admit(runtime, open);
+    const card = messenger.sent.find(output => output.sourceId === open.id);
+    if (card?.picker?.kind !== "usage-reset") throw new Error("Expected a sent reset picker");
+    expect(card.text).toContain("사용 가능 계정 2개 · 지금 사용 가능 3개");
+    expect(card.text).toContain("계정 1개는 합계에서 제외");
+    const banked = messenger.sent.find(output => output.id === `${open.id}:usage-reset-banked`);
+    expect(banked?.text).toContain("Claude · 계정 #28 · Be… · 보유 2개 / 지금 사용 가능 0개");
+    expect(banked?.route).toEqual(open.route);
+    expect(banked?.picker).toBeUndefined();
+    expect(card.picker.groups[0]?.options).toEqual([
+      "Codex · 계정 #7 · al… · 사용 가능 2개 / 보유 3개", "Claude · 계정 #9 · Be… · 사용 가능 1개",
+    ]);
+    expect(JSON.stringify(card)).not.toContain("private");
+
+    const click = pickerClick(card, 0, 1);
+    if (!click.pickerSelection) throw new Error("Expected a card interaction");
+    const confirmed: Inbound = { ...click, pickerSelection: { ...click.pickerSelection, confirmed: true } };
+    await expect(runtime.receive(click)).rejects.toThrow();
+    await expect(runtime.receive({ ...confirmed, route: { ...open.route, threadId: "13" } })).rejects.toThrow();
+    await expect(runtime.receive({ ...confirmed, route: { ...open.route, authorityId: "8" } })).rejects.toThrow();
+    await admit(runtime, { ...message("usage-reset-text-target", open.route, "/usage reset anthropic/9"),
+      ...(outcome === "unconfirmed" ? { messageId: "1750000000.000002" } : {}) });
+    expect(await Bun.file(join(directory, "attempts")).exists()).toBe(false);
+
+    if (outcome === "changed offer") writeFileSync(join(directory, "changed"), "");
+    await admit(runtime, confirmed);
+    await admit(runtime, confirmed);
+    const attempts = Bun.file(join(directory, "attempts"));
+    if (outcome === "changed offer") expect(await attempts.exists()).toBe(false);
+    else expect(await attempts.text()).toBe("anthropic/9\n");
+    expect(store.input(confirmed.id)?.state).toBe(outcome === "reset" ? "done" : outcome === "unconfirmed" ? "uncertain" : "cancelled");
+    const result = messenger.sent.find(output => output.sourceId === confirmed.id);
+    expect(result?.route).toEqual(open.route);
+    expect(result?.text).toContain(outcome === "reset" ? "리셋권 1개 사용을 확인했습니다"
+      : outcome === "unconfirmed" ? `!resolve ${confirmed.id}`
+      : outcome === "changed offer" ? "리셋권 상태가 바뀌었습니다" : "리셋권을 사용하지 않았다고 확인했습니다");
+    expect(result?.text).not.toContain("private");
+    if (outcome === "reset") {
+      const balance = messenger.sent.find(output => output.id === `${confirmed.id}:usage-reset-balance`);
+      expect(balance?.route).toEqual(open.route);
+      expect(balance?.text).toContain("남은 리셋권 0개");
+    }
+    expect(main.prompts).toEqual([]);
+    if (outcome === "unconfirmed") {
+      expect(result?.text).toContain("!usage reset");
+      writeFileSync(join(directory, "relogin"), "");
+      const secondOpen = message("1750000000.000012", open.route, "/usage reset");
+      await admit(runtime, secondOpen);
+      const freshCard = messenger.sent.find(output => output.sourceId === secondOpen.id);
+      if (freshCard?.picker?.kind !== "usage-reset") throw new Error("Expected a new live balance");
+      const freshClick = pickerClick(freshCard, 0, 1);
+      if (!freshClick.pickerSelection) throw new Error("Expected a fresh card interaction");
+      expect(freshCard.picker.groups[0]?.options[1]).toContain("계정 #12");
+      await admit(runtime, { ...freshClick, pickerSelection: { ...freshClick.pickerSelection, confirmed: true } });
+      expect(await attempts.text()).toBe("anthropic/9\n");
+      expect(store.input(freshClick.id)?.state).toBe("cancelled");
+    }
+  });
+
+  test.each(["empty", "unavailable", "unsupported"] as const)("saved reset discovery distinguishes %s without creating a confirmation card", async state => {
+    const { runtime, config, store, messenger, directory } = fixture();
+    const executable = join(directory, "omp-reset-discovery");
+    config.command = [executable];
+    const row = { provider: "openai-codex", credentialId: 7, credits: [], availableCount: 0, redeemableCount: 0,
+      ...(state === "unavailable" ? { error: "provider diagnostics must never be posted" } : {}) };
+    writeFileSync(executable, `#!/bin/sh
+case "$*" in
+  "usage --help") printf '%s\\n' '${state === "unsupported" ? "omp usage [ACTION]" : "omp usage [ACTION] [TARGET]\nomp usage reset codex/3"}' ;;
+  "usage reset --json") echo '${JSON.stringify({ accounts: [row] })}' ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o700 });
+    await runtime.start();
+    const open = message(`usage-reset-${state}`, route(), "/usage reset");
+    await admit(runtime, open);
+    const output = messenger.sent.find(item => item.sourceId === open.id);
+    expect(output?.picker).toBeUndefined();
+    expect(store.input(open.id)?.state).toBe(state === "unsupported" ? "cancelled" : "done");
+    expect(output?.text).toContain(state === "empty" ? "지금 사용할 수 있는 리셋권이 없습니다"
+      : state === "unavailable" ? "계정 1개는 합계에서 제외" : "CLI는 계정 지정 리셋권 사용을 지원하지 않습니다");
+    expect(output?.text).not.toContain("diagnostics");
+  });
+
+  test("usage shows masked names and quotas from all OMP usage providers only in the requesting thread", async () => {
     const { runtime, config, main, store, messenger, directory } = fixture(3, undefined, { readOmpUsage });
     const executable = join(directory, "omp-usage-fixture");
     config.command = [executable, "--profile", "work", "--model", "fixture/capable"];
     // Opposite ends of the same local day can fall on different UTC dates.
     const generatedAt = new Date(2027, 0, 9, 0, 5).getTime();
     const report = {
-      provider: "openai-codex", fetchedAt: 1, metadata: { email: "private@example.test" }, raw: { token: "private-token" },
+      provider: "openai-codex", fetchedAt: 1, metadata: { email: "wo*d*", orgName: "Te*" }, raw: { token: "private-token" },
       limits: [{
         id: "weekly", label: "All models", scope: { provider: "openai-codex", accountId: "private-account-id" },
         amount: { unit: "percent", remainingFraction: 0.625 },
@@ -4738,7 +5682,7 @@ describe("priority native head commands", () => {
     const snapshot = {
       generatedAt,
       reports: [report, {
-        provider: "openai-codex", fetchedAt: 2, metadata: { email: "private-other@example.test" },
+        provider: "openai-codex", fetchedAt: 2, metadata: { email: "private-other@example.test", accountId: "a9*" },
         limits: [{
           id: "five-hour", label: "5 Hour", scope: { provider: "openai-codex" },
           amount: { unit: "percent", usedFraction: 0.09 },
@@ -4751,12 +5695,21 @@ describe("priority native head commands", () => {
           amount: { unit: "percent", remaining: 7 },
           window: { id: "7d", label: "7 Day" },
         }],
+      }, {
+        provider: "deepai-code", fetchedAt: 4,
+        limits: [{ label: "Daily for meter-private@example.test", scope: { accountId: "de*" },
+          window: { id: "daily", label: "Daily quota org_7b2" },
+          amount: { unit: "requests", remaining: 140, limit: 200 } },
+        { label: "org_7b2", amount: { unit: "account_76532", remaining: 9, limit: 10 } }],
+      }, {
+        provider: "google-antigravity", fetchedAt: 5, metadata: { projectId: "pr*" },
+        limits: [],
       }],
-      accountsWithoutUsage: [{ provider: "openai-codex", email: "private-unreported@example.test" }],
-      disabledCredentials: [{ provider: "openai-codex", email: "private-disabled@example.test" }],
+      accountsWithoutUsage: [{ provider: "openai-codex", email: "un*" }],
+      disabledCredentials: [{ provider: "openai-codex", email: "private-disabled@example.test", orgName: "**Unexpected heading**" }],
     };
     writeFileSync(executable, `#!/bin/sh
-[ "$*" = "--profile=work usage --json --redact --no-extensions" ] || exit 2
+[ "$*" = "--profile=work usage --json --redact" ] || exit 2
 cat <<'EOF'
 ${JSON.stringify(snapshot)}
 EOF
@@ -4769,14 +5722,39 @@ EOF
     const output = messenger.sent.find(output => output.sourceId === input.id);
     expect(output?.route).toEqual(input.route);
     expect(output?.text).toContain(`OMP 사용량 · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
-    expect(output?.text).toContain("Codex · 계정 1\n• 주간 (All models)  62.5% 남음 · 오늘 23:34 초기화");
+    expect(output?.text).toContain("Codex · 계정 1 · wo…d… / Te…\n• 주간 (All models)  62.5% 남음 · 오늘 23:34 초기화");
     expect(output?.text).toContain("0% 남음 · 0 credits 남음 · 한도 도달");
-    expect(output?.text).toMatch(/Codex · 계정 2\n• 5시간  91% 남음 · [^\n]*10[^\n]* 20:15 초기화/);
-    expect(output?.text).toContain("Codex · 계정 3\n• 남은 한도 미확인");
+    expect(output?.text).toMatch(/Codex · 계정 2 · a9…\n• 5시간  91% 남음 · [^\n]*10[^\n]* 20:15 초기화/);
+    expect(output?.text).toContain("Codex · 계정 3 · un…\n• 남은 한도 미확인");
     expect(output?.text).toContain("Codex · 계정 4\n• 계정 비활성화됨");
     expect(output?.text).toContain("Claude\n• 주간 (Sonnet)  7% 남음");
+    expect(output?.text).toContain("deepai-code · de…\n• 일간  70% 남음 · 140 requests 남음\n• 사용량 항목 2  90% 남음");
+    expect(output?.text).toContain("google-antigravity · pr…\n• 남은 한도 미확인");
     expect(output?.text).not.toContain("private");
+    expect(output?.text).not.toMatch(/org_7b2|account_76532/);
+    expect(output?.text).not.toContain("Unexpected heading");
     expect(main.prompts).toHaveLength(1);
+  });
+
+  test("usage respects configured extension policy and overlay order", async () => {
+    const { runtime, config, store, messenger, directory } = fixture(3, undefined, {
+      readOmpUsage: config => readOmpUsage(config, { ...process.env, PI_CONFIG_FILES: "base.yml",
+        OMP_SUPERAGENT_GATEWAY_TOKEN: "fixture-gateway-secret" }),
+    });
+    const executable = join(directory, "omp-usage-explicit-extension");
+    config.command = [executable, "--config", "extra.yml", "--no-extensions", "-e", "local provider.ts",
+      "--config=final policy.yml", "--hook", "usage hook.ts"];
+    writeFileSync(executable, `#!/bin/sh
+[ -z "$OMP_SUPERAGENT_GATEWAY_TOKEN" ] && [ "$PI_CONFIG_FILES" = "base.yml${delimiter}extra.yml${delimiter}final policy.yml" ] &&
+  [ "$#" -eq 6 ] && [ "$1" = usage ] && [ "$2" = --json ] && [ "$3" = --redact ] &&
+  [ "$4" = --no-extensions ] && [ "$5" = "--extension=local provider.ts" ] && [ "$6" = "--extension=usage hook.ts" ] || exit 2
+echo '{"reports":[{"provider":"explicit-extension","limits":[]}]}'
+`, { mode: 0o700 });
+    await runtime.start();
+    const input = message("usage-explicit-extension", route(), "/usage");
+    await admit(runtime, input);
+    expect(store.input(input.id)?.state).toBe("done");
+    expect(messenger.sent.find(output => output.sourceId === input.id)?.text).toContain("explicit-extension");
   });
 
   test.each([0, 1])("usage reports failure without exposing stdout or stderr (CLI exit %i)", async code => {
@@ -6904,9 +7882,10 @@ describe("real Store runtime coordination", () => {
     expect(launched).toEqual([]);
   });
 
-  test.each(["Discord thread", "DM", "Slack question thread"] as const)("%s held at an old implicit workspace question retains its exact source without replay", async kind => {
+  test.each(["Discord thread", "steering in a Discord thread", "DM", "Slack question thread"] as const)("%s held at an old implicit workspace question retains its exact source without replay", async kind => {
     const { runtime, store, main, launched, config, messenger } = fixture();
     const slack = kind === "Slack question thread";
+    const steering = kind === "steering in a Discord thread";
     if (slack) config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] };
     const thread = slack ? route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" })
       : kind === "DM" ? route(null, { guildId: null, topicId: "old-work" }) : route("50");
@@ -6924,15 +7903,18 @@ describe("real Store runtime coordination", () => {
     const question = store.output("158:workspace");
     if (!question?.remoteId) throw new Error("Missing original workspace question");
     const destination = slack ? { ...thread, threadId: question.remoteId } : thread;
+    if (steering) await admit(runtime, headMessage("157", destination, "Review the release."));
     const followup = { ...message("159", kind === "DM" ? route(null, { guildId: null }) : destination, "Use @current.txt."),
       messageId: slack ? "1750000002.000003" : "159",
-      ...(kind === "Discord thread" ? { reply: { messageId: question.remoteId, text: "", authorId: thread.accountId } } : {}) };
+      ...(kind === "Discord thread" || steering ? { reply: { messageId: question.remoteId, text: "", authorId: thread.accountId } } : {}) };
     await admit(runtime, followup);
     await admit(runtime, followup);
-    expect(main.prompts).toHaveLength(1);
-    expect(main.prompts[0]?.command.message).toContain("Inspect \\u0040previous.txt before release.");
-    expect(main.prompts[0]?.command.message).not.toContain("@previous.txt");
-    expect(main.prompts[0]?.command.message).toContain(followup.text);
+    expect(main.prompts).toHaveLength(steering ? 2 : 1);
+    const prompt = main.prompts.at(-1)?.command;
+    expect(prompt?.streamingBehavior).toBe(steering ? "steer" : undefined);
+    expect(prompt?.message).toContain("Inspect \\u0040previous.txt before release.");
+    expect(prompt?.message).not.toContain("@previous.txt");
+    expect(prompt?.message).toContain(followup.text);
     expect(store.input(followup.id)).toMatchObject({ target: "main", route: destination, state: "submitted" });
     expect(store.input(original.id)).toMatchObject({ state: "pending", requestId: null });
     expect(store.output("159:workspace")).toBeNull();
@@ -6968,26 +7950,22 @@ describe("real Store runtime coordination", () => {
     expect(turn).not.toContain("candidateCount");
   });
 
-  test("an expired steering lookup cannot skip an earlier standalone HEAD request", async () => {
+  test("a steer whose run ends during native preflight cannot skip an earlier standalone HEAD request", async () => {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    const { runtime, config, store, main, hosts, messenger } = fixture(3, undefined, { topicMemory: {
-      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: false }),
-      search: async query => {
-        entered.resolve(); await release.promise;
-        return { backend: "mnemopi", query, items: [], count: 0 };
-      },
-    } });
-    const lane = savedLane(store, config, "context", route("55"), process.pid);
-    hosts.set(lane.socketPath, new HostTransport(lane.sessionFile, "session-context"));
+    const { runtime, store, main } = fixture();
     await runtime.start();
     await admit(runtime, headMessage("100", route("51"), "Original HEAD task"));
     await admit(runtime, headMessage("101", route("52"), "Queued first in another thread"));
+    main.beforeState = async () => {
+      main.beforeState = undefined;
+      entered.resolve();
+      await release.promise;
+    };
     await runtime.receive(message("102", route("51"), "Check the login parser."));
     try {
       await entered.promise;
       main.complete("First task finished");
-      await messenger.whenSent(1);
-      await runtime.kick();
+      expect(store.input("102")?.state).toBe("pending");
     } finally { release.resolve(); }
     await main.whenPrompts(2);
     expect(main.prompts[1]?.command.message).toContain("Queued first in another thread");
@@ -6995,6 +7973,29 @@ describe("real Store runtime coordination", () => {
     await main.whenPrompts(3);
     expect(main.prompts[2]?.command.message).toContain("Check the login parser.");
     expect(main.prompts[2]?.command.streamingBehavior).toBeUndefined();
+  });
+
+  test("an acknowledged approval wakes a pending steer in the same active HEAD run", async () => {
+    const { runtime, store, main, messenger } = fixture();
+    const destination = route("51");
+    await runtime.start();
+    await admit(runtime, headMessage("100", destination, "Review the proposed change."));
+    const frame = { type: "extension_ui_request", id: "steering-confirm", method: "confirm", title: "Proceed?", message: "Continue reviewing?" };
+    main.state.pendingUiRequests = [frame];
+    main.emit(frame);
+    await messenger.whenApproval();
+    const [card] = messenger.shown.values();
+    if (!card || !messenger.handlers) throw new Error("HEAD did not surface its approval");
+    await messenger.handlers.message(message("101", destination, "Recheck the parser before continuing."));
+    await runtime.kick();
+    expect(store.input("101")?.state).toBe("pending");
+
+    await messenger.handlers.answer(card.id, { confirmed: true }, card.route);
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(store.input("100")?.state).toBe("submitted");
+    expect(store.input("101")?.state).toBe("submitted");
+    expect(main.prompts[1]?.command.streamingBehavior).toBe("steer");
   });
 
   test("a slow HEAD routing lookup does not delay an existing thread or reorder HEAD work", async () => {

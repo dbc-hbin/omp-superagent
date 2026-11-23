@@ -9,7 +9,7 @@ use super::{
     Effect, State,
     addressing::{addressed_text, has_inline_mention},
     ingress::{authorized_message, reply_id},
-    model::{Message, Reference, RemoteAttachment, Route},
+    model::{Channel, Message, Reference, RemoteAttachment, Route},
     rest::broken,
 };
 
@@ -97,13 +97,13 @@ impl Revision {
     }
 }
 
-fn edit_has_addressing_metadata(raw: &Value, message: &Message, route: &Route) -> bool {
+fn edit_has_addressing_metadata(raw: &Value, message: &Message, route: &Route, channel: &Channel) -> bool {
     if message.mentions.is_none() && has_inline_mention(&message.content, &route.account_id) {
         return false;
     }
     reply_id(message, route).is_some_and(|(_, reference)| reference.kind == 0)
         || addressed_text(message, &route.account_id).is_some()
-        || route.thread_id.is_some()
+        || channel.is_thread_owned_by(&route.account_id)
         || message.kind != 19
         || raw.get("message_reference").is_some()
 }
@@ -140,6 +140,7 @@ impl State {
         raw: &Value,
         create: bool,
         route: &Route,
+        channel: &Channel,
         addressing: bool,
     ) -> Effect<Option<Message>> {
         let Some(id) = raw["id"].as_str() else { return Ok(None) };
@@ -152,7 +153,7 @@ impl State {
         if received.as_ref().is_some_and(|message| {
             create || message.edited_timestamp.as_deref().and_then(timestamp).is_some()
                 && raw.get("attachments").is_some()
-                && (!addressing || edit_has_addressing_metadata(raw, message, route))
+                && (!addressing || edit_has_addressing_metadata(raw, message, route, channel))
         }) {
             return Ok(received);
         }

@@ -92,7 +92,7 @@ async fn restart_keeps_checkpointed_owner_candidates_in_order_even_on_unseen_thr
         discord_fixture_with_store(json!({"discord":{"requireAddressing":false}}), &store).await;
     respond(&responses, REFERENCE, StatusCode::OK, bot_message());
     respond(&responses, "/channels/92", StatusCode::OK,
-        json!({"id":"92","guild_id":"77","type":11,"parent_id":"88"}));
+        json!({"id":"92","guild_id":"77","type":11,"parent_id":"88","owner_id":"71"}));
     respond(&responses, "/channels/92/messages/203", StatusCode::OK, thread);
     respond(&responses, "/channels/99/messages/204", StatusCode::OK, dm);
     let mut socket = start(&hub, &ws, false).await;
@@ -109,6 +109,42 @@ async fn restart_keeps_checkpointed_owner_candidates_in_order_even_on_unseen_thr
     assert!(dm["input"]["route"]["guildId"].is_null());
     assert_eq!(event(&hub, &store).await["input"]["messageId"], "205");
     assert!(journal(&temporary).is_empty());
+    hub.stop().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn restart_recovers_only_the_exact_shared_thread_reply_from_an_old_pin() {
+    let temporary = Temp::new();
+    let store = Arc::new(Store::open(&temporary.0).unwrap());
+    let (hub, ws, _, _, server, responses, _) =
+        discord_fixture_with_store(json!({"discord":{"requireAddressing":true}}), &store).await;
+    let mut route = parent();
+    route["threadId"] = json!("93");
+    respond(&responses, "/channels/93", StatusCode::OK,
+        json!({"id":"93","type":11,"guild_id":"77","parent_id":"88","owner_id":"73"}));
+    for (id, rest_stamp) in [("229", FIRST_EDIT), ("230", "2026-11-21T01:02:04.456000+00:00")] {
+        let mut edit = message(id, Some("77"), "93", "42", "pinned reply edit");
+        edit["type"] = json!(19);
+        edit["edited_timestamp"] = json!(FIRST_EDIT);
+        edit["attachments"] = json!([]);
+        edit["message_reference"] = Value::Null;
+        let row = json!({"account_id":"71","owner_id":"42","id":id,"channel_id":"93","guild_id":"77",
+            "exact_guild":true,"create":false,"require_addressing":true,
+            "evidence":{"Verified":{"route":route,"message":edit}}});
+        crate::store::DiscordIntake(&store).push(("71","42","93"), &row.to_string()).unwrap();
+        edit["edited_timestamp"] = json!(rest_stamp);
+        edit["message_reference"] = json!({"message_id":"111","channel_id":"93","guild_id":"77"});
+        edit["referenced_message"] = bot_message();
+        edit["referenced_message"]["channel_id"] = json!("93");
+        respond(&responses, &format!("/channels/93/messages/{id}"), StatusCode::OK, edit);
+    }
+    let mut socket = start(&hub, &ws, false).await;
+    dispatch(&mut socket, 3, "MESSAGE_CREATE", mention("231", "<@71> after restart")).await;
+    let recovered = event(&hub, &store).await;
+    assert_eq!(recovered["input"]["messageId"], "229");
+    assert_eq!(recovered["input"]["reply"]["authorId"], "71");
+    assert_eq!(event(&hub, &store).await["input"]["messageId"], "231");
     hub.stop().await.unwrap();
     server.abort();
 }

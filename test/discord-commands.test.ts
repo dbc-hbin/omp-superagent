@@ -14,7 +14,7 @@ describe("Discord command catalog", () => {
       expect(command.contexts).toEqual([InteractionContextType.Guild, InteractionContextType.BotDM]);
       expect(command.integration_types).toEqual([ApplicationIntegrationType.GuildInstall]);
       expect(parseDiscordCommand(command.name, [])).toBe(`/${command.name}`);
-      if (["head", "model", "effort", "compact", "stop", "new", "resolve", "cron"].includes(command.name)) {
+      if (["head", "model", "effort", "compact", "stop", "new", "resolve", "cron", "usage"].includes(command.name)) {
         expect(command.options).toEqual([{
           name: "text", type: ApplicationCommandOptionType.String, description: expect.any(String), required: false,
         }]);
@@ -27,12 +27,17 @@ describe("Discord command catalog", () => {
     expect(parseDiscordCommand(name, [{ name: "text", type: ApplicationCommandOptionType.String, value: "  first line\nsecond line  " }])).toBe(`/${name} first line\nsecond line`);
   });
 
+  test("the registered usage command accepts reset and preserves argumentless quota lookup", () => {
+    expect(parseDiscordCommand("usage", [{ name: "text", type: ApplicationCommandOptionType.String, value: "reset" }])).toBe("/usage reset");
+    expect(parseDiscordCommand("usage", [])).toBe("/usage");
+  });
+
   test("rejects unknown commands and every stale option shape instead of ignoring data", () => {
     const text = { name: "text", type: ApplicationCommandOptionType.String, value: "high" };
     for (const name of ["hermes", "clear", "models", "STATUS", "/status", "status\n", ""]) {
       expect(parseDiscordCommand(name, [])).toBeNull();
     }
-    for (const name of ["help", "status", "restart", "context", "usage", "resume", "main"]) {
+    for (const name of ["help", "status", "restart", "context", "resume", "main"]) {
       expect(parseDiscordCommand(name, [text])).toBeNull();
     }
     for (const options of [

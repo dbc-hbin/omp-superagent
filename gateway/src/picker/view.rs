@@ -1,25 +1,48 @@
-use super::{Entry, Item, Kind, Menu, PAGE, PREFIX, Screen};
+use super::{Entry, Item, Kind, Menu, PAGE, PREFIX, Screen, Stage};
 
 const LABEL_LIMIT: usize = 68; // Slack plain_text has a 75-character limit.
 const TEXT_LIMIT: usize = 2_000; // Discord component-message content limit.
 
 impl Entry {
     pub(super) fn view(&self, screen: Screen) -> Option<Menu> {
-        let count = self.count(screen)?;
+        let control =
+            |action: &str| format!("{PREFIX}{}:{}:{action}", self.token.simple(), screen.revision);
+        let button = |action: &str, label: &str| Item {
+            label: label.to_owned(),
+            control: control(action),
+            value: action.to_owned(),
+        };
+        let (group, page) = match screen.stage {
+            Stage::Browse { group, page } => (group, page),
+            Stage::ConfirmUsageReset { option } => {
+                let label = self.picker.groups.first()?.options.get(option)?;
+                let footer = format!("\n\nUse one currently available OMP usage reset credit for:\n{label}");
+                return Some(Menu {
+                    text: self.with_footer(&footer)?,
+                    select_id: control("s"),
+                    options: Vec::new(),
+                    buttons: vec![
+                        button("c", "Confirm"),
+                        button("b", "Back"),
+                        button("x", "Cancel"),
+                    ],
+                });
+            }
+        };
+        let count = self.count(group)?;
         if count == 0 {
             return None;
         }
-        let group = screen.group.and_then(|index| self.picker.groups.get(index));
+        let group = group.and_then(|index| self.picker.groups.get(index));
         let title = match (self.picker.kind, group) {
             (Kind::Effort, _) => "Choose thinking effort".to_owned(),
+            (Kind::UsageReset, _) => "Choose an account for a usage reset".to_owned(),
             (Kind::Model, Some(group)) => {
                 format!("Choose a model from {}", shorten(&group.label, LABEL_LIMIT))
             }
             (Kind::Model, None) => "Choose a model provider".to_owned(),
         };
-        let control =
-            |action: &str| format!("{PREFIX}{}:{}:{action}", self.token.simple(), screen.revision);
-        let first = screen.page.saturating_mul(PAGE);
+        let first = page.saturating_mul(PAGE);
         let mut options = Vec::with_capacity(PAGE);
         for index in first..count.min(first.saturating_add(PAGE)) {
             let current = self.picker.current.as_ref();
@@ -50,32 +73,32 @@ impl Entry {
         }
         let pages = count.div_ceil(PAGE);
         let mut buttons = Vec::new();
-        let mut button = |action: &str, label: &str| {
-            buttons.push(Item {
-                label: label.to_owned(),
-                control: control(action),
-                value: action.to_owned(),
-            });
-        };
-        if screen.page > 0 {
-            button("p", "Previous");
+        if page > 0 {
+            buttons.push(button("p", "Previous"));
         }
-        if screen.page < pages.saturating_sub(1) {
-            button("n", "Next");
+        if page < pages.saturating_sub(1) {
+            buttons.push(button("n", "Next"));
         }
-        if matches!(self.picker.kind, Kind::Model) && screen.group.is_some() {
-            button("b", "Back");
+        if self.picker.kind == Kind::Model && group.is_some() {
+            buttons.push(button("b", "Back"));
         }
-        button("x", "Cancel");
-        let footer = format!("\n\n{title} · page {}/{pages}", screen.page + 1);
-        let status = shorten(&self.text, TEXT_LIMIT.saturating_sub(footer.encode_utf16().count()));
-        let text = format!("{status}{footer}");
+        buttons.push(button("x", "Cancel"));
+        let footer = format!("\n\n{title} · page {}/{pages}", page + 1);
         Some(Menu {
-            text,
+            text: self.with_footer(&footer)?,
             select_id: control("s"),
             options,
             buttons,
         })
+    }
+
+    fn with_footer(&self, footer: &str) -> Option<String> {
+        let remaining = TEXT_LIMIT.checked_sub(footer.encode_utf16().count())?;
+        if remaining == 0 {
+            return Some(footer.to_owned());
+        }
+        let status = shorten(&self.text, remaining);
+        Some(format!("{status}{footer}"))
     }
 }
 

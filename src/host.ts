@@ -10,7 +10,7 @@ import {
   type RpcAgentProcess,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { RPC_GOAL_CONTINUATION_MODE } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
-import { HostChannel, type HostResponse, type HostState } from "./host-protocol";
+import { HostChannel, PR_REVIEW_GITHUB_ENV, PR_REVIEW_SYSTEM_PROMPT, type HostResponse, type HostState } from "./host-protocol";
 import { requireHostOwner } from "./host-owner-path";
 import { inspectInstalledOmp, resolveOmpCommand } from "./installed-omp";
 import type { DialogResponse, LanePresetSnapshot } from "./contracts";
@@ -21,9 +21,31 @@ const CONNECT_TIMEOUT_MS = 5_000;
 const START_TIMEOUT_MS = 30_000;
 const MAX_PENDING_BYTES = 16 * 1024 * 1024;
 const MAX_PENDING_WRITES = 4096;
+export const PR_REVIEW_INPUT_PREFIX = "Static PR review input:\n";
+
+// These settings are scoped to the private launch overlay. In particular no
+// review text enters the ordinary memory backend or an autonomous side turn.
+const prReviewSettings = {
+  memory: { backend: "off" },
+  goal: { enabled: false },
+  compaction: { enabled: false },
+  advisor: { enabled: false },
+  autolearn: { enabled: false },
+  dev: { autoqa: false },
+  skills: { enabled: false, enableSkillCommands: false, customDirectories: [] },
+  mcp: { enableProjectConfig: false },
+  marketplace: { autoUpdate: "off" },
+  magicKeywords: { enabled: false },
+  prewalk: { enabled: false, auto: "off" },
+  spotlight: { experiment: { enabled: false } },
+  providers: { cacheWarming: "off" },
+  telemetry: { otlpExportEnabled: false },
+};
 
 export interface HostOptions {
   command: string[];
+  /** Local managed static review lane; cwd must be a private empty non-checkout. */
+  readonly prReviewOnly?: true;
   /** Target-owned launch policy, never decoded from an SSH request. */
   readonly worker?: WorkerHostProfile;
   socketPath: string;
@@ -176,7 +198,8 @@ export class HostConnection {
     const timeout = setTimeout(disconnect, CONNECT_TIMEOUT_MS);
     try {
       const state = await connection.#handshake();
-      if (state.hostPid !== expected.pid || state.sessionId !== expected.sessionId || state.sessionFile !== expected.sessionFile) {
+      if (state.prReviewPolicy !== undefined || state.hostPid !== expected.pid || state.sessionId !== expected.sessionId ||
+          state.sessionFile !== expected.sessionFile) {
         throw new Error("Remote Host identity differs from its worker registration");
       }
       await connection.#enableActivityUpdates(state);
@@ -229,7 +252,8 @@ export class HostConnection {
   }
 
   async #enableActivityUpdates(state: HostState): Promise<void> {
-    if (typeof state.loadedSuperkitPath !== "string" || !path.isAbsolute(state.loadedSuperkitPath))
+    if (state.prReviewPolicy?.version !== 1 &&
+        (typeof state.loadedSuperkitPath !== "string" || !path.isAbsolute(state.loadedSuperkitPath)))
       throw new Error("Native Host has not verified its omp-superkit extension; stop and start the Host");
     const capability = await this.request({ type: "get_host_admission", messageUpdateCapability: true });
     if (!capability.success || capability.command !== "get_host_admission") {
@@ -242,6 +266,12 @@ export class HostConnection {
     if (!response.success || response.command !== "set_host_message_updates" || response.data?.messageUpdates !== messageUpdates) {
       throw new Error("Owned Host did not acknowledge its advertised activity projection");
     }
+  }
+
+  /** Call on the exact local connection before admitting each review round. */
+  async assertPrReviewOnly(cwd: string): Promise<void> {
+    const state = await this.client.getState();
+    await assertPrReviewState(state, cwd);
   }
 
   /** Private adapter correlation. Stock RpcClient deliberately has no generic request API. */
@@ -284,6 +314,23 @@ export function connect(socketPath: string): Promise<HostConnection> {
   return HostConnection.connect(socketPath);
 }
 
+async function assertPrReviewState(state: HostState, cwd: string): Promise<void> {
+  const canonical = await fs.realpath(cwd);
+  if (state.prReviewPolicy?.version !== 1 || state.prReviewPolicy.cwd !== canonical ||
+      typeof state.prReviewPolicy.modelApi !== "string" || state.prReviewPolicy.modelApi !== state.model?.api ||
+      !Array.isArray(state.dumpTools) || state.dumpTools.length !== 0)
+    throw new Error("Native Host did not confirm the local static PR review policy");
+}
+
+async function assertPrReviewLaunch(options: HostOptions): Promise<void> {
+  if (options.worker || options.modelPreset || options.modelSettings || options.env.OMP_SUPERAGENT_WORKER_ATTEMPT)
+    throw new Error("Static PR review requires an exact-model local Host, without worker or preset policy");
+  const { extractProfileFlags } = await import("@oh-my-pi/pi-coding-agent/cli/profile-bootstrap");
+  const bootstrap = extractProfileFlags(options.command.slice(1));
+  if (bootstrap.argv.length || bootstrap.aliasName !== undefined)
+    throw new Error("Static PR review Host accepts only the native --profile launch prefix");
+}
+
 export async function buildHostArgs(options: HostOptions, configPath = `${options.socketPath}.config.json`,
   composition?: { extensionPaths: string[]; noExtensions: boolean }): Promise<string[]> {
   assertSocketPath(options.socketPath);
@@ -298,6 +345,14 @@ export async function buildHostArgs(options: HostOptions, configPath = `${option
   }
   if (!Number.isSafeInteger(options.subagentConcurrency) || options.subagentConcurrency < 1) {
     throw new Error("subagentConcurrency must be a positive integer");
+  }
+  if (options.prReviewOnly) {
+    await assertPrReviewLaunch(options);
+    return ["--mode", "rpc-ui", "--session", options.sessionFile, "--cwd", options.cwd,
+      "--no-tools", "--no-extensions", "--no-lsp", "--no-skills", "--no-rules", "--no-context-files",
+      "--no-title", "--no-prewalk", "--offline",
+      "--trusted-extension", await fs.realpath(fileURLToPath(new URL("./host-extension.ts", import.meta.url))),
+      "--system-prompt", PR_REVIEW_SYSTEM_PROMPT, "--config", configPath];
   }
   if (options.modelPreset) {
     // Only named lane presets need the SDK's model resolver. HEAD launches
@@ -341,7 +396,30 @@ export async function startHost(options: HostOptions, beforeSessionPrepare?: () 
 async function launchHost(options: HostOptions, beforeSessionPrepare?: () => void): Promise<{ pid: number }> {
   // Snapshot once before any awaits; an updater may activate a newer revision
   // during startup, but this Host must load one exact immutable package.
-  const managedUlwPath = selectManagedUlw(options);
+  if (options.prReviewOnly) {
+    await assertPrReviewLaunch(options);
+    await privateDirectory(options.cwd);
+    const cwd = await fs.realpath(options.cwd);
+    if ((await fs.readdir(cwd)).length) throw new Error("Static PR review workspace must be empty");
+    // No Git invocation (including hooks or configuration) is needed to
+    // distinguish an empty directory from an empty subdirectory of a checkout.
+    for (let dir = cwd; ; dir = path.dirname(dir)) {
+      if (await fs.lstat(path.join(dir, ".git")).then(() => true, error => {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+        throw error;
+      })) throw new Error("Static PR review workspace must be outside a Git checkout");
+      if (path.dirname(dir) === dir) break;
+    }
+    const { assertWorkerWorkspaceStartup } = await import("./worker-profile");
+    assertWorkerWorkspaceStartup(cwd, options.env.HOME ?? "");
+    const env = { ...options.env };
+    for (const name of [...PR_REVIEW_GITHUB_ENV,
+      MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV]) delete env[name];
+    options = { ...options, cwd, env, managedUlwPath: undefined, managedUlwRoot: undefined };
+  }
+  // Do not discover, load or preflight Superkit (or persist a global memory
+  // fallback) for isolated review lanes.
+  const managedUlwPath = options.prReviewOnly ? undefined : selectManagedUlw(options);
   const fixture = options.managedUlwPath ?? options.env[MANAGED_ULW_FIXTURE_ENV];
   const hostOwnerExecutable = await requireHostOwner();
   const fixtureRoot = options.managedUlwRoot ?? options.env[MANAGED_ULW_FIXTURE_ROOT_ENV];
@@ -349,7 +427,7 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
     : Bun.which("bun", { PATH: options.env.PATH ?? process.env.PATH }));
   if (!bun || !path.isAbsolute(bun)) throw new Error("Managed Host launch requires an explicit installed Bun executable");
   options = { ...options, command: resolveOmpCommand(options.command, options.env.PATH ?? ""), managedUlwPath,
-    env: { ...options.env, [MANAGED_ULW_ENV]: managedUlwPath,
+    env: { ...options.env, ...(managedUlwPath ? { [MANAGED_ULW_ENV]: managedUlwPath } : {}),
     OMP_SUPERAGENT_BUN: bun,
     ...(fixture ? { [MANAGED_ULW_FIXTURE_ENV]: fixture } : {}),
     ...(fixtureRoot ? { [MANAGED_ULW_FIXTURE_ROOT_ENV]: fixtureRoot } : {}) } };
@@ -382,6 +460,7 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
       ...options.worker?.config,
       task: { maxConcurrency: options.subagentConcurrency },
       goal: { continuationModes: [RPC_GOAL_CONTINUATION_MODE] },
+      ...(options.prReviewOnly ? prReviewSettings : {}),
       ...(options.modelPreset ? { modelPresets: { [options.modelPreset.name]: options.modelPreset.preset } } : {}),
       ...(initialSettings ? {
         modelRoles: {
@@ -398,37 +477,62 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
       throw new Error("Host log must be a private regular file owned by this user");
     }
     const manifestPath = path.join(launchDirectory, "owner.json");
-    const extensionPaths = [fileURLToPath(new URL("../", import.meta.url)), managedUlwPath, options.extensionPath,
-      fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
-      fileURLToPath(new URL("./host-extension.ts", import.meta.url))];
     const { env: _inheritedEnvironment, worker: _workerProfile, ...launchOptions } = options;
     const helperPath = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
     let manifest: Record<string, unknown> | undefined;
     // Preparation used to run inside the owner; it shares the same startup budget.
     let deadline = 0;
-    // One helper process discovers the launch composition, then prepares the
-    // session from the manifest built here. The composition arrives before the
-    // helper can create or publish this session, so a worker persists its
-    // launch fence only after discovery and before preparation.
-    const { prepared } = await managedUlwLaunch({ cwd: options.cwd, managedUlwPath,
-      extensionPaths, configPath, parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
-      ...(options.worker ? { worker: { extensionPaths: options.worker.extensionPaths } } : {}),
-      launchArgs: [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
-      env: options.env, bunCommand: [bun, "--no-env-file"] }, {
-      stderr: log.fd, timeoutMs: START_TIMEOUT_MS,
-      manifest: async composition => {
-        manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath,
-          memoryWriteDir: composition.memoryWriteDir, processBackend, helperPath,
-          nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
-        deadline = Date.now() + START_TIMEOUT_MS;
-        beforeSessionPrepare?.();
-        return manifest;
-      },
-    });
+    let prepared: string | undefined;
+    if (managedUlwPath === undefined) {
+      const composition = { extensionPaths: [], noExtensions: true, memoryWriteDir: null };
+      manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath,
+        memoryWriteDir: composition.memoryWriteDir, processBackend, helperPath,
+        nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
+      deadline = Date.now() + START_TIMEOUT_MS;
+      beforeSessionPrepare?.();
+      const prepare = Bun.spawn([bun, "--no-env-file", helperPath, "launch"], {
+        cwd: options.worker ? launchDirectory : options.cwd, env: options.env,
+        stdin: new Blob([`null\n${JSON.stringify(manifest)}`]), stdout: "pipe", stderr: log.fd,
+        timeout: START_TIMEOUT_MS, killSignal: "SIGKILL",
+      });
+      const [stdoutText, code] = await Promise.all([new Response(prepare.stdout).text(), prepare.exited]);
+      if (Date.now() >= deadline) throw new Error("Native session preparation timed out");
+      if (code !== 0) throw new Error("Native session preparation failed");
+      const markerLine = "\nMANAGED_ULW_LAUNCH ";
+      const markerIndex = stdoutText.indexOf(markerLine);
+      const newlineIndex = markerIndex === -1 ? -1 : stdoutText.indexOf("\n", markerIndex + markerLine.length);
+      if (newlineIndex === -1) throw new Error("Native session preparation did not return a launch marker");
+      prepared = stdoutText.slice(newlineIndex + 1);
+    } else {
+      const extensionPaths = [fileURLToPath(new URL("../", import.meta.url)), managedUlwPath, options.extensionPath,
+        fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
+        fileURLToPath(new URL("./host-extension.ts", import.meta.url))];
+      // One helper process discovers the launch composition, then prepares the
+      // session from the manifest built here. The composition arrives before the
+      // helper can create or publish this session, so a worker persists its
+      // launch fence only after discovery and before preparation.
+      ({ prepared } = await managedUlwLaunch({ cwd: options.cwd, managedUlwPath,
+        extensionPaths, configPath, parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
+        ...(options.worker ? { worker: { extensionPaths: options.worker.extensionPaths } } : {}),
+        launchArgs: [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
+        env: options.env, bunCommand: [bun, "--no-env-file"] }, {
+        stderr: log.fd, timeoutMs: START_TIMEOUT_MS,
+        manifest: async composition => {
+          manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath,
+            memoryWriteDir: composition.memoryWriteDir, processBackend, helperPath,
+            nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
+          deadline = Date.now() + START_TIMEOUT_MS;
+          beforeSessionPrepare?.();
+          return manifest;
+        },
+      }));
+    }
     if (Date.now() >= deadline) throw new Error("Native session preparation timed out");
     const flags = JSON.parse(prepared!);
     if (typeof flags?.toolsExplicitlySelected !== "boolean" || typeof flags.noTools !== "boolean")
       throw new Error("Native session preparation did not confirm tool selection");
+    if (options.prReviewOnly && (!flags.noTools || flags.toolsExplicitlySelected))
+      throw new Error("Native launch did not resolve the stock no-tools selection");
     await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, toolsExplicitlySelected: flags.toolsExplicitlySelected,
       noTools: flags.noTools, inventory: flags.inventory }), { flag: "wx", mode: 0o600 });
     if (Date.now() >= deadline) throw new Error("Native Host startup timed out before launch");
@@ -470,7 +574,7 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
         await Bun.sleep(50);
         continue;
       }
-      const { connection, identity } = await HostConnection.open(options.socketPath, Math.max(1, deadline - Date.now()));
+      const { connection, identity, state } = await HostConnection.open(options.socketPath, Math.max(1, deadline - Date.now()));
       try {
         if (identity.dev !== startingSocket.dev || identity.ino !== startingSocket.ino) {
           throw new Error("Launched RPC socket identity changed while connecting");
@@ -479,6 +583,7 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
         if (path.resolve(identity.sessionFile) !== path.resolve(options.sessionFile)) {
           throw new Error("Launched RPC host identified a different session file");
         }
+        if (options.prReviewOnly) await assertPrReviewState(state, options.cwd);
         if (failure) throw failure;
         return { pid: identity.pid };
       } finally { await connection.close(); }
