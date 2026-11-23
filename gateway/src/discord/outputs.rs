@@ -97,16 +97,16 @@ impl Payload {
     /// or one text attachment named after `nonce` when the text needs more.
     fn split(text: &str, nonce: &str, parts: usize) -> Effect<Vec<Self>> {
         let rendered = markdown::render(text, FILE_LIMIT);
-        if rendered.len() > FILE_LIMIT {
+        if rendered.text.len() > FILE_LIMIT {
             return Err(EffectError::rejected(
                 "Discord text attachment exceeds the safe 8 MiB upload limit",
             ));
         }
-        if rendered.is_empty() {
+        if rendered.text.is_empty() {
             return Ok(vec![Self::text("(empty output)".to_owned())]);
         }
-        if utf16(&rendered) <= MESSAGE_LIMIT {
-            return Ok(vec![Self::text(rendered.into_owned())]);
+        if utf16(&rendered.text) <= MESSAGE_LIMIT {
+            return Ok(vec![Self::text(rendered.text.into_owned())]);
         }
         if let Some(chunks) = markdown::split(&rendered, MESSAGE_LIMIT, parts) {
             return Ok(chunks.into_iter().map(Self::text).collect());
@@ -115,7 +115,7 @@ impl Payload {
         Ok(vec![Self::attachment(
             "Full text is attached (exceeds Discord's message limit).",
             name,
-            rendered.into_owned().into_bytes(),
+            rendered.text.into_owned().into_bytes(),
         )])
     }
 

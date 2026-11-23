@@ -473,9 +473,12 @@ approval.
   not a second copy of the file.
 - Long outputs use a single bounded text attachment where supported. Discord
   first splits an over-limit reply at paragraph, line, then space boundaries
-  into at most five ordered messages, closing and reopening a code fence that
-  crosses a boundary; only the first replies to the original message, each part
-  has its own nonce, and the first message ID is the delivery receipt. For newly
+  into at most five ordered messages of up to 2,000 UTF-16 units, closing and
+  reopening a code fence that crosses a boundary. Rendered table fields stay
+  whole across message boundaries; when a field cannot fit, the bounded text
+  attachment preserves its Markdown rather than cutting through it.
+  Only the first message replies to the original. Each part has its own nonce,
+  and the first message ID is the delivery receipt. For newly
   completed multipart sends the Gateway also records later message IDs for scoped
   reply lookup; partial or uncertain sends are not workspace evidence. The Gateway has
   25 seconds for the whole Discord output, including destination lookup,
@@ -483,9 +486,12 @@ approval.
   No new parts are posted after that deadline. An in-flight POST at expiry or
   a failure after a visible part is uncertain; nothing is resent. Slack
   uses upload URL → bytes → `files.completeUploadExternal`, not `files.upload`.
-  Telegram and Slack do not automatically retry remote mutations. Discord formats
-  pipe tables as fixed-width code blocks at delivery, preserving the stored
-  original. [Delivery classification](../../src/delivery.ts) distinguishes
+  Telegram and Slack do not automatically retry remote mutations. Discord renders
+  ordinary Markdown pipe tables at delivery as stacked list items, with the
+  column labels and each row's values on separate lines. This leaves links,
+  emphasis and inline code available to Discord's Markdown renderer and lets
+  prose wrap naturally. Existing code blocks and stored output are unchanged.
+  [Delivery classification](../../src/delivery.ts) distinguishes
   definite rejection from uncertainty across the IPC boundary.
 - Receipt/working reactions are best-effort decorations bound to the real
   source message. They neither delay nor prove admission, execution or delivery.
