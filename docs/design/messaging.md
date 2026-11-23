@@ -195,6 +195,22 @@ not spend a saved reset or retry the original input; later inputs keep their
 durable order. The quota and credential contracts were checked against the
 [pinned OMP SDK](../../DESIGN.md#stock-omp-and-verification-scope).
 
+Any other settled HEAD failure (`prompt_result` status `error`) whose exact
+native run journal contains only its single prompt, failed model replies without
+tool calls, native `provider_refusal` entries and usage records closes as
+cancelled at settlement, with a failure notice and without replay. The same
+receipt identity, run ordinal, session and file binding as the quota rule
+applies, and every output of the input must have a terminal delivery state. An
+input already held after a restart closes the same way during reconciliation;
+after the settled receipt only usage records and native or extension `custom`
+entries (for example `session_exit`) are tolerated, never a later message, run
+or tool start.
+A started tool, a steered follow-up, an unknown journal entry, an unreadable
+journal or a provable quota hold keeps the input uncertain. That failure notice
+names the exact `/resolve <input-id>`, and the first new owner message held
+behind it receives one notice naming the blocking input. Later held messages
+receive no further notice for the same blocker.
+
 `/resolve [input-id]` (`!resolve` in Slack) manually closes an uncertain head
 input as cancelled. A stalled lane exposes its exact input ID and queue blocker
 through `/status` or `lane_inspect`. Only the operator in the bound topic can use
