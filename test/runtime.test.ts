@@ -1750,7 +1750,9 @@ describe("same-HEAD evidence recovery", () => {
       main.afterEntries = async () => { journalRead.resolve(); };
       quotaReply.resolve(true);
       await journalRead.promise;
-      await admit(runtime, applicationCommand("check-foreign-receipt"));
+      const status = applicationCommand("1550450500000000001");
+      await admit(runtime, status);
+      expect(store.input(status.id)?.state).toBe("done");
       expect(store.input(id)?.state).toBe("uncertain");
       expect(store.input("after-foreign-receipt")?.state).toBe("pending");
       expect(main.prompts).toEqual([]);
