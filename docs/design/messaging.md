@@ -140,6 +140,18 @@ barrier or selected priority owner controls (`/restart`, `/stop`, `/stop head`);
 ordinary intake keeps its order. After the first approval barrier, a head outage
 does not close Gateway admission. Reconnecting does not replay already submitted work.
 
+The head receipt does not wait for a [historical topic search](#topic-routing-and-controls),
+which may read large native journals. An input that needs one is appended to a
+durable deferred-routing queue in the coordination store (`intake:deferred-routing`),
+receipted, and then searched and admitted in the background. Until it is admitted,
+every later input of the same physical channel or DM (including its threads and
+logical topics) is queued behind it, so none overtakes it; other conversations are
+not held. A redelivery of a queued input is deduplicated by its ID. A pending queued
+choice fences the automatic history choice like an unreceipted Gateway event. A
+failed admission stays first in its conversation and is retried with bounded
+backoff; a permanent denial is dropped. The queue survives a restart and resumes
+in order once intake is ready.
+
 Telegram persists its per-bot offset after admission and acknowledges it with the
 next `getUpdates`. There is no Bot API history fetch; recovery cannot exceed its
 24-hour update retention. Omit the previous offset after 24 hours of inactivity,

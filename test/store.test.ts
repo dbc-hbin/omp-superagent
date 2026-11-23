@@ -5,7 +5,7 @@ import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { Client, Collection, type ClientUser, type Message } from "discord.js";
-import { physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
+import { DEFERRED_ROUTING_META, physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { Store } from "../src/store.ts";
@@ -781,6 +781,25 @@ describe("durable coordination store", () => {
         clock.mockRestore();
         gateway.close();
       }
+    });
+  }
+
+  for (const { name, holds, event } of gatewayChoiceCases) {
+    test(`automatic history choice ${holds ? "waits for" : "ignores"} ${name} ACKed but awaiting deferred routing`, () => {
+      const { store, directory } = fixture();
+      const choice = confirmedChoice(store, directory);
+      const { input, deadline } = choice;
+      const clock = spyOn(Date, "now").mockReturnValue(deadline + 10);
+      try {
+        store.setMeta(DEFERRED_ROUTING_META, JSON.stringify([{
+          ...inbound("discord:account:902:original"), messageId: "902", text: "1", receivedAt: choice.confirmedAt,
+          ...event(choice, directory),
+        }]));
+        expect(store.hasPendingTopicChoice(input, deadline)).toBe(holds);
+        expect(store.tryAutoTopicChoice(input, deadline, "")).toBe(!holds);
+        store.setMeta(DEFERRED_ROUTING_META, "[]");
+        if (holds) expect(store.tryAutoTopicChoice(input, deadline, "")).toBe(true);
+      } finally { clock.mockRestore(); }
     });
   }
 

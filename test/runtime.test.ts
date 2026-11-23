@@ -389,6 +389,7 @@ const pickerClick = (output: OutputRecord, group: number, option: number): Inbou
 });
 async function admit(runtime: Superagent, input: Inbound): Promise<void> {
   await runtime.receive(input);
+  await runtime.routingSettled();
   await runtime.kick();
 }
 
@@ -10220,23 +10221,25 @@ const historicalNow = Date.parse("2026-11-18T12:00:00.000Z");
 const historicalRequest = "지난주 로그인 버그 보던 데서 계속해줘";
 const historicalTask = (detail: string) => `로그인 버그 조사: ${detail} 문제를 확인해줘`;
 
-function historyFixture(recall: "available" | "unavailable" = "available") {
+function historyFixture(recall: "available" | "unavailable" = "available", searchGate?: Promise<void>) {
   const searches: string[] = [];
-  const f = fixture(3, undefined, { topicMemory: {
+  const topicMemory: RuntimeAdapters["topicMemory"] = {
     status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: true }),
     search: async query => {
       searches.push(query);
+      await searchGate;
       if (recall === "unavailable") throw new Error("private-provider-diagnostic");
       return { backend: "mnemopi", query, items: [], count: 0 };
     },
-  } });
+  };
+  const f = fixture(3, undefined, { topicMemory });
   if (!f.config.discord) throw new Error("Missing Discord fixture config");
   f.config.discord.allowedChannelIds.push("5");
   const destination = route("53", { channelId: "5" });
   const current = savedLane(f.store, f.config, "current", destination, process.pid);
   const worker = new HostTransport(current.sessionFile, "session-current");
   f.hosts.set(current.socketPath, worker);
-  return { ...f, current, destination, worker, searches };
+  return { ...f, current, destination, worker, searches, topicMemory };
 }
 
 function writeHistoricalTurn(lane: Lane, detail: string, at = "2026-11-11T12:00:00.000Z"): void {
@@ -10266,6 +10269,68 @@ function historicalAnswer(question: OutputRecord | null, lane: Lane): { number: 
   if (!number) throw new Error(`Missing offered entry for ${lane.id}`);
   return { number, reply: { messageId: question.remoteId, authorId: null, text: "quoted text is not authoritative" } };
 }
+
+describe("deferred historical topic routing", () => {
+  test("Gateway receipt does not wait for the history search, and later inputs keep conversation order", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, store, destination, current, worker, searches } = historyFixture("available", search.promise);
+    await runtime.start();
+    const first = { ...message("710", destination, historicalRequest), receivedAt: historicalNow };
+    const second = { ...message("711", destination, "Also check the session cookie flags."), receivedAt: historicalNow + 1 };
+    const elsewhere = headMessage("712", route("13"));
+
+    // Each receive resolves (the Gateway receipt) while the search is still blocked.
+    await runtime.receive(first);
+    await runtime.receive(first);
+    await runtime.receive(second);
+    await runtime.receive(elsewhere);
+    expect(searches).toEqual([historicalRequest]);
+    expect(store.input(first.id)).toBeNull();
+    // The same conversation must not overtake the pending routing; another one is not held.
+    expect(store.input(second.id)).toBeNull();
+    expect(store.input(elsewhere.id)).toMatchObject({ target: "main" });
+
+    search.resolve();
+    await runtime.routingSettled();
+    await runtime.kick();
+    expect(searches).toEqual([historicalRequest]);
+    expect(store.getMeta("intake:deferred-routing")).toBe("[]");
+    expect(store.input(`handoff:${first.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
+    // The follow-up reaches the lane only after the request routed first.
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([
+      expect.stringContaining(`Request ID: handoff:${first.id}:${current.id}`),
+      expect.stringContaining(`Request ID: handoff:${second.id}:${current.id}`),
+    ]);
+  });
+
+  test("routing still pending at shutdown is admitted after restart without a new Gateway delivery", async () => {
+    const search = Promise.withResolvers<void>();
+    const { runtime, config, directory, destination, current, hosts, errors, topicMemory } = historyFixture("available", search.promise);
+    await runtime.start();
+    const first = { ...message("720", destination, historicalRequest), receivedAt: historicalNow };
+    await runtime.receive(first);
+    const stopping = runtime.stop();
+    search.resolve();
+    await stopping;
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    expect(JSON.parse(reopened.getMeta("intake:deferred-routing") ?? "[]")).toEqual([first]);
+    expect(reopened.input(first.id)).toBeNull();
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
+    const worker = new HostTransport(current.sessionFile, "session-current");
+    hosts.set(current.socketPath, worker);
+    const restarted = new Superagent(config, reopened, new MessengerTransport(), join(directory, "extension.ts"), error => errors.push(error), {
+      topicMemory, connect: async path => path === hostPaths(config, "main").socketPath ? head : hosts.get(path)!,
+    });
+    fixtures.find(entry => entry.runtime === runtime)!.runtime = restarted;
+    await restarted.start();
+    await restarted.routingSettled();
+    await restarted.kick();
+    expect(reopened.getMeta("intake:deferred-routing")).toBe("[]");
+    expect(reopened.input(`handoff:${first.id}:${current.id}`)).toMatchObject({ target: current.id, state: "submitted" });
+    expect(worker.prompts.map(turn => turn.command.message)).toEqual([expect.stringContaining(first.text)]);
+  });
+});
 
 describe("historical continuation in an existing Discord work thread", () => {
   test.each(["unique match", "lookup miss", "lookup outage"] as const)("%s dispatches only in the current session", async outcome => {

@@ -39,6 +39,9 @@ export function physicalRouteKey(route: Route): string {
   return routeKey(physicalRoute(route));
 }
 
+/** Store meta key: owner inputs acknowledged to Gateway whose topic routing is still pending, in delivery order. */
+export const DEFERRED_ROUTING_META = "intake:deferred-routing";
+
 export interface Attachment {
   id: string;
   name: string;

@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
-  HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
+  DEFERRED_ROUTING_META, HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
   type ActiveInputState, type KickoffHold, type OutputRecord, type Route, type StorePort, type WorkflowActivation,
   type HeadModelChange, type HeadRecoveryAttempt, type HeadRecoveryEffect,
 } from "./contracts.ts";
@@ -345,14 +345,21 @@ export class Store implements StorePort {
   hasPendingTopicChoice(input: InputRecord, deadline: number): boolean {
     const { platform, accountId, authorityId, guildId, channelId, threadId } = input.route;
     if (platform !== "discord" || guildId === null || threadId === null) return false;
+    // An input already ACKed to Gateway but still awaiting deferred topic routing
+    // has no head receipt yet either; it fences the choice like a pending ledger row.
+    const deferred = (JSON.parse(this.getMeta(DEFERRED_ROUTING_META) ?? "[]") as Inbound[]).filter(item => !item.pickerSelection
+      && (typeof item.messageId === "string" || typeof item.interactionId === "string")
+      && Number.isSafeInteger(item.receivedAt) && item.receivedAt >= input.receivedAt && item.receivedAt <= deadline
+      && item.id !== input.id && physicalRouteKey(item.route) === physicalRouteKey(input.route))
+      .map(item => ({ id: item.id, text: item.text, messageId: item.messageId, replyId: item.reply?.messageId ?? null, authoredAt: item.receivedAt }));
     // Gateway creates the shared ingress ledger; standalone Store use has none.
-    if (!this.db.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_events'").get()) return false;
+    const ledger = this.db.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_events'").get() !== null;
     const questionId = `${input.id}:workspace`;
     const choices: readonly { readonly cwd: string }[] = JSON.parse(this.getMeta(`topic-history:${input.id}`) ?? "[]");
     // The Gateway pending index skips delivered history, including terminal rejections.
     // Unresolved rows stay pending. The durable insert, not its wall-clock timestamp,
     // fences a timely-authored choice even when transport-delayed.
-    const rows = this.db.query<{
+    const rows = ledger ? this.db.query<{
       readonly id: string; readonly text: string; readonly messageId: string | null;
       readonly replyId: string | null; readonly authoredAt: number;
     }, [number, number, string, string, string, string, string, string, string]>(`
@@ -375,8 +382,9 @@ export class Store implements StorePort {
         AND json_extract(data, '$.input.route.guildId') = ?
         AND json_extract(data, '$.input.route.channelId') = ?
         AND json_extract(data, '$.input.route.threadId') = ?
-    `).iterate(input.receivedAt, deadline, input.id, platform, accountId, authorityId, guildId, channelId, threadId);
-    for (const row of rows) {
+    `) : null;
+    const pending = rows?.iterate(input.receivedAt, deadline, input.id, platform, accountId, authorityId, guildId, channelId, threadId) ?? [];
+    for (const row of [...deferred, ...pending]) {
       if (row.messageId !== null && row.id.startsWith(`discord:${accountId}:${row.messageId}:edit:`)) continue;
       const questionReply = row.replyId !== null && this.sentOutputForMessage(input.route, row.replyId)?.id === questionId;
       const scopedReply = questionReply || row.replyId !== null && row.replyId === input.messageId;
