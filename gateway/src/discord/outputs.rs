@@ -30,6 +30,9 @@ pub(super) struct Output {
     reply_to: Option<MessageReference>,
     /// A durable status message this output replaces in place.
     edit_of: Option<MessageReference>,
+    /// Initial status message; falls back to one attachment instead of splitting.
+    #[serde(default)]
+    status: bool,
     picker: Option<Picker>,
     result_attachment: Option<ResultAttachment>,
 }
@@ -179,6 +182,11 @@ impl State {
         if let Some(target) = &output.edit_of {
             return self.edit_status(output, target, deadline).await;
         }
+        if output.status && (output.picker.is_some() || output.result_attachment.is_some()) {
+            return Err(EffectError::rejected(
+                "Discord status requires a plain message",
+            ));
+        }
         if let Some(reply) = &output.reply_to
             && (!snowflake(&reply.message_id) || reply.route.physical() != output.route.physical())
         {
@@ -240,7 +248,11 @@ impl State {
             Some(card) => vec![Payload::new(
                 &card.menu.text, &first_nonce, Some(picker_components(&card.menu)),
             )?],
-            None => Payload::split(&output.text, &first_nonce, MESSAGE_PARTS)?,
+            None => Payload::split(
+                &output.text,
+                &first_nonce,
+                if output.status { 1 } else { MESSAGE_PARTS },
+            )?,
         };
         let mut sent_ids = Vec::with_capacity(payloads.len());
         for (part, mut payload) in payloads.into_iter().enumerate() {

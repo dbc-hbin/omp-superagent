@@ -957,3 +957,73 @@ async fn status_edits_replace_their_message_and_cards_become_embeds() {
     hub.stop().await.unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn card_only_progress_and_long_initial_status_edit_in_one_message() {
+    let (_temporary, store, hub, ws, mut observed, _, server) =
+        discord_fixture(json!({"discord":{}})).await;
+    let (started, mut socket) = time::timeout(Duration::from_secs(5), async {
+        tokio::join!(hub.start(), identify(&ws, false))
+    })
+    .await
+    .unwrap();
+    started.unwrap();
+    hub.ready.send_replace(true);
+    dispatch(&mut socket, 2, "MESSAGE_CREATE", message("501", None, "99", "42", "owner DM")).await;
+    let route = event(&hub, &store).await["input"]["route"].clone();
+
+    let card = r#"{"root":"c","elements":{"c":{"type":"Card","props":{"title":"Progress"}}}}"#;
+    let card_status = hub
+        .effect("send", &[json!({"id":"card-only-1","route":route,"status":true,
+            "text":format!("⏳\n```card\n{card}\n```")})])
+        .await
+        .unwrap();
+    assert_eq!(card_status, "700");
+    let card_posted = received(&mut observed, "/channels/99/messages").await;
+    assert_eq!(card_posted["content"], "⏳");
+    assert_eq!(card_posted["embeds"], json!([{"title":"Progress"}]));
+
+    // A >2000 char initial status falls back to a single text attachment so a
+    // subsequent short edit replaces the entire status in place with zero chunks left.
+    let long_status = format!("⏳ {}", "a".repeat(2500));
+    let long_id = hub
+        .effect("send", &[json!({"id":"long-status-1","route":route,"text":long_status,"status":true})])
+        .await
+        .unwrap();
+    assert_eq!(long_id, "700");
+    let long_posted = received(&mut observed, "/channels/99/messages").await;
+    let raw = long_posted.as_str().expect("multipart upload for long initial status");
+    assert!(raw.contains("Full text is attached (exceeds Discord's message limit)."));
+    assert!(observed.try_recv().is_err(), "long initial status must use one post, never split chunks");
+
+    let short_edit = hub
+        .effect("send", &[json!({"id":"long-status-2","route":route,"text":"⏳ done",
+            "editOf":{"route":route,"messageId":"700"}})])
+        .await
+        .unwrap();
+    assert_eq!(short_edit, "700");
+    let patch = received(&mut observed, "/channels/99/messages/700").await;
+    assert_eq!(patch["content"], "⏳ done");
+    assert_eq!(patch["embeds"], json!([]));
+    assert_eq!(patch["attachments"], json!([]));
+    assert!(observed.try_recv().is_err());
+
+    // Non-Discord routes and rich payloads cannot claim status=true.
+    let telegram_route = json!({"platform":"telegram","accountId":"bot","authorityId":"42",
+        "guildId":null,"channelId":"-100","threadId":null});
+    let non_discord = hub
+        .effect("send", &[json!({"id":"bad-status-tg","route":telegram_route,"text":"⏳ x","status":true})])
+        .await
+        .unwrap_err();
+    assert_eq!(non_discord.certainty, "rejected");
+    let with_picker = hub
+        .effect("send", &[json!({"id":"bad-status-picker","route":route,"text":"Pick","status":true,
+            "picker":{"kind":"model","sessionId":"s","generation":0,"expiresAt":2,"groups":[{"label":"M","options":["fixture/a"]}]}})])
+        .await
+        .unwrap_err();
+    assert_eq!(with_picker.certainty, "rejected");
+    assert!(observed.try_recv().is_err());
+
+    hub.stop().await.unwrap();
+    server.abort();
+}

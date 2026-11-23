@@ -6035,7 +6035,7 @@ export class Superagent {
         && (live.id !== "main" || this.headStopping === 0)) {
         const eventId = key(JSON.stringify([live.sessionId, live.generation, progress.identity]));
         try {
-          if (this.store.progress(live.input.id, live.generation, live.sessionId, eventId, progress.text)) {
+          if (this.store.progress(live.input.id, live.generation, live.sessionId, eventId, progress.text, this.config.discord?.editProgressInPlace === true)) {
             this.background(this.kick());
           }
         } catch (error) { this.report(error); }
@@ -6170,7 +6170,7 @@ export class Superagent {
         catch (error) { this.report(error); }
       }
       this.store.settle(input.id, state, !reviewingLaneDecision && (text || live.id !== "main")
-        ? { id: `${input.id}:answer`, text } : undefined, headModel);
+        ? { id: `${input.id}:answer`, text } : undefined, headModel, this.config.discord?.editProgressInPlace === true);
       if (live.input === input) {
         live.admitted.clear();
         live.input = undefined;
@@ -6436,12 +6436,12 @@ export class Superagent {
               }
               if (verification === "deferred") { deferredLaneNotices.add(output.id); continue; }
               if (verification === "held") {
-                if (!this.stopped && this.store.claimOutput(output.id))
+                if (!this.stopped && this.store.claimOutput(output.id, this.config.discord?.editProgressInPlace === true))
                   this.store.finishOutput(output.id, "failed", undefined, "Lane watch notice is held or no longer tracked");
                 continue;
               }
             }
-            if (this.stopped || !this.store.claimOutput(output.id)) continue;
+            if (this.stopped || !this.store.claimOutput(output.id, this.config.discord?.editProgressInPlace === true)) continue;
             let remoteId: string;
             try {
               if (isLaneWatchNotice(output.id)) {

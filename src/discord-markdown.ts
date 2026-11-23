@@ -91,8 +91,12 @@ function pad(value: string, width: number, align: Align): string {
   return value + " ".repeat(missing);
 }
 
-/** Check the byte budget before allocating any padded cells or separators. */
-function formatTable(rows: string[][], aligns: Align[], maxBytes: number): { lines: string[]; bytes: number } | null {
+/** Check the byte or UTF-16 budget before allocating any padded cells or separators. */
+function formatTable(
+  rows: string[][],
+  aligns: Align[],
+  budget: { kind: "bytes" | "utf16"; max: number },
+): { lines: string[]; bytes: number; utf16: number } | null {
   const widths = aligns.map(() => 3);
   for (const row of rows) {
     for (let column = 0; column < row.length; column++) {
@@ -101,14 +105,25 @@ function formatTable(rows: string[][], aligns: Align[], maxBytes: number): { lin
   }
   const alignOf = (column: number): Align => aligns[column] ?? "left";
   const fence = "```";
-  // Each row has a frame, display-width cells, and one newline. UTF-8 cell
-  // bytes may exceed their display width; the separator contains only ASCII.
-  const rowWidth = 3 * widths.length + 1 + widths.reduce((sum, width) => sum + width, 0);
-  let bytes = 2 * fence.length + rows.length + 2 + (rows.length + 1) * rowWidth;
+  const widthSum = widths.reduce((sum, width) => sum + width, 0);
+  // 7 accounts for "```\n" (4) + "```" (3); separator line has "| " + " | " + " |\n".
+  const sepLen = 2 + 3 * widths.length + widthSum;
+  let bytes = 7 + sepLen;
+  let utf16 = bytes;
   for (const row of rows) {
-    for (const cell of row) bytes += Buffer.byteLength(cell, "utf8") - Bun.stringWidth(cell);
+    let rowBytes = 2;
+    let rowUtf16 = 2;
+    for (let column = 0; column < widths.length; column++) {
+      const cell = row[column] ?? "";
+      const missing = Math.max(0, widths[column]! - Bun.stringWidth(cell));
+      const padFrame = missing + 3;
+      rowBytes += padFrame + Buffer.byteLength(cell, "utf8");
+      rowUtf16 += padFrame + cell.length;
+    }
+    bytes += rowBytes;
+    utf16 += rowUtf16;
   }
-  if (bytes > maxBytes) return null;
+  if ((budget.kind === "bytes" ? bytes : utf16) > budget.max) return null;
   const line = (cells: string[]) =>
     `| ${widths.map((width, column) => pad(cells[column] ?? "", width, alignOf(column))).join(" | ")} |`;
   // Pure dashes keep the grid exact; alignment is already visible in the padded
@@ -117,7 +132,7 @@ function formatTable(rows: string[][], aligns: Align[], maxBytes: number): { lin
   const lines = [fence, line(rows[0]!), separator];
   for (let index = 1; index < rows.length; index++) lines.push(line(rows[index]!));
   lines.push(fence);
-  return { lines, bytes };
+  return { lines, bytes, utf16 };
 }
 
 /**
@@ -166,7 +181,7 @@ export function renderDiscordMarkdown(text: string, maxBytes: number): string {
       rows.push(row);
       sourceBytes += 1 + Buffer.byteLength(lines[next]!, "utf8");
     }
-    const table = formatTable(rows, delimiter, maxBytes - bytes + sourceBytes);
+    const table = formatTable(rows, delimiter, { kind: "bytes", max: maxBytes - bytes + sourceBytes });
     if (!table) return text;
     bytes += table.bytes - sourceBytes;
     for (const rendered of table.lines) out.push(rendered);
@@ -269,7 +284,10 @@ function cardEmbed(source: string): DiscordEmbed {
         if (!Array.isArray(columns) || columns.length === 0 || !columns.every(cell => typeof cell === "string")
           || !Array.isArray(rows) || !rows.every(row => Array.isArray(row) && row.length === columns.length
             && row.every(cell => typeof cell === "string"))) throw new InvalidCard();
-        const table = formatTable([columns as string[], ...rows as string[][]], columns.map(() => "left"), Infinity)!;
+        const used = parts.reduce((sum, part) => sum + part.length, 0) + parts.length;
+        const table = formatTable([columns as string[], ...rows as string[][]], columns.map(() => "left"),
+          { kind: "utf16", max: EMBED_DESCRIPTION - used });
+        if (!table) throw new InvalidCard();
         parts.push(table.lines.join("\n"));
         break;
       }

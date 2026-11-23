@@ -122,9 +122,13 @@ fn block_start(line: &str) -> bool {
     matches!(line.as_bytes().get(marker), None | Some(b' ' | b'\t'))
 }
 
-pub(super) fn table(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Option<String> {
-    let mut widths = vec![3; aligns.len()];
-    let mut extra_bytes = 0;
+enum TableBudget {
+    Bytes(usize),
+    Utf16(usize),
+}
+
+fn render_table(rows: &[Vec<String>], aligns: &[Align], budget: TableBudget) -> Option<String> {
+    let mut widths = vec![3usize; aligns.len()];
     for row in rows {
         for (column, cell) in row.iter().enumerate() {
             let width = cell.width();
@@ -133,15 +137,40 @@ pub(super) fn table(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Op
             } else {
                 widths.push(width.max(3));
             }
-            extra_bytes += cell.len().saturating_sub(width);
         }
     }
-    let row_width = 3 * widths.len() + 1 + widths.iter().sum::<usize>();
-    let bytes = 8 + rows.len() + (rows.len() + 1) * row_width + extra_bytes;
-    if bytes > budget {
+    let width_sum = widths
+        .iter()
+        .try_fold(0usize, |sum, &width| sum.checked_add(width))?;
+    let sep_len = widths
+        .len()
+        .checked_mul(3)?
+        .checked_add(2)?
+        .checked_add(width_sum)?;
+    // 7 accounts for "```\n" (4) + "```" (3).
+    let mut total_bytes = 7usize.checked_add(sep_len)?;
+    let mut total_utf16 = total_bytes;
+    for row in rows {
+        let mut row_bytes = 2usize;
+        let mut row_utf16 = 2usize;
+        for (column, &width) in widths.iter().enumerate() {
+            let cell = row.get(column).map_or("", String::as_str);
+            let missing = width.saturating_sub(cell.width());
+            let pad_frame = missing.checked_add(3)?;
+            row_bytes = row_bytes.checked_add(pad_frame)?.checked_add(cell.len())?;
+            row_utf16 = row_utf16.checked_add(pad_frame)?.checked_add(utf16(cell))?;
+        }
+        total_bytes = total_bytes.checked_add(row_bytes)?;
+        total_utf16 = total_utf16.checked_add(row_utf16)?;
+    }
+    let exceeded = match budget {
+        TableBudget::Bytes(max) => total_bytes > max,
+        TableBudget::Utf16(max) => total_utf16 > max,
+    };
+    if exceeded {
         return None;
     }
-    let mut out = String::with_capacity(bytes);
+    let mut out = String::with_capacity(total_bytes);
     out.push_str("```\n");
     for (index, row) in rows.iter().enumerate() {
         out.push('|');
@@ -171,6 +200,14 @@ pub(super) fn table(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Op
     }
     out.push_str("```");
     Some(out)
+}
+
+pub(super) fn table(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Option<String> {
+    render_table(rows, aligns, TableBudget::Bytes(budget))
+}
+
+pub(super) fn table_utf16(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Option<String> {
+    render_table(rows, aligns, TableBudget::Utf16(budget))
 }
 
 pub(super) fn render(text: &str, budget: usize) -> Cow<'_, str> {

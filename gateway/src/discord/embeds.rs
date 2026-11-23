@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use serde_json::{Map, Value, json};
 
-use super::markdown::{Align, closes, opens, table};
+use super::markdown::{Align, closes, opens, table_utf16};
 use super::model::utf16;
 
 // Discord's documented embed limits, counted in UTF-16 units like message text.
@@ -176,7 +176,17 @@ impl<'a> Walk<'a> {
                     grid.push(row);
                 }
                 let aligns = vec![Align::Left; grid[0].len()];
-                self.embed.parts.push(table(&grid, &aligns, usize::MAX).ok_or(Invalid)?);
+                let used = self
+                    .embed
+                    .parts
+                    .iter()
+                    .map(|part| utf16(part))
+                    .sum::<usize>()
+                    .saturating_add(self.embed.parts.len());
+                let remaining = EMBED_DESCRIPTION.saturating_sub(used);
+                self.embed
+                    .parts
+                    .push(table_utf16(&grid, &aligns, remaining).ok_or(Invalid)?);
             }
             "Divider" => self.embed.parts.push("\u{2500}".repeat(16)),
             "Image" => {
@@ -296,5 +306,29 @@ mod tests {
             assert_eq!(content, case.content, "{}", case.name);
             assert_eq!(embeds, case.embeds, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn oversized_sparse_table_card_rejects_before_allocating_and_preserves_fence() {
+        let mut rows = vec![vec!["x".repeat(10_000), "y".to_owned()]];
+        rows.extend(std::iter::repeat_n(vec!["1".to_owned(), "2".to_owned()], 1_000));
+        let spec = serde_json::json!({
+            "root": "card",
+            "elements": {
+                "card": { "type": "Card", "children": ["tbl"] },
+                "tbl": { "type": "Table", "props": { "columns": ["a", "b"], "rows": rows } },
+            },
+        });
+        let source = format!("```card\n{spec}\n```");
+        let (content, embeds) = super::extract(&source);
+        assert_eq!(content, source);
+        assert!(embeds.is_empty());
+
+        let boundary_rows = vec![vec!["이름".to_owned(), "값".to_owned()], vec!["가".to_owned(), "1".to_owned()]];
+        let aligns = vec![super::Align::Left; 2];
+        let rendered = super::table_utf16(&boundary_rows, &aligns, usize::MAX).unwrap();
+        let exact = rendered.encode_utf16().count();
+        assert!(super::table_utf16(&boundary_rows, &aligns, exact).is_some());
+        assert!(super::table_utf16(&boundary_rows, &aligns, exact - 1).is_none());
     }
 }

@@ -190,4 +190,33 @@ describe("Discord card fences", () => {
     expect(result.embeds.map(embed => embed.title)).toEqual(Array.from({ length: 10 }, (_, index) => `#${index}`));
     expect(result.text).toBe(card(10));
   });
+
+  test("overflowing or sparse card tables fail pre-allocation and preserve original card fences", () => {
+    const spec = {
+      root: "card",
+      elements: {
+        card: { type: "Card", children: ["tbl"] },
+        tbl: {
+          type: "Table",
+          props: {
+            columns: ["a", "b"],
+            rows: [["x".repeat(10_000), "y"], ...Array.from({ length: 1_000 }, () => ["1", "2"])],
+          },
+        },
+      },
+    };
+    const source = ["```card", JSON.stringify(spec), "```"].join("\n");
+    expect(extractDiscordCards(source)).toEqual({ text: source, embeds: [] });
+
+    const cjkLimit = {
+      root: "card",
+      elements: {
+        card: { type: "Card", children: ["note", "tbl"] },
+        note: { type: "Text", props: { text: "z".repeat(4050) } },
+        tbl: { type: "Table", props: { columns: ["이름", "값"], rows: [["가", "1"]] } },
+      },
+    };
+    const overSource = ["```card", JSON.stringify(cjkLimit), "```"].join("\n");
+    expect(extractDiscordCards(overSource)).toEqual({ text: overSource, embeds: [] });
+  });
 });

@@ -914,16 +914,42 @@ describe("Discord output delivery", () => {
   test("card fences become embeds and status updates edit their message without reposting", async () => {
     const { messenger, channel } = await fixture();
     const card = JSON.stringify({ root: "c", elements: { c: { type: "Card", props: { title: "Status" } } } });
-    await messenger.send(output(`⏳ working\n\`\`\`card\n${card}\n\`\`\``));
-    expect(channel.sent[0]).toMatchObject({ content: "⏳ working", embeds: [{ title: "Status" }] });
+    await messenger.send({ ...output(`⏳\n\`\`\`card\n${card}\n\`\`\``), status: true });
+    expect(channel.sent[0]).toMatchObject({ content: "⏳", embeds: [{ title: "Status" }] });
     const status = new RemoteMessage("700", channel.id, channel.guildId, {});
     channel.remote.set(status.id, status);
     expect(await messenger.send({ ...output("⏳ still working"), editOf: { route, messageId: "700" } })).toBe("700");
     expect(status.edits).toEqual([expect.objectContaining({ content: "⏳ still working", embeds: [], attachments: [] })]);
+
+    // A >2000 char initial status posts one attachment message that a short edit replaces in place.
+    const originalSend = channel.send.bind(channel);
+    channel.send = async payload => {
+      const msg = await originalSend(payload);
+      if (channel.sent.length === 2) {
+        const numeric = new RemoteMessage("702", channel.id, channel.guildId, payload);
+        channel.remote.set("702", numeric);
+        return numeric;
+      }
+      return msg;
+    };
+    const longReceipt = await messenger.send({ ...output(`⏳ ${"a".repeat(2500)}`), id: "long-status", status: true });
+    expect(longReceipt).toBe("702");
+    expect(channel.sent).toHaveLength(2);
+    expect(channel.sent[1]!.files).toHaveLength(1);
+    expect(await messenger.send({ ...output("⏳ done"), id: "long-status-edit", editOf: { route, messageId: longReceipt } })).toBe(longReceipt);
+    expect(channel.remote.get(longReceipt)?.edits).toEqual([
+      expect.objectContaining({ content: "⏳ done", embeds: [], attachments: [], files: [] }),
+    ]);
+
     await expect(messenger.send({ ...output("⏳ gone"), editOf: { route, messageId: "701" } })).rejects.toMatchObject({ certainty: "rejected" });
     await expect(messenger.send({ ...output("⏳ moved"), editOf: { route: { ...route, channelId: "foreign" }, messageId: "700" } }))
       .rejects.toMatchObject({ certainty: "rejected" });
-    expect(channel.sent).toHaveLength(1);
+    await expect(messenger.send({ ...output("⏳ tg", { ...route, platform: "telegram" }), status: true }))
+      .rejects.toMatchObject({ certainty: "rejected" });
+    await expect(messenger.send({ ...output("⏳ picker"), status: true, picker: {
+      kind: "model", sessionId: "s", generation: 0, expiresAt: 2, groups: [{ label: "M", options: ["fixture/a"] }],
+    } })).rejects.toMatchObject({ certainty: "rejected" });
+    expect(channel.sent).toHaveLength(2);
     expect(status.edits).toHaveLength(1);
     await messenger.stop();
   });

@@ -67,7 +67,8 @@ const SCHEMA = `
     source_id TEXT NOT NULL, route TEXT NOT NULL, text TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending'
       CHECK(state IN ('pending','sending','sent','uncertain','failed')),
-    remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT, result_attachment TEXT, edit_of TEXT
+    remote_id TEXT, error TEXT, reply_to TEXT, picker TEXT, result_attachment TEXT, edit_of TEXT,
+    status INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS outputs_queue ON outputs(state, sequence);
   CREATE INDEX IF NOT EXISTS outputs_sent_message ON outputs(remote_id) WHERE state = 'sent' AND remote_id IS NOT NULL;
@@ -105,6 +106,7 @@ interface OutputRow {
   picker: string | null;
   result_attachment: string | null;
   edit_of: string | null;
+  status: number;
   text: string;
   state: OutputRecord["state"];
   remote_id: string | null;
@@ -121,6 +123,7 @@ const toOutput = (row: OutputRow): OutputRecord => ({
   id: row.id, sourceId: row.source_id, route: JSON.parse(row.route) as Route,
   ...(row.reply_to === null ? {} : { replyTo: JSON.parse(row.reply_to) as NonNullable<OutputRecord["replyTo"]> }),
   ...(row.edit_of === null ? {} : { editOf: JSON.parse(row.edit_of) as NonNullable<OutputRecord["editOf"]> }),
+  ...(row.status ? { status: true } : {}),
   ...(row.picker === null ? {} : { picker: JSON.parse(row.picker) as NonNullable<OutputRecord["picker"]> }),
   ...(row.result_attachment === null ? {} : { resultAttachment: JSON.parse(row.result_attachment) as NonNullable<OutputRecord["resultAttachment"]> }),
   text: row.text, state: row.state, remoteId: row.remote_id, error: row.error,
@@ -206,6 +209,7 @@ export class Store implements StorePort {
       if (!outputColumns.some(column => column.name === "picker")) db.run("ALTER TABLE outputs ADD COLUMN picker TEXT");
       if (!outputColumns.some(column => column.name === "result_attachment")) db.run("ALTER TABLE outputs ADD COLUMN result_attachment TEXT");
       if (!outputColumns.some(column => column.name === "edit_of")) db.run("ALTER TABLE outputs ADD COLUMN edit_of TEXT");
+      if (!outputColumns.some(column => column.name === "status")) db.run("ALTER TABLE outputs ADD COLUMN status INTEGER NOT NULL DEFAULT 0");
       this.db = db;
       this.writerLock = lock;
     } catch (error) {
@@ -651,17 +655,24 @@ export class Store implements StorePort {
   }
 
   /**
-   * Discord shows one ⏳ status message per progress stream. Each update is its
-   * own immutable output; `claimOutput` decides whether it edits that message.
-   * Other platforms keep posting ordinary progress messages.
+   * When opted in on Discord (`editInPlace`), nonterminal progress uses one
+   * `⏳` status message edited in place. Each update stays its own immutable
+   * output; `claimOutput` decides whether it edits that message. By default (or
+   * on other platforms), every update posts as an ordinary new message.
    */
-  private queueStatus(output: Pick<OutputRecord, "id" | "sourceId" | "route" | "text">, stream: string): boolean {
-    if (output.route.platform !== "discord") return this.queueOutput(output);
+  private queueStatus(
+    output: Pick<OutputRecord, "id" | "sourceId" | "route" | "text">,
+    stream: string,
+    editInPlace = false,
+  ): boolean {
+    if (!editInPlace || output.route.platform !== "discord") return this.queueOutput(output);
     this.setMeta(`status-stream:${output.id}`, stream);
-    return this.queueOutput({ ...output, text: `⏳ ${output.text}` });
+    const trimmed = output.text.trimStart();
+    const text = /^(?:`{3,}|~{3,})/.test(trimmed) ? `⏳\n${trimmed}` : `⏳ ${output.text}`;
+    return this.queueOutput({ ...output, text, status: true });
   }
 
-  progress(id: string, generation: number, sessionId: string, eventId: string, text: string): boolean {
+  progress(id: string, generation: number, sessionId: string, eventId: string, text: string, editInPlace = false): boolean {
     if (!text.trim()) return false;
     return this.db.transaction(() => {
       const context = { inputId: id, generation, sessionId };
@@ -673,7 +684,7 @@ export class Store implements StorePort {
       this.setMeta(seen, "true");
       if (input.target === "main") {
         this.setMeta(`progress-output:${receiptId}`, JSON.stringify(context));
-        return this.queueStatus({ id: receiptId, sourceId: id, route: input.route, text }, id);
+        return this.queueStatus({ id: receiptId, sourceId: id, route: input.route, text }, id, editInPlace);
       }
       const topic = this.topicDelivery(id);
       if (topic) {
@@ -684,7 +695,7 @@ export class Store implements StorePort {
           .run("Nonterminal progress superseded", previous);
         this.setMeta(pendingKey, receiptId);
         this.setMeta(`progress-output:${receiptId}`, JSON.stringify(context));
-        return this.queueStatus({ id: receiptId, sourceId: topic.outputSourceId, route: topic.route, text }, id);
+        return this.queueStatus({ id: receiptId, sourceId: topic.outputSourceId, route: topic.route, text }, id, editInPlace);
       }
       const lane = this.requireLane(input.target!);
       const sourceId = this.getMeta(`handoff-source:${id}`);
@@ -794,7 +805,7 @@ export class Store implements StorePort {
     }).immediate();
   }
 
-  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange): boolean {
+  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange, editInPlace = false): boolean {
     return this.db.transaction(() => {
       const input = this.input(id);
       if (!input || input.state === "done" || input.state === "cancelled" || input.state === state) return false;
@@ -832,8 +843,17 @@ export class Store implements StorePort {
           ].join("\n\n"),
         }, "main", { [`activity-source:${receiptId}`]: source.id });
       } else if (output) {
-        if (progress) this.setMeta(`progress-output:${output.id}`, progress);
-        this.queueOutput({ ...output, sourceId: id, route: input.route });
+        if (progress) {
+          this.setMeta(`progress-output:${output.id}`, progress);
+          if (!output.picker) {
+            const { inputId } = JSON.parse(progress) as { inputId: string };
+            this.queueStatus({ ...output, sourceId: id, route: input.route }, inputId, editInPlace);
+          } else {
+            this.queueOutput({ ...output, sourceId: id, route: input.route });
+          }
+        } else {
+          this.queueOutput({ ...output, sourceId: id, route: input.route });
+        }
       }
       this.db.query("UPDATE inputs SET state = ? WHERE id = ?").run(state, id);
       if (headModel && state === "done" && input.state === "submitted" && input.target === "main") {
@@ -965,11 +985,15 @@ export class Store implements StorePort {
   }
 
   queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean {
+    if (output.status && (output.route.platform !== "discord" || output.picker || output.resultAttachment)) {
+      throw new Error(`Status delivery requires a plain Discord message: ${output.id}`);
+    }
     return this.db.transaction(() => {
       const existing = this.output(output.id);
       if (existing) {
         if (existing.sourceId !== output.sourceId || routeKey(existing.route) !== routeKey(output.route)
-          || existing.text !== output.text || !isDeepStrictEqual(existing.picker, output.picker)
+          || existing.text !== output.text || Boolean(existing.status) !== Boolean(output.status)
+          || !isDeepStrictEqual(existing.picker, output.picker)
           || !isDeepStrictEqual(existing.resultAttachment, output.resultAttachment)
           || output.replyTo !== undefined && (!existing.replyTo
             || existing.replyTo.messageId !== output.replyTo.messageId
@@ -1011,9 +1035,9 @@ export class Store implements StorePort {
         || physicalRouteKey(output.replyTo.route) !== physicalRouteKey(replyTo.route))) {
         throw new Error(`Output reply differs from its source: ${output.id}`);
       }
-      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to, picker, result_attachment) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      return this.db.query("INSERT INTO outputs(id, source_id, route, text, reply_to, picker, result_attachment, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .run(output.id, output.sourceId, JSON.stringify(output.route), output.text, replyTo ? JSON.stringify(replyTo) : null,
-          output.picker ? JSON.stringify(output.picker) : null, attachment ? JSON.stringify(attachment) : null).changes === 1;
+          output.picker ? JSON.stringify(output.picker) : null, attachment ? JSON.stringify(attachment) : null, output.status ? 1 : 0).changes === 1;
     }).immediate();
   }
 
@@ -1034,7 +1058,7 @@ export class Store implements StorePort {
    * creation was confirmed. The edit target is persisted with the claim, so a
    * redelivery of this output keeps the same physical message.
    */
-  claimOutput(id: string): boolean {
+  claimOutput(id: string, editInPlace = false): boolean {
     return this.db.transaction(() => {
       const progress = this.getMeta(`progress-output:${id}`);
       if (progress && !this.progressOpen(JSON.parse(progress))) {
@@ -1043,7 +1067,7 @@ export class Store implements StorePort {
       }
       const output = this.output(id);
       if (output?.state !== "pending") return false;
-      const stream = this.getMeta(`status-stream:${id}`);
+      const stream = editInPlace ? this.getMeta(`status-stream:${id}`) : null;
       const anchorId = stream && !output.editOf ? this.getMeta(`status-anchor:${stream}`) : null;
       const anchor = anchorId ? this.output(anchorId) : null;
       if (anchor?.state === "sent" && anchor.remoteId && physicalRouteKey(anchor.route) === physicalRouteKey(output.route)) {

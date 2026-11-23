@@ -432,6 +432,11 @@ export class DiscordMessenger implements Messenger {
 
   async send(output: OutputRecord): Promise<string> {
     try {
+      if (output.status !== undefined && (typeof output.status !== "boolean"
+        || output.status && (output.route.platform !== "discord"
+          || output.picker !== undefined || output.resultAttachment !== undefined))) {
+        throw new DeliveryError("Discord status requires a plain Discord message", "rejected");
+      }
       if (output.editOf !== undefined) {
         // A status update replaces its message; a rejected edit is never reposted.
         if (!object(output.editOf) || typeof output.editOf.messageId !== "string" || !/^[0-9]{1,20}$/.test(output.editOf.messageId)
