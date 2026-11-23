@@ -3,6 +3,8 @@ import { existsSync, lstatSync, readlinkSync, realpathSync, statSync, watch, typ
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { visitEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import { resolveSessionLeafId, type FileEntry, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
 import type { MemoryRuntimeContext } from "@oh-my-pi/pi-coding-agent/memory-backend";
 import { getAgentDbPath } from "@oh-my-pi/pi-utils/dirs";
@@ -49,6 +51,89 @@ import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, 
 import type { RemotePlacement, WorkerProbe, WorkerRegistration, WorkerSelector } from "./worker-wire";
 
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
+
+/**
+ * OMP appends `:thinking` and `@upstream` routing to a model selector, so compare
+ * the model portion and let the suffix describe the same model.
+ */
+const sameSelector = (selector: string, model: string) => selector === model
+  || selector.startsWith(`${model}:`) || selector.startsWith(`${model}@`);
+
+/**
+ * A `model_change` transition OMP recorded: where the lane left and where it
+ * arrived, so a single entry can be matched from both ends.
+ */
+interface RecordedModelChange { from?: string; to: string; fallback: boolean; retry: boolean }
+
+/**
+ * The model transition OMP itself last recorded on a lane's active branch.
+ *
+ * A retry fallback only lives as long as one host process, so a restarted lane
+ * loses the evidence for a model change it could not explain and fences every
+ * later dispatch as operator drift. OMP persists the same decision as `role`
+ * plus `resolvedModelIsFallback` on each `model_change` entry, and that survives
+ * restarts, so read it back instead of trusting process memory.
+ *
+ * Only the active branch counts. The append log also holds abandoned branches
+ * and late entries replayed onto the leaf they were written against, and an
+ * entry OMP later superseded is not evidence for the live session. Replaying
+ * the leaf the way the session loader does (`activeLeafId`) and walking
+ * `parentId` from it keeps a stale marker from authorising a later mismatch.
+ *
+ * `fallback` says which direction the last transition went. OMP records the
+ * substitute with `resolvedModelIsFallback`; the clear back to the configured
+ * model is written as the ephemeral role without that flag, so the flag alone
+ * must not be latched across transitions. `from` is the nearest earlier
+ * model on the same branch, which is what the lane held before this move.
+ */
+async function recordedModelChange(sessionFile: string): Promise<RecordedModelChange | null> {
+  let entries: SessionEntry[];
+  try {
+    const loaded: FileEntry[] = [];
+    await visitEntriesFromFile(sessionFile, entry => { loaded.push(entry); });
+    entries = loaded.filter((entry): entry is SessionEntry => entry.type !== "session");
+  } catch {
+    return null;
+  }
+  const byId = new Map(entries.map(entry => [entry.id, entry]));
+  const branch: SessionEntry[] = [];
+  const seen = new Set<string>();
+  for (let cursor = resolveSessionLeafId(entries); cursor && !seen.has(cursor);) {
+    seen.add(cursor);
+    const entry = byId.get(cursor);
+    if (!entry) break;
+    branch.push(entry);
+    cursor = entry.parentId;
+  }
+  // `branch` starts at the leaf, so index 0 is the newest entry.
+  for (let index = 0; index < branch.length; index++) {
+    const change = branch[index];
+    if (change.type !== "model_change") continue;
+    const fields = change as { model?: unknown; role?: unknown; resolvedModelIsFallback?: unknown };
+    if (typeof fields.model !== "string" || !fields.model) continue;
+    // `branch` walks back from the leaf, so this entry's predecessor in time
+    // sits at a higher index.
+    let from: string | undefined;
+    for (let earlier = index + 1; earlier < branch.length; earlier++) {
+      const previous = branch[earlier];
+      if (previous.type !== "model_change") continue;
+      const model = (previous as { model?: unknown }).model;
+      if (typeof model === "string" && model) from = model;
+      break;
+    }
+    // Only a retry transition carries the ephemeral role. An ordinary selection
+    // records a role-less (default) entry, so its presence is what distinguishes
+    // OMP's own fallback handling from a model someone simply chose.
+    return {
+      from,
+      to: fields.model,
+      fallback: fields.resolvedModelIsFallback === true,
+      retry: fields.role === "fallback",
+    };
+  }
+  return null;
+}
+
 const presetSyncFallbackIntervalMs = 120_000;
 const presetSyncDebounceMs = 150;
 const presetSyncRetryBaseMs = 100;
@@ -1492,6 +1577,49 @@ export class Superagent {
     }
   }
 
+  /**
+   * Accept drift when the transcript shows OMP made exactly this change itself.
+   *
+   * A restart drops `Live.nativeFallback` while the transcript keeps OMP's own
+   * role markers, so the lane used to fence forever on a change no operator made.
+   * Two transitions are legitimate, and both ends must match what OMP recorded:
+   *
+   * - the substitute still running: the lane held `default`, the session reports
+   *   `fallback`, and this is the entry OMP flagged `resolvedModelIsFallback`.
+   * - the restore after resume dropped the ephemeral role: the lane held
+   *   `fallback`, the session reports `default`, and this is the unflagged entry.
+   *
+   * Matching only the destination would excuse an ordinary selection. A plain
+   * `/model` write also records a default model change, so a lane saved on A
+   * whose live session sits on a configured B would look like automatic
+   * recovery when nothing failed. The entry's source identity is what separates
+   * the two, so a source matching neither recorded end stays held as operator or
+   * unmanaged drift. A preset lane is excluded because its frozen snapshot, not
+   * the transcript, describes the roles it must run.
+   */
+  private async adoptRecordedFallback(lane: Lane, actual: LaneModel, available: LaneModelCandidate[]):
+    Promise<{ lane: Lane; from: string; to: string; restored: boolean } | null> {
+    if (lane.model === null || lane.modelPreset !== null) return null;
+    if (!available.some(candidate => sameLaneModel(candidate, actual))) return null;
+    const change = await recordedModelChange(lane.sessionFile);
+    // A retry transition is the only evidence OMP made this move. An ordinary
+    // selection records the same shape without that role, so accepting it would
+    // turn a configured model change into fake automatic recovery.
+    if (!change || !change.retry || !change.from) return null;
+    const from = laneModelArgument(lane.model);
+    const to = laneModelArgument(actual);
+    // The saved lane model must be the transition's source, and the live model
+    // its destination. Either alone would accept an ordinary model selection.
+    if (!sameSelector(change.from, from) || !sameSelector(change.to, to)) return null;
+    const reason = change.fallback
+      ? `Native retry fallback adopted from the lane transcript: ${from} -> ${to} (not operator-selected)`
+      : `Native session resumed on its configured model: ${from} -> ${to} (retry fallback was ephemeral, not operator-selected)`;
+    if (!this.store.changeLaneModel(lane.id, lane.generation, lane.model, actual, reason, null, null)) {
+      throw new Error(`Lane ${lane.id} fallback adoption raced with another state change; inspect before resuming`);
+    }
+    return { lane: this.requireLane(lane.id), from, to, restored: !change.fallback };
+  }
+
   private async checkLaneModel(live: Live): Promise<RuntimeState | null> {
     if (live.id === "main") return null;
     if (this.restartFence()) return this.state(live);
@@ -1546,7 +1674,17 @@ export class Superagent {
         lane = this.requireLane(live.id);
       }
       if (!sameLaneModel(lane.model, actual)) {
-        throw new Error(`Lane ${live.id} model drift: expected ${laneModelArgument(lane.model!)}, actual ${laneModelArgument(actual)}; reconcile the native session or start a new explicitly selected lane. No model was reset and no prompt was sent`);
+        // OMP replaced the model on its own -- a retry fallback, or a resume that
+        // dropped the ephemeral fallback role. Rejecting that drift fences the
+        // lane forever after a transient provider outage, so accept exactly the
+        // change the lane transcript records as OMP's own and tell the owner.
+        // Drift to a model neither slot records is operator-made and stays held.
+        const fallback = await this.adoptRecordedFallback(lane, actual, available);
+        if (!fallback) {
+          throw new Error(`Lane ${live.id} model drift: expected ${laneModelArgument(lane.model!)}, actual ${laneModelArgument(actual)}; reconcile the native session or start a new explicitly selected lane. No model was reset and no prompt was sent`);
+        }
+        lane = fallback.lane;
+        this.background(this.noticeModelDriftAdopted(lane, fallback.from, fallback.to, fallback.restored));
       }
       if (lane.modelPreset !== null) {
         if (!lane.modelPresetSnapshot) throw new Error(`Lane ${live.id} has a preset label without its frozen native snapshot`);
@@ -7594,6 +7732,38 @@ export class Superagent {
     while (!this.stopped && this.routeOutbounds.size) {
       await Promise.all([...this.routeOutbounds.values()]);
     }
+  }
+
+  /**
+   * Tell the owner that a substitute model answered, and that the lane adopted
+   * it. The message must never read as if the requested model answered.
+   */
+  private async noticeModelDriftAdopted(lane: Lane, from: string, to: string, restored = false): Promise<void> {
+    if (this.stopped) return;
+    // A restored lane is back on the configured model, so the fallback wording
+    // ("a substitute answered") would be false. Only the substitute case warns.
+    const text = restored
+      ? [
+        "모델 장애로 대체 모델을 쓰던 레인이 재개되면서 설정된 모델로 돌아왔습니다.",
+        `레인: ${lane.id}`,
+        `기존 기록: ${from}`,
+        `현재 모델: ${to}`,
+        "대체 모델은 임시였으므로 레인 기록만 실제 모델로 맞췄습니다.",
+      ].join("\n")
+      : [
+        "모델 장애로 대체 모델로 전환되었고, 레인이 그 전환을 자동으로 수용했습니다.",
+        `레인: ${lane.id}`,
+        `요청한 모델: ${from}`,
+        `실제 응답 모델: ${to}`,
+        "이 답변은 요청한 모델이 아니라 대체 모델이 생성한 것입니다. 원래 모델로 되돌리려면 모델을 다시 선택해 주세요.",
+      ].join("\n");
+    this.store.queueOutput({
+      id: `model-fallback-adopted:${lane.id}:${lane.generation}:${key(`${from}>${to}`)}`,
+      sourceId: `model-fallback-adopted:${lane.id}`,
+      route: lane.route,
+      text,
+    });
+    await this.flushOutputs();
   }
 
   private startOutputRouteWorker(routeKeyValue: string, initialBatch?: OutputRecord[]): Promise<void> {

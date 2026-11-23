@@ -236,9 +236,31 @@ Each lane records a resolved model, selection reason, and the complete native
 role/thinking preset snapshot if a preset was selected. A later preset/global
 change does not change that snapshot. Resume and reconnect check native
 readback; unavailability or drift holds dispatch without silently selecting a
-different model. An authorized `lane_set_model` can change one eligible idle
-lane, with durable intent and readback. `config.model` is a head launch default,
-not the lane default or a reason to overwrite a saved head's model on restart.
+different model. The one exception is a switch OMP itself made. OMP records a
+retry substitute as a `model_change` entry with `role: "fallback"`, and because
+that role is ephemeral, resume deliberately drops it and restores the configured
+model. So the durable lane record and the native session can legitimately differ
+in either direction, and OMP's own entry names both ends of that move. Recovery
+requires a transition whose source is the lane's saved model and whose
+destination is the live one; only then is it adopted and the durable record made
+to follow it. The owner is told which direction happened, and only a still-live
+substitute is reported as a different model answering.
+
+The evidence is the active transcript branch, not the whole append log, and it
+is the newest `model_change` on that branch. An abandoned branch or an entry a
+later one superseded cannot authorise a mismatch, and the fallback flag is not
+latched across transitions: the clear back to the configured model is written
+with the ephemeral role and no fallback flag, so an earlier substitute marker
+does not survive it. A destination match alone is not enough either. An ordinary
+selection also records a `model_change`, so a lane saved on one model whose live
+session sits on a configured other model would otherwise look like automatic
+recovery; a transition without that retry role, or one whose source is not the
+saved model, stays fenced as unreported operator or unmanaged drift. Frozen
+preset lanes are excluded, because their snapshot, not the transcript, describes
+the roles they must run. An authorized `lane_set_model`
+can change one eligible idle lane, with durable intent and readback.
+`config.model` is a head launch default, not the lane default or a reason to
+overwrite a saved head's model on restart.
 Managed Hosts use private settings overlays, with native session-scope
 readback. Legacy lanes without a recorded selection adopt their authoritative
 native model rather than assuming the current head default; only an unstarted
