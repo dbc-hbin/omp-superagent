@@ -1638,6 +1638,81 @@ describe("same-HEAD evidence recovery", () => {
     instance.main.emit({ type: "session_settled" });
   }
 
+  const quotaError = { provider: "openai-codex", model: "gpt-6.2-astra", retryable: false,
+    message: "Codex error event: The usage limit has been reached (code=usage_limit_reached)" };
+
+  test("a settled Codex quota refusal automatically releases later HEAD work only after quota recovery", async () => {
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const checked = Promise.withResolvers<void>();
+    let recovered = false;
+    const { runtime, main, store, messenger } = fixture(3, undefined, {
+      readHeadQuota: async () => { checked.resolve(); return recovered; },
+    });
+    main.state.model = { provider: quotaError.provider, id: quotaError.model };
+    main.journalLeaf = true;
+    try {
+      await runtime.start();
+      await admit(runtime, headMessage("quota-refusal", route("failed-route")));
+      const original = main.prompts[0];
+      if (!original) throw new Error("Original HEAD request was not admitted");
+      const error = quotaError;
+      const frame = { type: "prompt_result", id: original.id, status: "error", agentInvoked: true, sessionSettled: true, error };
+      main.entries.push(
+        { id: "quota-error", type: "message", message: { role: "assistant", provider: error.provider,
+          model: error.model, stopReason: "error", content: [] } },
+        { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { frame }), timestamp: new Date(now - 1).toISOString() },
+      );
+      main.state.isStreaming = false;
+      main.state.isSettled = true;
+      main.emit(frame);
+      await messenger.whenSent(1);
+      await admit(runtime, headMessage("after-quota", route("later-route")));
+      await checked.promise;
+      expect(store.input("quota-refusal")?.state).toBe("uncertain");
+      expect(store.input("after-quota")?.state).toBe("pending");
+      expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id]);
+
+      recovered = true;
+      clock.mockReturnValue(now + 10 * 60_000);
+      await runtime.kick();
+      await main.whenPrompts(2);
+      expect(store.input("quota-refusal")?.state).toBe("cancelled");
+      const later = store.input("after-quota");
+      expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id, later?.requestId ?? "missing"]);
+      expect(later?.state).toBe("submitted");
+      main.complete("Later work answered");
+      await messenger.whenSent(3);
+      await runtime.kick();
+      expect(store.input("after-quota")?.state).toBe("done");
+      expect(messenger.sent.at(-1)).toMatchObject({ sourceId: "after-quota", route: route("later-route"), text: "Later work answered" });
+    } finally { clock.mockRestore(); }
+  });
+
+  test("a prior tool execution keeps a later Codex quota failure on manual hold", async () => {
+    const now = Date.now();
+    const instance = fixture(3, undefined, { readHeadQuota: async () => true });
+    const { runtime, main, store } = instance;
+    const error = quotaError;
+    main.state.model = { provider: error.provider, id: error.model };
+    const id = saved(instance, "quota-after-tool");
+    main.entries.splice(2, 2,
+      { id: "tool-attempt", type: "message", message: { role: "assistant", stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "previous-tool", name: "write", arguments: {} }] } },
+      { id: "tool-result", type: "message", message: { role: "toolResult", toolCallId: "previous-tool" } },
+      { id: "quota-error", type: "message", message: { role: "assistant", provider: error.provider,
+        model: error.model, stopReason: "error", content: [] } },
+      { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", {
+        frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error },
+      }), timestamp: new Date(now - 1).toISOString() },
+    );
+    await runtime.start();
+    await admit(runtime, headMessage("after-unsafe-quota"));
+    expect(store.input(id)?.state).toBe("uncertain");
+    expect(store.input("after-unsafe-quota")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+  });
+
   test("actual prompt acknowledgement loss uses durable receipts once, fences queued work, and notifies only the original route", async () => {
     const instance = fixture();
     const { runtime, main, store, messenger } = instance;

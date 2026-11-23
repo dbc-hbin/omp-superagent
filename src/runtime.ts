@@ -29,7 +29,8 @@ import { findPastTopic, findRoutingTopics, pastTopicQuery, readPastTopic, routin
 import { parseLaneReportResult } from "./lane-report";
 import { isLaneWatchNotice, LaneWatcher, type LaneWatchCommand } from "./lane-watch";
 import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
-import { headRecoveryEvidence } from "./head-recovery";
+import { headRecoveryEvidence, type HeadQuotaFailure } from "./head-recovery";
+import { HEAD_QUOTA_CHECK_MS } from "./head-quota";
 import { isPrObservation, PrWatcher, type PrWatchCommand } from "./pr-watch";
 import { CRON_RUN_PREFIX, CronJobs, type CronCreate } from "./cron-jobs";
 import { couldMatchResetAccount, listOmpUsageResets, OmpResetUnsupported, readOmpUsage, redeemOmpUsageReset, type OmpResetAccount } from "./omp-usage";
@@ -156,6 +157,7 @@ export interface RuntimeAdapters {
   requestRestart?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord>;
   readPrSnapshot?: typeof readPrSnapshot;
   readOmpUsage: typeof readOmpUsage;
+  readHeadQuota?: (failure: HeadQuotaFailure, sessionId: string, signal: AbortSignal) => Promise<boolean>;
 }
 interface Live {
   id: string;
@@ -377,6 +379,7 @@ export class Superagent {
   private bootstrapActive?: string;
   private recoveryReconciliation?: Promise<void>;
   private recoveryAgain = false;
+  private nextHeadQuotaCheck?: number;
   private readonly adapters: RuntimeAdapters;
   private pumping?: Promise<void>;
   private outbound?: Promise<void>;
@@ -874,28 +877,38 @@ export class Superagent {
     return { attemptId: attempt.attemptId, decision: decision.decision, ...(outcome ? { outcome } : {}) };
   }
 
-  private async reconcileHeadRecovery(): Promise<void> {
+  private async reconcileHeadRecovery(checkQuota = false): Promise<void> {
     if (this.recoveryReconciliation) { this.recoveryAgain = true; return this.recoveryReconciliation; }
     this.recoveryReconciliation = (async () => {
+      let observeQuota = checkQuota;
       try {
         do {
           this.recoveryAgain = false;
-          await this.reconcileHeadRecoveryOnce();
+          await this.reconcileHeadRecoveryOnce(observeQuota);
+          observeQuota = false;
         } while (this.recoveryAgain && !this.stopped);
       } finally { this.recoveryReconciliation = undefined; }
     })();
     return this.recoveryReconciliation;
   }
 
-  private async reconcileHeadRecoveryOnce(): Promise<void> {
-    if (!this.ready || !this.recoveryControllerIdle()) return;
+  private async reconcileHeadRecoveryOnce(checkQuota: boolean): Promise<void> {
+    if (!this.ready || this.stopped) return;
     const head = this.live.get("main");
-    if (!head || !this.current(head) || head.preparing) return;
+    if (!head || !this.current(head)) return;
     const active = this.recoveryAttempt();
     const candidates = active ? [] : this.store.inputs("main", "uncertain").filter(input =>
       input.requestId && input.generation === head.generation
       && this.store.getMeta(`head-native-owner:${input.id}`) && !this.store.getMeta(`head:recovery:${input.id}`));
-    if (!active && !candidates.length) return;
+    if (!active && !candidates.length) {
+      this.nextHeadQuotaCheck = undefined;
+      return;
+    }
+    // If native/operation guards prevent the initial inspection, let the
+    // existing controller wake inspect it later. No provider read is armed
+    // past that inspection unless the exact journal establishes a quota hold.
+    if (this.adapters.readHeadQuota && !active) this.nextHeadQuotaCheck ??= Date.now();
+    if (!this.recoveryControllerIdle() || head.preparing) return;
     const version = head.nativeVersion;
     const state = await this.state(head);
     if (!this.recoveryIdle(state)) return;
@@ -938,33 +951,52 @@ export class Superagent {
         }));
       }
       this.store.setMeta("head:recovery-active", "");
-      // A delayed original frame cannot retain admission or produce another answer.
-      for (const [requestId, admitted] of head.admitted) {
-        if (admitted.input.id !== active.inputId) continue;
-        this.activity(admitted.input, false);
-        head.admitted.delete(requestId);
-      }
-      if (head.input?.id === active.inputId) {
-        head.input = undefined;
-        head.result = undefined;
-        head.assistantOutcome = undefined;
-        head.text = "";
-        head.running = false;
-      }
-      head.busy = false;
+      this.releaseHeadRecoveryAdmission(head, active.inputId);
       await this.flushOutputs();
       this.background(this.kick());
       return;
     }
     // The selected input is exact and durable; historical inputs without a
     // pre-submission journal boundary cannot be made safe by inference.
+    let quotaHold = false;
     for (const input of candidates) {
-      const owner = JSON.parse(this.store.getMeta(`head-native-owner:${input.id}`)!) as
+      const ownerKey = `head-native-owner:${input.id}`;
+      const ownerRecord = this.store.getMeta(ownerKey);
+      if (!ownerRecord) continue;
+      const owner = JSON.parse(ownerRecord) as
         Pick<HeadRecoveryAttempt, "requestId" | "generation" | "sessionId" | "sessionFile" | "cursor">;
       if (owner.requestId !== input.requestId || owner.generation !== input.generation
         || owner.sessionId !== state.sessionId || owner.sessionFile !== state.sessionFile
         || owner.cursor !== null && typeof owner.cursor !== "string") continue;
       const evidence = headRecoveryEvidence(entries, owner);
+      const quota = evidence?.quotaFailure;
+      if (quota && this.adapters.readHeadQuota && sameLaneModel(quota.model, confirmed.model)) {
+        quotaHold = true;
+        if (!checkQuota || this.headUsageResetActive
+          || this.store.headRecoveryEffects(input.id).some(effect => !["sent", "complete", "failed"].includes(effect.state))) continue;
+        const stopBoundary = this.store.getMeta("head:stop-boundary");
+        const signal = AbortSignal.any([this.stopSignal.signal, AbortSignal.timeout(15_000)]);
+        // A failed or unavailable read is not a recovery signal. Native auth
+        // diagnostics can include credentials; never send them to a messenger.
+        const recovered = await this.adapters.readHeadQuota(quota, head.sessionId, signal).catch(() => false);
+        if (!recovered || signal.aborted || !this.recoveryControllerIdle()) return;
+        const latest = await this.state(head);
+        const held = this.store.input(input.id);
+        if (signal.aborted || !this.current(head) || head.nativeVersion !== version || head.preparing || this.headUsageResetActive
+          || !this.recoveryControllerIdle() || !this.recoveryIdle(latest) || latest.hostPid !== confirmed.hostPid
+          || !sameLaneModel(quota.model, latest.model) || this.store.getMeta("head:stop-boundary") !== stopBoundary
+          || this.store.getMeta(ownerKey) !== ownerRecord || !authorizeRoute(this.config, input.route)
+          || held?.target !== "main" || held.state !== "uncertain" || held.requestId !== owner.requestId
+          || held.generation !== owner.generation
+          || this.store.headRecoveryEffects(input.id).some(effect => !["sent", "complete", "failed"].includes(effect.state))) return;
+        if (this.store.settle(input.id, "cancelled", { id: `${input.id}:quota-recovered`,
+          text: "Codex 사용량 회복을 확인해 실패한 요청의 보류를 자동으로 해제했습니다. 원래 요청을 다시 실행하거나 완료로 처리하지 않았습니다." })) {
+          this.nextHeadQuotaCheck = undefined;
+          this.releaseHeadRecoveryAdmission(head, input.id);
+          this.background(this.kick());
+        }
+        return;
+      }
       if (!evidence || !evidence.outcome || !Number.isSafeInteger(state.hostPid) || state.hostPid! <= 0) continue;
       const effects = this.store.headRecoveryEffects(input.id);
       if (effects.some(effect => !["sent", "complete", "failed"].includes(effect.state))) continue;
@@ -1000,6 +1032,24 @@ export class Superagent {
       }
       return;
     }
+    if (!quotaHold) this.nextHeadQuotaCheck = undefined;
+  }
+
+  private releaseHeadRecoveryAdmission(head: Live, inputId: string): void {
+    // A delayed original frame cannot retain admission or produce another answer.
+    for (const [requestId, admitted] of head.admitted) {
+      if (admitted.input.id !== inputId) continue;
+      this.activity(admitted.input, false);
+      head.admitted.delete(requestId);
+    }
+    if (head.input?.id === inputId) {
+      head.input = undefined;
+      head.result = undefined;
+      head.assistantOutcome = undefined;
+      head.text = "";
+      head.running = false;
+    }
+    head.busy = false;
   }
 
   private async intake<T>(operation: () => Promise<T>): Promise<T> {
@@ -4568,7 +4618,7 @@ export class Superagent {
     }
     const uncertainInputs = inputs.filter(candidate => candidate.state === "uncertain");
     const uncertain = uncertainInputs.length
-      ? `\nUncertain HEAD inputs held (block later HEAD work): ${uncertainInputs.map(candidate => JSON.stringify(candidate.id)).join(", ")}. Eligible exact native evidence receives one isolated same-HEAD recovery decision; missing, failed, ambiguous evidence or effects remain held without replay. Inspect the original native session or use owner /resolve <input-id> to close uncertainty without claiming completion.`
+      ? `\nUncertain HEAD inputs held (block later HEAD work): ${uncertainInputs.map(candidate => JSON.stringify(candidate.id)).join(", ")}. A proven tool-free Codex quota refusal can close after native quota recovery. Other eligible native evidence receives one isolated same-HEAD recovery decision; ambiguous results or effects remain held without replay. Inspect the original native session or use owner /resolve <input-id> to close uncertainty without claiming completion.`
       : "";
     return `Native HEAD: ${state ? this.nativeStatus(state) : "unavailable or unverified"}.\nPreset initialization: ${this.initialization ? `${this.initialization.state}; ${this.initialization.detail}` : "not managed by this runtime"}.\nLogical topic: ${JSON.stringify(input.route.topicId ?? input.route.threadId ?? "main")}; shared HEAD session: ${state ? JSON.stringify(state.sessionId) : "unverified"}.\nHEAD inputs: ${counts(inputs)}; durable approvals: ${this.store.approvals("main").length}; stop pending: ${this.headStopping > 0}; managed compaction pending: ${!!this.headCompaction}.${uncertain}\nBound lane: ${laneStatus}.\nIdle/settled is not proof of task completion; uncertain effects are never automatically repeated.`;
   }
@@ -5314,6 +5364,13 @@ export class Superagent {
     await this.priorityTail.catch(this.report);
     await this.headStopTail.catch(this.report);
     if (!this.ready || this.stopped || this.headRotationHeld()) return;
+    if (this.nextHeadQuotaCheck !== undefined && Date.now() >= this.nextHeadQuotaCheck
+      && !this.recoveryReconciliation && this.recoveryControllerIdle() && !this.headUsageResetActive) {
+      // Only a proven quota hold arms the ordinary wake. Respect OMP's
+      // five-minute usage cache rather than probing on every intake/tick.
+      this.nextHeadQuotaCheck = Date.now() + HEAD_QUOTA_CHECK_MS;
+      this.background(this.reconcileHeadRecovery(true));
+    }
     if (this.pumping) { this.repeat = true; return this.pumping; }
     // Intake can arrive while pump's final output flush is still awaiting I/O,
     // after its inner repeat condition was already evaluated. Keep that wake in
@@ -6250,6 +6307,7 @@ export class Superagent {
     if (live.id !== "main") this.store.updateLane(live.id, live.generation, { runtimeState: "idle", lastActivityAt: live.lastActivity });
     const result = live.result;
     const cancelled = input && this.store.input(input.id)?.state === "cancelled";
+    let headFailed = false;
     if (input && (result || cancelled) && admissions.every(admitted => admitted.result
       || this.store.input(admitted.input.id)?.state === "cancelled")) {
       // The originating command's result includes failures outside assistant
@@ -6261,6 +6319,7 @@ export class Superagent {
         : live.assistantOutcome && live.assistantOutcome.run > 1 ? live.assistantOutcome.status : result!.status;
       const completed = outcome === "completed";
       const state = completed ? "done" : outcome === "aborted" ? "cancelled" : "uncertain";
+      headFailed = live.id === "main" && state === "uncertain";
       const text = completed ? (result!.agentInvoked || result!.goalResume && live.ownedRuns > 0 ? live.text : "") : outcome === "aborted"
         ? "실행이 중단되었습니다. 작업 완료로 처리하지 않았습니다."
         : "실행이 실패했습니다. 작업 완료로 처리하지 않았습니다.";
@@ -6310,6 +6369,8 @@ export class Superagent {
       }
     }
     await this.flushOutputs();
+    if (headFailed && this.nextHeadQuotaCheck === undefined && this.adapters.readHeadQuota)
+      await this.reconcileHeadRecovery();
     void this.kick().catch(this.report);
   }
 
