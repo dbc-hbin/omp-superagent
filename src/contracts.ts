@@ -1,6 +1,7 @@
 import type { ModelPreset as NativeModelPreset } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import type { LaneEvidence, LaneReport, LaneWaitTarget } from "./lane-report";
 import type { CronUpdate } from "./cron-jobs";
+import type { ReviewRound } from "./pr-intake-review";
 import type { GroupReply, GroupRequest } from "./group-policy";
 import type { StagedResultAttachment } from "./result-attachment";
 import type { RemotePlacement } from "./worker-wire";
@@ -307,9 +308,13 @@ export interface HeadRecoveryEffect {
 }
 
 export interface StorePort {
+  /** Typed, noninteractive work on the confirmed bot offer; never valid for ordinary owner intake. */
+  receivePrWork(input: Inbound, target: string | null, round: ReviewRound): boolean;
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   ownerSource(id: string): InputRecord | null;
+  /** Manager handoff's verified reply route, pinned if a bound reply joined its run. */
+  laneReplyRoute(input: InputRecord, source: InputRecord): Route;
   /** Exact original owner and authorized delivery route for a topic-owned lane input. */
   topicDelivery(id: string): { readonly source: InputRecord; readonly route: Route; readonly outputSourceId: string } | null;
   /** Whether an unowned dialog could belong to a durable topic admission on this native generation. */

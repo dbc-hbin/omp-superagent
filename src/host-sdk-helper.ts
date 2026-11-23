@@ -1,7 +1,7 @@
 // Short-lived SDK operations. The Rust owner, not this process, owns native stdin and the reconnectable socket.
 import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { rename, writeFile } from "node:fs/promises";
+import { chmod, rename, writeFile } from "node:fs/promises";
 import type { RpcAbortAndRestoreQueueResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import type { HostOptions } from "./host";
 import type { Frame } from "./host-protocol";
@@ -10,6 +10,7 @@ import type { RotationSelection } from "./head-rotation";
 type Manifest = {
   readonly options: Omit<HostOptions, "env">;
   readonly args: string[];
+  readonly configPath: string;
   readonly processBackend: "broker" | "daemon";
   readonly headRotationSelection?: RotationSelection;
 };
@@ -68,13 +69,54 @@ async function run(operation: string | undefined, manifest: Manifest, input: unk
       const argv = resolveCliArgv(bootstrap.argv);
       if ("error" in argv) throw new Error(argv.error);
       const parsed = parseArgs(argv.argv.slice(1));
+      if (options.prReviewOnly) {
+        if (parsed.noTools !== true || parsed.tools !== undefined || !parsed.noExtensions ||
+            !parsed.noSkills || !parsed.noRules || !parsed.noContextFiles || !parsed.noLsp ||
+            !parsed.noTitle || !parsed.noPrewalk || !parsed.offline ||
+            parsed.trustedExtensions?.length !== 1 || parsed.config?.length !== 1 || parsed.config[0] !== manifest.configPath)
+          throw new Error("Stock CLI arguments do not enforce the static PR review launch policy");
+        const { getAgentDir } = await import("@oh-my-pi/pi-utils/dirs");
+        const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
+        const { cfgDisabledProviders } = await import("@oh-my-pi/pi-coding-agent/config/model-settings");
+        const { getAllCapabilitiesInfo } = await import("@oh-my-pi/pi-coding-agent/discovery");
+        const { getAllPluginToolPaths } = await import("@oh-my-pi/pi-coding-agent/extensibility/plugins/loader");
+        const { PR_REVIEW_GITHUB_ENV } = await import("./host-protocol");
+        if (PR_REVIEW_GITHUB_ENV.some(name => process.env[name]))
+          throw new Error("Static PR review cannot load GitHub credentials from the native profile");
+        const native = await Settings.loadReadOnly({ cwd: options.cwd, agentDir: getAgentDir() });
+        // Stock custom tool loading also has an independent legacy plugin scan,
+        // outside the capability-provider switch. Refuse such a profile without
+        // importing any of those modules in the SDK preparation process.
+        if ((await getAllPluginToolPaths(options.cwd)).length)
+          throw new Error("Static PR review cannot isolate this profile's legacy plugin tools");
+        const disabled = new Set(cfgDisabledProviders.get(native));
+        for (const capability of getAllCapabilitiesInfo()) {
+          if (["mcps", "tools", "prompts", "slash-commands", "system-prompt"].includes(capability.id))
+            for (const provider of capability.providers) disabled.add(provider.id);
+        }
+        const overlay = JSON.parse(await Bun.file(manifest.configPath).text());
+        const staging = `${manifest.configPath}.${crypto.randomUUID()}`;
+        await writeFile(staging, JSON.stringify({ ...overlay, disabledProviders: [...disabled] }), { mode: 0o600, flag: "wx" });
+        await rename(staging, manifest.configPath);
+      }
       const { lstat, stat } = await import("node:fs/promises");
       const expectedWorkerSession = process.env.OMP_SUPERAGENT_WORKER_EXPECTED_SESSION;
-      const missing = await (expectedWorkerSession === undefined ? stat : lstat)(options.sessionFile).then(async info => {
+      const missing = await (expectedWorkerSession === undefined && !options.prReviewOnly ? stat : lstat)(options.sessionFile).then(async info => {
         if (expectedWorkerSession !== undefined) {
           const { readSessionHeaderId } = await import("@oh-my-pi/pi-coding-agent/session/session-loader");
           if (!info.isFile() || !expectedWorkerSession || await readSessionHeaderId(options.sessionFile) !== expectedWorkerSession)
             throw new Error("Worker journal no longer matches the reserved session");
+        }
+        if (options.prReviewOnly) {
+          if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)
+            throw new Error("Static PR review journal is not a private owned regular file");
+          const { visitEntriesFromFileStream } = await import("@oh-my-pi/pi-coding-agent/session/session-loader");
+          let verified = false;
+          await visitEntriesFromFileStream(options.sessionFile, entry => {
+            if (entry.type === "custom" && entry.customType === "superagent_pr_review_policy" &&
+                isDeepStrictEqual(entry.data, { version: 1, cwd: options.cwd })) verified = true;
+          }, { throwIfMissing: true, onMalformedRecord: () => { throw new Error("Static PR review journal is malformed"); } });
+          if (!verified) throw new Error("Refusing to restore a journal not created for static PR review");
         }
         return false;
       }, error => {
@@ -87,6 +129,8 @@ async function run(operation: string | undefined, manifest: Manifest, input: unk
         const session = SessionManager.create(options.cwd, dirname(options.sessionFile));
         try {
           await session.setSessionFile(options.sessionFile);
+          if (options.prReviewOnly)
+            session.appendCustomEntry("superagent_pr_review_policy", { version: 1, cwd: options.cwd });
           const selection = manifest.headRotationSelection;
           if (selection) {
             session.appendModelChange(`${selection.provider}/${selection.modelId}`);
@@ -95,9 +139,12 @@ async function run(operation: string | undefined, manifest: Manifest, input: unk
           await session.ensureOnDisk();
           session.flushSync();
         } finally { await session.close(); }
+        if (options.prReviewOnly) await chmod(options.sessionFile, 0o600);
       }
-      const { publishNativeSession } = await import("./native-sessions");
-      await publishNativeSession(options.sessionFile, options.cwd);
+      if (!options.prReviewOnly) {
+        const { publishNativeSession } = await import("./native-sessions");
+        await publishNativeSession(options.sessionFile, options.cwd);
+      }
       const { hostInventoryManifest } = await import("./host-inventory-manifest");
       return { toolsExplicitlySelected: parsed.tools !== undefined, noTools: parsed.noTools === true,
         inventory: await hostInventoryManifest(manifest.processBackend, options.cwd) };

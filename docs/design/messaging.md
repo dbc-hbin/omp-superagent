@@ -210,10 +210,11 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   recall results or journal excerpts. Matches do not dispatch work, authorize
   approvals, or reopen a session. If recall is unavailable, direct journal
   matches can still inform HEAD; a missing hint does not block ordinary chat.
-  Lookup does not reserve a standalone turn for a steering input after its
-  original turn ends. HEAD verifies useful leads or asks only if material
-  ambiguity remains. Native file and model references in historical data are
-  inert, unlike references in the current owner's task.
+  Advisory lookup applies to new turns; a follow-up already eligible to steer
+  has a verified destination and does not wait for recall. HEAD verifies useful
+  leads or asks only if material ambiguity remains. Native file and model
+  references in historical data are inert, unlike references in the current
+  owner's task.
 - Explicit `cwd: /absolute/path`, `/new` with a task, an exact reply to a placed
   original or its delivered message with a verified workspace, and intentional
   historical lookup use controller placement. Invalid explicit cwd is rejected,
@@ -289,12 +290,23 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   not rollback of effects. A DM edit whose original request was placed by HEAD
   reuses that verified lane, even if a newer topic is now active. If placement
   is still in progress or cannot be verified, the edit creates no topic.
-- For an active native run, eligible ordinary same-route follow-ups use native
-  `steer`. Match the full route including account, authority, thread and topic;
-  controls, internal reports and workflow selection do not join the run. Keep
-  each source, receipt and outcome binding; jointly handled inputs produce one
-  result for the cohort. A lane still needs explicit `lane_message`; pause,
-  approval, compaction and uncertainty gates still apply.
+- Ordinary follow-ups default to native `steer` when their destination has an
+  eligible active run: unbound requests and ordinary `/head` text go to HEAD;
+  ordinary replies in a bound work thread go to its lane without `lane_message`.
+  If a follow-up arrives before the native start event, that event rechecks
+  pending inputs. An idle destination receives a new prompt.
+  Match the full route including account, authority, thread and topic. A bound
+  reply can join the kickoff initiated elsewhere only if the existing verified
+  delivery route is this exact thread. A manager handoff keeps its HEAD review
+  mode, with the verified reply route fixed for the joined run, including logical
+  topics backed by native threads. Keep each source and native receipt distinct
+  and deliver one result for a jointly handled cohort. History lookup verifies
+  a joined reply's topic ownership and its own completed native receipt, not the
+  manager's instructions or completion.
+  Controls, internal reports and workflow selection do not join the run.
+  Pause, approval, compaction and uncertainty gates still apply. Durable intake
+  and RPC admission do not prove consumption: OMP consumes steers at native
+  boundaries, and a run can settle before a follow-up reaches such a boundary.
 
 | Platform | Command and topic representation |
 | --- | --- |
