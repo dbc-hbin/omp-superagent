@@ -43,7 +43,8 @@ pub(super) async fn start(hub: &Hub, ws: &TcpListener, voice: bool) -> FixtureSo
     hub.ready.send_replace(true);
     dispatch(&mut socket, 2, "GUILD_CREATE", json!({
         "id":"77","channels":[{"id":"88","type":0,"topic":null},{"id":"89","type":0}],
-        "threads":[{"id":"90","type":11,"parent_id":"88"},{"id":"91","type":11,"parent_id":"89"}],
+        "threads":[{"id":"90","type":11,"parent_id":"88","owner_id":"71"},{"id":"91","type":11,"parent_id":"89","owner_id":"71"},
+            {"id":"93","type":11,"parent_id":"88","owner_id":"73"}],
         "voice_states":[]
     })).await;
     socket
@@ -88,6 +89,17 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         "url":"https://cdn.discordapp.com/attachments/88/131/file.txt"}]);
     let mut thread = mention("223", "<@71> addressed thread");
     thread["channel_id"] = json!("90");
+    let mut foreign_thread = mention("227", "<@71> addressed foreign thread");
+    foreign_thread["channel_id"] = json!("93");
+    let mut edited = message("228", Some("77"), "93", "42", "edited reply to this bot");
+    edited["type"] = json!(19);
+    edited["attachments"] = json!([]);
+    edited["edited_timestamp"] = json!("2026-11-21T01:02:03.456000+00:00");
+    let mut full = edited.clone();
+    full["message_reference"] = json!({"message_id":"111","channel_id":"93","guild_id":"77"});
+    full["referenced_message"] = bot_message();
+    full["referenced_message"]["channel_id"] = json!("93");
+    respond(&responses, "/channels/93/messages/228", StatusCode::OK, full);
 
     for (index, (kind, raw)) in [
         ("MESSAGE_CREATE", owner("201", "plain parent chat")),
@@ -108,6 +120,9 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         ("MESSAGE_UPDATE", checked_reply),
         ("MESSAGE_CREATE", message("222", Some("77"), "90", "42", "unaddressed thread")),
         ("MESSAGE_CREATE", thread),
+        ("MESSAGE_CREATE", message("226", Some("77"), "93", "42", "unaddressed foreign thread")),
+        ("MESSAGE_CREATE", foreign_thread),
+        ("MESSAGE_UPDATE", edited),
         ("MESSAGE_CREATE", file),
         ("MESSAGE_CREATE", dm),
     ].into_iter().enumerate() {
@@ -135,6 +150,13 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         assert_eq!(input["messageId"], id);
         assert_eq!(input["text"], text);
     }
+    let foreign = event(&hub, &store).await["input"].clone();
+    assert_eq!(foreign["route"]["threadId"], "93");
+    assert_eq!(foreign["messageId"], "227");
+    assert_eq!(foreign["text"], "addressed foreign thread");
+    let edited = event(&hub, &store).await;
+    assert_eq!(edited["input"]["messageId"], "228");
+    assert_eq!(edited["input"]["reply"]["authorId"], "71");
     let file = event(&hub, &store).await;
     assert_eq!(file["input"]["text"], "");
     assert_eq!(file["input"]["attachments"][0]["id"], "131");
@@ -146,7 +168,7 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
     slash["guild_id"] = json!("77");
     slash["channel"]["id"] = json!("88");
     slash["member"] = json!({"user":{"id":"42"}});
-    dispatch(&mut socket, 23, "INTERACTION_CREATE", slash).await;
+    dispatch(&mut socket, 26, "INTERACTION_CREATE", slash).await;
     received(&mut observed, "/interactions/550/offline-interaction/callback").await;
     let status = event(&hub, &store).await;
     assert_eq!(status["input"]["text"], "/status");

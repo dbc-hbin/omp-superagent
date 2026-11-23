@@ -12,12 +12,14 @@ import { lanePlacement } from "./lane-rows";
 import { sameLaneModel } from "./lane-models";
 import { NativePresetManager } from "./native-presets";
 import { publishNativeSession } from "./native-sessions";
+import { isPrReviewLane } from "./pr-intake-review";
 import { MODEL_PRESET_NAMES, WORKFLOW_NAMES } from "./contracts";
 import type { PrWatchCommand } from "./pr-watch";
 import type { LaneWatchCommand } from "./lane-watch";
 import { registerDecisionAsk } from "./decision-tool";
 import { registerResultAttach, RESULT_ATTACH_TOOL } from "./result-attachment";
 import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent, type RotationProbeEvent } from "./head-rotation";
+import { readHeadQuota } from "./head-quota";
 
 // Inject the role contract, not the references. Resolve the reference directory
 // from this package so a same-name workspace skill cannot change the procedure.
@@ -486,7 +488,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
         let messenger: ReturnType<typeof createGatewayMessenger>;
         try {
           for (const lane of store.lanes()) {
-            if (lane.remote || !lane.sessionId) continue;
+            if (lane.remote || !lane.sessionId || isPrReviewLane(store, lane.id)) continue;
             const { sessionFile } = hostPaths(config, lane.id);
             if (lane.sessionFile !== sessionFile) throw new Error("Refusing to publish a lane outside its managed session path");
             await publishNativeSession(sessionFile, lane.cwd, lane.sessionId);
@@ -500,6 +502,11 @@ export default function superagentExtension(pi: ExtensionAPI): void {
           pi.logger.error(`Superagent: ${error instanceof Error ? error.message : String(error)}`);
         }, {
           topicMemory: ctx.memory,
+          readHeadQuota: (failure, sessionId, signal) => {
+            const session = pi.pi.AgentRegistry.global().get(pi.pi.MAIN_AGENT_ID)?.session;
+            return session instanceof pi.pi.AgentSession && session.sessionId === sessionId
+              ? readHeadQuota(session, failure, signal) : Promise.resolve(false);
+          },
           resolvePreset: async (name, thinkingContext) => (await nativePresets(ctx)).resolve(name, thinkingContext),
           inspectPresets: async () => (await nativePresets(ctx)).inspect(),
           syncPresetRoles: async canWrite => (await nativePresets(ctx)).syncRoles(store, canWrite, () => ctx.modelRegistry.refresh("offline")),

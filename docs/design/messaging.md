@@ -29,7 +29,9 @@ catch-up. The default is `false`. A message must actually mention the
 authenticated bot or be a verified reply in that conversation to a message it
 authored. Typing the bot's name, mentioning a different bot, or copying a bot
 message without actually addressing the bot does not count.
-Authorized thread conversations can continue without addressing. When enabled,
+Authorized threads that this bot created can continue without addressing; a
+thread started by another bot or person needs the same mention or verified
+reply as its parent channel. When enabled,
 verified inline mentions of this bot are removed from ordinary owner input in
 guild parent channels and threads, so a text command still parses as a command.
 The owner, guild and parent-channel checks still apply. Owner DMs, Discord
@@ -158,6 +160,21 @@ remain held. Recovery cannot dispatch, answer approvals, run tools outside its
 gate or repeat the original request. A later stop or manual resolution invalidates
 older recovery work.
 
+An exact, settled HEAD `openai-codex` quota refusal with no tool calls or
+partial answer can also close as cancelled without a recovery model turn.
+Only that hold arms a usage check on the existing controller wake, at most once
+per OMP usage-cache interval. The current session and same model must have a
+permitted, healthy credential in native OMP model health and a matching usage
+report with measured headroom above its effective reserve after the failure.
+The credential must also appear in any discovered account roster for the model.
+Credit-funded overage, a reset timestamp, a stale report, missing account
+attribution, or an uncertain effect is not proof. The controller rechecks the
+exact native run journal, stop boundary and current request ownership before
+closing the hold. This does
+not spend a saved reset or retry the original input; later inputs keep their
+durable order. The quota and credential contracts were checked against the
+[pinned OMP 19.0.0 SDK](../../DESIGN.md#stock-omp-and-verification-scope).
+
 `/resolve [input-id]` (`!resolve` in Slack) manually closes an uncertain head
 input as cancelled. A stalled lane exposes its exact input ID and queue blocker
 through `/status` or `lane_inspect`. Only the operator in the bound topic can use
@@ -193,10 +210,11 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   recall results or journal excerpts. Matches do not dispatch work, authorize
   approvals, or reopen a session. If recall is unavailable, direct journal
   matches can still inform HEAD; a missing hint does not block ordinary chat.
-  Lookup does not reserve a standalone turn for a steering input after its
-  original turn ends. HEAD verifies useful leads or asks only if material
-  ambiguity remains. Native file and model references in historical data are
-  inert, unlike references in the current owner's task.
+  Advisory lookup applies to new turns; a follow-up already eligible to steer
+  has a verified destination and does not wait for recall. HEAD verifies useful
+  leads or asks only if material ambiguity remains. Native file and model
+  references in historical data are inert, unlike references in the current
+  owner's task.
 - Explicit `cwd: /absolute/path`, `/new` with a task, an exact reply to a placed
   original or its delivered message with a verified workspace, and intentional
   historical lookup use controller placement. Invalid explicit cwd is rejected,
@@ -272,12 +290,23 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   not rollback of effects. A DM edit whose original request was placed by HEAD
   reuses that verified lane, even if a newer topic is now active. If placement
   is still in progress or cannot be verified, the edit creates no topic.
-- For an active native run, eligible ordinary same-route follow-ups use native
-  `steer`. Match the full route including account, authority, thread and topic;
-  controls, internal reports and workflow selection do not join the run. Keep
-  each source, receipt and outcome binding; jointly handled inputs produce one
-  result for the cohort. A lane still needs explicit `lane_message`; pause,
-  approval, compaction and uncertainty gates still apply.
+- Ordinary follow-ups default to native `steer` when their destination has an
+  eligible active run: unbound requests and ordinary `/head` text go to HEAD;
+  ordinary replies in a bound work thread go to its lane without `lane_message`.
+  If a follow-up arrives before the native start event, that event rechecks
+  pending inputs. An idle destination receives a new prompt.
+  Match the full route including account, authority, thread and topic. A bound
+  reply can join the kickoff initiated elsewhere only if the existing verified
+  delivery route is this exact thread. A manager handoff keeps its HEAD review
+  mode, with the verified reply route fixed for the joined run, including logical
+  topics backed by native threads. Keep each source and native receipt distinct
+  and deliver one result for a jointly handled cohort. History lookup verifies
+  a joined reply's topic ownership and its own completed native receipt, not the
+  manager's instructions or completion.
+  Controls, internal reports and workflow selection do not join the run.
+  Pause, approval, compaction and uncertainty gates still apply. Durable intake
+  and RPC admission do not prove consumption: OMP consumes steers at native
+  boundaries, and a run can settle before a follow-up reaches such a boundary.
 
 | Platform | Command and topic representation |
 | --- | --- |
@@ -290,7 +319,7 @@ is a separate explicit apply, not a side effect of setup, doctor or start. Comma
 intake must not wait for a model; Discord's ephemeral admission reply and Slack's
 Socket Mode acknowledgement are not the actual command result.
 
-The head sends model and effort menus through its normal outbox. The Gateway
+The head sends model, effort, and saved-reset menus through its normal outbox. The Gateway
 renders native components and binds each click to the owner, exact sent card,
 physical conversation, and displayed page. Navigation and cancellation only
 edit the card. One final click admits an ordinary durable control receipt on
@@ -302,6 +331,31 @@ on the same route.
 The interaction pattern was compared with [Hermes Agent at 242315ce](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/gateway/slash_commands_model.py#L516-L567);
 the catalogue and mutation remain native OMP, and no upstream picker code is used.
 
+`/usage reset` chooses an exact linked account from the configured OMP profile.
+The first click only changes the displayed card revision; Confirm on that
+revision is the only action that admits a reset request. Cancel closes the card
+without admitting any request. The head checks the original sent card and live
+availability, then persists the attempt before asking the installed CLI to
+redeem one currently usable ticket on that account. The native CLI selects
+the ticket; the chat card does not authorize or pin an individual grant.
+Duplicate or interrupted attempts are never replayed. Native success is
+recorded before checking the refreshed balance; a missing receipt never
+implies the ticket was or was not spent. An uncertain attempt holds further
+redemptions for a matching or indistinguishable provider account, even after
+re-login changes the local row or adds identity fields. The operator must check
+the balance and close the original hold with `/resolve` (`!resolve` in Slack).
+Banked tickets that cannot currently be spent are reported separately from
+the selectable accounts, without a Confirm action.
+An admitted reset holds restart handoff until its outcome is durably recorded.
+Account options show the native selector number and, when available, a short
+masked account or organization hint; raw identities never enter the card.
+Capability is checked against the configured binary's `omp usage --help`.
+The [OMP 19.0.0 CLI source](https://github.com/can1357/oh-my-pi/blob/57771ae562b9345e0579bceb2d68d585e3e6927e/packages/coding-agent/src/cli/usage-cli.ts)
+and the installed 19.1.0 CLI expose a read-only `usage reset --json` list
+and a separate `usage reset <provider>/<credential id>` redemption.
+Older executables without the exact-target command show an unsupported state;
+there is no provider fallback or mutation of local quota counters.
+
 Thread capability comes from the authenticated adapter. Permission or network
 failure is not permission to fall back to another destination. Preserve the
 original binding when creating a sibling topic and journal creation intent before
@@ -311,19 +365,31 @@ permissions, then reads back title, tags or archived state. Exact tag IDs and
 required/moderated tag policy apply. Archiving a thread does not pause its lane,
 and reopening it does not resume it.
 
-For a bound Discord work thread, an owned native run adds `⏳` to the title;
-verified `lane_close` completion replaces it with `✅`. Native settlement alone
-does not mark work complete. Pausing clears the working marker and cancelling
-clears either marker. Resumed work gets the working marker again when it runs.
-The head reads the current title and updates its prefix through the same
-authorized thread API. These edits need Manage Threads, are best effort, and
-skip archived threads. They do not change tags, archive state, or lane execution.
+For a bound Discord work thread, an owned run or queued lane input adds `⏳`
+to the title. Outstanding inputs, approvals, or result delivery can keep that
+marker. After the latest run succeeds and its final reply is confirmed sent,
+the head automatically replaces it with `✅`. This marks the delivered request,
+not independent verification of its acceptance criteria or closure of the lane.
+Explicit `lane_close` completion also shows `✅`; pause and cancellation remove
+the marker. A follow-up replaces the check with `⏳` again.
 
-`/help`, `/status`, `/context` and `/usage` are code-handled reads with no model
-turn. [`/usage`](../../src/omp-usage.ts) invokes the configured executable and
-profile with `usage --json --redact --no-extensions` and projects provider quota
-and reset data, without sending account identifiers or raw responses. Unknown
-quota is not zero or an estimate of this session's usage. `/compact` uses native
+When startup recovery allows writes, the head reconciles managed work threads
+from stored run and delivery receipts without launching unloaded lanes. It changes only the
+prefix through the authorized thread API. Edits are best effort, require
+Manage Threads, and skip archived threads. A confirmed Discord rate limit
+defers reconciliation and rechecks current state before the next write;
+an ambiguous write is not retried.
+
+`/help`, `/status`, `/context` and `/usage` are code-handled reads with no model turn.
+[`/usage`](../../src/omp-usage.ts) invokes the configured executable and
+profile with `usage --json --redact`, so OMP discovers built-in and extension-provided
+usage sources. Both usage and reset preserve explicit `--no-extensions`,
+`--extension`, `--hook` and `--config` inputs from the configured launch command.
+Neither subprocess receives the Gateway bearer or configured messenger credentials.
+The reply includes safe OMP-masked account names when available, never full
+email addresses, raw IDs, or raw responses. Unrecognized meter names use
+numbered labels rather than publishing provider-controlled text.
+Unknown quota is not zero or an estimate of this session's usage. `/compact` uses native
 compaction and requires an idle eligible head; status and priority stop remain
 available while it runs. `/stop` pauses the bound lane. In an unbound topic a
 reply can select the exact pending placement or the running HEAD request on

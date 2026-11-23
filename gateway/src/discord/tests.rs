@@ -549,10 +549,50 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     assert_eq!(picked["input"]["messageId"], Value::Null);
     assert_eq!(picked["input"]["pickerSelection"], json!({"outputId":"model-card","cardId":"700","group":0,"option":8}));
     click["id"] = json!("513");
-    let last_sequence = 1217;
-    dispatch(&mut socket, last_sequence, "INTERACTION_CREATE", click).await;
+    dispatch(&mut socket, 1217, "INTERACTION_CREATE", click).await;
     assert_eq!(received(&mut observed, "/interactions/513/offline-interaction/callback").await["type"], 4);
     assert_eq!(store.pending().unwrap(), 0);
+
+    dispatch(&mut socket, 1218, "INTERACTION_CREATE", interaction("515", 2, json!({
+        "type":1,"name":"usage","options":[{"type":3,"name":"text","value":" reset "}]
+    }))).await;
+    received(&mut observed, "/interactions/515/offline-interaction/callback").await;
+    let reset = event(&hub, &store).await;
+    assert_eq!(reset["input"]["text"], "/usage reset");
+    assert_eq!(reset["input"]["messageId"], Value::Null);
+    let label = "Codex · 계정 #7 · 사용 가능 2개";
+    hub.effect("send", &[json!({
+        "id":"reset-card","route":route,"text":"Saved resets",
+        "picker":{"kind":"usage-reset","expiresAt":crate::store::now().unwrap()+300_000,
+            "groups":[{"label":"Accounts","options":[label]}]}
+    })]).await.unwrap();
+    let outgoing = received(&mut observed, "/channels/99/messages").await;
+    let select = &outgoing["components"][0]["components"][0];
+    assert_eq!(select["options"][0]["label"], label);
+    let mut choose = interaction("516", 3, json!({
+        "custom_id":select["custom_id"],"component_type":3,"values":["0"]
+    }));
+    choose["message"] = last_card.lock().unwrap().clone();
+    dispatch(&mut socket, 1219, "INTERACTION_CREATE", choose).await;
+    let review = received(&mut observed, "/interactions/516/offline-interaction/callback").await;
+    assert_eq!(review["type"], 7);
+    assert!(review["data"]["content"].as_str().unwrap().contains(label));
+    assert_eq!(store.pending().unwrap(), 0, "choosing an account must not admit a spend");
+    let rows = review["data"]["components"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "confirmation must not send an empty Discord select");
+    let buttons = rows[0]["components"].as_array().unwrap();
+    let confirm = buttons.iter().find(|button| button["type"] == 2 && button["label"] == "Confirm").unwrap();
+    let mut click = interaction("517", 3, json!({"custom_id":confirm["custom_id"],"component_type":2}));
+    click["message"] = last_card.lock().unwrap().clone();
+    click["message"]["components"] = review["data"]["components"].clone();
+    let last_sequence = 1220;
+    dispatch(&mut socket, last_sequence, "INTERACTION_CREATE", click).await;
+    let closed = received(&mut observed, "/interactions/517/offline-interaction/callback").await;
+    assert_eq!(closed["data"]["components"], json!([]));
+    let confirmed = event(&hub, &store).await;
+    assert_eq!(confirmed["input"]["route"], route);
+    assert_eq!(confirmed["input"]["pickerSelection"],
+        json!({"outputId":"reset-card","cardId":"700","group":0,"option":0,"confirmed":true}));
 
     let send = hub
         .effect(

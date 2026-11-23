@@ -372,7 +372,8 @@ worker. That is not a stop command for an already running lane.
   idle head session, not existing lanes or global defaults. You can also ask the head
   with `/head` to switch its own model after that turn. Global preset changes
   require explicit `--global`. Slack's message commands use `!`.
-- `/usage` shows provider account quotas and reset times reported by stock OMP, without a model turn.
+- `/usage` shows masked account names, quotas, and reset times for built-in and extension-provided usage sources reported by stock OMP, without a model turn.
+- `/usage reset` shows available saved reset tickets by account. Pick an account and Confirm to spend one; requires stock OMP with account-targeted usage reset support.
 - To receive a generated file, start an owner request with `attach: path/to/result.pdf` (relative to the work directory).
 - For a shared server or room, [configure restricted group access](docs/OPERATIONS.md#단체방서버-권한-분리) for request intake, tool-free chat or scoped worktree edits. These rooms cannot operate the owner session.
 - Ask `/head` to summarize CI every two hours, or use `/cron add "every 2h" Summarize CI`, and

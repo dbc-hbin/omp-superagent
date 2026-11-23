@@ -1,9 +1,11 @@
 import type { ModelPreset as NativeModelPreset } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import type { LaneEvidence, LaneReport, LaneWaitTarget } from "./lane-report";
 import type { CronUpdate } from "./cron-jobs";
+import type { ReviewRound } from "./pr-intake-review";
 import type { GroupReply, GroupRequest } from "./group-policy";
 import type { StagedResultAttachment } from "./result-attachment";
 import type { RemotePlacement } from "./worker-wire";
+import type { OmpResetAccount } from "./omp-usage";
 
 /** Coordination records only. OMP owns transcripts and execution state. */
 export type Platform = "discord" | "telegram" | "slack";
@@ -113,6 +115,8 @@ export interface Inbound {
     readonly cardId: string;
     readonly group: number;
     readonly option: number;
+    /** Emitted only by the reset picker's separate Confirm action. */
+    readonly confirmed?: true;
   };
   text: string;
   /** Physical Discord content when `text` is an addressed command or a confirmed voice draft. */
@@ -226,6 +230,7 @@ export type HeadPicker = {
 } & (
   | { readonly kind: "model"; readonly currentProvider?: string }
   | { readonly kind: "effort"; readonly forModel: LaneModel }
+  | { readonly kind: "usage-reset"; readonly accounts: readonly Pick<OmpResetAccount, "target" | "label" | "identity" | "offer">[] }
 );
 
 export interface KickoffHold {
@@ -307,9 +312,13 @@ export interface HeadRecoveryEffect {
 }
 
 export interface StorePort {
+  /** Typed, noninteractive work on the confirmed bot offer; never valid for ordinary owner intake. */
+  receivePrWork(input: Inbound, target: string | null, round: ReviewRound): boolean;
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   ownerSource(id: string): InputRecord | null;
+  /** Manager handoff's verified reply route, pinned if a bound reply joined its run. */
+  laneReplyRoute(input: InputRecord, source: InputRecord): Route;
   /** Exact original owner and authorized delivery route for a topic-owned lane input. */
   topicDelivery(id: string): { readonly source: InputRecord; readonly route: Route; readonly outputSourceId: string } | null;
   /** Whether an unowned dialog could belong to a durable topic admission on this native generation. */
@@ -320,6 +329,11 @@ export interface StorePort {
   tryAutoTopicChoice(input: InputRecord, deadline: number, pin: string): boolean;
   inputs(target?: string, state?: ActiveInputState): InputRecord[];
   hasInput(target: string, state: ActiveInputState): boolean;
+  /** Latest admitted lane run, excluding inputs joined to another run. */
+  latestLaneRun(target: string): InputRecord | null;
+  /** A successful lane run still has an unresolved final report or delivery. */
+  hasPendingLaneResult(target: string): boolean;
+  hasPendingLanePlacement(target: string): boolean;
   /** An uncertain HEAD input with a nonempty original native-owner record. */
   hasHeadRecoveryInput(): boolean;
   /** No automatic head replacement while an original HEAD delivery is unresolved. */

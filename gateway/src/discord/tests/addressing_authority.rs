@@ -39,7 +39,7 @@ async fn restart_cannot_promote_unresolved_thread_to_owner_after_policy_changes(
             discord_fixture_with_store(ordinary.clone(), &store).await;
         respond(&responses, REPLY_LOOKUP, StatusCode::OK, bot_message());
         respond(&responses, "/channels/92", StatusCode::OK,
-            json!({"id":"92","type":11,"guild_id":"77","parent_id":"89"}));
+            json!({"id":"92","type":11,"guild_id":"77","parent_id":"89","owner_id":"71"}));
         respond(&responses, "/channels/92/messages/203", StatusCode::OK, unresolved);
         let mut socket = start(&hub, &ws, false).await;
         dispatch(&mut socket, 3, "MESSAGE_CREATE", mention("204", "<@71> allowed work")).await;

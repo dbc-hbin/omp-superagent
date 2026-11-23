@@ -104,6 +104,60 @@ async fn picker_poll_admits_only_the_owner_selection_on_the_exact_card() -> Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn usage_reset_picker_only_admits_the_current_confirm_button() -> Result<()> {
+    let mut fixture = Fixture::start().await?;
+    let route = json!({
+        "platform":"telegram","accountId":"900","authorityId":"42",
+        "guildId":null,"channelId":"42","threadId":null
+    });
+    let label = "Claude · 계정 #9 · 사용 가능 2개";
+    let output = json!({
+        "id":"usage-reset","route":route,"text":"Saved resets",
+        "picker":{
+            "kind":"usage-reset","expiresAt":now()?.saturating_add(60_000),
+            "groups":[{"label":"Accounts","options":[label]}]
+        }
+    });
+    assert_eq!(fixture.hub.effect("send", &[output]).await?, "123");
+    let accounts = current_card(&fixture)?;
+    let account = button(&accounts, label)?;
+
+    fixture.hub.ready.send_replace(true);
+    let (_, poll) = fixture.poll().await?;
+    poll.send(json!([callback(4, "choose-account", 42, account, &accounts)]))
+        .expect("poll receiver");
+    let choice_ack = fixture.callback_feedback("choose-account", false).await?;
+    assert_eq!(fixture.store.pending()?, 0);
+    choice_ack.send(json!(true)).expect("choice feedback receiver");
+    let (_, poll) = fixture.poll().await?;
+    let confirmation = current_card(&fixture)?;
+    assert_eq!(fixture.store.pending()?, 0);
+    assert!(confirmation["text"].as_str().is_some_and(|text| text.contains(label)));
+    let confirm = button(&confirmation, "Confirm")?;
+    poll.send(json!([
+        callback(5, "old-account-page", 42, account, &accounts),
+        callback(6, "confirm-reset", 42, confirm, &confirmation),
+        callback(7, "duplicate-confirm", 42, confirm, &confirmation)
+    ]))
+    .expect("poll receiver");
+    fixture.feedback("old-account-page", true).await?;
+    let confirm_ack = fixture.callback_feedback("confirm-reset", false).await?;
+    assert_eq!(fixture.store.pending()?, 1);
+    let event = fixture.store.next(None)?.context("Expected one durable reset confirmation")?.event;
+    assert_eq!(event["input"]["route"], route);
+    assert_eq!(event["input"]["pickerSelection"],
+        json!({"outputId":"usage-reset","cardId":"123","group":0,"option":0,"confirmed":true}));
+    confirm_ack.send(json!(true)).expect("confirmation feedback receiver");
+    fixture.callback_feedback("duplicate-confirm", true).await?
+        .send(json!(true)).expect("duplicate feedback receiver");
+    let (_, _outstanding) = fixture.poll().await?;
+    assert_eq!(fixture.store.pending()?, 1);
+    assert_eq!(current_card(&fixture)?["reply_markup"]["inline_keyboard"], json!([]));
+    fixture.hub.stop().await?;
+    Ok(())
+}
+
 fn current_card(fixture: &Fixture) -> Result<Value> {
     fixture
         .remote

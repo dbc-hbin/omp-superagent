@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import * as net from "node:net";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { UnitScope } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
@@ -10,7 +11,7 @@ import { lookup as lookupSetting } from "@oh-my-pi/pi-coding-agent/config/regist
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { resolveThinkingLevelForModel } from "@oh-my-pi/pi-tui/thinking";
 import { parseSessionEntries, readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { HostChannel, indexServiceCompletions, serviceGenerationKey, type Frame, type ServiceUnit } from "./host-protocol";
+import { HostChannel, PR_REVIEW_GITHUB_ENV, PR_REVIEW_SYSTEM_PROMPT, indexServiceCompletions, serviceGenerationKey, type Frame, type ServiceUnit } from "./host-protocol";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { fitAbortAndRestoreQueueResponse } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
@@ -31,6 +32,24 @@ const serviceOwner = ({ agent, sessionManager }: ExtensionContext) => {
   const id = sessionManager.getSessionId();
   return agent.kind === "sub" && agent.id === "advisor" ? `${id}-advisor` : id;
 };
+
+const reviewInferenceApis = new Set(["openai-completions", "openai-responses", "openai-codex-responses",
+  "azure-openai-responses", "anthropic-messages"]);
+const stockAutoresearchTools = ["init_experiment", "run_experiment", "log_experiment", "update_notes"] as const;
+// --no-tools can still leave builtins in the registration catalogue: write
+// on stock 19.0, resolution/QA devices on 19.1. None may be enabled, mounted,
+// presented to the provider, or executed by the restricted session.
+const stockInactiveTools = new Set(["write", "resolve", "reject", "propose", "report_issue"]);
+const reviewSettingValues = {
+  "memory.backend": "off", "goal.enabled": false, "compaction.enabled": false, "advisor.enabled": false, "autolearn.enabled": false,
+  "skills.enabled": false, "skills.enableSkillCommands": false, "mcp.enableProjectConfig": false,
+  "marketplace.autoUpdate": "off", "magicKeywords.enabled": false, "prewalk.enabled": false,
+  "prewalk.auto": "off", "spotlight.experiment.enabled": false, "providers.cacheWarming": "off", "telemetry.otlpExportEnabled": false,
+  "dev.autoqa": false,
+} as const;
+const reviewModelAllowed = (model: { api: string; provider: string; transport?: unknown } | undefined) =>
+  model !== undefined && reviewInferenceApis.has(model.api) && model.provider !== "gitlab-duo" && model.transport !== "pi-native";
+class ReviewIsolationError extends Error {}
 
 /** Match the running CLI's own RPC settlement predicate (old and new SDK surface). */
 function pendingNativeWake(session: { readonly wakeSources?: unknown; readonly hasPendingAsyncWork?: () => boolean }): boolean {
@@ -65,6 +84,9 @@ export default function hostExtension(pi: ExtensionAPI): void {
   let instanceKey: string | undefined;
   const selectedSuperkit = process.env[MANAGED_ULW_ENV];
   const workerAttempt = process.env.OMP_SUPERAGENT_WORKER_ATTEMPT;
+  const reviewCwd = process.env.OMP_SUPERAGENT_PR_REVIEW_CWD;
+  if (reviewCwd && PR_REVIEW_GITHUB_ENV.some(name => process.env[name]))
+    throw new Error("Static PR review cannot load GitHub credentials from the native profile");
   let loadedSuperkitPath: string | undefined;
   type ServiceStart = {
     readonly name: string; readonly scope: UnitScope; readonly owner: string;
@@ -146,6 +168,83 @@ export default function hostExtension(pi: ExtensionAPI): void {
       defaultThinkingLevel: cfgDefaultThinkingLevel.get(readOnly(session.settings)) };
   };
   type NativeSession = InstanceType<typeof pi.pi.AgentSession>;
+  let reviewStream: NativeSession["agent"]["streamFn"] | undefined;
+  const reviewPolicy = (session: NativeSession, cwd: string) => {
+    const model = session.model;
+    if (!reviewModelAllowed(model) || !model)
+      throw new ReviewIsolationError("Static PR review requires a known tool-less inference API, not an external agent harness");
+    if (workerAttempt || realpathSync(session.sessionManager.getCwd()) !== cwd)
+      throw new ReviewIsolationError("Static PR review workspace identity is unavailable");
+    if (!reviewStream || session.agent.streamFn !== reviewStream)
+      throw new ReviewIsolationError("Static PR review provider dispatch guard is unavailable");
+    const enabled = session.getEnabledToolNames?.();
+    if (!Array.isArray(enabled) || enabled.length)
+      throw new ReviewIsolationError("Static PR review cannot establish an empty native enabled tool set");
+    // OMP 19.1 calls its separately mounted tool surface tool commands.
+    const mounted: unknown = "getMountedToolCommandNames" in session && typeof session.getMountedToolCommandNames === "function"
+      ? session.getMountedToolCommandNames() : session.getMountedXdevToolNames?.();
+    if (!Array.isArray(mounted) || mounted.length)
+      throw new ReviewIsolationError("Static PR review cannot establish an empty native device tool set");
+    if (!Array.isArray(session.agent.state.tools) || session.agent.state.tools.length ||
+        !Array.isArray(session.skills) || session.skills.length || session.autoCompactionEnabled !== false || session.getGoalModeState()?.enabled)
+      throw new ReviewIsolationError("Static PR review found native tools, skills, or autonomous execution enabled");
+    return { version: 1, cwd, modelApi: model.api };
+  };
+  const armReview = async (session: NativeSession, cwd: string) => {
+    if (typeof session.agent.streamFn !== "function") throw new ReviewIsolationError("Native provider dispatch guard is unavailable");
+    const runner = session.extensionRunner;
+    const self = realpathSync(fileURLToPath(import.meta.url));
+    if (!runner || typeof runner.getLoadedExtensions !== "function" || typeof runner.isExtensionActive !== "function"
+        || session.hasPendingDeferredExtensions)
+      throw new ReviewIsolationError("Native extension inventory is unavailable in static PR review");
+    const extensions = runner.getLoadedExtensions();
+    const other = extensions.filter(extension => extension.resolvedPath !== self);
+    // Stock SDKs may register their internal autoresearch factory and its
+    // default-inactive tools even with --no-tools. No ambient extension or
+    // arbitrary inline factory may be active in a review session.
+    if (!extensions.some(extension => extension.resolvedPath === self && runner.isExtensionActive(extension.path))
+        || other.some(extension => !/^<inline-\d+>$/.test(extension.resolvedPath)
+          || extension.commands.size !== 1 || !extension.commands.has("autoresearch")
+          || extension.tools.size !== stockAutoresearchTools.length
+          || !stockAutoresearchTools.every(name => extension.tools.has(name)))
+        || other.length > 1 || pi.getAllTools().some(tool =>
+          !(tool.sourceInfo?.source === "extension" && stockAutoresearchTools.some(name => name === tool.name))
+          && !(tool.sourceInfo?.source === "builtin" && stockInactiveTools.has(tool.name)))) {
+      throw new ReviewIsolationError("Unexpected native extension or registered tool in static PR review");
+    }
+    const settings = readOnly(session.settings);
+    for (const [id, expected] of Object.entries(reviewSettingValues)) {
+      const handle = lookupSetting(id);
+      if (!handle || !Object.is(handle.get(settings), expected)) throw new ReviewIsolationError(`Static PR review cannot enforce ${id}`);
+    }
+    const dispatch = session.agent.streamFn;
+    reviewStream = (model, input, options) => {
+      reviewPolicy(session, cwd);
+      // The actual candidate can differ from the selection on provider retry.
+      // Reject it before native dispatch, rather than trusting provider naming.
+      if (!reviewModelAllowed(model) || input.tools?.length || input.inactiveTools?.length)
+        throw new Error("Static PR review refused a tool-capable provider request");
+      const checkedPayload: NonNullable<NonNullable<typeof options>["onPayload"]> = async (payload, current, signal) => {
+        const replacement = await options?.onPayload?.(payload, current, signal);
+        const outgoing = replacement ?? payload;
+        if (!reviewModelAllowed(current ?? model) || !outgoing || typeof outgoing !== "object"
+            || ["tools", "functions", "mcp_servers"].some(key => {
+              const value = Object.getOwnPropertyDescriptor(outgoing, key)?.value;
+              return value !== undefined && (!Array.isArray(value) || value.length !== 0);
+            }))
+          throw new Error("Static PR review refused non-tool-free provider payload");
+        return replacement;
+      };
+      return dispatch(model, { ...input, systemPrompt: [PR_REVIEW_SYSTEM_PROMPT] }, { ...options, onPayload: checkedPayload });
+    };
+    session.agent.streamFn = reviewStream;
+    await session.setActiveToolPresentation([], []);
+    reviewPolicy(session, cwd);
+  };
+  if (reviewCwd) {
+    pi.on("before_agent_start", () => ({ systemPrompt: [PR_REVIEW_SYSTEM_PROMPT] }));
+  }
+
   // The view is live: callers only inspect it synchronously, before appending
   // or yielding. Older supported CLIs may expose only the copying API.
   const entries = (manager: NativeSession["sessionManager"]) =>
@@ -434,6 +533,11 @@ export default function hostExtension(pi: ExtensionAPI): void {
     }
     if (command.type === "activate") {
       const identity = exact();
+      if (reviewCwd) {
+        if (command.noTools !== true || command.toolsExplicitlySelected !== false)
+          throw new Error("Static PR review requires the native no-tools launch selection");
+        reviewPolicy(identity.session, reviewCwd);
+      }
       // Native's default tool selection omits the goal tool. Add it only for
       // that default, never widen an explicit --tools or --no-tools selection.
       if (command.toolsExplicitlySelected === false && command.noTools === false
@@ -456,9 +560,10 @@ export default function hostExtension(pi: ExtensionAPI): void {
     if (command.type === "snapshot") {
       const ownership = await owned();
       // The owner requires this first snapshot before opening its public socket.
-      loadedSuperkitPath ??= await verifyHostSuperkit(ownership.identity.session, selectedSuperkit);
+      const prReviewPolicy = reviewCwd ? reviewPolicy(ownership.identity.session, reviewCwd) : undefined;
+      if (!reviewCwd) loadedSuperkitPath ??= await verifyHostSuperkit(ownership.identity.session, selectedSuperkit);
       // Only an owner that implements the cursor command can advertise it to peers.
-      return { ...ownerIdentity(ownership.identity), loadedSuperkitPath, settingsScope: "session", modelSettings: snapshot(),
+      return { ...ownerIdentity(ownership.identity), loadedSuperkitPath, prReviewPolicy, settingsScope: "session", modelSettings: snapshot(),
         journalCursorControlVersion: 1,
         hasOwnedRunningWork: ownership.unknown ? undefined : ownership.busy, mutationHeld, observationHeld,
         admitted: ownership.identity.session.hasAdmittedSubmission,
@@ -539,6 +644,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
     if (context?.agent.kind === "main") observation("rpc_agent_start", { runOrdinal: ++runOrdinal, hostPid: process.pid });
   });
   pi.on("tool_call", async (event, ctx) => {
+    if (reviewCwd) return { block: true, reason: "Static PR review does not execute tools" };
     const input = event.input as Frame;
     if (event.toolName !== "bash") return;
     const name = serviceName(input.name);
@@ -614,6 +720,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
   });
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.agent.kind !== "main") {
+      if (reviewCwd) throw new Error("Static PR review cannot start a native child");
       const root = pi.pi.AgentRegistry.global().get(pi.pi.MAIN_AGENT_ID)?.session;
       if (!(root instanceof pi.pi.AgentSession) || !ctx.agent.parentId)
         throw new Error("Native descendant root ownership is unavailable");
@@ -628,6 +735,13 @@ export default function hostExtension(pi: ExtensionAPI): void {
     context = ctx;
     const identity = exact();
     pendingNativeWake(identity.session);
+    if (reviewCwd) {
+      try { await armReview(identity.session, reviewCwd); }
+      catch (error) {
+        process.stderr.write(`${error instanceof ReviewIsolationError ? error.message : "Static PR review native guard setup failed"}\n`);
+        throw error;
+      }
+    }
     await ctx.sessionManager.ensureOnDisk();
     if (exact().ref !== identity.ref) throw new Error("Native session changed during materialization");
     identity.session.sessionManager.flushSync();

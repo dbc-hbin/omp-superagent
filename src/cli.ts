@@ -87,11 +87,14 @@ Owner controls in chat (not shell commands):
   Send /help in Discord or Telegram. In Slack messages replace / with ! (e.g. !help, !status);
   registered Slack commands use /superagent-* (e.g. /superagent-status).
   /status, /context, /usage     Inspect HEAD state, context or usage without starting a model turn.
+  /usage reset                 List saved reset tickets; choose an account then confirm to spend one.
   /model [list|provider/id]     Inspect or select the shared HEAD model; changes require an idle HEAD.
   /model preset [list|NAME]     Inspect or select a preset. Only NAME --global also saves future defaults.
   /effort [LEVEL]               Inspect or change HEAD thinking effort; existing lanes keep their settings.
   /compact [instructions]       Compact idle HEAD context, optionally with multiline instructions.
   /cron [help]                  Schedule and manage one-time or recurring jobs in this conversation.
+  /cron pr-add "every 5m" OWNER/REPO  Review newly opened external PRs and comment on GitHub (Discord guild parent).
+  /cron pr-mode JOB review|fix|merge  Set the unattended ceiling: comment only, safe fix, or gated merge. Korean mode phrases also work.
   /new [request], /main         Start a topic or return to the main topic in the owner's DM.
   /stop [head|LANE_ID]          Stop work, not the service. Pause the bound lane, or reply to select a
                                 pending placement or active request. Use /stop head for the global stop.

@@ -27,6 +27,7 @@ const reply = "Socket host smoke response";
 type Handlers = Parameters<Messenger["start"]>[0];
 export class RecordingMessenger implements Messenger {
   readonly sent: OutputRecord[] = [];
+  readonly threadTitles: string[] = [];
   handlers?: Handlers;
   thread?: ThreadInfo;
   async start(handlers: Handlers): Promise<void> { this.handlers = handlers; }
@@ -52,6 +53,7 @@ export class RecordingMessenger implements Messenger {
   }
   async updateThread(route: Route, changes: ThreadUpdate): Promise<ThreadInfo> {
     this.thread = { ...await this.inspectThread(route), ...changes };
+    this.threadTitles.push(this.thread.title);
     return structuredClone(this.thread);
   }
   async fetchAfter(_route: Route, _messageId: string): Promise<Inbound[]> { return []; }
@@ -363,15 +365,15 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       modelReason, acceptance: ["Reply only inside the original topic thread"] });
     expect(created.route).toEqual(threadRoute);
     expect(created.cwd).toBe(laneCwd);
-    await until(() => messenger.thread?.title === "⏳ Independent topic", "native lane run labels its Discord work thread");
     await until(() => delivered(report(firstHandoff)), "lane report returns to head before external answer");
-    expect(messenger.thread?.title).toBe("⏳ Independent topic");
+    await until(() => messenger.thread?.title === "✅ Independent topic", "delivered native settlement checks off the working marker");
+    expect(messenger.threadTitles).toEqual(["⏳ Independent topic", "✅ Independent topic"]);
     const firstLane = store.lane(created.id)!;
     expect(firstLane.sessionId).toBeTruthy();
     expect(firstLane.sessionId).not.toBe(headState.sessionId);
     expect(firstLane.sessionFile).not.toBe(mainPaths.sessionFile);
     expect(firstLane.pid).not.toBe(child.pid);
-    expect(firstLane.generation).toBe(1);
+    expect(firstLane).toMatchObject({ generation: 1, workState: "open", result: null });
     expect(firstLane).toMatchObject({ model: laneModel, modelReason, modelPreset: modelSelection ? "middle" : null,
       modelPresetSnapshot: modelSelection ? middlePreset : null });
     expect(store.input(topic.id)).toMatchObject({ target: "main", state: "done", generation: 0 });
@@ -440,8 +442,11 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     expect(requestIds(parseSessionEntries(await fs.readFile(firstLane.sessionFile, "utf8")))).toEqual([firstHandoff]);
     const followupHandoff = `handoff:${followup.id}:${created.id}`;
     await runtime.messageLane(created.id, followupTask, followup.id);
-    if (modelSelection) await until(() => messenger.thread?.title === "⏳ Independent topic", "resumed work replaces the completed title marker");
     await until(() => delivered(report(followupHandoff)), "explicit follow-up report and head answer settlement");
+    await until(() => messenger.thread?.title === "✅ Independent topic", "delivered follow-up settlement checks off the working marker");
+    expect(messenger.threadTitles).toEqual([
+      "⏳ Independent topic", "✅ Independent topic", "⏳ Independent topic", "✅ Independent topic",
+    ]);
     expectedDelivered.push({ ...followup, id: report(followupHandoff) });
     const finalLane = store.lane(created.id)!;
     expect(finalLane).toMatchObject({ sessionId: firstLane.sessionId, sessionFile: firstLane.sessionFile,

@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import type { HeadRecoveryAttempt } from "./contracts";
 
+export interface HeadQuotaFailure {
+  readonly model: { readonly provider: "openai-codex"; readonly id: string };
+  readonly failedAt: number;
+}
+
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
 
@@ -44,12 +49,46 @@ export function headRecoveryEvidence(entries: unknown[], owner: Pick<HeadRecover
     else if (latestStart && (latestRunStatus === "stop" || latestRunStatus === "length")) outcome = "done";
     else if (latestStart && latestRunStatus === "aborted") outcome = "cancelled";
   }
+  const error = object(frame.error);
+  const failedAt = typeof receipt.timestamp === "string" ? Date.parse(receipt.timestamp) : NaN;
+  const receiptIndex = slice.indexOf(receipt);
+  const sameQuotaRun = typeof receiptData.hostPid === "number" && Number.isSafeInteger(receiptData.hostPid)
+    && receiptData.hostPid > 0 && typeof receiptData.instanceKey === "string" && receiptData.instanceKey !== ""
+    && typeof receiptData.runOrdinal === "number" && Number.isSafeInteger(receiptData.runOrdinal) && receiptData.runOrdinal > 0
+    && receiptData.hostPid === startData.hostPid && receiptData.instanceKey === startData.instanceKey
+    && receiptData.runOrdinal === startData.runOrdinal;
+  // The exact provider refused the entire turn. An earlier tool, partial
+  // answer, other request, or unknown journal effect makes this unsafe to close.
+  const quotaFailure: HeadQuotaFailure | null = frame.status === "error" && frame.sessionSettled === true
+    && frame.agentInvoked === true && error.provider === "openai-codex" && typeof error.model === "string" && error.model !== ""
+    && error.retryable === false && typeof error.message === "string"
+    // Stock OMP's RPC error lacks a structured quota code. Match either
+    // native Codex formatter, but require the exact code in its metadata.
+    && /^Codex (?:error event|response failed)(?:: [\s\S]+)? \(code=usage_limit_reached(?:, status=[a-z_]+)?\)$/.test(error.message)
+    && Number.isFinite(failedAt) && sameQuotaRun && latestRunStatus === "error"
+    && users.length === 1 && receiptIndex > latestStartIndex
+    && slice.every((entry, index) => {
+      if (entry.type === "model_usage" || entry === receipt) return true;
+      if (index >= receiptIndex) return false;
+      if (matches(entry, "rpc_agent_start")) {
+        const start = object(entry.data);
+        return start.hostPid === receiptData.hostPid && start.instanceKey === receiptData.instanceKey
+          && typeof start.runOrdinal === "number" && Number.isSafeInteger(start.runOrdinal)
+          && start.runOrdinal > 0 && start.runOrdinal <= Number(receiptData.runOrdinal);
+      }
+      if (entry.type !== "message") return false;
+      const message = object(entry.message);
+      return message.role === "user" || message.role === "assistant" && message.stopReason === "error"
+        && message.provider === error.provider && message.model === error.model
+        && Array.isArray(message.content) && message.content.length === 0;
+    })
+    ? { failedAt, model: { provider: error.provider, id: error.model } } : null;
   const selected = [receipt, ...starts, ...assistants];
   if (selected.some(entry => typeof entry.id !== "string")) return null;
   const entryIds = [...new Set(selected.map(entry => String(entry.id)))];
   const proof = { entryIds, receiptStatus: String(frame.status), latestRunStatus: latestRunStatus ?? null,
     outcome: outcome ?? null };
-  return { ...proof, boundary: String(journal[end]!.id),
+  return { ...proof, quotaFailure, boundary: String(journal[end]!.id),
     fingerprint: createHash("sha256").update(JSON.stringify(slice.map(entry => [
       entry.id, entry.type, entry.customType,
       matches(entry, "rpc_prompt_result") ? object(entry.data).frame : null,

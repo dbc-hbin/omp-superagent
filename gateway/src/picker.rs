@@ -1,3 +1,4 @@
+// allow: SIZE_OK — Each picker transition and its admission binding are evaluated atomically.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -19,10 +20,11 @@ pub(crate) const CANCELLED: &str = "Selection cancelled. Nothing was changed.";
 const PAGE: usize = 8;
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 enum Kind {
     Model,
     Effort,
+    UsageReset,
 }
 
 #[derive(Clone, Deserialize)]
@@ -88,16 +90,31 @@ struct Entry {
 
 #[derive(Clone, Copy)]
 struct Screen {
-    group: Option<usize>,
-    page: usize,
+    stage: Stage,
     revision: u32,
+}
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Browse { group: Option<usize>, page: usize },
+    ConfirmUsageReset { option: usize },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Pick(usize),
+    Previous,
+    Next,
+    Back,
+    Cancel,
+    Confirm,
 }
 
 struct Card {
     entry: Entry,
     message_id: String,
     navigating: bool,
-    selection: Option<(usize, Selection)>,
+    selection: Option<(Action, Selection)>,
 }
 
 #[derive(Clone, Default)]
@@ -119,7 +136,10 @@ impl Pickers {
         text: &str,
         spec: &Picker,
     ) -> Result<Option<Opening>, EffectError> {
-        if spec.expires_at <= time()? || spec.groups.is_empty() {
+        if spec.expires_at <= time()?
+            || spec.groups.is_empty()
+            || (spec.kind == Kind::UsageReset && spec.groups.len() != 1)
+        {
             return Ok(None);
         }
         let entry = Entry {
@@ -129,11 +149,13 @@ impl Pickers {
             text: text.to_owned(),
             picker: spec.clone(),
             screen: Screen {
-                group: match spec.kind {
-                    Kind::Model => None,
-                    Kind::Effort => Some(0),
+                stage: Stage::Browse {
+                    group: match spec.kind {
+                        Kind::Model => None,
+                        Kind::Effort | Kind::UsageReset => Some(0),
+                    },
+                    page: 0,
                 },
-                page: 0,
                 revision: 0,
             },
         };
@@ -164,7 +186,7 @@ impl Pickers {
         value: Option<&str>,
         matches: impl FnOnce(&Value, &str) -> bool,
     ) -> Result<Option<Change>, EffectError> {
-        let Some((token, revision, action)) = parse(control) else {
+        let Some((token, revision, action)) = parse(control, value) else {
             return Ok(None);
         };
         let current = time()?;
@@ -175,65 +197,62 @@ impl Pickers {
         let Some(card) = cards.get_mut(&token) else {
             return Ok(None);
         };
-        let entry = &mut card.entry;
+        let entry = &card.entry;
         if card.navigating || revision != entry.screen.revision || !matches(&entry.route, &card.message_id) {
             return Ok(None);
         }
-        let action = match (action, value) {
-            ("s", Some(value)) if number::<usize>(value).is_some() => value,
-            ("s", None) | (_, Some(_)) => return Ok(None),
-            (_, None) => action,
-        };
-        if let Some((index, selection)) = &card.selection {
+        if let Some((original, selection)) = &card.selection {
             // Only the exact same durable event may be retried after an
             // unconfirmed SQLite write. A second choice cannot replace it.
-            return Ok((number::<usize>(action) == Some(*index))
-                .then(|| Change::Select(selection.clone())));
+            return Ok((action == *original).then(|| Change::Select(selection.clone())));
         }
-        if action == "x" {
+        if action == Action::Cancel {
             cards.remove(&token);
             return Ok(Some(Change::Cancel));
         }
-        let mut next = entry.screen;
-        let Some(count) = entry.count(next) else {
-            return Ok(None);
-        };
-        let offset = next.page.saturating_mul(PAGE);
-        match action {
-            "p" if next.page > 0 => next.page -= 1,
-            "n" if next.page < count.div_ceil(PAGE).saturating_sub(1) => next.page += 1,
-            "b" if matches!(entry.picker.kind, Kind::Model) && next.group.is_some() => {
-                next.page = next.group.unwrap_or_default() / PAGE;
-                next.group = None;
-            }
-            _ => {
-                let Some(index) = number::<usize>(action)
-                    .filter(|index| *index >= offset && *index < count && index / PAGE == next.page)
-                else {
+        let stage = match entry.screen.stage {
+            Stage::Browse { group, page } => {
+                let Some(count) = entry.count(group) else {
                     return Ok(None);
                 };
-                if let Some(group) = next.group {
-                    let event = json!({"kind": "message", "input": {
-                        "id": format!("picker:{}", entry.output_id),
-                        "route": entry.route,
-                        "messageId": null,
-                        "receivedAt": current,
-                        "attachments": [],
-                        "text": "",
-                        "pickerSelection": {
-                            "outputId": entry.output_id, "cardId": card.message_id,
-                            "group": group, "option": index
+                match action {
+                    Action::Previous if page > 0 => Stage::Browse { group, page: page - 1 },
+                    Action::Next if page < count.div_ceil(PAGE).saturating_sub(1) => {
+                        Stage::Browse { group, page: page + 1 }
+                    }
+                    Action::Back if entry.picker.kind == Kind::Model && group.is_some() => {
+                        Stage::Browse { group: None, page: group.unwrap_or_default() / PAGE }
+                    }
+                    Action::Pick(index) if index < count && index / PAGE == page => {
+                        match (entry.picker.kind, group) {
+                            (Kind::UsageReset, Some(0)) => Stage::ConfirmUsageReset { option: index },
+                            (Kind::Model | Kind::Effort, Some(group)) => {
+                                return Ok(Some(card.select(action, group, index, current)));
+                            }
+                            (Kind::Model, None) => Stage::Browse { group: Some(index), page: 0 },
+                            (Kind::UsageReset, _) | (Kind::Effort, None) => return Ok(None),
                         }
-                    }});
-                    let selection = Selection { token, event };
-                    card.selection = Some((index, selection.clone()));
-                    return Ok(Some(Change::Select(selection)));
+                    }
+                    Action::Previous
+                    | Action::Next
+                    | Action::Back
+                    | Action::Pick(_)
+                    | Action::Confirm
+                    | Action::Cancel => return Ok(None),
                 }
-                next.group = Some(index);
-                next.page = 0;
             }
-        }
-        next.revision = next.revision.saturating_add(1);
+            Stage::ConfirmUsageReset { option } => match action {
+                Action::Back => Stage::Browse { group: Some(0), page: option / PAGE },
+                Action::Confirm => return Ok(Some(card.select(action, 0, option, current))),
+                Action::Previous | Action::Next | Action::Pick(_) | Action::Cancel => {
+                    return Ok(None);
+                }
+            },
+        };
+        let Some(revision) = revision.checked_add(1) else {
+            return Ok(None);
+        };
+        let next = Screen { stage, revision };
         Ok(entry.view(next).map(|menu| {
             card.navigating = true;
             Change::Show(Navigation { token, next, menu })
@@ -262,19 +281,54 @@ impl Pickers {
     }
 }
 
+impl Card {
+    fn select(&mut self, action: Action, group: usize, option: usize, current: i64) -> Change {
+        let entry = &self.entry;
+        let mut selected = json!({
+            "outputId": entry.output_id, "cardId": self.message_id,
+            "group": group, "option": option
+        });
+        if action == Action::Confirm {
+            selected["confirmed"] = json!(true);
+        }
+        let event = json!({"kind": "message", "input": {
+            "id": format!("picker:{}", entry.output_id),
+            "route": entry.route,
+            "messageId": null,
+            "receivedAt": current,
+            "attachments": [],
+            "text": "",
+            "pickerSelection": selected
+        }});
+        let selection = Selection { token: entry.token, event };
+        self.selection = Some((action, selection.clone()));
+        Change::Select(selection)
+    }
+}
+
 impl Entry {
-    fn count(&self, screen: Screen) -> Option<usize> {
-        match screen.group {
+    fn count(&self, group: Option<usize>) -> Option<usize> {
+        match group {
             None => Some(self.picker.groups.len()),
             Some(group) => Some(self.picker.groups.get(group)?.options.len()),
         }
     }
 }
 
-fn parse(control: &str) -> Option<(Uuid, u32, &str)> {
+fn parse(control: &str, value: Option<&str>) -> Option<(Uuid, u32, Action)> {
     let (id, rest) = control.strip_prefix(PREFIX)?.split_once(':')?;
     let (revision, action) = rest.split_once(':')?;
     let token = Uuid::try_parse(id).ok()?;
+    let action = match (action, value) {
+        ("s", Some(index)) => Action::Pick(number(index)?),
+        ("s", None) | (_, Some(_)) => return None,
+        ("p", None) => Action::Previous,
+        ("n", None) => Action::Next,
+        ("b", None) => Action::Back,
+        ("x", None) => Action::Cancel,
+        ("c", None) => Action::Confirm,
+        (index, None) => Action::Pick(number(index)?),
+    };
     Some((token, number(revision)?, action))
 }
 

@@ -391,7 +391,9 @@ impl State {
         if voice_control {
             return Ok(None);
         }
-        let proof = addressing && route.thread_id.is_none() && text.is_none();
+        // Only threads this bot created continue without addressing; a thread
+        // another bot or person started is a shared conversation like its parent.
+        let proof = addressing && !channel.is_thread_owned_by(&route.account_id) && text.is_none();
         if let Some(text) = text.filter(|text| !Voice::matches_control(text)) {
             if text.is_empty() && input["attachments"].as_array().is_some_and(Vec::is_empty) {
                 return Ok(None);
