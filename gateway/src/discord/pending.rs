@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use super::{
     Effect, State,
+    addressing::addressed_text,
     ingress::{LiveWire, authorized_message},
     message_source::Revision,
     model::{Channel, Message, Route, hash},
@@ -43,6 +44,7 @@ struct Verified {
     route: Route,
     channel: Channel,
     message: Box<Message>,
+    needs_pin: bool,
 }
 
 enum Resolution {
@@ -167,6 +169,7 @@ impl Pending {
             });
         }
         let addressing = self.addressing(state, &route);
+        let mut needs_pin = true;
         let message = match &self.evidence {
             Evidence::Coordinates(revision) => {
                 let originally_allowed = match &self.coordinate_authority {
@@ -191,13 +194,30 @@ impl Pending {
                 state.verify_wire(source, self.create, &route, &channel, addressing).await?
             }
             Evidence::Verified { route: expected, message } if *expected == route => {
-                Some(message.as_ref().clone())
+                // Earlier Gateways pinned some thread reply edits without their
+                // reference. Preserve an admission receipt; otherwise recover
+                // the missing proof from this revision only, then pin it.
+                if !self.create && addressing && channel.is_thread()
+                    && !channel.is_thread_owned_by(&route.account_id)
+                    && message.kind == 19 && message.message_reference.is_none()
+                    && addressed_text(message, &route.account_id).is_none()
+                    && state.with_context(message, &route, &channel, addressing).await?.is_none()
+                {
+                    let Value::Object(mut wire) = json!(message) else {
+                        return Err(broken("Discord pinned message could not be projected"));
+                    };
+                    wire.remove("message_reference");
+                    state.verify_wire(&Value::Object(wire), false, &route, &channel, addressing).await?
+                } else {
+                    needs_pin = false;
+                    Some(message.as_ref().clone())
+                }
             }
             Evidence::Wire { .. } | Evidence::Verified { .. } => return Ok(Resolution::Refused),
         };
         let Some(message) = message.filter(|message| message.id == self.id && authorized_message(message, &route))
         else { return Ok(Resolution::Refused) };
-        Ok(Resolution::Owner(Box::new(Verified { route, channel, message: Box::new(message) })))
+        Ok(Resolution::Owner(Box::new(Verified { route, channel, message: Box::new(message), needs_pin })))
     }
 }
 
@@ -233,11 +253,11 @@ impl State {
                 Resolution::Refused => None,
                 Resolution::LiveGroup(route) => Some(route),
                 Resolution::Owner(owner) => {
-                    let Verified { route, channel, message } = *owner;
+                    let Verified { route, channel, message, needs_pin } = *owner;
                     // Pin immediately after source/authority verification.
                     // A second, independent reply read may fail and must never
                     // cause us to hydrate a now-superseded message revision.
-                    if !matches!(&pending.evidence, Evidence::Verified { .. }) {
+                    if needs_pin {
                         pending.evidence = Evidence::Verified { route: route.clone(), message: message.clone() };
                         pending.coordinate_authority = None;
                         retry(|| ready(
