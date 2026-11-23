@@ -361,12 +361,16 @@ discarding custom commands or enabling disabled extensions.
   head outbox. A job created with `/cron add shell` is a verbatim shell job: its
   run is admitted like any other and passes the same ordered dispatch, live-route
   (`assertRoute`), and stop/recovery fences before being claimed as submitted and
-  running `/bin/sh -c` alone (credential env removed, 30 s cap) instead of a model
-  turn, then settles with stdout. Empty or `[SILENT]` output posts nothing; only the
+  running `/bin/sh -c` in an asynchronous detached process group (credential env
+  removed, 30 s cap) instead of a model turn, then settles with stdout while
+  holding HEAD without blocking independent lanes. Empty or `[SILENT]` output posts
+  nothing; only the
   SHA-256 of the last posted output is persisted, and an identical hash suppresses
   the post. The hash is recorded after the settlement, so a crash can repeat one
   post but never lose one. Non-zero exit or timeout is always reported and leaves the
-  hash alone. A run interrupted mid-spawn becomes uncertain and is never replayed.
+  hash alone. Active `/stop head` terminates the shell process group and confirms
+  exit before reporting stop completion; a run interrupted mid-spawn across restart
+  becomes uncertain and is never replayed.
   Only the owner command creates these; `cron_create` cannot. See the [operator reference](../OPERATIONS.md#예약-작업-cron)
   for schedule syntax and controls.
 - [PR watch](../../src/pr-watch.ts) reads only explicitly registered GitHub PRs
