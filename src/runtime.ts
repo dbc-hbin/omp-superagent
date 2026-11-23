@@ -6125,6 +6125,7 @@ export class Superagent {
       }
       historyContext = null;
     }
+    const topicRun = steering && owner ? this.store.topicDelivery(owner.id) : topic;
     const hint = this.routingHints.get(input.id);
     if (hint || steering && live.id === "main") {
       // Intake can place or cancel the old request during recall, attachments
@@ -6136,7 +6137,6 @@ export class Superagent {
       ].filter(Boolean).join("\n");
       this.routingHints.delete(input.id);
     }
-    const topicRun = steering && owner ? this.store.topicDelivery(owner.id) : topic;
     this.store.setMeta(`steering-owner:${input.id}`, steering ? owner!.id : input.id);
     if (!this.store.submit(input.id, requestId, live.generation)) return;
     const submitted = { ...input, requestId, generation: live.generation, state: "submitted" as const };
