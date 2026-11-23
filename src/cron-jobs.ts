@@ -8,10 +8,8 @@ import { compareMessageIds } from "./message-order";
 import { parsePrModeControl, prModeArgument, prModeEffects, type PrIntakeMode } from "./pr-intake-mode";
 
 const jobsKey = "cron:jobs";
-export const CRON_SHELL_SILENT = "[SILENT]";
-const shellKey = (runId: string) => `cron-shell:${runId}`;
-const shellOutputHashKey = (outputId: string) => `cron-shell-hash:${outputId}`;
 export const CRON_RUN_PREFIX = "cron-run:";
+const shellDisabled = "Direct shell cron jobs are disabled. Use /cron add with a scheduled HEAD prompt, which keeps the usual approval checks.";
 const manualPrEffects = "manual: discovery only; use the explicit owner commands for review, fix, or merge when the native checks allow";
 const approvalFallback = "Work above the selected mode still needs an explicit owner command and must pass the native checks.";
 const stalePrOrder = "This PR intake command predates a newer control. No PR intake settings were changed.";
@@ -19,7 +17,6 @@ const unverifiedPrOrder = "PR intake control order could not be verified. Send /
 const usage = [
   '/cron add "every 2h" Check the build', '/cron add "in 30m" Remind me',
   '/cron add "TZ=Asia/Seoul 0 9 * * 1-5" Summarize CI',
-  '/cron add shell "every 1h" df -h   (runs the command alone, no model turn; posts stdout)',
   '/cron list | show ID | pause ID | resume ID | run ID | remove ID',
   '/cron edit ID "schedule" [prompt] | /cron edit ID prompt NEW_PROMPT',
   '/cron pr-add "every 5m" OWNER/REPO | /cron show ID [PR_NUMBER]',
@@ -43,12 +40,8 @@ interface PromptJob extends JobTiming {
   readonly kind?: "prompt"; // Older prompt jobs have no discriminant.
   readonly schedule: CronSchedule;
   readonly prompt: string;
-  /** The prompt is a shell command run alone; its stdout is posted verbatim. */
+  /** Legacy records are kept for inspection/removal, never executed or converted to prompts. */
   readonly shell?: true;
-  /** Command revision tied to outputHash so stale in-flight runs cannot restore an edited command's hash. */
-  readonly commandRevision?: string;
-  /** SHA-256 of the last posted shell output; the only output state kept. */
-  readonly outputHash?: string;
 }
 
 export interface CronPrJob extends JobTiming {
@@ -85,20 +78,6 @@ export interface CronCreate {
   readonly prompt: string;
 }
 
-export interface CronShellResult {
-  readonly exitCode: number | null;
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly error?: string;
-}
-
-export interface CronShellOutcome {
-  /** Text to post, or null to stay silent. */
-  readonly text: string | null;
-  /** Hash to persist after a successful post; null leaves the stored hash unchanged. */
-  readonly hash: string | null;
-}
-
 export interface CronUpdate {
   readonly text: string;
   readonly state?: "cancelled";
@@ -112,10 +91,6 @@ function jobMetadata(state: CronState, changed: CronJob, remove = false) {
   if (!remove) next.push(changed);
   return { [jobsKey]: JSON.stringify({ ...state, jobs: next }) };
 }
-
-const outputHash = (text: string) => createHash("sha256").update(text).digest("hex");
-
-function shellRevision(job: PromptJob): string { return job.commandRevision ?? job.sourceId; }
 
 function prRunKey(id: string): string { return `cron-pr:run:${id}`; }
 
@@ -158,8 +133,7 @@ function originalPrAdd(text: string) {
 }
 
 function runMetadata(job: CronJob, run: Inbound): Readonly<Record<string, string>> {
-  return job.kind === "pr-intake" ? { [prRunKey(run.id)]: prRunIdentity(job) }
-    : job.shell ? { [shellKey(run.id)]: JSON.stringify({ jobId: job.id, revision: shellRevision(job) }) } : {};
+  return job.kind === "pr-intake" ? { [prRunKey(run.id)]: prRunIdentity(job) } : {};
 }
 
 function cronRun(job: CronJob, source: InputRecord, trigger: string, now: number): Inbound {
@@ -169,7 +143,6 @@ function cronRun(job: CronJob, source: InputRecord, trigger: string, now: number
     ...(source.invocationId === undefined ? {} : { invocationId: source.invocationId }),
     receivedAt: now, attachments: [],
     text: job.kind === "pr-intake" ? `Repository PR intake scan for scheduled job ${job.id}.`
-      : job.shell ? job.prompt
       : `Scheduled job ${job.id}. Execute only the stored owner prompt below. No interactive follow-up, delegation authority, standing approval or new schedule is implied.\n\n${job.prompt}`,
   };
 }
@@ -386,13 +359,15 @@ export class CronJobs {
 
   private status(job: CronJob, proposedMode?: PrIntakeMode): string {
     const last = job.lastRunId ? this.store.input(job.lastRunId)?.state ?? "missing" : "none";
-    const state = job.kind === "pr-intake" && job.removed ? "removed"
+    const disabled = job.kind !== "pr-intake" && job.shell === true;
+    const nextAt = disabled ? null : job.nextAt;
+    const state = disabled ? "shell disabled" : job.kind === "pr-intake" && job.removed ? "removed"
       : last === "uncertain" || last === "missing" ? "held (reconcile the original HEAD input)"
       : job.paused ? "paused" : job.stopBoundary !== this.store.getMeta("head:stop-boundary") ? "held by HEAD stop"
       : job.nextAt === null ? "no next run" : "scheduled";
-    const detail = job.kind === "pr-intake" ? `; PR intake ${job.repository}` : job.shell ? "; shell" : "";
+    const intake = job.kind === "pr-intake" ? `; PR intake ${job.repository}` : "";
     const policy = job.kind === "pr-intake" ? `\n${this.prModeStatus(job, proposedMode)}` : "";
-    return `${job.id} — ${state}${detail}; ${describeCronSchedule(job.schedule)}; next: ${job.nextAt === null ? "none" : new Date(job.nextAt).toISOString()}; last: ${last}${job.lastRunId ? ` (${job.lastRunId})` : ""}${policy}`;
+    return `${job.id} — ${state}${intake}; ${describeCronSchedule(job.schedule)}; next: ${nextAt === null ? "none" : new Date(nextAt).toISOString()}; last: ${last}${job.lastRunId ? ` (${job.lastRunId})` : ""}${policy}`;
   }
 
   private prModeStatus(job: CronPrJob, proposedMode?: PrIntakeMode): string {
@@ -544,7 +519,7 @@ export class CronJobs {
         return { text: `To prove this is a new control, reply directly to this status with ${next}.\n\n${summary}`,
           metadata: { [prStatusKey(source.id)]: this.prStatusReceipt(job, boundary) } };
       }
-      if (!details) return { text: `${this.status(job)}\n\nPrompt:\n${job.prompt}` };
+      if (!details) return { text: job.shell === true ? this.status(job) : `${this.status(job)}\n\nPrompt:\n${job.prompt}` };
     }
     if (this.store.getMeta("head:restart-fence")) return reject("Gateway and HEAD restart is held. No cron job was changed.");
     if (!this.originalMessage(input)) {
@@ -557,24 +532,17 @@ export class CronJobs {
       if (action === "edit" && !found) return reject("No cron job with that ID in this conversation.");
       const previous = action === "edit" ? found?.job : undefined;
       if (previous?.kind === "pr-intake") return reject("PR intake jobs cannot be edited as prompt jobs. To change the schedule, remove and re-enroll it here.");
-      const shellAdd = !previous && /^shell\s+/.test(tail);
-      const shell = shellAdd || previous?.shell === true;
-      const body = previous ? details : shellAdd ? tail.replace(/^shell\s+/, "") : tail;
+      if (previous?.shell === true || !previous && /^shell(?:\s|$)/u.test(tail)) return reject(shellDisabled);
+      const body = previous ? details : tail;
       const pair = /^"([^"\r\n]+)"(?:\s+([\s\S]+))?$/.exec(body);
       const schedule = pair ? parseCronSchedule((pair[1] ?? "").trim(), now) : previous?.schedule;
-      const rawPrompt = pair ? (pair[2] ? pair[2].trim() : previous?.prompt)
-        : previous && /^prompt\s+/.test(body) ? body.replace(/^prompt\s+/, "").trim() : undefined;
-      const prompt = rawPrompt === undefined ? undefined : shell ? rawPrompt : promptText(rawPrompt);
+      const prompt = pair ? (pair[2] ? promptText(pair[2]) : previous?.prompt)
+        : previous && /^prompt\s+/.test(body) ? promptText(body.replace(/^prompt\s+/, "")) : undefined;
       if (!schedule || !prompt) return reject(`Invalid schedule or missing prompt. Recurring intervals must be at least one minute.\n${usage}`);
-      // A changed command is new output territory: its first run always posts.
-      const commandChanged = !previous || prompt !== previous.prompt;
-      const commandRevision = shell ? (commandChanged ? input.id : shellRevision(previous)) : undefined;
-      const keepHash = previous?.outputHash !== undefined && !commandChanged;
-      const job: PromptJob = { id: previous?.id ?? randomUUID(), sourceId: previous?.sourceId ?? input.id,
+      const job = { id: previous?.id ?? randomUUID(), sourceId: previous?.sourceId ?? input.id,
         schedule, prompt, nextAt: pair ? nextCronTime(schedule, now) : previous?.nextAt ?? null,
         paused: previous?.paused ?? false, stopBoundary: previous ? previous.stopBoundary : boundary,
-        lastRunId: previous?.lastRunId ?? null, ...(shell ? { shell: true as const, commandRevision } : {}),
-        ...(keepHash ? { outputHash: previous.outputHash } : {}) };
+        lastRunId: previous?.lastRunId ?? null };
       return { text: `${previous ? "Updated" : "Created"} cron job. ${this.status(job)}`, metadata: jobMetadata(state, job) };
     }
     if (!["show", "pause", "resume", "run", "remove", "delete"].includes(action) || !id || details) return reject(usage);
@@ -613,6 +581,7 @@ export class CronJobs {
       return { text: `${remove ? "Removed" : "Paused"} cron job ${job.id}.${cancellation}${active}`,
         metadata: { ...jobMetadata(state, changed, remove && job.kind !== "pr-intake"), ...orderMetadata }, ...cancelPending };
     }
+    if (job.kind !== "pr-intake" && job.shell === true) return reject(shellDisabled);
     if (last?.state === "uncertain" || job.lastRunId && !last) {
       return reject(`The previous cron run ${job.lastRunId} is uncertain. Inspect it and use /resolve before running again.`);
     }
@@ -632,63 +601,9 @@ export class CronJobs {
       metadata: { ...jobMetadata(state, { ...job, lastRunId: run.id }), ...runMetadata(job, run) }, run };
   }
 
-  /** The verbatim shell job and command revision a cron run input belongs to, if any. */
-  shellRun(input: InputRecord): { readonly jobId: string; readonly revision: string | null; readonly command: string } | null {
-    if (!input.id.startsWith(CRON_RUN_PREFIX)) return null;
-    const raw = this.store.getMeta(shellKey(input.id));
-    if (!raw) return null;
-    if (raw.startsWith("{")) {
-      try {
-        const parsed = JSON.parse(raw) as { jobId?: unknown; revision?: unknown };
-        if (typeof parsed.jobId === "string") {
-          return { jobId: parsed.jobId, revision: typeof parsed.revision === "string" ? parsed.revision : null, command: input.text };
-        }
-      } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-      }
-    }
-    return { jobId: raw, revision: null, command: input.text };
-  }
-
-  /**
-   * Decide what a finished shell run posts. Failures are always reported and
-   * never touch the stored hash; empty/[SILENT]/unchanged output stays quiet.
-   */
-  shellOutcome(jobId: string, revision: string | null, run: CronShellResult): CronShellOutcome {
-    if (run.error !== undefined || run.exitCode !== 0) {
-      const detail = run.error ?? `exit code ${run.exitCode}`;
-      const output = [run.stdout, run.stderr].filter(part => part.trim()).join("\n");
-      return { text: `Cron shell job ${jobId} failed (${detail}).${output ? `\n${output}` : ""}`, hash: null };
-    }
-    if (!run.stdout.trim() || run.stdout.includes(CRON_SHELL_SILENT)) return { text: null, hash: null };
-    const hash = outputHash(run.stdout);
-    const job = this.state().jobs.find((job): job is PromptJob => job.id === jobId && job.kind !== "pr-intake" && job.shell === true);
-    const matchesRevision = job !== undefined && (revision === null || shellRevision(job) === revision);
-    if (!matchesRevision) return { text: run.stdout, hash: null };
-    return job.outputHash === hash ? { text: null, hash: null } : { text: run.stdout, hash };
-  }
-
-  /** Stage the hash of a shell output pending delivery confirmation. */
-  stageShellOutputHash(outputId: string, jobId: string, revision: string | null, hash: string): void {
-    this.store.setMeta(shellOutputHashKey(outputId), JSON.stringify({ jobId, revision, hash }));
-  }
-
-  /** Persist a staged shell output hash only once delivery is confirmed sent for the same command revision. */
-  confirmShellOutputSent(outputId: string): void {
-    const raw = this.store.getMeta(shellOutputHashKey(outputId));
-    if (!raw) return;
-    let receipt: { jobId?: unknown; revision?: unknown; hash?: unknown };
-    try { receipt = JSON.parse(raw) as { jobId?: unknown; revision?: unknown; hash?: unknown }; }
-    catch (error) {
-      if (error instanceof SyntaxError) return;
-      throw error;
-    }
-    if (typeof receipt.jobId !== "string" || typeof receipt.hash !== "string") return;
-    const revision = typeof receipt.revision === "string" ? receipt.revision : null;
-    const state = this.state();
-    const job = state.jobs.find((job): job is PromptJob => job.id === receipt.jobId && job.kind !== "pr-intake" && job.shell === true);
-    if (!job || (revision !== null && shellRevision(job) !== revision)) return;
-    this.store.setMeta(jobsKey, jobMetadata(state, { ...job, outputHash: receipt.hash })[jobsKey]);
+  /** Both legacy marker formats were saved with the run and survive job removal. */
+  isDisabledShellRun(id: string): boolean {
+    return id.startsWith(CRON_RUN_PREFIX) && this.store.getMeta(`cron-shell:${id}`) !== null;
   }
 
   poll(now: number): void {
@@ -698,6 +613,7 @@ export class CronJobs {
     for (const job of state.jobs.filter(job => job.nextAt !== null && job.nextAt <= now)
       .sort((left, right) => (left.nextAt ?? 0) - (right.nextAt ?? 0))) {
       if (job.nextAt === null || job.paused || job.stopBoundary !== boundary || job.kind === "pr-intake" && job.removed) continue;
+      if (job.kind !== "pr-intake" && job.shell === true) continue;
       const source = this.source(job);
       if (!source) continue;
       const last = job.lastRunId ? this.store.input(job.lastRunId) : null;

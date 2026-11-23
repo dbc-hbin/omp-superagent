@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
@@ -33,7 +32,7 @@ import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "./contracts";
 import { headRecoveryEvidence, type HeadQuotaFailure } from "./head-recovery";
 import { HEAD_QUOTA_CHECK_MS } from "./head-quota";
 import { isPrObservation, PrWatcher, type PrWatchCommand } from "./pr-watch";
-import { CRON_RUN_PREFIX, CronJobs, type CronCreate, type CronShellResult } from "./cron-jobs";
+import { CRON_RUN_PREFIX, CronJobs, type CronCreate } from "./cron-jobs";
 import { CronPrIntake, isPrIntakeOffer, type IntakeScan } from "./cron-pr-intake";
 import { prModeArgument } from "./pr-intake-mode";
 import { intakeStatusKey, intakeThreadKey, intakeWorkId, intakeWorkPrefix, prThreadTitle } from "./pr-intake-work";
@@ -363,35 +362,6 @@ interface HeadRoutingHint {
   evidence?: string | null;
 }
 
-interface ShellRun {
-  readonly inputId: string;
-  readonly controller: AbortController;
-  done: Promise<void>;
-  stopRequested: boolean;
-  groupConfirmed: boolean;
-}
-
-const CRON_SHELL_TIMEOUT_MS = 30_000;
-const CRON_SHELL_MAX_BYTES = 1 << 20;
-const CRON_SHELL_FORCE_KILL_MS = 500;
-const CRON_SHELL_STOP_WAIT_MS = 5_000;
-const CRON_SHELL_GROUP_POLL_MS = 20;
-const CRON_SHELL_GROUP_WAIT_MS = 5_500;
-
-function isProcessGroupAlive(pid: number): boolean {
-  try { process.kill(-pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException | undefined)?.code !== "ESRCH"; }
-}
-
-function killProcessGroup(pid: number, signal: NodeJS.Signals, exited: boolean): void {
-  try { process.kill(-pid, signal); }
-  catch {
-    if (!exited) {
-      try { process.kill(pid, signal); } catch {}
-    }
-  }
-}
-
 /** One controller for durable coordination; OMP remains the execution/transcript owner. */
 export class Superagent {
   private readonly live = new Map<string, Live>();
@@ -407,7 +377,6 @@ export class Superagent {
   private readonly pauseRevisions = new Map<string, number>();
   private readonly modelChanges = new Map<string, Promise<unknown>>();
   private readonly tasks = new Set<Promise<unknown>>();
-  private readonly shellRuns = new Map<string, ShellRun>();
   private readonly activeReactions = new Map<string, string>();
   private readonly reactionQueues = new Map<string, Promise<void>>();
   private readonly threadEditQueues = new Map<string, Promise<unknown>>();
@@ -567,10 +536,22 @@ export class Superagent {
       const stopBoundary = this.store.getMeta("head:stop-boundary");
       if (stopBoundary) {
         const boundary = JSON.parse(stopBoundary) as { cancelledInputIds: string[] };
-        for (const id of boundary.cancelledInputIds) this.store.settle(id, "cancelled");
+        for (const id of boundary.cancelledInputIds) {
+          // An older shell stop receipt did not prove that the process exited.
+          if (this.cronJobs.isDisabledShellRun(id)) {
+            const state = this.store.input(id)?.state;
+            if (state === "submitted" || state === "uncertain") continue;
+          }
+          this.store.settle(id, "cancelled");
+        }
       }
       for (const input of this.store.inputs(undefined, "submitted")) {
         if (recovered.has(input.id)) continue;
+        if (this.cronJobs.isDisabledShellRun(input.id)) {
+          this.store.settle(input.id, "uncertain", { id: `${input.id}:interrupted`,
+            text: "An earlier shell cron run was not repeated. Verify its state on the original host before resolving it." });
+          continue;
+        }
         const owner = this.store.getMeta(`steering-owner:${input.id}`);
         this.store.settle(input.id, "uncertain", !owner || owner === input.id ? {
           id: `${input.id}:interrupted`,
@@ -878,7 +859,7 @@ export class Superagent {
   private recoveryControllerIdle(): boolean {
     return !this.stopped && !this.headStopping && !this.headCompaction && !this.restartFence()
       && !this.restartActive && !this.bootstrapActive && !this.initializationHoldsHead()
-      && !this.laneMutations && this.operations.size === 0 && this.modelChanges.size === 0 && this.shellRuns.size === 0;
+      && !this.laneMutations && this.operations.size === 0 && this.modelChanges.size === 0;
   }
 
   private recoveryPromptMatches(entries: unknown[], attempt: HeadRecoveryAttempt): boolean {
@@ -4509,7 +4490,7 @@ export class Superagent {
     // Pending/uncertain inputs and resident lane execution are durable state to
     // recover, not reasons to refuse a service lifecycle operation.
     return this.prControlActive || this.activePrs.size > 0 || this.headUsageResetActive || this.connecting.size > 0 || this.operations.size > 0 || this.laneMutations > 0
-      || this.modelChanges.size > 0 || this.shellRuns.size > 0 || this.callbacks.size > 0 || this.groups?.busy === true
+      || this.modelChanges.size > 0 || this.callbacks.size > 0 || this.groups?.busy === true
       || this.routeOutbounds.size > 0
       || [...this.live.values()].some(live => live.preparing > 0 || !!live.releasing);
   }
@@ -4639,7 +4620,7 @@ export class Superagent {
     head.running = false;
     head.assistantOutcome = undefined;
     head.text = "";
-    await Promise.all([...this.operations.values(), ...this.modelChanges.values(), ...[...this.shellRuns.values()].map(run => run.done), this.headStopTail]);
+    await Promise.all([...this.operations.values(), ...this.modelChanges.values(), this.headStopTail]);
     await this.awaitInflightOutputs();
     this.assertRestartCurrent(restart);
     const actual = await this.state(head);
@@ -5246,6 +5227,7 @@ export class Superagent {
         if (candidate.id === input.id) break; // Durable ledger order, not timestamps or today's topic.
         const earlierCommand = this.headCommand(candidate);
         if (candidate.state === "uncertain" || this.controls.has(candidate.id) || this.laneResumeOwner(candidate)
+          || candidate.state === "submitted" && this.cronJobs.isDisabledShellRun(candidate.id)
           || earlierCommand && (this.readOnlyHeadCommand(earlierCommand) || earlierCommand.name === "stop" || candidate.state !== "pending")) continue;
         cancelledInputIds.push(candidate.id);
       }
@@ -5263,12 +5245,6 @@ export class Superagent {
     }
     for (const id of cancelledInputIds) {
       if (this.store.settle(id, "cancelled") && id.startsWith("report:")) this.syncLaneThreadAfterResult(id);
-    }
-    for (const run of this.shellRuns.values()) {
-      if (cancelledInputIds.includes(run.inputId)) {
-        run.stopRequested = true;
-        run.controller.abort();
-      }
     }
     const head = this.live.get("main");
     if (head) for (const [requestId, admitted] of head.admitted) {
@@ -5308,20 +5284,6 @@ export class Superagent {
     const operation = this.headStopTail.catch(() => {}).then(async () => {
       const failures: unknown[] = [];
       try {
-        const activeShellRuns = [...this.shellRuns.values()];
-        for (const run of activeShellRuns) {
-          run.stopRequested = true;
-          run.controller.abort();
-        }
-        if (activeShellRuns.length > 0) {
-          await Promise.race([
-            Promise.allSettled(activeShellRuns.map(run => run.done)),
-            Bun.sleep(CRON_SHELL_STOP_WAIT_MS),
-          ]);
-          if (activeShellRuns.some(run => this.shellRuns.has(`cron-shell:${run.inputId}`) || !run.groupConfirmed)) {
-            failures.push(new Error("Running cron shell job did not confirm exit"));
-          }
-        }
         const live = this.live.get("main");
         if (!live || !this.current(live)) throw new Error("Native HEAD unavailable");
         // Persist approval cancellation before sending the original native IDs.
@@ -5352,7 +5314,11 @@ export class Superagent {
         } catch (error) { failures.push(error); }
         const actual = await this.state(live);
         live.busy = !actual.isSettled;
-        if (actual.isStreaming || !actual.isSettled || actual.isCompacting || actual.queuedMessageCount !== 0
+        const legacyShellUnverified = this.store.inputs("main").some(candidate =>
+          (candidate.state === "submitted" || candidate.state === "uncertain") && this.cronJobs.isDisabledShellRun(candidate.id));
+        if (legacyShellUnverified) {
+          this.controlReply(input, "HEAD stop boundary is durable, but an earlier shell cron process may still be running. Verify its state on the original host before resolving the run.", "uncertain");
+        } else if (actual.isStreaming || !actual.isSettled || actual.isCompacting || actual.queuedMessageCount !== 0
           || actual.hasPendingAsyncWork !== false || actual.hasOwnedRunningWork !== false
           || actual.goal?.enabled || actual.pendingUiRequests?.length || failures.length) {
           this.controlReply(input, `HEAD stop boundary is durable, but native cleanup is not fully confirmed. ${this.nativeStatus(actual)}. Services/async work may remain; no task completion or historical-effect rollback is claimed.`, "uncertain");
@@ -5856,188 +5822,6 @@ export class Superagent {
         ? "The native change outcome is uncertain. It was not repeated; later HEAD work is held. Use /model or /effort to inspect the actual state and reconcile the original request."
         : "Native HEAD state or capabilities could not be verified; no change was made.", submitted ? "uncertain" : "cancelled");
     }
-  }
-
-  // A verbatim shell run has no model turn. Verify live route, queue and
-  // stop/recovery fences at the ordered dispatch boundary, claim as submitted
-  // before spawning so a crash leaves it uncertain (never re-run), then settle
-  // with verbatim stdout or nothing when silent or unchanged.
-  private async dispatchCronShell(
-    live: Live,
-    input: InputRecord,
-    shell: { readonly jobId: string; readonly revision: string | null; readonly command: string },
-  ): Promise<void> {
-    if (this.stopped || this.restartFence() || this.headRecoveryActive() || this.headStopping > 0
-      || this.headCompaction || this.pendingHeadModel() || this.initializationHoldsHead()
-      || this.kickoffHeld("main")) return;
-    // A stored route is not proof the same bot is still authenticated.
-    if (!this.messenger.assertRoute) return;
-    try { await this.messenger.assertRoute(input.route); }
-    catch (error) {
-      // A socket/response failure is also not proof of the route.
-      if (!(error instanceof Error)) this.report(error);
-      return;
-    }
-    const confirmed = await this.state(live);
-    const confirmedInput = this.store.input(input.id);
-    const earlierHeld = this.store.inputs("main").some(candidate =>
-      candidate.id !== input.id && (candidate.state === "submitted" || candidate.state === "uncertain"));
-    if (this.stopped || !this.current(live) || live.input || live.busy
-      || !confirmed.isSettled || confirmed.isStreaming || confirmed.isCompacting
-      || confirmed.pendingUiRequests?.length || this.store.approvals("main").length
-      || this.restartFence() || this.headRecoveryActive() || this.headStopping > 0
-      || this.headCompaction || this.pendingHeadModel() || this.initializationHoldsHead()
-      || this.kickoffHeld("main") || earlierHeld
-      || confirmedInput?.state !== "pending" || confirmedInput.target !== "main") return;
-    const opId = `cron-shell:${input.id}`;
-    if (this.shellRuns.has(opId)) return;
-    if (!this.store.submit(input.id, `cron-shell-${key(input.id)}`, live.generation)) return;
-    const env = { ...process.env };
-    for (const name of credentialEnvNames(this.config)) delete env[name];
-    const controller = new AbortController();
-    const run: ShellRun = { inputId: input.id, controller, stopRequested: false, groupConfirmed: false, done: Promise.resolve() };
-    const done = (async () => {
-      try {
-        const { result, groupConfirmed } = await this.executeCronShell(shell.command, env, controller.signal);
-        run.groupConfirmed = groupConfirmed;
-        if (this.stopped || run.stopRequested || this.store.input(input.id)?.state !== "submitted") return;
-        const outcome = this.cronJobs.shellOutcome(shell.jobId, shell.revision, result);
-        const outputId = `${input.id}:cron-shell`;
-        if (outcome.text !== null && outcome.hash !== null) {
-          this.cronJobs.stageShellOutputHash(outputId, shell.jobId, shell.revision, outcome.hash);
-        }
-        this.store.settle(input.id, "done", outcome.text === null ? undefined : { id: outputId, text: outcome.text });
-      } finally {
-        this.shellRuns.delete(opId);
-        if (!this.stopped) {
-          this.background(this.flushOutputs(physicalRouteKey(input.route)));
-          if (this.ready) this.background(this.kick());
-        }
-      }
-    })();
-    run.done = done;
-    this.shellRuns.set(opId, run);
-    this.background(done);
-  }
-
-  private async executeCronShell(
-    command: string,
-    env: Record<string, string | undefined>,
-    signal: AbortSignal,
-  ): Promise<{ readonly result: CronShellResult; readonly groupConfirmed: boolean }> {
-    const abortSignal = AbortSignal.any([this.stopSignal.signal, signal]);
-    if (abortSignal.aborted) {
-      return { result: { exitCode: null, stdout: "", stderr: "", error: "Aborted before spawn" }, groupConfirmed: true };
-    }
-    return await new Promise<{ readonly result: CronShellResult; readonly groupConfirmed: boolean }>(resolve => {
-      const child = spawn("/bin/sh", ["-c", command], {
-        cwd: this.config.headCwd,
-        env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
-      let stdoutBytes = 0;
-      let stderrBytes = 0;
-      let exited = false;
-      let closed = false;
-      let terminated = false;
-      let settled = false;
-      let abortError: string | undefined;
-      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-      let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-      let groupPollTimer: ReturnType<typeof setTimeout> | undefined;
-
-      const terminate = (reason?: string) => {
-        if (reason && abortError === undefined) abortError = reason;
-        terminated = true;
-        if (settled || !child.pid) return;
-        killProcessGroup(child.pid, "SIGTERM", exited);
-        if (!forceKillTimer) {
-          forceKillTimer = setTimeout(() => {
-            if (!settled && child.pid) killProcessGroup(child.pid, "SIGKILL", exited);
-          }, CRON_SHELL_FORCE_KILL_MS);
-          forceKillTimer.unref?.();
-        }
-      };
-
-      const appendChunk = (chunks: Buffer[], current: number, chunk: Buffer): number => {
-        if (current + chunk.length > CRON_SHELL_MAX_BYTES) {
-          const remaining = Math.max(0, CRON_SHELL_MAX_BYTES - current);
-          if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
-          terminate("stdout/stderr maxBuffer exceeded");
-          return CRON_SHELL_MAX_BYTES;
-        }
-        chunks.push(chunk);
-        return current + chunk.length;
-      };
-
-      const onAbort = () => terminate();
-      const finalize = (code: number | null, signalName: NodeJS.Signals | null, groupConfirmed: boolean) => {
-        if (settled) return;
-        settled = true;
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-        if (forceKillTimer) clearTimeout(forceKillTimer);
-        if (groupPollTimer) clearTimeout(groupPollTimer);
-        abortSignal.removeEventListener("abort", onAbort);
-        const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-        const stderr = Buffer.concat(stderrChunks).toString("utf8");
-        const result: CronShellResult = abortError !== undefined
-          ? { exitCode: code, stdout, stderr, error: abortError }
-          : code !== null
-          ? { exitCode: code, stdout, stderr }
-          : { exitCode: null, stdout, stderr, error: signalName ? `terminated by ${signalName}` : "terminated unexpectedly" };
-        resolve({ result, groupConfirmed });
-      };
-
-      const onClose = (code: number | null, signalName: NodeJS.Signals | null) => {
-        if (closed) return;
-        closed = true;
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-        if (!child.pid) {
-          finalize(code, signalName, true);
-          return;
-        }
-        if (abortSignal.aborted) terminate();
-        if (!terminated) {
-          finalize(code, signalName, true);
-          return;
-        }
-        // Keep ownership until the entire detached process group has exited,
-        // even if a descendant with independent stdio outlives the shell.
-        const deadline = Date.now() + CRON_SHELL_GROUP_WAIT_MS;
-        const pid = child.pid;
-        const checkGroup = () => {
-          if (settled) return;
-          if (!isProcessGroupAlive(pid)) {
-            finalize(code, signalName, true);
-            return;
-          }
-          if (Date.now() >= deadline) {
-            finalize(code, signalName, false);
-            return;
-          }
-          groupPollTimer = setTimeout(checkGroup, CRON_SHELL_GROUP_POLL_MS);
-          groupPollTimer.unref?.();
-        };
-        checkGroup();
-      };
-
-      child.stdout?.on("data", (chunk: Buffer) => { stdoutBytes = appendChunk(stdoutChunks, stdoutBytes, chunk); });
-      child.stderr?.on("data", (chunk: Buffer) => { stderrBytes = appendChunk(stderrChunks, stderrBytes, chunk); });
-      child.on("exit", () => { exited = true; });
-      child.on("error", error => {
-        if (abortError === undefined) abortError = error.message;
-        onClose(null, null);
-      });
-      child.on("close", (code, signalName) => onClose(code, signalName));
-
-      timeoutTimer = setTimeout(() => terminate("Cron shell command timed out after 30s"), CRON_SHELL_TIMEOUT_MS);
-      timeoutTimer.unref?.();
-      abortSignal.addEventListener("abort", onAbort, { once: true });
-      if (abortSignal.aborted) terminate();
-    });
   }
 
   private cronControl(id: string, argument: string): void {
@@ -6564,6 +6348,10 @@ export class Superagent {
           if (input.target && (input.state === "submitted" || input.state === "uncertain")) heldTargets.add(input.target);
           if (input.target === "main" && input.state !== "pending") earlierMain.add(input.id);
           if (this.stopped || input.state !== "pending") continue;
+          if (this.cronJobs.isDisabledShellRun(input.id)) {
+            this.store.settle(input.id, "cancelled");
+            continue; // Never send a legacy shell command to a model as a fallback.
+          }
           if (input.target === null) {
             const owner = this.store.getMeta(`topic-owner:${input.id}`);
             if (owner && !resumingLanes.has(owner)) {
@@ -6601,7 +6389,7 @@ export class Superagent {
             continue;
           }
           if (input.target === "main") earlierMain.add(input.id);
-          if (input.target === "main" && (this.headRecoveryActive() || this.initializationHoldsHead() || this.headStopping > 0 || this.headCompaction || this.pendingHeadModel() || this.shellRuns.size > 0)) continue;
+          if (input.target === "main" && (this.headRecoveryActive() || this.initializationHoldsHead() || this.headStopping > 0 || this.headCompaction || this.pendingHeadModel())) continue;
           if (this.modelChanges.has(input.target)) continue;
           if (this.blocked.has(input.target)) continue;
           if (heldKickoffs.has(input.target)) continue;
@@ -6629,15 +6417,6 @@ export class Superagent {
                 live.busy = !state.isSettled;
                 continue;
               }
-            }
-            const shell = live.id === "main" ? this.cronJobs.shellRun(input) : null;
-            if (shell) {
-              if (!steering) {
-                await this.dispatchCronShell(live, input, shell);
-                const state = this.store.input(input.id)?.state;
-                if (state === "submitted" || state === "uncertain" || this.shellRuns.has(`cron-shell:${input.id}`)) heldTargets.add("main");
-              }
-              continue;
             }
             // Advisory history helps HEAD choose placement for a new turn.
             // A same-route steer already has a destination; do not hold it for recall.
@@ -6745,7 +6524,7 @@ export class Superagent {
     if (this.restartFence() || live.id === "main" && this.headRecoveryActive() || !owner || !live.running || live.releasing || !this.current(live)
       || this.store.input(owner.id)?.state !== "submitted"
       || input.state !== "pending" || input.target !== live.id || owner.workflow || input.workflow
-      || routeKey(owner.route) !== routeKey(input.route) || this.headCommand(input) || this.cronJobs.shellRun(input)
+      || routeKey(owner.route) !== routeKey(input.route) || this.headCommand(input)
       || this.requestText(input).trimStart().startsWith("/") || this.store.approvals(live.id).length
       || this.modelChanges.has(live.id) || this.blocked.has(live.id)) return false;
     const inputs = this.store.inputs(live.id);
@@ -6784,7 +6563,6 @@ export class Superagent {
 
   private async dispatch(live: Live, input: InputRecord, steering = false): Promise<void> {
     if (this.restartFence() || live.id === "main" && this.headRecoveryActive()) return;
-    if (this.cronJobs.shellRun(input)) return;
     const owner = live.input;
     if (steering && !this.canSteer(live, input)) return;
     live.preparing++;
@@ -7659,6 +7437,10 @@ export class Superagent {
           }
         }
         if (this.stopped || !this.store.claimOutput(output.id)) continue;
+        if (output.id === `${output.sourceId}:cron-shell` && this.cronJobs.isDisabledShellRun(output.sourceId)) {
+          this.store.finishOutput(output.id, "failed", undefined, "Legacy cron shell output was not sent");
+          continue;
+        }
         const resultInputId = /^(.+):answer(?::done)?$/.exec(output.id)?.[1];
         let remoteId: string;
         try {
@@ -7694,7 +7476,6 @@ export class Superagent {
         }
         // Persist a successful remote send without reinterpreting a local failure.
         this.store.finishOutput(output.id, "sent", remoteId);
-        if (output.id.endsWith(":cron-shell")) this.cronJobs.confirmShellOutputSent(output.id);
         if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
         delivered = true;
       }
@@ -7747,7 +7528,7 @@ export class Superagent {
     for (const live of this.live.values()) {
       for (const { input } of live.admitted.values()) this.activity(input, false);
     }
-    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, ...this.routeOutbounds.values(), this.catchupTask, ...this.tasks, ...this.operations.values(), ...[...this.shellRuns.values()].map(run => run.done)]);
+    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, ...this.routeOutbounds.values(), this.catchupTask, ...this.tasks, ...this.operations.values()]);
     await this.messenger.stop();
     await Promise.allSettled([...this.live.values()].map(async live => { live.unsubscribe(); await live.connection.close(); }));
     this.live.clear();

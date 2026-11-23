@@ -106,7 +106,13 @@ file, or a lease alone. Release ownership and the slot only after actual native
 exit; a shutdown ACK is not exit. Reload the same native session when authorized.
 
 The resident Rust owner speaks the stock JSONL/v2 protocol. Bun and the published SDK still
-prepare and publish the native session under its exact profile. The owner invokes short-lived
+prepare and publish the native session under its exact profile. One short-lived
+[SDK helper](../../src/host-sdk-helper.ts) per launch first reports the managed launch
+composition from native discovery without creating or publishing a session; only after the launcher answers with
+the manifest built from that composition does the same process prepare the session. A worker
+persists its launch fence immediately before the manifest is sent, so a refusal or timeout
+before then still releases the slot. Discovery and preparation have separate deadlines.
+A descendant holding output open cannot extend those deadlines. The owner invokes short-lived
 SDK helpers for operations that depend on stock semantics, including fitting a withdrawn
 queue and verifying journal persistence after exit. On the private v2 interrupt channel,
 queue restoration uses the SDK's reassembled-frame byte limit: this is the value of
@@ -366,22 +372,12 @@ discarding custom commands or enabling disabled extensions.
   approval authority. An unresolved run is not repeated; a head stop fence
   requires explicit per-job resume. Pause and removal can cancel a queued
   run, not interrupt submitted or uncertain work. Delivery uses the normal
-  head outbox. A job created with `/cron add shell` is a verbatim shell job: its
-  run is admitted like any other and passes the same ordered dispatch, live-route
-  (`assertRoute`), and stop/recovery fences before being claimed as submitted and
-  running `/bin/sh -c` in an asynchronous detached process group (credential env
-  removed, 30 s cap) instead of a model turn, then settles with stdout while
-  holding HEAD without blocking independent lanes. Empty or `[SILENT]` output posts
-  nothing; only the SHA-256 of the last confirmed `sent` output is persisted and
-  bound to its command revision, and an identical hash suppresses the post. Rejected
-  or unconfirmed posts do not suppress the next run, and an in-flight older
-  revision cannot overwrite the hash after `/cron edit`. Non-zero exit or timeout
-  is always reported and leaves the hash alone. Active `/stop head` terminates the
-  shell process group and confirms the entire process group exit before reporting
-  stop completion (reporting an uncertain stop if group exit is unconfirmed); a run
-  interrupted mid-spawn across restart becomes uncertain and is never replayed.
-  Only the owner command creates these; `cron_create` cannot. See the [operator reference](../OPERATIONS.md#예약-작업-cron)
-  for schedule syntax and controls.
+  head outbox. Direct shell schedules are disabled: an authenticated route and
+  scrubbed credentials are not a runtime capability boundary. Legacy shell
+  jobs remain inspectable and removable; pending runs are cancelled rather
+  than forwarded to a model, and queued shell output is not sent. Verify any
+  previously started legacy run on its original host before resolving it.
+  See the [operator reference](../OPERATIONS.md#예약-작업-cron) for syntax and controls.
 - [Repository PR intake](../../src/cron-pr-intake.ts) is a typed cron job, not
   an executable prompt. Only original configured-owner Discord guild parent
   controls enroll a repository. Discovery pins the authenticated GitHub owner

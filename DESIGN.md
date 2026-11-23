@@ -169,7 +169,10 @@ The [package manifest](package.json) pins the published SDK to **19.0.0**, with
 upstream [v19.0.0 source](https://github.com/can1357/oh-my-pi/commit/57771ae562b9345e0579bceb2d68d585e3e6927e).
 That pin is not a CLI version allowlist. [CLI inspection](src/installed-omp.ts)
 checks CLI identity, public `rpc-ui`, resume, extension and model flags, and the
-advertised process interface. Host initialization checks the real RPC/extension
+advertised process interface. A process reuses an inspection only while the
+configured executable's resolved regular file (path, device, inode, size, mtime,
+ctime), its resolved shebang interpreter and the inspected loader environment
+are unchanged. Failures are never reused. Host initialization checks the real RPC/extension
 surface. Do not patch or build OMP, use the in-tree SDK as the CLI, or use a
 runtime wrapper in place of the native CLI.
 

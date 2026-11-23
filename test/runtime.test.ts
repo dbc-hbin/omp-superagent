@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { basename, delimiter, dirname, join } from "node:path";
 import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
 import { physicalRouteKey, routeKey } from "../src/contracts";
@@ -1587,426 +1587,120 @@ test("cron controls scope job management to the original thread and send one HEA
   expect(errors).toEqual([]);
 });
 
-test("verbatim shell cron jobs post stdout without a model turn, suppress silent and repeated output, and always report failures", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
+test("direct shell cron registration fails without queuing a model turn", async () => {
+  const { runtime, main, store, errors } = fixture();
   const origin = route("11");
-  messenger.assertRoute = () => {};
   await runtime.start();
-  const mode = join(directory, "shell-mode");
-  writeFileSync(mode, "alpha");
-  const add = message("301", origin, `/cron add shell "every 2h" cat ${mode}`);
-  await admit(runtime, add);
-  const id = store.output(`${add.id}:head-control`)?.text.match(/[0-9a-f-]{36}/)?.[0];
-  if (!id) throw new Error("Cron registration did not return a job ID");
-  const trigger = async (n: number) => {
-    const runId = `cron-run:${id}:${n}`;
-    await admit(runtime, message(String(n), origin, `/cron run ${id}`));
-    for (let i = 0; i < 100; i++) {
-      const done = store.input(runId)?.state === "done";
-      const out = store.output(`${runId}:cron-shell`);
-      if (done && (!out || out.state !== "pending" && out.state !== "sending")) break;
-      await Bun.sleep(10);
-    }
-    return store.output(`${runId}:cron-shell`)?.text ?? null;
-  };
-  expect(await trigger(302)).toBe("alpha");
-  expect(store.input(`cron-run:${id}:302`)?.state).toBe("done");
-  expect(await trigger(303)).toBeNull(); // identical output is suppressed
-  expect(store.input(`cron-run:${id}:303`)?.state).toBe("done");
-  writeFileSync(mode, "alpha [SILENT] beta");
-  expect(await trigger(304)).toBeNull();
-  writeFileSync(mode, "");
-  expect(await trigger(305)).toBeNull();
-  writeFileSync(mode, "beta");
-  expect(await trigger(306)).toBe("beta");
-  expect(await trigger(307)).toBeNull();
-  writeFileSync(mode, "alpha"); // a silent run did not replace the last posted hash
-  expect(await trigger(308)).toBe("alpha");
-  await admit(runtime, message("309", origin, `/cron edit ${id} prompt sh -c 'echo broken >&2; exit 3'`));
-  expect(await trigger(310)).toContain("failed (exit code 3).\nbroken");
-  expect(await trigger(311)).toContain("failed (exit code 3)"); // failures are never deduplicated
+
+  await admit(runtime, message("301", origin, '/cron add shell "every 2h" printf benign'));
+  expect(store.input("301")?.state).toBe("cancelled");
+  expect(store.output("301:head-control")?.text).toContain("Direct shell cron jobs are disabled");
+  await admit(runtime, message("302", origin, '/cron create shell "every 2h" printf benign'));
+  expect(store.input("302")?.state).toBe("cancelled");
+  expect(store.output("302:head-control")?.text).toContain("Direct shell cron jobs are disabled");
+  await admit(runtime, message("303", origin, "/cron list"));
+  expect(store.output("303:head-control")?.text).toBe("No cron jobs in this conversation.");
   expect(main.prompts).toEqual([]);
   expect(errors).toEqual([]);
 });
 
-test("timer-due verbatim shell cron jobs run at the ordered dispatch boundary without submitting a model prompt", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
+test("legacy shell cron jobs cannot run, become model prompts, or send queued shell output", async () => {
+  const { runtime, messenger, main, store, errors } = fixture();
   const origin = route("11");
   messenger.assertRoute = () => {};
-  let now = Date.parse("2026-11-23T00:00:00.000Z");
-  const clock = spyOn(Date, "now").mockImplementation(() => now);
-  try {
-    await runtime.start();
-    const marker = join(directory, "timer-ran");
-    const add = message("321", origin, `/cron add shell "every 1m" sh -c 'echo timer-ok; touch ${marker}'`);
-    await admit(runtime, add);
-    const id = store.output(`${add.id}:head-control`)?.text.match(/[0-9a-f-]{36}/)?.[0];
-    if (!id) throw new Error("Cron registration did not return a job ID");
-    expect(existsSync(marker)).toBe(false);
+  const source = message("311", origin, '/cron add shell "every 2h" printf benign');
+  const ordinarySource = message("312", origin, '/cron add "every 2h" Check the fixture');
+  const jobId = "legacy-shell";
+  const ordinaryId = "ordinary-cron";
+  const pending = `cron-run:${jobId}:312`;
+  const completed = `cron-run:${jobId}:313`;
+  const outputId = `${completed}:cron-shell`;
+  const nextAt = Date.now() - 1;
+  const revision = JSON.stringify({ jobId, revision: source.id });
 
-    now += 61_000;
-    await runtime.kick();
-    for (let i = 0; i < 100; i++) {
-      if (messenger.sent.some(output => output.id.startsWith(`cron-run:${id}:`) && output.id.endsWith(":cron-shell"))) break;
-      await Bun.sleep(10);
-    }
-    expect(existsSync(marker)).toBe(true);
-    expect(main.prompts).toEqual([]);
-    const sent = messenger.sent.find(output => output.id.startsWith(`cron-run:${id}:`) && output.id.endsWith(":cron-shell"));
-    expect(sent?.text).toBe("timer-ok\n");
-    expect(errors).toEqual([]);
-  } finally {
-    clock.mockRestore();
-  }
-});
+  store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+  store.settle(source.id, "done");
+  store.receive(ordinarySource, "main", { [`user-source:${ordinarySource.id}`]: "true" });
+  store.settle(ordinarySource.id, "done");
+  store.receive({ ...source, id: pending, text: "printf benign" }, "main", {
+    [`cron-shell:${pending}`]: revision,
+    "cron:jobs": JSON.stringify({ registrations: {}, jobs: [{
+      id: jobId, sourceId: source.id, shell: true, prompt: "printf benign", commandRevision: source.id,
+      schedule: { kind: "interval", milliseconds: 7_200_000 }, nextAt, paused: false, stopBoundary: null, lastRunId: pending,
+    }, {
+      id: ordinaryId, sourceId: ordinarySource.id, prompt: "Check the fixture",
+      schedule: { kind: "interval", milliseconds: 7_200_000 }, nextAt, paused: false, stopBoundary: null, lastRunId: null,
+    }] }),
+  });
+  store.receive({ ...source, id: completed, text: "printf benign" }, "main", { [`cron-shell:${completed}`]: revision });
+  store.settle(completed, "done", { id: outputId, text: "legacy output" });
 
-test("verbatim shell cron jobs enforce messenger.assertRoute and earlier uncertain HEAD fences", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
-  const origin = route("11");
-  let routeVerified = false;
-  messenger.assertRoute = async () => {
-    if (!routeVerified) throw new Error("Messenger account not verified");
-  };
   await runtime.start();
-  const marker = join(directory, "fenced-shell");
-  const add = message("331", origin, `/cron add shell "every 2h" sh -c 'touch ${marker}; echo fenced-ok'`);
-  await admit(runtime, add);
-  const id = store.output(`${add.id}:head-control`)?.text.match(/[0-9a-f-]{36}/)?.[0];
-  if (!id) throw new Error("Cron registration did not return a job ID");
-
-  // 1. Failing assertRoute prevents claiming or spawning the shell command.
-  await admit(runtime, message("332", origin, `/cron run ${id}`));
-  const runId = `cron-run:${id}:332`;
-  expect(store.input(runId)?.state).toBe("pending");
-  expect(existsSync(marker)).toBe(false);
-  expect(main.prompts).toEqual([]);
-
-  // 2. An earlier uncertain HEAD input also fences execution even once the route is verified.
-  await admit(runtime, message("332b", origin, `/cron pause ${id}`));
-  expect(store.input(runId)?.state).toBe("cancelled");
-  const uncertain = headMessage("330-uncertain", origin, "Hold HEAD before cron");
-  store.receive(uncertain, "main", { [`user-source:${uncertain.id}`]: "true" });
-  store.submit(uncertain.id, "req-uncertain-330", 0);
-  store.settle(uncertain.id, "uncertain");
-  await admit(runtime, message("332c", origin, `/cron resume ${id}`));
-  await admit(runtime, message("333", origin, `/cron run ${id}`));
-  const fencedRunId = `cron-run:${id}:333`;
-  routeVerified = true;
-  await runtime.kick();
-  expect(store.input(fencedRunId)?.state).toBe("pending");
-  expect(existsSync(marker)).toBe(false);
-
-  // 3. Once the uncertain HEAD input is resolved, the shell job runs without a model turn.
-  await admit(runtime, message("334", origin, `/resolve ${uncertain.id}`));
-  await runtime.kick();
-  for (let i = 0; i < 100; i++) {
-    if (store.input(fencedRunId)?.state === "done" && messenger.sent.some(output => output.id === `${fencedRunId}:cron-shell`)) break;
-    await Bun.sleep(10);
-  }
-  expect(store.input(fencedRunId)?.state).toBe("done");
-  expect(existsSync(marker)).toBe(true);
-  expect(messenger.sent.some(output => output.id === `${fencedRunId}:cron-shell` && output.text === "fenced-ok\n")).toBe(true);
-  expect(main.prompts).toEqual([]);
-  expect(errors).toEqual([]);
-});
-
-test("active /stop head terminates a running verbatim shell cron process group, suppresses output, and confirms stop", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
-  messenger.assertRoute = () => {};
-  await runtime.start();
-  const origin = route("11");
-  const parentPidFile = join(directory, "shell-parent.pid");
-  const childPidFile = join(directory, "shell-child.pid");
-  const startedFile = join(directory, "shell-started");
-  const cmd = `sh -c 'echo $$ > "${parentPidFile}"; sleep 30 & echo $! > "${childPidFile}"; touch "${startedFile}"; wait; echo SHOULD_NOT_POST'`;
-  await admit(runtime, message("341", origin, `/cron add shell "every 2h" ${cmd}`));
-  const id = store.output("341:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
-  if (!id) throw new Error("Cron registration did not return a job ID");
-
-  await admit(runtime, message("342", origin, `/cron run ${id}`));
-  const runId = `cron-run:${id}:342`;
-  for (let i = 0; i < 100 && !existsSync(startedFile); i++) await Bun.sleep(20);
-  expect(existsSync(startedFile)).toBe(true);
-  expect(store.input(runId)?.state).toBe("submitted");
-
-  const parentPid = Number(readFileSync(parentPidFile, "utf8").trim());
-  const childPid = Number(readFileSync(childPidFile, "utf8").trim());
-  expect(parentPid).toBeGreaterThan(0);
-  expect(childPid).toBeGreaterThan(0);
-
-  await admit(runtime, message("343", origin, "/stop head"));
-  for (let i = 0; i < 100 && !store.output("343:head-control"); i++) await Bun.sleep(20);
-  expect(store.input("343")?.state).toBe("cancelled");
-  expect(store.input(runId)?.state).toBe("cancelled");
-  expect(store.output("343:head-control")?.text).toContain("HEAD stop confirmed:");
-  expect(store.output(`${runId}:cron-shell`)).toBeNull();
-  expect(messenger.sent.some(output => output.text.includes("SHOULD_NOT_POST"))).toBe(false);
-
-  const isAlive = (pid: number) => {
-    try { process.kill(pid, 0); return true; }
-    catch { return false; }
-  };
-  for (let i = 0; i < 40 && (isAlive(parentPid) || isAlive(childPid)); i++) await Bun.sleep(25);
-  expect(isAlive(parentPid)).toBe(false);
-  expect(isAlive(childPid)).toBe(false);
-  expect(main.prompts).toEqual([]);
-  expect(errors).toEqual([]);
-}, 15_000);
-
-test("running a slow verbatim shell cron job does not block dispatching an unrelated lane while still holding HEAD", async () => {
-  const { runtime, config, messenger, main, hosts, store, errors, directory } = fixture();
-  messenger.assertRoute = () => {};
-  await runtime.start();
-  const origin = route("11");
-  const laneRoute = route("22");
-  const lane = savedLane(store, config, "lane-independent", laneRoute);
-  const startedFile = join(directory, "slow-started");
-  const releaseFile = join(directory, "slow-release");
-  const cmd = `sh -c 'touch "${startedFile}"; n=0; while [ ! -f "${releaseFile}" ] && [ "$n" -lt 250 ]; do sleep 0.02; n=$((n + 1)); done; echo slow-done'`;
-  await admit(runtime, message("351", origin, `/cron add shell "every 2h" ${cmd}`));
-  const id = store.output("351:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
-  if (!id) throw new Error("Cron registration did not return a job ID");
-
-  await admit(runtime, message("352", origin, `/cron run ${id}`));
-  const runId = `cron-run:${id}:352`;
-  for (let i = 0; i < 100 && !existsSync(startedFile); i++) await Bun.sleep(20);
-  expect(existsSync(startedFile)).toBe(true);
-  expect(store.input(runId)?.state).toBe("submitted");
-
-  // Queued HEAD work stays behind the active shell run, while an unrelated lane runs freely.
-  await admit(runtime, headMessage("353", origin, "Queued HEAD behind slow shell"));
-  expect(main.prompts).toEqual([]);
-
-  await admit(runtime, message("354", laneRoute, "Run independent lane now"));
-  const laneHost = hosts.get(lane.socketPath);
-  if (!laneHost) throw new Error("Independent lane host did not start while shell cron was running");
-  await laneHost.whenPrompts(1);
-  expect(laneHost.prompts).toHaveLength(1);
-  expect(main.prompts).toEqual([]);
-  laneHost.complete("Lane completed independently");
-  const handoffId = `handoff:354:${lane.id}`;
-  for (let i = 0; i < 100 && !messenger.sent.some(output => output.id === `${handoffId}:answer`); i++) await Bun.sleep(20);
-  expect(messenger.sent.some(output => output.id === `${handoffId}:answer` && output.text === "Lane completed independently")).toBe(true);
-  expect(store.input(runId)?.state).toBe("submitted");
-
-  // Releasing the shell finishes it and then unblocks the queued HEAD request.
-  writeFileSync(releaseFile, "go");
-  for (let i = 0; i < 100 && store.input(runId)?.state !== "done"; i++) await Bun.sleep(20);
-  expect(store.input(runId)?.state).toBe("done");
   await main.whenPrompts(1);
+  expect(main.prompts[0]?.command.message).toEndWith("Check the fixture");
+  main.complete("Ordinary scheduled result");
+  const jobs = JSON.parse(store.getMeta("cron:jobs")!).jobs;
+  const ordinary = jobs.find((job: { id: string }) => job.id === ordinaryId);
+  const legacy = jobs.find((job: { id: string }) => job.id === jobId);
+  expect(ordinary?.nextAt).toBeGreaterThan(Date.now());
+  expect(legacy?.nextAt).toBe(nextAt);
+  await waitForOutput(messenger, `${ordinary?.lastRunId}:answer`);
+  await admit(runtime, message("314", origin, "/cron list"));
+  await waitForOutput(messenger, "314:head-control");
+  expect(store.input(pending)?.state).toBe("cancelled");
+  expect(store.output(outputId)?.state).toBe("failed");
+  expect(messenger.sent.some(output => output.id === outputId)).toBe(false);
+  expect(store.output("314:head-control")?.text).toContain("shell disabled");
+  expect(store.output("314:head-control")?.text).toContain("next: none");
+
+  await admit(runtime, message("315", origin, `/cron show ${jobId}`));
+  expect(store.output("315:head-control")?.text).toContain("shell disabled");
+  expect(store.output("315:head-control")?.text).not.toContain("printf benign");
+  for (const [id, action] of [["316", `run ${jobId}`], ["317", `resume ${jobId}`], ["318", `edit ${jobId} prompt This must not become a prompt`]] as const) {
+    await admit(runtime, message(id, origin, `/cron ${action}`));
+    expect(store.input(id)?.state).toBe("cancelled");
+    expect(store.output(`${id}:head-control`)?.text).toContain("Direct shell cron jobs are disabled");
+  }
+  await admit(runtime, message("319", origin, `/cron remove ${jobId}`));
+  expect(store.output("319:head-control")?.text).toContain("Removed cron job");
   expect(main.prompts).toHaveLength(1);
-  main.complete("HEAD resumed after shell");
-  for (let i = 0; i < 100 && (!messenger.sent.some(output => output.id === `${runId}:cron-shell`) || !messenger.sent.some(output => output.id === "353:answer")); i++) await Bun.sleep(20);
-  expect(messenger.sent.some(output => output.id === `${runId}:cron-shell` && output.text === "slow-done\n")).toBe(true);
-  expect(messenger.sent.some(output => output.id === "353:answer" && output.text === "HEAD resumed after shell")).toBe(true);
   expect(errors).toEqual([]);
-}, 15_000);
+});
 
-test("active /stop head waits for detached stdio-independent SIGTERM-ignoring descendant group exit before confirming stop", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
-  messenger.assertRoute = () => {};
-  await runtime.start();
+test("HEAD stop does not claim a previously submitted legacy shell run has stopped", async () => {
+  const { runtime, messenger, main, store, errors } = fixture();
   const origin = route("11");
-  const parentPidFile = join(directory, "descendant-parent.pid");
-  const childPidFile = join(directory, "descendant-child.pid");
-  const startedFile = join(directory, "descendant-started");
-  const descendantScript = join(directory, "descendant.sh");
-  writeFileSync(descendantScript, [
-    "#!/bin/sh",
-    'trap "" TERM',
-    "exec </dev/null >/dev/null 2>&1",
-    `echo $$ > "${childPidFile}"`,
-    `touch "${startedFile}"`,
-    "exec sleep 30",
-    "",
-  ].join("\n"));
-  chmodSync(descendantScript, 0o755);
-  const cmd = `echo $$ > "${parentPidFile}"; "${descendantScript}" & wait; echo SHOULD_NOT_POST`;
-  await admit(runtime, message("361", origin, `/cron add shell "every 2h" ${cmd}`));
-  const id = store.output("361:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
-  if (!id) throw new Error("Cron registration did not return a job ID");
+  const id = "cron-run:legacy-shell:321";
+  store.receive(message(id, origin, "printf benign"), "main", { [`cron-shell:${id}`]: "legacy-shell" });
+  store.submit(id, "legacy-shell-receipt", 0);
+  store.setMeta("head:stop-boundary", JSON.stringify({ inputId: "legacy-stop", cancelledInputIds: [id] }));
+  await runtime.start();
+  expect(store.input(id)?.state).toBe("uncertain");
+  expect(store.output(`${id}:interrupted`)?.text).toContain("original host");
+  await admit(runtime, message("322", origin, "/stop head"));
+  await waitForOutput(messenger, "322:head-control");
 
-  await admit(runtime, message("362", origin, `/cron run ${id}`));
-  const runId = `cron-run:${id}:362`;
-  for (let i = 0; i < 100 && !existsSync(startedFile); i++) await Bun.sleep(20);
-  expect(existsSync(startedFile)).toBe(true);
-  expect(store.input(runId)?.state).toBe("submitted");
-
-  const parentPid = Number(readFileSync(parentPidFile, "utf8").trim());
-  const childPid = Number(readFileSync(childPidFile, "utf8").trim());
-  expect(parentPid).toBeGreaterThan(0);
-  expect(childPid).toBeGreaterThan(0);
-
-  await admit(runtime, message("363", origin, "/stop head"));
-  for (let i = 0; i < 200 && !store.output("363:head-control"); i++) await Bun.sleep(20);
-  expect(store.input("363")?.state).toBe("cancelled");
-  expect(store.input(runId)?.state).toBe("cancelled");
-  expect(store.output("363:head-control")?.text).toContain("HEAD stop confirmed:");
-
-  const isAlive = (pid: number) => {
-    try { process.kill(pid, 0); return true; }
-    catch { return false; }
-  };
-  // Group exit must already be complete when /stop head confirms stop, without waiting afterwards.
-  expect(isAlive(parentPid)).toBe(false);
-  expect(isAlive(childPid)).toBe(false);
+  expect(store.input(id)?.state).toBe("uncertain");
+  expect(store.input("322")?.state).toBe("uncertain");
+  expect(store.output("322:head-control")?.text).toContain("an earlier shell cron process may still be running");
   expect(main.prompts).toEqual([]);
   expect(errors).toEqual([]);
-}, 15_000);
+});
 
-test("active /stop head reports uncertain stop when shell process group exit cannot be confirmed", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
-  messenger.assertRoute = () => {};
-  await runtime.start();
-  const origin = route("11");
-  const parentPidFile = join(directory, "unconfirmed-parent.pid");
-  const startedFile = join(directory, "unconfirmed-started");
-  const cmd = `echo $$ > "${parentPidFile}"; touch "${startedFile}"; sleep 30`;
-  await admit(runtime, message("371", origin, `/cron add shell "every 2h" ${cmd}`));
-  const id = store.output("371:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
-  if (!id) throw new Error("Cron registration did not return a job ID");
-
-  await admit(runtime, message("372", origin, `/cron run ${id}`));
-  const runId = `cron-run:${id}:372`;
-  for (let i = 0; i < 100 && !existsSync(startedFile); i++) await Bun.sleep(20);
-  expect(existsSync(startedFile)).toBe(true);
-  const parentPid = Number(readFileSync(parentPidFile, "utf8").trim());
-  expect(parentPid).toBeGreaterThan(0);
-
-  const realKill = process.kill.bind(process);
-  const killSpy = spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
-    if (pid === -parentPid && signal === 0) return true;
-    return realKill(pid, signal as never);
-  }) as typeof process.kill);
-  try {
-    await admit(runtime, message("373", origin, "/stop head"));
-    for (let i = 0; i < 400 && !store.output("373:head-control"); i++) await Bun.sleep(25);
-    expect(store.input("373")?.state).toBe("uncertain");
-    expect(store.input(runId)?.state).toBe("cancelled");
-    expect(store.output("373:head-control")?.text).not.toContain("HEAD stop confirmed:");
-    expect(store.output("373:head-control")?.text).toContain("native cleanup is not fully confirmed");
-    expect(main.prompts).toEqual([]);
-    expect(errors).toEqual([]);
-  } finally {
-    killSpy.mockRestore();
-    try { realKill(-parentPid, "SIGKILL"); } catch {}
-  }
-}, 15_000);
-
-test("shell cron duplicate suppression binds hash to confirmed sent delivery and command revision", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
-  const origin = route("11");
-  messenger.assertRoute = () => {};
-  const baseSend = messenger.send.bind(messenger);
-  let shellSendMode: "ok" | "reject" | "uncertain" = "reject";
-  messenger.send = async output => {
-    if (output.id.endsWith(":cron-shell")) {
-      if (shellSendMode === "reject") throw new DeliveryError("Rejected by messenger", "rejected");
-      if (shellSendMode === "uncertain") throw new Error("Transient transport drop");
-    }
-    return baseSend(output);
-  };
-  await runtime.start();
-  const mode = join(directory, "delivery-hash-mode");
-  writeFileSync(mode, "alpha");
-  await admit(runtime, message("381", origin, `/cron add shell "every 2h" cat "${mode}"`));
-  const id = store.output("381:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
-  if (!id) throw new Error("Cron registration did not return a job ID");
-
-  const waitShellOutput = async (n: number) => {
-    const runId = `cron-run:${id}:${n}`;
-    await admit(runtime, message(String(n), origin, `/cron run ${id}`));
-    for (let i = 0; i < 100; i++) {
-      const done = store.input(runId)?.state === "done";
-      const out = store.output(`${runId}:cron-shell`);
-      if (done && out && out.state !== "pending" && out.state !== "sending") return out;
-      await Bun.sleep(10);
-    }
-    return store.output(`${runId}:cron-shell`);
-  };
-
-  // 1. Rejected delivery must not record outputHash, so next identical run still posts.
-  const first = await waitShellOutput(382);
-  expect(first?.state).toBe("failed");
-  shellSendMode = "ok";
-  const second = await waitShellOutput(383);
-  expect(second?.state).toBe("sent");
-  expect(second?.text).toBe("alpha");
-
-  // 2. Uncertain delivery must not record outputHash and must never be replayed.
-  writeFileSync(mode, "beta");
-  shellSendMode = "uncertain";
-  const third = await waitShellOutput(384);
-  expect(third?.state).toBe("uncertain");
-  shellSendMode = "ok";
-  await runtime.kick();
-  await Bun.sleep(50);
-  expect(messenger.sent.some(output => output.id === `cron-run:${id}:384:cron-shell`)).toBe(false);
-  expect(store.output(`cron-run:${id}:384:cron-shell`)?.state).toBe("uncertain");
-  const fourth = await waitShellOutput(385);
-  expect(fourth?.state).toBe("sent");
-  expect(fourth?.text).toBe("beta");
-
-  // 3. Editing the command while an older revision is in flight prevents the old run from seeding the new revision's hash.
-  const startedFile = join(directory, "rev-started");
-  const releaseFile = join(directory, "rev-release");
-  await admit(runtime, message("386", origin,
-    `/cron edit ${id} prompt sh -c 'touch "${startedFile}"; n=0; while [ ! -f "${releaseFile}" ] && [ "$n" -lt 250 ]; do sleep 0.02; n=$((n + 1)); done; echo shared-out'`));
-  await admit(runtime, message("387", origin, `/cron run ${id}`));
-  const inFlightId = `cron-run:${id}:387`;
-  for (let i = 0; i < 100 && !existsSync(startedFile); i++) await Bun.sleep(20);
-  expect(store.input(inFlightId)?.state).toBe("submitted");
-
-  await admit(runtime, message("388", origin, `/cron edit ${id} prompt echo shared-out`));
-  writeFileSync(releaseFile, "go");
-  for (let i = 0; i < 100; i++) {
-    const out = store.output(`${inFlightId}:cron-shell`);
-    if (store.input(inFlightId)?.state === "done" && out?.state === "sent") break;
-    await Bun.sleep(20);
-  }
-  expect(store.output(`${inFlightId}:cron-shell`)?.state).toBe("sent");
-
-  const newRevRun = await waitShellOutput(389);
-  expect(newRevRun?.state).toBe("sent");
-  expect(newRevRun?.text).toBe("shared-out\n");
-
-  await admit(runtime, message("390", origin, `/cron run ${id}`));
-  const supRunId = `cron-run:${id}:390`;
-  for (let i = 0; i < 100 && store.input(supRunId)?.state !== "done"; i++) await Bun.sleep(10);
-  expect(store.output(`${supRunId}:cron-shell`)).toBeNull();
-  expect(main.prompts).toEqual([]);
-  expect(errors.length).toBeGreaterThanOrEqual(2); // rejected + uncertain delivery reports
-}, 15_000);
-
-test("shell cron preserves outer double quotes around commands", async () => {
-  const { runtime, messenger, main, store, errors, directory } = fixture();
+test("changing only the schedule preserves literal quotation marks in an ordinary cron prompt", async () => {
+  const { runtime, messenger, main, store } = fixture();
   const origin = route("11");
   messenger.assertRoute = () => {};
   await runtime.start();
-  const spacedDir = join(directory, "dir with space");
-  mkdirSync(spacedDir);
-  const scriptPath = join(spacedDir, "echo.sh");
-  writeFileSync(scriptPath, "#!/bin/sh\necho quoted-ok\n");
-  chmodSync(scriptPath, 0o755);
 
-  await admit(runtime, message("391", origin, `/cron add shell "every 2h" "${scriptPath}"`));
-  const id = store.output("391:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
+  const literal = '"Keep these quotation marks"';
+  await admit(runtime, message("331", origin, `/cron add "every 2h" ${JSON.stringify(literal)}`));
+  const id = store.output("331:head-control")?.text.match(/[0-9a-f-]{36}/)?.[0];
   if (!id) throw new Error("Cron registration did not return a job ID");
-
-  await admit(runtime, message("392", origin, `/cron show ${id}`));
-  expect(store.output("392:head-control")?.text).toContain(`"${scriptPath}"`);
-
-  await admit(runtime, message("393", origin, `/cron run ${id}`));
-  const runId = `cron-run:${id}:393`;
-  for (let i = 0; i < 100; i++) {
-    const out = store.output(`${runId}:cron-shell`);
-    if (store.input(runId)?.state === "done" && out?.state === "sent") break;
-    await Bun.sleep(10);
-  }
-  expect(store.output(`${runId}:cron-shell`)?.state).toBe("sent");
-  expect(store.output(`${runId}:cron-shell`)?.text).toBe("quoted-ok\n");
-  expect(main.prompts).toEqual([]);
-  expect(errors).toEqual([]);
+  await admit(runtime, message("332", origin, `/cron edit ${id} "every 3h"`));
+  await admit(runtime, message("333", origin, `/cron run ${id}`));
+  await main.whenPrompts(1);
+  expect(main.prompts[0]?.command.message).toEndWith(literal);
 });
 
 test("pausing a cron job while HEAD is busy cancels its pending execution without interrupting HEAD", async () => {

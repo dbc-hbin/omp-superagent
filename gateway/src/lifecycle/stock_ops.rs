@@ -16,7 +16,7 @@ use tokio::{
 use super::LifecycleConfig;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
-const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
+pub(super) const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 impl LifecycleConfig {
     /// Refuse unsupported profiles without changing native settings or creating state.
