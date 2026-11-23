@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -9,6 +9,7 @@ import { buildHostArgs, connect, HostConnection, HostStartError, startHost, type
 import { HostChannel, HostRequestTimeout, serviceCompletionRecorded } from "../src/host-protocol";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
 import { writeStockHostExecutable } from "./fixtures/stock-host";
+import { hostOwnerExecutable } from "../src/host-owner-path";
 import { offlineMnemopi } from "./fixtures/native-memory";
 
 test("adapter correlation times out without replay and still observes a late original response", async () => {
@@ -649,4 +650,39 @@ await stockHostFixture({ sessionFile, beforeReady: async () => {
     // detached pipe owner is gone. The fixture fallback has not run yet.
     await waitForFixtureProcessExit([pid, identity.adapterOwnerPid]);
   } finally { await reattached.close(); }
+}, 60_000);
+
+test("repeated Host starts reuse the executable inspection and prepare in one helper spawn", async () => {
+  const roots = [await directory(true), await directory(true)];
+  const executable = path.join(roots[0]!, "host.ts");
+  await writeStockHostExecutable(executable, `
+import { recordHostFixture } from ${JSON.stringify(path.resolve(import.meta.dir, "fixtures/host-fixture-processes.ts"))};
+import { stockHostFixture } from ${JSON.stringify(path.resolve(import.meta.dir, "fixtures/stock-host.ts"))};
+recordHostFixture(process.env.TEST_HOST_FIXTURE_ROOT);
+await stockHostFixture({ sessionFile: process.argv[process.argv.indexOf("--session") + 1] });
+`);
+  const helper = [process.execPath, "--no-env-file", path.resolve(import.meta.dir, "../src/host-sdk-helper.ts"), "launch"];
+  const spawned: string[][][] = [];
+  const spy = spyOn(Bun, "spawn");
+  try {
+    for (const root of roots) {
+      spy.mockClear();
+      const launch = { ...options(root), command: [executable] };
+      launch.env = { ...launch.env, TEST_HOST_FIXTURE_ROOT: root };
+      await startFixtureHost(launch);
+      // node:child_process launches the resident owner through Bun.spawn's
+      // options form; its argv ends in a fresh private manifest path.
+      spawned.push(spy.mock.calls.map(([command]) => Array.isArray(command) ? command
+        : [(command as unknown as { cmd: string[] }).cmd[0]!]));
+      expect(await Bun.file(launch.sessionFile).exists()).toBe(true);
+    }
+  } finally { spy.mockRestore(); }
+  // Before: three CLI probes, launch discovery, session preparation and the
+  // owner on every start (6 spawns). Now the probes run once per executable
+  // identity and one helper both discovers the launch and prepares the
+  // session: 5 spawns for the first start, 2 for each later one.
+  expect(spawned).toEqual([
+    [[executable, "--version"], [executable, "--help"], [executable, "ps", "--help"], helper, [hostOwnerExecutable]],
+    [helper, [hostOwnerExecutable]],
+  ]);
 }, 60_000);

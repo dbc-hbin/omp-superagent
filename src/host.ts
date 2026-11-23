@@ -15,7 +15,7 @@ import { requireHostOwner } from "./host-owner-path";
 import { inspectInstalledOmp, resolveOmpCommand } from "./installed-omp";
 import type { DialogResponse, LanePresetSnapshot } from "./contracts";
 import type { WorkerHostProfile } from "./worker-profile";
-import { activeManagedUlw, managedUlwLaunchExtensions, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
+import { activeManagedUlw, managedUlwLaunch, MANAGED_ULW_ENV, MANAGED_ULW_FIXTURE_ENV, MANAGED_ULW_FIXTURE_ROOT_ENV, validateManagedUlwPackage } from "./managed-ulw";
 
 const CONNECT_TIMEOUT_MS = 5_000;
 const START_TIMEOUT_MS = 30_000;
@@ -401,28 +401,32 @@ async function launchHost(options: HostOptions, beforeSessionPrepare?: () => voi
     const extensionPaths = [fileURLToPath(new URL("../", import.meta.url)), managedUlwPath, options.extensionPath,
       fileURLToPath(new URL("./board-extension.ts", import.meta.url)),
       fileURLToPath(new URL("./host-extension.ts", import.meta.url))];
-    const composition = await managedUlwLaunchExtensions({ cwd: options.cwd, managedUlwPath,
+    const { env: _inheritedEnvironment, worker: _workerProfile, ...launchOptions } = options;
+    const helperPath = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
+    let manifest: Record<string, unknown> | undefined;
+    // Preparation used to run inside the owner; it shares the same startup budget.
+    let deadline = 0;
+    // One helper process discovers the launch composition, then prepares the
+    // session from the manifest built here. The composition arrives before the
+    // helper can create or publish this session, so a worker persists its
+    // launch fence only after discovery and before preparation.
+    const { prepared } = await managedUlwLaunch({ cwd: options.cwd, managedUlwPath,
       extensionPaths, configPath, parentConfigPath: process.env.OMP_SUPERAGENT_HOST_CONFIG, commandArgs: options.command.slice(1),
       ...(options.worker ? { worker: { extensionPaths: options.worker.extensionPaths } } : {}),
       launchArgs: [...options.command.slice(1), ...await buildHostArgs(options, configPath)],
-      env: options.env, bunCommand: [bun, "--no-env-file"] });
-    const { env: _inheritedEnvironment, worker: _workerProfile, ...launchOptions } = options;
-    const helperPath = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
-    const manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath, memoryWriteDir: composition.memoryWriteDir,
-      processBackend, helperPath, nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
-    // Preparation used to run inside the owner; it shares the same startup budget.
-    const deadline = Date.now() + START_TIMEOUT_MS;
-    // The SDK helper is the first operation that can create or publish this
-    // session. A worker must persist its launch fence before spawning it.
-    beforeSessionPrepare?.();
-    const prepare = Bun.spawn([bun, "--no-env-file", helperPath, "prepare"], {
-      cwd: options.worker ? launchDirectory : options.cwd, env: options.env, stdin: new Blob([JSON.stringify(manifest)]), stdout: "pipe", stderr: log.fd,
-      timeout: START_TIMEOUT_MS, killSignal: "SIGKILL",
+      env: options.env, bunCommand: [bun, "--no-env-file"] }, {
+      stderr: log.fd, timeoutMs: START_TIMEOUT_MS,
+      manifest: async composition => {
+        manifest = { options: launchOptions, args: await buildHostArgs(options, configPath, composition), configPath,
+          memoryWriteDir: composition.memoryWriteDir, processBackend, helperPath,
+          nativeSocket: path.join(path.dirname(options.socketPath), `.n-${crypto.randomUUID().slice(0, 8)}.sock`) };
+        deadline = Date.now() + START_TIMEOUT_MS;
+        beforeSessionPrepare?.();
+        return manifest;
+      },
     });
-    const [prepared, code] = await Promise.all([new Response(prepare.stdout).text(), prepare.exited]);
     if (Date.now() >= deadline) throw new Error("Native session preparation timed out");
-    if (code !== 0) throw new Error("Native session preparation failed");
-    const flags = JSON.parse(prepared);
+    const flags = JSON.parse(prepared!);
     if (typeof flags?.toolsExplicitlySelected !== "boolean" || typeof flags.noTools !== "boolean")
       throw new Error("Native session preparation did not confirm tool selection");
     await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, toolsExplicitlySelected: flags.toolsExplicitlySelected,

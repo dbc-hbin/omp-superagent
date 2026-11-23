@@ -249,6 +249,31 @@ else process.exit(8);
     }
   });
 
+  test("reuses an inspection until the configured executable file changes, never a failure", async () => {
+    const f = await executable();
+    const calls = async () => (await Bun.file(f.audit).text()).trim().split("\n").length;
+    const [first, concurrent] = await Promise.all([inspectInstalledOmp([f.command]), inspectInstalledOmp([f.command])]);
+    expect(concurrent).toEqual(first);
+    expect(await inspectInstalledOmp([f.command])).toEqual(first);
+    expect(await calls()).toBe(3);
+
+    const source = await Bun.file(f.command).text();
+    writeFileSync(f.command, source.replace("rpc, rpc-ui", "rpc"));
+    await expect(inspectInstalledOmp([f.command])).rejects.toThrow("public stdio RPC (rpc-ui)");
+    // --version and --help ran again; the refused help stops before ps --help.
+    expect(await calls()).toBe(5);
+    writeFileSync(f.command, source);
+    await expect(inspectInstalledOmp([f.command])).resolves.toEqual(first);
+    expect(await calls()).toBe(8);
+
+    // A different file behind the same configured path is a new executable.
+    const replacement = await executable("20.0.0");
+    rmSync(f.command);
+    symlinkSync(replacement.command, f.command);
+    await expect(inspectInstalledOmp([f.command])).resolves.toMatchObject({ version: "20.0.0" });
+    expect(await calls()).toBe(8);
+  });
+
   test.each(["18.22.2", "20.0.0", `${testedVersion}-preview`])("reports OMP %s when the CLI exposes the required capabilities", async version => {
     const f = await executable(version);
     await expect(inspectInstalledOmp([f.command])).resolves.toMatchObject({ version, executable: f.command });

@@ -106,7 +106,12 @@ file, or a lease alone. Release ownership and the slot only after actual native
 exit; a shutdown ACK is not exit. Reload the same native session when authorized.
 
 The resident Rust owner speaks the stock JSONL/v2 protocol. Bun and the published SDK still
-prepare and publish the native session under its exact profile. The owner invokes short-lived
+prepare and publish the native session under its exact profile. One short-lived
+[SDK helper](../../src/host-sdk-helper.ts) per launch first reports the managed launch
+composition from native discovery without creating or publishing a session; only after the launcher answers with
+the manifest built from that composition does the same process prepare the session. A worker
+persists its launch fence between those two steps, so a discovery refusal still releases the
+slot. The owner invokes short-lived
 SDK helpers for operations that depend on stock semantics, including fitting a withdrawn
 queue and verifying journal persistence after exit. On the private v2 interrupt channel,
 queue restoration uses the SDK's reassembled-frame byte limit: this is the value of

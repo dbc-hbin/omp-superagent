@@ -126,11 +126,49 @@ async function run(operation: string | undefined, manifest: Manifest, input: unk
   }
 }
 
+/**
+ * Launch discovery, then session preparation, in this one process. Reads the
+ * discovery input line, reports the composition, and prepares only after the
+ * launcher answers with its manifest; EOF instead means discovery only.
+ */
+async function launch() {
+  const reader = Bun.stdin.stream().getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  while (!buffered.includes("\n")) {
+    const chunk = await reader.read();
+    if (chunk.done) throw new Error("Missing launch discovery input");
+    buffered += decoder.decode(chunk.value, { stream: true });
+  }
+  const newline = buffered.indexOf("\n");
+  const input = JSON.parse(buffered.slice(0, newline));
+  let rest = buffered.slice(newline + 1);
+  const { managedUlwLaunchComposition } = await import("./managed-ulw");
+  let composition;
+  try { composition = await managedUlwLaunchComposition(input); }
+  catch (error) {
+    // Discovery refusals name the launch argument or package the operator must change.
+    process.stdout.write(`\nMANAGED_ULW_LAUNCH_ERROR ${JSON.stringify(error instanceof Error ? error.message : String(error))}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write(`\nMANAGED_ULW_LAUNCH ${JSON.stringify(composition)}\n`);
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) rest += decoder.decode(chunk.value, { stream: true });
+  rest += decoder.decode();
+  if (!rest) return;
+  const manifest: Manifest = JSON.parse(rest);
+  process.stdout.write(JSON.stringify(await run("prepare", manifest, manifest)));
+}
+
 const [, , operation, path] = process.argv;
 try {
-  const input = await Bun.stdin.json();
-  const manifest: Manifest = operation === "prepare" ? input : await Bun.file(path!).json();
-  process.stdout.write(JSON.stringify(await run(operation, manifest, input)));
+  if (operation === "launch") await launch();
+  else if (operation === "prepare") throw new Error("Session preparation follows launch discovery");
+  else {
+    const input = await Bun.stdin.json();
+    const manifest: Manifest = await Bun.file(path!).json();
+    process.stdout.write(JSON.stringify(await run(operation, manifest, input)));
+  }
 } catch {
   // SDK errors may contain native frames, authorization data or prompt content.
   console.error("Host SDK operation failed");

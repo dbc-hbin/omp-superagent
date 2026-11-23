@@ -189,8 +189,7 @@ async function probe(packagePath: string, stage: string, manifest: UlwManifest):
     home, manifest.probeTimeoutMs, env);
 }
 
-/** Snapshot native discovery in the exact environment the installed CLI will use. */
-export async function managedUlwLaunchExtensions(options: {
+type ManagedUlwLaunchOptions = {
   cwd: string;
   managedUlwPath: string;
   extensionPaths: string[];
@@ -203,23 +202,96 @@ export async function managedUlwLaunchExtensions(options: {
   env: Record<string, string | undefined>;
   bunCommand: string[];
   worker?: Pick<WorkerHostProfile, "extensionPaths">;
-}): Promise<{ extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null }> {
-  if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
-  const { env, bunCommand, ...input } = options;
-  const output = await run([...bunCommand, ...(input.worker ? ["--no-install"] : []), fileURLToPath(import.meta.url),
-    input.worker ? "--worker-launch-extensions" : "--launch-extensions", JSON.stringify(input)],
-    input.worker ? dirname(options.configPath) : options.cwd, 30_000,
-    Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)));
-  const result = output.split("\n").findLast(line => line.startsWith("MANAGED_ULW_LAUNCH "));
-  if (!result) throw new Error("Stock OMP discovery did not return a launch composition");
-  return JSON.parse(result.slice("MANAGED_ULW_LAUNCH ".length));
+};
+export type ManagedUlwLaunchInput = Omit<ManagedUlwLaunchOptions, "env" | "bunCommand">;
+export type ManagedUlwLaunchComposition = { extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null };
+
+const LAUNCH_DISCOVERY_TIMEOUT_MS = 30_000;
+const LAUNCH_MARKER = "MANAGED_ULW_LAUNCH ";
+const LAUNCH_ERROR_MARKER = "MANAGED_ULW_LAUNCH_ERROR ";
+
+/** Snapshot native discovery in the exact environment the installed CLI will use. */
+export async function managedUlwLaunchExtensions(options: ManagedUlwLaunchOptions): Promise<ManagedUlwLaunchComposition> {
+  return (await managedUlwLaunch(options)).composition;
 }
 
-if (import.meta.main && process.argv[2] === "--worker-launch-extensions") {
-  const input: {
-    cwd: string; managedUlwPath: string; extensionPaths: string[]; launchArgs: string[];
-    worker: Pick<WorkerHostProfile, "extensionPaths">;
-  } = JSON.parse(process.argv[3] ?? "");
+/**
+ * Run native launch discovery in the Host SDK helper. With `prepare`, the same
+ * helper process then prepares the native session from the manifest the caller
+ * builds after seeing the composition, so one launch costs one helper spawn.
+ * The helper prepares nothing until that manifest arrives on its stdin.
+ */
+export async function managedUlwLaunch(options: ManagedUlwLaunchOptions, prepare?: {
+  /** Native stderr destination; preparation output may contain session data. */
+  stderr: number;
+  timeoutMs: number;
+  manifest: (composition: ManagedUlwLaunchComposition) => unknown;
+}): Promise<{ composition: ManagedUlwLaunchComposition; prepared?: string }> {
+  if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
+  const { env, bunCommand, ...input } = options;
+  const helper = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
+  const child = Bun.spawn([...bunCommand, ...(input.worker ? ["--no-install"] : []), helper, "launch"], {
+    cwd: input.worker ? dirname(options.configPath) : options.cwd,
+    env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)),
+    stdin: "pipe", stdout: "pipe", stderr: prepare?.stderr ?? "pipe",
+    timeout: LAUNCH_DISCOVERY_TIMEOUT_MS + (prepare?.timeoutMs ?? 0), killSignal: "SIGKILL",
+  });
+  const stderr = typeof child.stderr === "number" || !child.stderr ? Promise.resolve("") : new Response(child.stderr).text();
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  const fail = async (message: string): Promise<never> => {
+    child.stdin.end();
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    const [code, diagnostic] = await Promise.all([child.exited, stderr]);
+    throw new Error(`${message} (${code})${diagnostic ? `: ${diagnostic.slice(-2000)}` : ""}`);
+  };
+  try {
+    child.stdin.write(`${JSON.stringify(input)}\n`);
+    child.stdin.flush();
+    let line: string | undefined;
+    for (;;) {
+      const lines = output.split("\n");
+      const index = lines.slice(0, -1).findIndex(entry => entry.startsWith(LAUNCH_MARKER) || entry.startsWith(LAUNCH_ERROR_MARKER));
+      if (index >= 0) { line = lines[index]!; output = lines.slice(index + 1).join("\n"); break; }
+      const chunk = await reader.read();
+      if (chunk.done) return await fail("Stock OMP discovery did not return a launch composition");
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    if (line.startsWith(LAUNCH_ERROR_MARKER)) {
+      child.stdin.end();
+      await child.exited;
+      throw new Error(JSON.parse(line.slice(LAUNCH_ERROR_MARKER.length)));
+    }
+    const composition: ManagedUlwLaunchComposition = JSON.parse(line.slice(LAUNCH_MARKER.length));
+    if (prepare) child.stdin.write(JSON.stringify(await prepare.manifest(composition)));
+    child.stdin.end();
+    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) output += decoder.decode(chunk.value, { stream: true });
+    output += decoder.decode();
+    const code = await child.exited;
+    if (code !== 0) {
+      if (prepare) throw new Error("Native session preparation failed");
+      return await fail("Stock OMP discovery failed");
+    }
+    return prepare ? { composition, prepared: output } : { composition };
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      // A caller refusal before the manifest leaves the helper unprepared; never let it continue.
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+  }
+}
+
+/**
+ * Native discovery for one launch, run inside the short-lived Host SDK helper
+ * process: it imports SDK modules and mutates process-global discovery state.
+ */
+export async function managedUlwLaunchComposition(input: ManagedUlwLaunchInput): Promise<ManagedUlwLaunchComposition> {
+  return input.worker ? workerLaunchComposition({ ...input, worker: input.worker }) : launchComposition(input);
+}
+
+async function workerLaunchComposition(input: ManagedUlwLaunchInput & { worker: Pick<WorkerHostProfile, "extensionPaths"> }): Promise<ManagedUlwLaunchComposition> {
   const { assertWorkerWorkspaceStartup } = await import("./worker-profile");
   const { homedir } = await import("node:os");
   assertWorkerWorkspaceStartup(input.cwd, homedir());
@@ -236,14 +308,10 @@ if (import.meta.main && process.argv[2] === "--worker-launch-extensions") {
   // opt-in modules as files, while managed packages retain their own resources.
   const managed = validateManagedUlwPackage(input.managedUlwPath);
   const extensionPaths = [...new Set([...input.extensionPaths, managed, ...input.worker.extensionPaths])];
-  console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ extensionPaths, noExtensions: true, memoryWriteDir: null })}`);
+  return { extensionPaths, noExtensions: true, memoryWriteDir: null };
 }
 
-if (import.meta.main && process.argv[2] === "--launch-extensions") {
-  const input = JSON.parse(process.argv[3]!) as {
-    cwd: string; managedUlwPath: string; extensionPaths: string[]; parentConfigPath?: string;
-    commandArgs: string[]; launchArgs: string[];
-  };
+async function launchComposition(input: ManagedUlwLaunchInput): Promise<ManagedUlwLaunchComposition> {
   const { parseNativeLaunch } = await import("./native-launch-profile");
   const parsed = await parseNativeLaunch(input.launchArgs);
   const { extractProfileFlags } = await import("@oh-my-pi/pi-coding-agent/cli/profile-bootstrap");
@@ -399,7 +467,7 @@ if (import.meta.main && process.argv[2] === "--launch-extensions") {
   const current = await readNativeSettings(settings).catch(() => { throw new Error(memoryBlockReason({ status: "unknown" })); });
   const { memory } = await ensureManagedMemory(current, memoryWriteDir);
   if (memory.status !== "enabled") throw new Error(memoryBlockReason(memory));
-  console.log(`MANAGED_ULW_LAUNCH ${JSON.stringify({ ...composition, memoryWriteDir })}`);
+  return { ...composition, memoryWriteDir };
 }
 
 /** Serialized source preparation only. No Gateway, account adapter, or Host starts here. */

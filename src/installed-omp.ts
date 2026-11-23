@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,14 +27,52 @@ export function resolveOmpCommand(command: string[], path = process.env.PATH ?? 
   return [executable, ...args];
 }
 
-/** Inspect CLI metadata only; never open an agent or provider session. */
+type InstalledOmp = Awaited<ReturnType<typeof probeInstalledOmp>>;
+const inspected = new Map<string, { identity: string; result: Promise<InstalledOmp> }>();
+
+/** The file the kernel executes: replacing, rewriting or retargeting it changes this identity. */
+function executableIdentity(executable: string): string {
+  const target = realpathSync(executable);
+  const { dev, ino, size, mtimeNs, ctimeNs } = statSync(target, { bigint: true });
+  return JSON.stringify([target, dev, ino, size, mtimeNs, ctimeNs].map(String));
+}
+
+/**
+ * Inspect CLI metadata only; never open an agent or provider session.
+ * Results are reused in this process while the configured executable's file
+ * identity is unchanged, so repeated Host starts do not respawn the probes.
+ */
 export async function inspectInstalledOmp(
   command: string[], credentials: string[] = [], environment: NodeJS.ProcessEnv = process.env,
-) {
+): Promise<InstalledOmp> {
   const path = environment.PATH ?? "";
   const [entry] = resolveOmpCommand(command, path);
   const executable = entry && (isAbsolute(entry) ? entry : Bun.which(entry, { PATH: path }));
   if (!executable) throw new Error(`Cannot find the configured OMP executable ${entry ?? ""} on PATH`);
+  let identity: string;
+  try { identity = executableIdentity(executable); }
+  catch { return probeInstalledOmp(executable, credentials, environment); }
+  const cached = inspected.get(executable);
+  if (cached?.identity === identity) return cached.result;
+  const result = probeInstalledOmp(executable, credentials, environment);
+  inspected.set(executable, { identity, result });
+  const forget = () => { if (inspected.get(executable)?.result === result) inspected.delete(executable); };
+  try {
+    const value = await result;
+    // A file replaced while it was probed may not be the one that answered.
+    let unchanged = false;
+    try { unchanged = executableIdentity(executable) === identity; } catch {}
+    if (!unchanged) forget();
+    return value;
+  } catch (error) {
+    forget();
+    throw error;
+  }
+}
+
+async function probeInstalledOmp(
+  executable: string, credentials: string[], environment: NodeJS.ProcessEnv,
+) {
   const env = { ...environment };
   for (const name of credentials) delete env[name];
   const probe = async (...args: string[]) => {
