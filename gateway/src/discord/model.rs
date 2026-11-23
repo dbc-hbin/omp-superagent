@@ -90,6 +90,8 @@ pub(super) struct Channel {
     pub kind: u8,
     pub guild_id: Option<String>,
     pub parent_id: Option<String>,
+    /// Creator of a thread channel; Discord reports it as `owner_id`.
+    pub owner_id: Option<String>,
     pub name: Option<String>,
     #[serde(default)]
     pub topic: Topic,

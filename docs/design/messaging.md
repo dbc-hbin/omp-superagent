@@ -29,7 +29,9 @@ catch-up. The default is `false`. A message must actually mention the
 authenticated bot or be a verified reply in that conversation to a message it
 authored. Typing the bot's name, mentioning a different bot, or copying a bot
 message without actually addressing the bot does not count.
-Authorized thread conversations can continue without addressing. When enabled,
+Authorized threads that this bot created can continue without addressing; a
+thread started by another bot or person needs the same mention or verified
+reply as its parent channel. When enabled,
 verified inline mentions of this bot are removed from ordinary owner input in
 guild parent channels and threads, so a text command still parses as a command.
 The owner, guild and parent-channel checks still apply. Owner DMs, Discord

@@ -43,7 +43,8 @@ pub(super) async fn start(hub: &Hub, ws: &TcpListener, voice: bool) -> FixtureSo
     hub.ready.send_replace(true);
     dispatch(&mut socket, 2, "GUILD_CREATE", json!({
         "id":"77","channels":[{"id":"88","type":0,"topic":null},{"id":"89","type":0}],
-        "threads":[{"id":"90","type":11,"parent_id":"88"},{"id":"91","type":11,"parent_id":"89"}],
+        "threads":[{"id":"90","type":11,"parent_id":"88","owner_id":"71"},{"id":"91","type":11,"parent_id":"89"},
+            {"id":"93","type":11,"parent_id":"88","owner_id":"73"}],
         "voice_states":[]
     })).await;
     socket
@@ -88,6 +89,8 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         "url":"https://cdn.discordapp.com/attachments/88/131/file.txt"}]);
     let mut thread = mention("223", "<@71> addressed thread");
     thread["channel_id"] = json!("90");
+    let mut foreign_thread = mention("227", "<@71> addressed foreign thread");
+    foreign_thread["channel_id"] = json!("93");
 
     for (index, (kind, raw)) in [
         ("MESSAGE_CREATE", owner("201", "plain parent chat")),
@@ -108,6 +111,8 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         ("MESSAGE_UPDATE", checked_reply),
         ("MESSAGE_CREATE", message("222", Some("77"), "90", "42", "unaddressed thread")),
         ("MESSAGE_CREATE", thread),
+        ("MESSAGE_CREATE", message("226", Some("77"), "93", "42", "unaddressed foreign thread")),
+        ("MESSAGE_CREATE", foreign_thread),
         ("MESSAGE_CREATE", file),
         ("MESSAGE_CREATE", dm),
     ].into_iter().enumerate() {
@@ -135,6 +140,10 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         assert_eq!(input["messageId"], id);
         assert_eq!(input["text"], text);
     }
+    let foreign = event(&hub, &store).await["input"].clone();
+    assert_eq!(foreign["route"]["threadId"], "93");
+    assert_eq!(foreign["messageId"], "227");
+    assert_eq!(foreign["text"], "addressed foreign thread");
     let file = event(&hub, &store).await;
     assert_eq!(file["input"]["text"], "");
     assert_eq!(file["input"]["attachments"][0]["id"], "131");
@@ -146,7 +155,7 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
     slash["guild_id"] = json!("77");
     slash["channel"]["id"] = json!("88");
     slash["member"] = json!({"user":{"id":"42"}});
-    dispatch(&mut socket, 23, "INTERACTION_CREATE", slash).await;
+    dispatch(&mut socket, 25, "INTERACTION_CREATE", slash).await;
     received(&mut observed, "/interactions/550/offline-interaction/callback").await;
     let status = event(&hub, &store).await;
     assert_eq!(status["input"]["text"], "/status");

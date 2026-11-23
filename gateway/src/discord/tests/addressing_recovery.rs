@@ -92,7 +92,7 @@ async fn restart_keeps_checkpointed_owner_candidates_in_order_even_on_unseen_thr
         discord_fixture_with_store(json!({"discord":{"requireAddressing":false}}), &store).await;
     respond(&responses, REFERENCE, StatusCode::OK, bot_message());
     respond(&responses, "/channels/92", StatusCode::OK,
-        json!({"id":"92","guild_id":"77","type":11,"parent_id":"88"}));
+        json!({"id":"92","guild_id":"77","type":11,"parent_id":"88","owner_id":"71"}));
     respond(&responses, "/channels/92/messages/203", StatusCode::OK, thread);
     respond(&responses, "/channels/99/messages/204", StatusCode::OK, dm);
     let mut socket = start(&hub, &ws, false).await;
