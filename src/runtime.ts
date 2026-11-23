@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
 import type { MemoryRuntimeContext } from "@oh-my-pi/pi-coding-agent/memory-backend";
@@ -22,7 +22,7 @@ import { HostConnection, type HostOptions, PR_REVIEW_INPUT_PREFIX, startHost } f
 import { compareMessageIds } from "./message-order";
 import { codingModels, isLaneModel, laneModelArgument, resolveLaneModelChoice, sameLaneModel, type LaneModelCandidate } from "./lane-models";
 import { advertisedLegacyWorkflow, advertisedWorkflow, headWorkflow, leadingWorkflow, workflowChoice, workflowContext, workflowPrompt } from "./workflow";
-import type { NativePresetInspection } from "./native-presets";
+import type { NativePresetInspection, PresetSyncOutcome } from "./native-presets";
 import type { HeadInitialization } from "./gateway-wire";
 import { repositoryRoot } from "./repository";
 import { discordThreadSplit, editsTopicPlacement, existingWorkspace, inferredWorkspace, namedWorkspaces, TOPIC_CHOICE_WAIT_MS, topicRequest } from "./topic-request";
@@ -49,7 +49,14 @@ import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, 
 import type { RemotePlacement, WorkerProbe, WorkerRegistration, WorkerSelector } from "./worker-wire";
 
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
-const presetSyncIntervalMs = 30_000;
+const presetSyncFallbackIntervalMs = 120_000;
+const presetSyncDebounceMs = 150;
+const presetSyncRetryBaseMs = 100;
+const presetSyncRetryMaxMs = 1_600;
+const presetSyncMaxRetries = 5;
+// Idle HEAD rotation keeps the 50% context threshold to rotate before stock
+// auto-compaction fires, matching host-extension.ts, Gateway rotation.rs, and DESIGN.md.
+const HEAD_ROTATION_CONTEXT_PERCENT = 50;
 const headPickerLifetimeMs = 5 * 60_000;
 const headControlPattern = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/;
 const dialogs = new Set(["select", "confirm", "input", "editor", "ask"]);
@@ -158,7 +165,8 @@ export interface RuntimeAdapters {
   workerConnect(...args: Parameters<typeof workerConnect>): Promise<RuntimeHost>;
   resolvePreset?: (name: string, thinkingContext?: Pick<LanePresetSnapshot, "defaultThinkingLevel">) => Promise<ResolvedLanePreset>;
   inspectPresets?: () => Promise<NativePresetInspection>;
-  syncPresetRoles?: (canWrite: () => boolean) => Promise<void>;
+  syncPresetRoles?: (canWrite: () => boolean) => Promise<void | PresetSyncOutcome>;
+  presetRolePaths?: () => Promise<readonly string[]> | readonly string[];
   persistPreset?: (selection: ResolvedLanePreset) => Promise<LanePresetSnapshot>;
   reapHeadJobs?: (identity: Pick<HeadRestart, "sessionId" | "sessionFile">) => Promise<boolean>;
   requestRestart?: (request: GatewayRestartRequest) => Promise<GatewayRestartRecord>;
@@ -415,7 +423,7 @@ export class Superagent {
   private nextHeadQuotaCheck?: number;
   private readonly adapters: RuntimeAdapters;
   private pumping?: Promise<void>;
-  private outbound?: Promise<void>;
+  private readonly routeOutbounds = new Map<string, Promise<void>>();
   private catchupTask?: Promise<void>;
   private discordCatchupRetry?: Promise<void>;
   private readonly discordCatchupRetries = new Map<string, DiscordCatchupRetry>();
@@ -439,6 +447,15 @@ export class Superagent {
   private prObservation?: Promise<void>;
   private presetSync?: Promise<void>;
   private nextPresetSync = 0;
+  private nextDeferredPresetSync?: number;
+  private presetSyncDirty = false;
+  private presetWatchFallback = false;
+  private presetWatchDebounce?: NodeJS.Timeout;
+  private presetSyncRetryTimer?: NodeJS.Timeout;
+  private presetSyncRetryCount = 0;
+  private presetWatchPaths: readonly string[] = [];
+  private presetWatchSnapshot = "";
+  private readonly presetWatchers: FSWatcher[] = [];
   private readonly remoteReconnect = new Map<string, RemoteRetry>();
   private readonly remoteAttaching = new Map<string, Promise<Live>>();
 
@@ -605,7 +622,12 @@ export class Superagent {
       this.timer.unref?.();
       await this.kick();
       this.observePrs();
+      await this.startPresetWatcher();
+      // Reconcile once after installing watchers so changes in the gap after
+      // initial startup sync are never left unapplied.
+      this.presetSyncDirty = true;
       this.observePresetRoles();
+      await this.presetSync;
     } catch (error) {
       await this.stop();
       throw error;
@@ -649,12 +671,12 @@ export class Superagent {
     const head = this.live.get("main");
     if (!head || !this.current(head) || !this.ready || this.stopped
       || state.hostPid !== process.pid || state.sessionId !== head.sessionId || state.sessionFile !== this.headSessionFile()
-      || !Number.isFinite(state.contextPercent) || state.contextPercent < 50
+      || !Number.isFinite(state.contextPercent) || state.contextPercent < HEAD_ROTATION_CONTEXT_PERCENT
       || head.busy || head.running || head.input || head.admitted.size || head.finishing
       || this.blocked.has("main") || this.headStopping || this.headCompaction || this.bootstrapActive
       || this.initializationHoldsHead() || this.restartFence() || this.restartActive || this.restartReconciliation
       || this.recoveryReconciliation || this.headRecoveryActive() || this.restartControllerBusy()
-      || this.controls.size || this.tasks.size || this.pumping || this.catchupTask || this.outbound || this.prObservation
+      || this.controls.size || this.tasks.size || this.pumping || this.catchupTask || this.routeOutbounds.size || this.prObservation
       || this.presetSync || this.reactionQueues.size || this.threadEditQueues.size || this.groups?.busy
       || this.store.approvals().length || this.store.outputs().length || this.store.hasUnresolvedHeadDelivery()
       || this.store.inputs().some(input => input.state === "pending" || input.state === "uncertain" || input.target === "main")
@@ -729,9 +751,9 @@ export class Superagent {
     const live = this.live.get("main")!;
     const recovery = "Inspect /model preset list and the native head log/session. Repair native high/middle/low presets with the existing OMP preset tools, then restart the head to verify; no initializer is automatically replayed.";
     try {
-      if (rotated) this.nextPresetSync = Date.now() + presetSyncIntervalMs;
+      if (rotated) this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
       if (!rotated && this.adapters.syncPresetRoles && !this.restartFence()) {
-        this.nextPresetSync = Date.now() + presetSyncIntervalMs;
+        this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
         await this.adapters.syncPresetRoles(() => this.current(live) && !this.restartFence() && !this.headStopping).catch(this.report);
       }
       const inspection = await this.adapters.inspectPresets!();
@@ -811,6 +833,7 @@ export class Superagent {
       this.bootstrapActive = undefined;
       live.busy = !actual.isSettled;
       if (!complete) this.report(new Error(this.initialization!.detail));
+      this.observePresetRoles();
     } catch (error) {
       if (!this.current(live) || !this.bootstrapActive) return;
       this.bootstrapActive = undefined;
@@ -1239,7 +1262,7 @@ export class Superagent {
         generation: live.generation, sessionId: live.sessionId, sessionFile, toolCallId: intent.toolCallId,
       },
     });
-    this.background(this.flushOutputs());
+    this.wakeOutputs(route);
     return `Result attachment ${id} was durably queued to the original topic, not yet confirmed delivered.`;
   }
 
@@ -2395,18 +2418,22 @@ export class Superagent {
       name: workflow, reason: "Original authorized user's leading workflow invocation", sourceId: input.id, provenance: "user",
     } : null)) return;
     this.remember(input);
-    if (this.settleTopicControl(input, bound)) { this.background(this.kick()); return; }
+    if (this.settleTopicControl(input, bound)) {
+      this.wakeOutputs(input.route);
+      this.background(this.kick());
+      return;
+    }
     const command = input.text.trim();
     const control = this.headCommand(this.store.input(input.id)!);
     if (control?.name === "cron") {
       this.cronControl(input.id, control.argument);
-      this.background(this.flushOutputs());
+      this.wakeOutputs(input.route);
       this.background(this.kick());
       return;
     }
     if (control && (control.name === "stop" || control.name === "restart" || this.readOnlyHeadCommand(control))) {
       if (control.name === "restart" && !this.admitRestart(this.store.input(input.id)!, control)) {
-        this.background(this.flushOutputs());
+        this.wakeOutputs(input.route);
         return;
       }
       this.controls.add(input.id);
@@ -2426,7 +2453,8 @@ export class Superagent {
       const operation = Promise.resolve().then(async () => {
         try { await this.headControl(this.store.input(input.id)!, control, false); }
         finally { this.controls.delete(input.id); }
-        await this.flushOutputs();
+        this.wakeOutputs();
+        await this.flushOutputs(physicalRouteKey(input.route));
         void this.kick().catch(this.report);
       });
       if (control.name !== "stop") this.priorityTail = operation;
@@ -2434,7 +2462,7 @@ export class Superagent {
     } else if (bound && command === "/resume") {
       if (this.restartFence()) {
         this.store.settle(input.id, "cancelled", { id: `${input.id}:control`, text: "Gateway AND HEAD restart is pending or held; the lane was not resumed." });
-        this.background(this.flushOutputs());
+        this.wakeOutputs(input.route);
         return;
       }
       this.background(this.kick());
@@ -2657,6 +2685,7 @@ export class Superagent {
           this.controls.add(input.id);
           const operation = this.headStopTail.catch(this.report).then(() => this.stopScopedHead(admitted, stop.sourceId, stop.exact)).finally(() => {
             this.controls.delete(input.id);
+            this.wakeOutputs(input.route);
             this.background(this.kick());
           });
           this.headStopTail = operation;
@@ -2674,7 +2703,7 @@ export class Superagent {
           && !this.store.inputs(lane.id, "submitted").some(other => other.id !== handoff.id)
           && !this.restartFence()) {
           this.admitStop(admitted, lane.id);
-          this.background(this.stopControl(admitted, lane.id).then(() => this.kick()));
+          this.background(this.stopControl(admitted, lane.id).then(() => { this.wakeOutputs(input.route); return this.kick(); }));
           return true;
         }
       }
@@ -3205,7 +3234,8 @@ export class Superagent {
       });
     }
     this.store.queueOutput({ id: kickoffId, sourceId: source.id, route: lane.route, text: input.kickoff });
-    await this.flushOutputs();
+    this.wakeOutputs(original.route);
+    await this.flushOutputs(physicalRouteKey(lane.route));
     if (this.store.output(kickoffId)?.state !== "sent") {
       throw new Error("Kickoff delivery is not confirmed; lane execution is held without retrying the message");
     }
@@ -3422,13 +3452,279 @@ export class Superagent {
       .finally(() => { this.prObservation = undefined; });
   }
 
+  private clearPresetSyncRetry(): void {
+    if (this.presetSyncRetryTimer) {
+      clearTimeout(this.presetSyncRetryTimer);
+      this.presetSyncRetryTimer = undefined;
+    }
+  }
+
+  private presetWatchState(paths: readonly string[]): {
+    direct: Map<string, Set<string>>;
+    ancestors: Map<string, Set<string>>;
+    uncovered: boolean;
+    snapshot: string;
+  } {
+    const direct = new Map<string, Set<string>>();
+    const ancestors = new Map<string, Set<string>>();
+    const add = (map: Map<string, Set<string>>, dir: string, name: string) => {
+      let names = map.get(dir);
+      if (!names) { names = new Set(); map.set(dir, names); }
+      names.add(name);
+    };
+    const addAncestor = (missingDir: string): boolean => {
+      let child = missingDir;
+      let parent = dirname(child);
+      while (parent !== child && !existsSync(parent)) {
+        child = parent;
+        parent = dirname(child);
+      }
+      if (parent !== child && existsSync(parent)) {
+        add(ancestors, parent, basename(child));
+        return true;
+      }
+      return false;
+    };
+    const statIdentity = (filePath: string, follow: boolean): string => {
+      try {
+        const info = (follow ? statSync : lstatSync)(filePath, { bigint: true });
+        const kind = !follow && info.isSymbolicLink() ? "l" : info.isDirectory() ? "d" : "f";
+        return `${info.dev}:${info.ino}:${kind}`;
+      } catch {
+        return "missing";
+      }
+    };
+    let uncovered = false;
+    const entries: string[] = [];
+    const watchLinks = (target: string) => {
+      const absolute = resolve(target);
+      let dir = parse(absolute).root;
+      let parts = absolute.slice(dir.length).split(sep);
+      let followed = 0;
+      while (parts.length) {
+        const name = parts.shift()!;
+        if (!name || name === ".") continue;
+        if (name === "..") { dir = dirname(dir); continue; }
+        const path = join(dir, name);
+        let info;
+        try { info = lstatSync(path, { bigint: true }); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") uncovered = true;
+          else add(ancestors, dir, name);
+          return;
+        }
+        if (!info.isSymbolicLink()) {
+          if (parts.length && !info.isDirectory()) { uncovered = true; return; }
+          dir = path;
+          continue;
+        }
+        // Subscribe to every physical hop, not just the input path and the final realpath.
+        add(ancestors, dir, name);
+        const parent = dirname(dir);
+        if (parent !== dir) add(ancestors, parent, basename(dir));
+        try {
+          const link = readlinkSync(path);
+          entries.push(`link:${path}|${info.dev}:${info.ino}|${link}`);
+          // Linux stops resolving paths after this many symlinks, including cycles.
+          if (++followed > 40) { uncovered = true; return; }
+          const root = parse(link).root;
+          if (root) dir = root;
+          parts = [...link.slice(root.length).split(sep), ...parts];
+        } catch { uncovered = true; return; }
+      }
+    };
+    for (const target of paths) {
+      const directory = dirname(target);
+      const name = basename(target);
+      watchLinks(target);
+      if (!existsSync(directory)) {
+        uncovered = true;
+        const watched = addAncestor(directory);
+        entries.push(`${target}|missing|${watched}`);
+        continue;
+      }
+      add(direct, directory, name);
+      const parentDir = dirname(directory);
+      if (parentDir !== directory && existsSync(parentDir)) add(ancestors, parentDir, basename(directory));
+      let realDir = "";
+      try {
+        realDir = realpathSync(directory);
+        if (realDir !== directory) {
+          add(direct, realDir, name);
+          const realParent = dirname(realDir);
+          if (realParent !== realDir && existsSync(realParent)) add(ancestors, realParent, basename(realDir));
+        }
+      } catch {
+        uncovered = true;
+      }
+      let resolved: string | null = null;
+      let covered = true;
+      try {
+        lstatSync(target);
+        try {
+          const real = realpathSync(target);
+          resolved = real;
+          if (real !== target) {
+            const realTargetDir = dirname(real);
+            if (existsSync(realTargetDir)) {
+              add(direct, realTargetDir, basename(real));
+              const realTargetParent = dirname(realTargetDir);
+              if (realTargetParent !== realTargetDir && existsSync(realTargetParent)) {
+                add(ancestors, realTargetParent, basename(realTargetDir));
+              }
+            } else {
+              covered = false;
+            }
+          }
+        } catch {
+          // Dangling symlink or unresolvable target: watch link target's parent/ancestor if possible and keep fallback active.
+          covered = false;
+          try {
+            const linkDest = resolve(directory, readlinkSync(target));
+            const linkDir = dirname(linkDest);
+            if (existsSync(linkDir)) add(direct, linkDir, basename(linkDest));
+            else addAncestor(linkDir);
+          } catch {}
+        }
+      } catch {
+        // File does not exist yet inside an existing directory: directory watch covers creation.
+      }
+      if (!covered) uncovered = true;
+      entries.push(`${target}|exists|${statIdentity(directory, true)}|${realDir}|${statIdentity(realDir, true)}|${resolved ?? ""}|${statIdentity(target, false)}|${statIdentity(target, true)}|${covered}`);
+    }
+    return { direct, ancestors, uncovered, snapshot: entries.join("\n") };
+  }
+
+  private async startPresetWatcher(): Promise<void> {
+    this.stopPresetWatcher(false);
+    this.presetWatchFallback = false;
+    if (!this.adapters.syncPresetRoles) return;
+    if (!this.adapters.presetRolePaths) {
+      this.presetWatchFallback = true;
+      return;
+    }
+    let paths: readonly string[];
+    try { paths = await this.adapters.presetRolePaths(); }
+    catch (error) {
+      this.presetWatchFallback = true;
+      this.report(error);
+      return;
+    }
+    if (this.stopped || !paths.length) {
+      this.presetWatchFallback = true;
+      return;
+    }
+    this.presetWatchPaths = paths;
+    const state = this.presetWatchState(paths);
+    this.presetWatchSnapshot = state.snapshot;
+    let uncovered = state.uncovered;
+    const directories = new Set([...state.direct.keys(), ...state.ancestors.keys()]);
+    for (const directory of directories) {
+      const directNames = state.direct.get(directory);
+      const ancestorNames = state.ancestors.get(directory);
+      try {
+        const watcher = watch(directory, { persistent: false }, (_event, filename) => {
+          if (this.stopped) return;
+          if (filename !== null) {
+            const name = String(filename);
+            if (!directNames?.has(name) && !ancestorNames?.has(name)) return;
+          } else if (!directNames?.size && ancestorNames?.size
+            && (!this.presetWatchPaths.length
+              || this.presetWatchState(this.presetWatchPaths).snapshot === this.presetWatchSnapshot)) {
+            return;
+          }
+          if (this.presetWatchDebounce) clearTimeout(this.presetWatchDebounce);
+          this.presetWatchDebounce = setTimeout(() => {
+            this.presetWatchDebounce = undefined;
+            void (async () => {
+              if (this.stopped) return;
+              if (this.presetWatchPaths.length
+                && this.presetWatchState(this.presetWatchPaths).snapshot !== this.presetWatchSnapshot) {
+                await this.startPresetWatcher();
+              }
+              if (this.stopped) return;
+              this.presetSyncRetryCount = 0;
+              this.clearPresetSyncRetry();
+              this.presetSyncDirty = true;
+              this.observePresetRoles();
+            })().catch(this.report);
+          }, presetSyncDebounceMs);
+          this.presetWatchDebounce.unref?.();
+        });
+        watcher.unref?.();
+        watcher.on("error", error => {
+          this.presetWatchFallback = true;
+          const next = Date.now() + presetSyncFallbackIntervalMs;
+          if (!this.nextPresetSync || next < this.nextPresetSync) this.nextPresetSync = next;
+          this.report(error);
+          watcher.close();
+        });
+        this.presetWatchers.push(watcher);
+      } catch (error) {
+        uncovered = true;
+        this.report(error);
+      }
+    }
+    if (uncovered || !this.presetWatchers.length) this.presetWatchFallback = true;
+  }
+
+  private stopPresetWatcher(clearRetry = true): void {
+    if (clearRetry) this.clearPresetSyncRetry();
+    if (this.presetWatchDebounce) {
+      clearTimeout(this.presetWatchDebounce);
+      this.presetWatchDebounce = undefined;
+    }
+    while (this.presetWatchers.length) {
+      try { this.presetWatchers.pop()!.close(); }
+      catch {}
+    }
+  }
+
   private observePresetRoles(): void {
     const sync = this.adapters.syncPresetRoles;
     const canWrite = () => this.ready && !this.stopped && !this.restartFence() && !this.headRotationHeld()
       && !this.headStopping && !this.bootstrapActive;
-    if (!sync || this.presetSync || Date.now() < this.nextPresetSync || !canWrite()) return;
-    this.nextPresetSync = Date.now() + presetSyncIntervalMs;
-    this.presetSync = sync(canWrite).catch(this.report).finally(() => { this.presetSync = undefined; });
+    if (!sync || this.presetSync || !canWrite()) return;
+    const now = Date.now();
+    const dueFallback = this.presetWatchFallback && now >= this.nextPresetSync;
+    const dueDeferred = this.nextDeferredPresetSync !== undefined && now >= this.nextDeferredPresetSync;
+    if (!this.presetSyncDirty && !dueFallback && !dueDeferred) return;
+    this.presetSyncDirty = false;
+    this.clearPresetSyncRetry();
+    if (this.presetWatchFallback) this.nextPresetSync = now + presetSyncFallbackIntervalMs;
+    if (this.nextDeferredPresetSync !== undefined) this.nextDeferredPresetSync = now + presetSyncFallbackIntervalMs;
+    let retryable = false;
+    this.presetSync = sync(canWrite)
+      .then(outcome => {
+        if (outcome === "deferred") {
+          retryable = true;
+          // Model availability can recover without changing any watched configuration.
+          this.nextDeferredPresetSync = Date.now() + presetSyncFallbackIntervalMs;
+        } else {
+          this.presetSyncRetryCount = 0;
+          this.nextDeferredPresetSync = undefined;
+        }
+      })
+      .catch(error => {
+        retryable = true;
+        this.report(error);
+      })
+      .finally(() => {
+        this.presetSync = undefined;
+        if (this.stopped) return;
+        if (this.presetSyncDirty) {
+          this.observePresetRoles();
+        } else if (retryable && this.presetSyncRetryCount < presetSyncMaxRetries) {
+          const delay = Math.min(presetSyncRetryBaseMs * 2 ** this.presetSyncRetryCount, presetSyncRetryMaxMs);
+          this.presetSyncRetryCount++;
+          this.presetSyncRetryTimer = setTimeout(() => {
+            this.presetSyncRetryTimer = undefined;
+            this.presetSyncDirty = true;
+            this.observePresetRoles();
+          }, delay);
+          this.presetSyncRetryTimer.unref?.();
+        }
+      });
   }
 
   async inspectThread(sourceId: string, laneId?: string): Promise<ThreadInfo> {
@@ -4166,6 +4462,7 @@ export class Superagent {
       || hold && this.store.getMeta("gateway:operator-stop") !== (restart.stopBoundary ?? null)) return;
     this.store.setMeta(`head:restart:${restart.inputId}`, JSON.stringify(restart));
     this.store.setMeta("head:restart-fence", hold ? JSON.stringify(restart) : "");
+    if (!hold) this.observePresetRoles();
   }
 
   private assertRestartCurrent(restart: HeadRestart): void {
@@ -4205,6 +4502,7 @@ export class Superagent {
     // recover, not reasons to refuse a service lifecycle operation.
     return this.prControlActive || this.activePrs.size > 0 || this.headUsageResetActive || this.connecting.size > 0 || this.operations.size > 0 || this.laneMutations > 0
       || this.modelChanges.size > 0 || this.shellRuns.size > 0 || this.callbacks.size > 0 || this.groups?.busy === true
+      || this.routeOutbounds.size > 0
       || [...this.live.values()].some(live => live.preparing > 0 || !!live.releasing);
   }
 
@@ -4334,6 +4632,7 @@ export class Superagent {
     head.assistantOutcome = undefined;
     head.text = "";
     await Promise.all([...this.operations.values(), ...this.modelChanges.values(), ...[...this.shellRuns.values()].map(run => run.done), this.headStopTail]);
+    await this.awaitInflightOutputs();
     this.assertRestartCurrent(restart);
     const actual = await this.state(head);
     this.assertRestartCurrent(restart);
@@ -4380,7 +4679,7 @@ export class Superagent {
         text: "Preparing to replace Gateway AND HEAD and restore the same native session, transcript and lane board. This is an ACK, not restart completion; new work is held until replacement readiness is verified." });
       // Joining an already-finishing drain is not proof this newly queued ACK
       // was included. Only a durable sent receipt authorizes the Gateway RPC.
-      do { await this.flushOutputs(); }
+      do { await this.flushOutputs(physicalRouteKey(input.route)); }
       while (!this.stopped && this.store.output(restart.ackOutputId)?.state === "pending");
       const ack = this.store.output(restart.ackOutputId);
       this.assertRestartCurrent(restart);
@@ -4907,6 +5206,7 @@ export class Superagent {
       this.controlReply(input, "The selected HEAD turn was cancelled in the queue, but native stop completion is unverified. It was not replayed.", "uncertain");
     } finally {
       this.headStopping--;
+      this.observePresetRoles();
     }
   }
 
@@ -5056,6 +5356,7 @@ export class Superagent {
       } finally {
         this.headStopping--;
         this.background(this.reconcileHeadRecovery());
+        this.observePresetRoles();
       }
     });
     this.headStopTail = operation;
@@ -5089,6 +5390,7 @@ export class Superagent {
       this.controlReply(input, `Uncertain HEAD input ${JSON.stringify(selected.id)} is now cancelled and no longer holds the durable queue. Native work must still settle before later work runs. This is not a retry and not a completion claim. ${this.store.inputs("main").some(candidate => candidate.state === "uncertain" && candidate.id !== input.id) ? "Other uncertain inputs remain held." : "No uncertain HEAD input remains."}`, "done");
       const head = this.live.get("main");
       if (head) this.background(this.finish(head));
+      this.wakeOutputs(input.route);
       this.background(this.kick().catch(this.report));
     };
     const previous = bound ? this.store.input(bound) : null;
@@ -5157,6 +5459,7 @@ export class Superagent {
     const live = this.live.get(lane.id);
     if (live) this.background(this.finish(live));
     this.background(this.syncLaneThreadTitle(lane));
+    this.wakeOutputs(control.route);
     this.background(this.kick().catch(this.report));
   }
 
@@ -5189,7 +5492,7 @@ export class Superagent {
     const selection = input.pickerSelection;
     const head = this.live.get("main");
     if (selection) {
-      if (this.store.output(selection.outputId)?.state === "sending") await this.outbound;
+      await this.awaitSendingOutput(selection.outputId);
       const output = this.store.output(selection.outputId);
       const picker = output?.picker;
       const stale = () => !head || !this.current(head) || picker?.kind !== "usage-reset"
@@ -5372,7 +5675,7 @@ export class Superagent {
       if (selection) {
         // A fast click may reach IPC before the outbox has recorded its result.
         // An uncertain send is not permission to mutate HEAD.
-        if (this.store.output(selection.outputId)?.state === "sending") await this.outbound;
+        await this.awaitSendingOutput(selection.outputId);
         const delivery = this.store.output(selection.outputId);
         if (!delivery?.picker || delivery.state !== "sent" || delivery.remoteId !== selection.cardId) {
           reply(`The original menu delivery could not be verified. Open ${prefix}${command.name} again; nothing was changed.`, "cancelled");
@@ -5470,7 +5773,8 @@ export class Superagent {
             if (!compaction.cancelled) reply("Native compaction outcome is uncertain. It was not repeated; later HEAD work is held. Use /status and /context to inspect and reconcile the original request.", "uncertain");
           } finally {
             if (this.headCompaction === compaction) this.headCompaction = undefined;
-            await this.flushOutputs();
+            this.wakeOutputs();
+            await this.flushOutputs(physicalRouteKey(input.route));
             void this.kick().catch(this.report);
           }
         })());
@@ -5944,6 +6248,7 @@ export class Superagent {
         settle("uncertain", uncertainty);
         this.report(error);
       } finally { this.controls.delete(input.id); }
+      this.wakeOutputs(input.route);
       await this.kick();
     })());
   }
@@ -6816,6 +7121,7 @@ export class Superagent {
         const eventId = key(JSON.stringify([live.sessionId, live.generation, progress.identity]));
         try {
           if (this.store.progress(live.input.id, live.generation, live.sessionId, eventId, progress.text)) {
+            this.wakeOutputs();
             this.background(this.kick());
           }
         } catch (error) { this.report(error); }
@@ -7209,83 +7515,167 @@ export class Superagent {
     return "ready";
   }
 
-  private async flushOutputs(): Promise<void> {
-    if (this.outbound) return this.outbound;
-    if (this.stopped) return;
+  private async awaitSendingOutput(outputId: string): Promise<void> {
+    const pending = this.store.output(outputId);
+    if (pending?.state === "sending") await this.routeOutbounds.get(physicalRouteKey(pending.route));
+  }
+
+  private filterFlushable(outputs: OutputRecord[]): OutputRecord[] {
+    return outputs.filter(output => this.watchDeliveryReady
+      || !(isLaneWatchNotice(output.id) || isPrIntakeOffer(output.id) || isPrObservation(output.sourceId)));
+  }
+
+  private async awaitInflightOutputs(): Promise<void> {
+    while (!this.stopped && this.routeOutbounds.size) {
+      await Promise.all([...this.routeOutbounds.values()]);
+    }
+  }
+
+  private startOutputRouteWorker(routeKeyValue: string, initialBatch?: OutputRecord[]): Promise<void> {
+    const existing = this.routeOutbounds.get(routeKeyValue);
+    if (existing) return existing;
     let delivered = false;
-    this.outbound = Promise.resolve().then(async () => {
-      const deferredLaneNotices = new Set<string>();
-      try {
-        while (!this.stopped) {
-          const outputs = this.store.outputs().filter(output => this.watchDeliveryReady
-            || !(isLaneWatchNotice(output.id) || isPrIntakeOffer(output.id) || isPrObservation(output.sourceId)));
-          if (outputs.every(output => deferredLaneNotices.has(output.id))) break;
-          for (const output of outputs) {
-            if (isPrIntakeOffer(output.id) && this.restartFence()) {
-              deferredLaneNotices.add(output.id);
-              continue;
-            }
-            if (isLaneWatchNotice(output.id)) {
-              if (deferredLaneNotices.has(output.id)) continue;
-              let verification: "ready" | "held" | "deferred";
-              try { verification = await this.verifyLaneWatchDelivery(output); }
-              catch (error) {
-                this.report(new Error("Lane watch notice cannot be verified", { cause: error }));
-                verification = "held";
-              }
-              if (verification === "deferred") { deferredLaneNotices.add(output.id); continue; }
-              if (verification === "held") {
-                if (!this.stopped && this.store.claimOutput(output.id))
-                  this.store.finishOutput(output.id, "failed", undefined, "Lane watch notice is held or no longer tracked");
-                continue;
-              }
-            }
-            if (this.stopped || !this.store.claimOutput(output.id)) continue;
-            const resultInputId = /^(.+):answer(?::done)?$/.exec(output.id)?.[1];
-            let remoteId: string;
-            try {
-              if (isPrIntakeOffer(output.id) && !this.cronPrIntake.canDeliver(output))
-                throw new DeliveryError("PR intake offer is held or no longer registered", "rejected");
-              if (isLaneWatchNotice(output.id)) {
-                let scope: ReturnType<LaneWatcher["deliveryScope"]>;
-                try { scope = this.laneWatcher.deliveryScope(output); }
-                catch (error) { throw new DeliveryError("Lane watch notice cannot be verified", "rejected", undefined, { cause: error }); }
-                if (!scope) throw new DeliveryError("Lane watch notice is held or no longer tracked", "rejected");
-              }
-              if (isPrObservation(output.sourceId)) {
-                let deliverable: boolean;
-                try { deliverable = this.prWatcher.deliverable(output); }
-                catch (error) { throw new DeliveryError("PR observation cannot be verified", "rejected", undefined, { cause: error }); }
-                if (!deliverable) throw new DeliveryError("PR observation is held or no longer tracked", "rejected");
-              }
-              if (groupRoom(this.config, output.route)) {
-                throw new DeliveryError("Owner output is not authorized in a restricted group room", "rejected");
-              }
-              if (output.resultAttachment) {
-                try { this.authorizeResultOwner(output.route); }
-                catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }
-              }
-              remoteId = await this.messenger.send(output);
-            }
-            catch (error) {
-              const rejected = error instanceof DeliveryError && error.certainty === "rejected";
-              this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
-              if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
-              this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
-              continue;
-            }
-            // Persist a successful remote send without reinterpreting a local failure.
-            this.store.finishOutput(output.id, "sent", remoteId);
-            if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
-            delivered = true;
+    const release = () => {
+      if (this.routeOutbounds.get(routeKeyValue) === worker) this.routeOutbounds.delete(routeKeyValue);
+    };
+    let worker: Promise<void>;
+    worker = Promise.resolve().then(async () => {
+      try { delivered = await this.flushOutputRoute(routeKeyValue, release, initialBatch); }
+      finally { release(); }
+      // A successful uncertainty notice changes the effect evidence. Wake the
+      // finite recovery drain on that event, not the ordinary maintenance timer.
+      if (!this.stopped && delivered && !this.recoveryReconciliation) this.background(this.reconcileHeadRecovery());
+    });
+    this.routeOutbounds.set(routeKeyValue, worker);
+    return worker;
+  }
+
+  private wakeOutputs(route?: Route): void {
+    if (!this.ready || this.stopped) return;
+    if (route) {
+      const routeKeyValue = physicalRouteKey(route);
+      if (!this.routeOutbounds.has(routeKeyValue)) {
+        const batch = this.filterFlushable(this.store.outputs(routeKeyValue));
+        if (batch.length) this.background(this.startOutputRouteWorker(routeKeyValue, batch));
+      }
+      return;
+    }
+    const byRoute = new Map<string, OutputRecord[]>();
+    for (const output of this.filterFlushable(this.store.outputs())) {
+      const routeKeyValue = physicalRouteKey(output.route);
+      let batch = byRoute.get(routeKeyValue);
+      if (!batch) { batch = []; byRoute.set(routeKeyValue, batch); }
+      batch.push(output);
+    }
+    for (const [routeKeyValue, batch] of byRoute) {
+      if (!this.routeOutbounds.has(routeKeyValue)) this.background(this.startOutputRouteWorker(routeKeyValue, batch));
+    }
+  }
+
+  private async flushOutputRoute(routeKeyValue: string, release: () => void, initialBatch?: OutputRecord[]): Promise<boolean> {
+    const deferredLaneNotices = new Set<string>();
+    let delivered = false;
+    let batch = initialBatch;
+    for (;;) {
+      if (this.stopped) {
+        release();
+        return delivered;
+      }
+      const outputs = batch ?? this.filterFlushable(this.store.outputs(routeKeyValue));
+      batch = undefined;
+      if (outputs.every(output => deferredLaneNotices.has(output.id))) {
+        // Release route ownership synchronously with the final empty-queue read so
+        // no microtask producer can join a draining worker after it stopped reading.
+        release();
+        return delivered;
+      }
+      for (const output of outputs) {
+        if (isPrIntakeOffer(output.id) && this.restartFence()) {
+          deferredLaneNotices.add(output.id);
+          continue;
+        }
+        if (isLaneWatchNotice(output.id)) {
+          if (deferredLaneNotices.has(output.id)) continue;
+          let verification: "ready" | "held" | "deferred";
+          try { verification = await this.verifyLaneWatchDelivery(output); }
+          catch (error) {
+            this.report(new Error("Lane watch notice cannot be verified", { cause: error }));
+            verification = "held";
+          }
+          if (verification === "deferred") { deferredLaneNotices.add(output.id); continue; }
+          if (verification === "held") {
+            if (!this.stopped && this.store.claimOutput(output.id))
+              this.store.finishOutput(output.id, "failed", undefined, "Lane watch notice is held or no longer tracked");
+            continue;
           }
         }
-      } finally { this.outbound = undefined; }
-    });
-    await this.outbound;
-    // A successful uncertainty notice changes the effect evidence. Wake the
-    // finite recovery drain on that event, not the ordinary maintenance timer.
-    if (delivered && !this.recoveryReconciliation) await this.reconcileHeadRecovery();
+        if (this.stopped || !this.store.claimOutput(output.id)) continue;
+        const resultInputId = /^(.+):answer(?::done)?$/.exec(output.id)?.[1];
+        let remoteId: string;
+        try {
+          if (isPrIntakeOffer(output.id) && !this.cronPrIntake.canDeliver(output))
+            throw new DeliveryError("PR intake offer is held or no longer registered", "rejected");
+          if (isLaneWatchNotice(output.id)) {
+            let scope: ReturnType<LaneWatcher["deliveryScope"]>;
+            try { scope = this.laneWatcher.deliveryScope(output); }
+            catch (error) { throw new DeliveryError("Lane watch notice cannot be verified", "rejected", undefined, { cause: error }); }
+            if (!scope) throw new DeliveryError("Lane watch notice is held or no longer tracked", "rejected");
+          }
+          if (isPrObservation(output.sourceId)) {
+            let deliverable: boolean;
+            try { deliverable = this.prWatcher.deliverable(output); }
+            catch (error) { throw new DeliveryError("PR observation cannot be verified", "rejected", undefined, { cause: error }); }
+            if (!deliverable) throw new DeliveryError("PR observation is held or no longer tracked", "rejected");
+          }
+          if (groupRoom(this.config, output.route)) {
+            throw new DeliveryError("Owner output is not authorized in a restricted group room", "rejected");
+          }
+          if (output.resultAttachment) {
+            try { this.authorizeResultOwner(output.route); }
+            catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }
+          }
+          remoteId = await this.messenger.send(output);
+        }
+        catch (error) {
+          const rejected = error instanceof DeliveryError && error.certainty === "rejected";
+          this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
+          if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
+          this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
+          continue;
+        }
+        // Persist a successful remote send without reinterpreting a local failure.
+        this.store.finishOutput(output.id, "sent", remoteId);
+        if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
+        delivered = true;
+      }
+    }
+  }
+
+  private async flushOutputs(targetRouteKey?: string): Promise<void> {
+    if (this.stopped) return;
+    const pending = this.filterFlushable(this.store.outputs(targetRouteKey));
+    if (!pending.length) {
+      if (targetRouteKey) {
+        const existing = this.routeOutbounds.get(targetRouteKey);
+        if (existing) await existing;
+        else await Promise.resolve().then(() => {});
+      } else if (this.routeOutbounds.size) {
+        await Promise.all([...this.routeOutbounds.values()]);
+      } else {
+        await Promise.resolve().then(() => {});
+      }
+      return;
+    }
+    const byRoute = new Map<string, OutputRecord[]>();
+    for (const output of pending) {
+      const routeKeyValue = physicalRouteKey(output.route);
+      let batch = byRoute.get(routeKeyValue);
+      if (!batch) { batch = []; byRoute.set(routeKeyValue, batch); }
+      batch.push(output);
+    }
+    const active = [...byRoute.entries()].map(([routeKeyValue, batch]) =>
+      this.startOutputRouteWorker(routeKeyValue, batch));
+    await Promise.all(active);
   }
 
   async stop(): Promise<void> {
@@ -7301,12 +7691,13 @@ export class Superagent {
     if (this.timer) clearInterval(this.timer);
     for (const retry of this.threadTitleRetries.values()) clearTimeout(retry);
     this.threadTitleRetries.clear();
+    this.stopPresetWatcher();
     this.discordCatchupRetries.clear();
     this.stopSignal.abort();
     for (const live of this.live.values()) {
       for (const { input } of live.admitted.values()) this.activity(input, false);
     }
-    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values(), ...[...this.shellRuns.values()].map(run => run.done)]);
+    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, ...this.routeOutbounds.values(), this.catchupTask, ...this.tasks, ...this.operations.values(), ...[...this.shellRuns.values()].map(run => run.done)]);
     await this.messenger.stop();
     await Promise.allSettled([...this.live.values()].map(async live => { live.unsubscribe(); await live.connection.close(); }));
     this.live.clear();

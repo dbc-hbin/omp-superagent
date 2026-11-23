@@ -367,7 +367,7 @@ export interface StorePort {
   commitHeadRecovery(expected: HeadRecoveryAttempt, decided: HeadRecoveryAttempt): boolean;
   queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error">): boolean;
   output(id: string): OutputRecord | null;
-  outputs(): OutputRecord[];
+  outputs(physicalRoute?: string): OutputRecord[];
   claimOutput(id: string): boolean;
   finishOutput(id: string, state: "sent" | "uncertain" | "failed" | "pending", remoteId?: string, error?: string): void;
   createLane(lane: Lane & { model: LaneModel; modelReason: string }, sourceId: string): Lane;

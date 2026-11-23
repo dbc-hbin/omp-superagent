@@ -1,5 +1,9 @@
 use super::*;
 
+fn split(text: &str, limit: usize, parts: usize) -> Option<Vec<String>> {
+    super::split(&Rendered::plain(text), limit, parts)
+}
+
 fn units(chunks: &[String]) -> Vec<usize> {
     chunks.iter().map(|chunk| utf16(chunk)).collect()
 }
@@ -154,4 +158,90 @@ fn split_refuses_more_than_the_allowed_parts() {
     let text = "word ".repeat(100);
     assert!(split(&text, 40, 5).is_none());
     assert!(split(&text, 200, 5).is_some_and(|chunks| chunks.len() <= 5));
+}
+
+#[test]
+fn split_can_break_between_table_fields_but_not_inside_a_markdown_link() {
+    let label = "한글 리뷰 링크";
+    let url = format!("https://example.invalid/{}", "x".repeat(1_500));
+    let note = "다시 확인했습니다. ".repeat(80);
+    let source = format!("| PR | 결과 |\n| --- | --- |\n| [{label}]({url}) | {note} |");
+    let rendered = render(&source, 8_000);
+    assert_eq!(
+        super::split(&rendered, 2_000, 5).unwrap(),
+        [
+            format!("- PR: [{label}]({url})"),
+            format!("  - 결과: {}", note.trim_end()),
+        ]
+    );
+
+    let url = format!("{url}/{}", "y".repeat(500));
+    let source = format!("| PR |\n| --- |\n| [{label}]({url}) |");
+    let rendered = render(&source, 8_000);
+    assert_eq!(rendered.text, format!("- PR: [{label}]({url})"));
+    assert!(super::split(&rendered, 2_000, 5).is_none());
+}
+
+#[test]
+fn render_keeps_indented_examples_and_labels_ragged_rows() {
+    let code = "    | Key | Value |\n    | --- | --- |\n\t| 1 | 2 |";
+    let source = format!(
+        "{code}\n\n| 키 | | 값 |\n| --- | --- | --- |\n\
+         | 한글 | `x \\| y` |\n| 둘째 | 값 | 셋째 | 넷째 |"
+    );
+    assert_eq!(
+        render(&source, 8_000).text,
+        format!(
+            "{code}\n\n- 키: 한글\n  - Column 2: `x | y`\n  - 값:\n\n\
+             - 키: 둘째\n  - Column 2: 값\n  - 값: 셋째\n  - Column 4: 넷째"
+        )
+    );
+}
+
+#[test]
+fn render_budgets_the_finished_text_across_tables() {
+    let first = "| Name | 결과 |\n|---|---|\n| One | 설명 |\n| Two | 완료 |";
+    let source = format!("{first}\n\n| Key |\n| {} |\n| value |", "-".repeat(100));
+    let expected = "- Name: One\n  - 결과: 설명\n\n- Name: Two\n  - 결과: 완료\n\n- Key: value";
+    assert_eq!(render(&source, source.len()).text, expected);
+}
+
+#[test]
+fn render_keeps_later_columns_after_unmatched_backticks() {
+    let source = "| 키 | 상태 |\n| --- | --- |\n| `` 미완료 `ok` 로그 | 정상 |";
+    assert_eq!(
+        render(source, 8_000).text,
+        "- 키: \\`\\` 미완료 `ok` 로그\n  - 상태: 정상"
+    );
+}
+
+#[test]
+fn render_distinguishes_list_tables_from_list_code() {
+    let code = "10. ```markdown\n    A | B\n    --- | ---\n    x | y\n    ```";
+    let indented = "        A | B\n        --- | ---\n        x | y";
+    let source = format!("{code}\n\n11. Results\n\n    Name | Status\n    - | -\n    build | pass\n\n{indented}");
+    let expected = format!("{code}\n\n11. Results\n\n    - Name: build\n      - Status: pass\n\n    ---\n\n{indented}");
+    assert_eq!(render(&source, 8_000).text, expected);
+    assert_eq!(render(&expected, 8_000).text, expected);
+}
+
+#[test]
+fn render_preserves_the_fence_when_a_tab_reaches_the_list_margin() {
+    let source = "- Example\n\n  ~~~md\n\tintro\n  A | B\n  --- | ---\n  x | y\n\t~~~\n\n| A | B |\n|-|-|\n| 1 | 2 |";
+    let expected = "- Example\n\n  ~~~md\n\tintro\n  A | B\n  --- | ---\n  x | y\n\t~~~\n\n- A: 1\n  - B: 2";
+    assert_eq!(render(source, 8_000).text, expected);
+}
+
+#[test]
+fn render_does_not_pair_literal_backticks_across_the_label_and_value() {
+    let source = "| `Tag |\n| --- |\n| [release](https://example.invalid/)` |";
+    assert_eq!(render(source, 8_000).text, "- \\`Tag: [release](https://example.invalid/)\\`");
+}
+
+#[test]
+fn split_does_not_turn_a_nested_table_into_indented_code() {
+    let source = format!("10. Results\n\n    | A | B |\n    | --- | --- |\n    | {} | 2 |", "x".repeat(20));
+    let rendered = render(&source, 8_000);
+    assert_eq!(rendered.text, format!("10. Results\n\n    - A: {}\n      - B: 2", "x".repeat(20)));
+    assert!(super::split(&rendered, 40, 5).is_none());
 }

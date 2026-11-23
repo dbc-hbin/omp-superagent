@@ -4445,8 +4445,9 @@ describe("controlled Gateway AND HEAD restart", () => {
   test("an ACK queued during another output drain still requires its own durable sent receipt", async () => {
     const { runtime, store, messenger, requests, handoff, config } = restartFixture();
     await runtime.start();
-    const sourceId = modelChangeSource(store, "restart-drain-source");
-    store.queueOutput({ id: "existing-drain", sourceId, route: store.input(sourceId)!.route, text: "Earlier output" });
+    store.receive(message("restart-drain-source", route()), "main");
+    store.settle("restart-drain-source", "done");
+    store.queueOutput({ id: "existing-drain", sourceId: "restart-drain-source", route: route(), text: "Earlier output" });
     const started = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     messenger.beforeSend = async output => { if (output.id === "existing-drain") { started.resolve(); await release.promise; } };
@@ -11779,5 +11780,636 @@ describe("ordinary placement in owner parents without native threads", () => {
       await expect(runtime.receive(message("9151", destination))).rejects.toThrow(/not authorized|Unauthorized/);
     }
     expect(store.input("9151")).toBeNull();
+  });
+});
+
+
+describe("preset role watcher and HEAD rotation threshold", () => {
+  test("syncPresetRoles uses debounced fs.watch without polling when healthy", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-watch-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "modelRoles: {}\n");
+    let calls = 0;
+    const synced = Promise.withResolvers<void>();
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile],
+      syncPresetRoles: async () => {
+        calls++;
+        if (calls >= 3) synced.resolve();
+      },
+    });
+    try {
+      await runtime.start();
+      // 1 initial sync in initializeHead + 1 post-watcher reconcile.
+      expect(calls).toBe(2);
+      // Advancing past 30s and 120s must not trigger periodic polling while fs.watch is active.
+      clock.mockReturnValue(now + 130_000);
+      await Bun.sleep(30);
+      expect(calls).toBe(2);
+
+      // Burst writes on the watched file coalesce into a single debounced sync.
+      writeFileSync(configFile, "modelRoles:\n  slow: a\n");
+      writeFileSync(configFile, "modelRoles:\n  slow: b\n");
+      const tmpFile = join(watchDir, "config.yml.tmp");
+      writeFileSync(tmpFile, "modelRoles:\n  slow: c\n");
+      renameSync(tmpFile, configFile);
+      await synced.promise;
+      await Bun.sleep(200);
+      expect(calls).toBe(3);
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("falls back to slow poll when fs.watch is unavailable and guards watch sync during restartFence", async () => {
+    let calls = 0;
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime, config, store, main } = fixture(3, undefined, {
+      presetRolePaths: () => ["/tmp/sa-nonexistent-preset-dir-999999/config.yml"],
+      syncPresetRoles: async () => { calls++; },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(2);
+      // 30s must not trigger the slow fallback poll.
+      clock.mockReturnValue(now + 35_000);
+      await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(10);
+      expect(calls).toBe(2);
+      // At 120s without a restart fence, the slow fallback poll runs.
+      clock.mockReturnValue(now + 120_000);
+      await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(10);
+      expect(calls).toBe(3);
+      // Restart fence blocks sync even when due.
+      store.setMeta("head:restart-fence", JSON.stringify({
+        inputId: "r-1", requestId: "req-1", ackOutputId: "ack-1",
+        ownerPid: process.pid, sessionId: main.state.sessionId,
+        sessionFile: hostPaths(config, "main").sessionFile, state: "handoff",
+      }));
+      clock.mockReturnValue(now + 240_000);
+      await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(10);
+      expect(calls).toBe(3);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("retains fallback and wakes when a missing project .omp directory is created alongside an existing global dir", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/sa-preset-mixed-"));
+    const globalDir = join(root, "global");
+    mkdirSync(globalDir);
+    const globalConfig = join(globalDir, "config.yml");
+    const projectOmp = join(root, "project", ".omp");
+    mkdirSync(join(root, "project"));
+    const projectConfig = join(projectOmp, "config.yml");
+    writeFileSync(globalConfig, "modelRoles: {}\n");
+    let calls = 0;
+    const synced = Promise.withResolvers<void>();
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [globalConfig, projectConfig],
+      syncPresetRoles: async () => {
+        calls++;
+        if (calls >= 3 && existsSync(projectConfig)) synced.resolve();
+      },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(2);
+      // Mixed coverage (global exists, project .omp missing) retains fallback polling.
+      clock.mockReturnValue(now + 120_000);
+      (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(20);
+      expect(calls).toBe(3);
+
+      // Creating .omp and .omp/config.yml later wakes the ancestor watcher and arms .omp directly.
+      mkdirSync(projectOmp);
+      writeFileSync(projectConfig, "modelRoles:\n  slow: a\n");
+      await synced.promise;
+      await Bun.sleep(200);
+      const countAfterCreate = calls;
+      expect(countAfterCreate).toBeGreaterThanOrEqual(4);
+
+      // Once .omp exists and is watched, fallback polling turns off while subsequent edits still trigger.
+      clock.mockReturnValue(now + 300_000);
+      (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(20);
+      expect(calls).toBe(countAfterCreate);
+
+      const edited = Promise.withResolvers<void>();
+      const prevCalls = calls;
+      writeFileSync(projectConfig, "modelRoles:\n  slow: b\n");
+      for (let i = 0; i < 40 && calls === prevCalls; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(prevCalls);
+      edited.resolve();
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("watches every hop in a cross-directory symlink chain and rebinds after a retarget", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/sa-preset-symlink-"));
+    const linkDir = join(root, "agent");
+    const bridgeDir = join(root, "bridge");
+    const targetDir = join(root, "shared");
+    const newTargetDir = join(root, "new-shared");
+    for (const dir of [linkDir, bridgeDir, targetDir, newTargetDir]) mkdirSync(dir);
+    const realTarget = join(targetDir, "config.yml");
+    const newTarget = join(newTargetDir, "config.yml");
+    const bridgePath = join(bridgeDir, "current");
+    const linkPath = join(linkDir, "config.yml");
+    writeFileSync(realTarget, "old");
+    writeFileSync(newTarget, "retargeted");
+    symlinkSync("../shared/config.yml", bridgePath);
+    symlinkSync("../bridge/current", linkPath);
+    let seen = "";
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [linkPath],
+      syncPresetRoles: async () => { seen = readFileSync(linkPath, "utf8"); },
+    });
+    const waitFor = async (value: string) => {
+      for (let i = 0; i < 60 && seen !== value; i++) await Bun.sleep(25);
+      expect(seen).toBe(value);
+    };
+    try {
+      await runtime.start();
+      expect(seen).toBe("old");
+      const tmp = join(targetDir, "config.yml.tmp");
+      writeFileSync(tmp, "replaced");
+      renameSync(tmp, realTarget);
+      await waitFor("replaced");
+
+      const bridgeTemp = join(bridgeDir, "current.tmp");
+      symlinkSync("../new-shared/config.yml", bridgeTemp);
+      renameSync(bridgeTemp, bridgePath);
+      await waitFor("retargeted");
+
+      writeFileSync(newTarget, "new target edited");
+      await waitFor("new target edited");
+    } finally {
+      await runtime.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("reconciles changes in the startup gap and retries transient sync failures with bounded backoff", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-retry-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "v1");
+    let seenDuringStart = "";
+    let attempts = 0;
+    const recovered = Promise.withResolvers<void>();
+    const { runtime, errors } = fixture(3, undefined, {
+      presetRolePaths: () => {
+        // Simulate an edit arriving after initial initializeHead sync but before watchers register.
+        writeFileSync(configFile, "v2-startup-gap");
+        return [configFile];
+      },
+      syncPresetRoles: async () => {
+        attempts++;
+        seenDuringStart = readFileSync(configFile, "utf8");
+        if (attempts === 2) throw new Error("transient lock contention");
+        if (attempts >= 3) recovered.resolve();
+      },
+    });
+    try {
+      await runtime.start();
+      // Attempt 1: initial sync (v1); Attempt 2: post-watcher reconcile sees v2-startup-gap and fails transiently.
+      expect(seenDuringStart).toBe("v2-startup-gap");
+      expect(attempts).toBe(2);
+      // Bounded retry recovers automatically without a second file edit.
+      await recovered.promise;
+      expect(attempts).toBe(3);
+      expect(errors).toHaveLength(1);
+    } finally {
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("stops retrying after the bounded retry limit on persistent sync failures", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-cap-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "v1");
+    let attempts = 0;
+    const { runtime, errors } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile],
+      syncPresetRoles: async () => {
+        attempts++;
+        throw new Error("persistent failure");
+      },
+    });
+    try {
+      await runtime.start();
+      // Initial sync (1) + post-watcher reconcile (2) both ran; retry 1..5 run at 100+200+400+800+1600ms = 3100ms.
+      await Bun.sleep(3_600);
+      expect(attempts).toBe(7);
+      expect(errors).toHaveLength(7);
+    } finally {
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("keeps a healthy watch's deferred sync pending until the model becomes available", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-deferred-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "v1");
+    let attempts = 0;
+    let available = false;
+    const exhausted = Promise.withResolvers<void>();
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime, errors } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile],
+      syncPresetRoles: async () => {
+        if (++attempts === 7) exhausted.resolve();
+        return available ? "applied" : "deferred";
+      },
+    });
+    const observe = () => (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+    try {
+      await runtime.start();
+      expect(attempts).toBe(2);
+      await exhausted.promise;
+      await Bun.sleep(200);
+      expect(attempts).toBe(7);
+      expect(errors).toEqual([]);
+
+      available = true; // No settings-file change to wake the healthy watcher.
+      clock.mockReturnValue(now + 119_000);
+      observe();
+      expect(attempts).toBe(7);
+      clock.mockReturnValue(now + 120_000);
+      observe();
+      expect(attempts).toBe(8);
+      await Bun.sleep(20);
+
+      clock.mockReturnValue(now + 360_000);
+      observe();
+      expect(attempts).toBe(8);
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("rebinds watchers when a watched .omp directory or intermediate symlink is replaced", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/sa-preset-replace-"));
+    const ompDir = join(root, ".omp");
+    const ompOld = join(root, ".omp.old");
+    mkdirSync(ompDir);
+    const configFile = join(ompDir, "config.yml");
+    writeFileSync(configFile, "v1");
+
+    const targetOne = join(root, "target-1");
+    const targetTwo = join(root, "target-2");
+    mkdirSync(targetOne);
+    mkdirSync(targetTwo);
+    writeFileSync(join(targetOne, "config.yml"), "s1");
+    writeFileSync(join(targetTwo, "config.yml"), "s2");
+    const symSub = join(root, "sub");
+    symlinkSync(targetOne, symSub);
+    const symConfig = join(symSub, "config.yml");
+
+    let calls = 0;
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile, symConfig],
+      syncPresetRoles: async () => { calls++; },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(2);
+
+      // Replace the .omp directory with a brand-new inode; later edits inside it must still fire.
+      renameSync(ompDir, ompOld);
+      mkdirSync(ompDir);
+      writeFileSync(configFile, "v2-new-dir");
+      const afterDirReplace = calls;
+      for (let i = 0; i < 40 && calls === afterDirReplace; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(afterDirReplace);
+      await Bun.sleep(200);
+
+      const beforeSubsequentEdit = calls;
+      writeFileSync(configFile, "v3-subsequent-edit");
+      for (let i = 0; i < 40 && calls === beforeSubsequentEdit; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(beforeSubsequentEdit);
+
+      // Swap an intermediate symlink directory atomically and verify subsequent edits in the new target fire.
+      const symTmp = join(root, "sub.tmp");
+      symlinkSync(targetTwo, symTmp);
+      renameSync(symTmp, symSub);
+      const afterSymSwap = calls;
+      for (let i = 0; i < 40 && calls === afterSymSwap; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(afterSymSwap);
+      await Bun.sleep(200);
+
+      const beforeSymEdit = calls;
+      writeFileSync(join(targetTwo, "config.yml"), "s3-subsequent");
+      for (let i = 0; i < 40 && calls === beforeSymEdit; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(beforeSymEdit);
+
+      // Fallback polling stays off when both replacement paths are covered.
+      const steady = calls;
+      clock.mockReturnValue(now + 300_000);
+      (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(20);
+      expect(calls).toBe(steady);
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("attestHeadRotation enforces 50% context threshold, idle window, and stop/restart guards", async () => {
+    const { runtime, config, store, main } = fixture();
+    await runtime.start();
+    // Allow startup background PR/restart observers to settle before probing idle rotation.
+    await Bun.sleep(20);
+    const sessionFile = join(config.stateDir, "sessions", "main", "session.jsonl");
+    const headState = {
+      hostPid: process.pid,
+      sessionId: main.state.sessionId,
+      sessionFile,
+      nativeRun: 1,
+      contextPercent: 49.9,
+      selection: {
+        provider: "fixture", modelId: "capable", reasoning: false,
+        thinkingLevel: "high", configuredThinkingLevel: "high",
+        modelSettings: main.state.modelSettings!,
+      },
+    };
+    const perfSpy = spyOn(performance, "now");
+    try {
+      const basePerf = performance.now();
+      perfSpy.mockReturnValue(basePerf + 31 * 60 * 1000);
+      expect(await runtime.attestHeadRotation(headState)).toBeNull();
+
+      expect(await runtime.attestHeadRotation({ ...headState, contextPercent: 50 })).toMatchObject({
+        contextPercent: 50,
+      });
+
+      store.setMeta("head:restart-fence", JSON.stringify({
+        inputId: "r-2", requestId: "req-2", ackOutputId: "ack-2",
+        ownerPid: process.pid, sessionId: main.state.sessionId,
+        sessionFile, state: "handoff",
+      }));
+      expect(await runtime.attestHeadRotation({ ...headState, contextPercent: 50 })).toBeNull();
+    } finally {
+      perfSpy.mockRestore();
+    }
+  });
+});
+
+
+describe("per-route outbox flushing", () => {
+  test("a slow physical route does not block delivery on another route", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5"] };
+    const slowChannel = route("10", { channelId: "4" });
+    const siblingThread = route("11", { channelId: "4" });
+    const otherChannel = route(null, { channelId: "5" });
+    const slowStarted = Promise.withResolvers<void>();
+    const releaseSlow = Promise.withResolvers<void>();
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      if (output.route.channelId === "4" && output.route.threadId === "10") {
+        slowStarted.resolve();
+        await releaseSlow.promise;
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    try {
+      await runtime.receive(message("9201", slowChannel, "/status"));
+      await slowStarted.promise;
+      await runtime.receive(message("9202", siblingThread, "/status"));
+      await runtime.receive(message("9203", otherChannel, "/status"));
+      await messenger.whenSent(2);
+      await Bun.sleep(20);
+      expect(store.output("9201:head-control")?.state).toBe("sending");
+      expect(store.output("9202:head-control")?.state).toBe("sent");
+      expect(store.output("9203:head-control")?.state).toBe("sent");
+    } finally {
+      releaseSlow.resolve();
+    }
+    await messenger.whenSent(3);
+    await Bun.sleep(20);
+    expect(store.output("9201:head-control")?.state).toBe("sent");
+  });
+
+  test("preserves strict sequence order within a physical route and leaves ambiguous failures uncertain", async () => {
+    const { runtime, store, messenger, errors } = fixture();
+    const dmA: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: null, channelId: "dm-1", threadId: null, topicId: "topic-a" };
+    const dmB: Route = { ...dmA, topicId: "topic-b" };
+    const firstStarted = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const attempted: string[] = [];
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      attempted.push(output.id);
+      if (output.id === "9211:head-control") {
+        firstStarted.resolve();
+        await releaseFirst.promise;
+        throw new DeliveryError("Gateway timeout", "uncertain");
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    try {
+      await runtime.receive(message("9211", dmA, "/help"));
+      await firstStarted.promise;
+      await runtime.receive(message("9212", dmB, "/help"));
+      await runtime.receive(message("9213", dmA, "/help"));
+      await Bun.sleep(20);
+      // Logical topics on the same physical DM share one serial queue.
+      expect(attempted).toEqual(["9211:head-control"]);
+    } finally {
+      releaseFirst.resolve();
+    }
+    await messenger.whenSent(2);
+    await Bun.sleep(20);
+    expect(attempted).toEqual(["9211:head-control", "9212:head-control", "9213:head-control"]);
+    expect(store.output("9211:head-control")).toMatchObject({ state: "uncertain", remoteId: null });
+    expect(store.output("9212:head-control")?.state).toBe("sent");
+    expect(store.output("9213:head-control")?.state).toBe("sent");
+    expect(errors.length).toBe(1);
+  });
+
+  test("restart on route B delivers its ACK immediately while route A is sending, then waits for A before handoff", async () => {
+    const { runtime, config, store, messenger, requests, handoff } = restartFixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5"] };
+    const routeA = route("10", { channelId: "4" });
+    const routeB = route(null, { channelId: "5" });
+    await runtime.start();
+    store.receive(message("restart-a-source", routeA), "main");
+    store.settle("restart-a-source", "done");
+    store.queueOutput({ id: "route-a-inflight", sourceId: "restart-a-source", route: routeA, text: "Inflight on A" });
+    const startedA = Promise.withResolvers<void>();
+    const releaseA = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => {
+      if (output.id === "route-a-inflight") {
+        startedA.resolve();
+        await releaseA.promise;
+      }
+    };
+    handoff.respond = async request => ({
+      ...request, gatewayPid: process.pid, headPid: process.pid, sessionId: "session-main",
+      sessionFile: hostPaths(config, "main").sessionFile, state: "accepted",
+    });
+    const draining = runtime.kick();
+    try {
+      await startedA.promise;
+      expect(store.output("route-a-inflight")?.state).toBe("sending");
+
+      await runtime.receive(message("restart-b", routeB, "/restart"));
+      await messenger.whenSent(1);
+      await Bun.sleep(20);
+      expect(store.output("restart-b:restart-ack")?.state).toBe("sent");
+      expect(store.output("route-a-inflight")?.state).toBe("sending");
+      expect(requests).toEqual([]);
+    } finally {
+      releaseA.resolve();
+    }
+    await draining;
+    await runtime.kick();
+    await Bun.sleep(20);
+    expect(store.output("route-a-inflight")?.state).toBe("sent");
+    expect(requests).toHaveLength(1);
+  });
+
+  test("mixed commands wake a newly pending route even while another route holds priorityTail", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5"] };
+    const routeA = route("10", { channelId: "4" });
+    const dmB: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: null, channelId: "dm-b", threadId: null };
+    const statusStarted = Promise.withResolvers<void>();
+    const releaseStatus = Promise.withResolvers<void>();
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      if (output.id === "9221:head-control") {
+        statusStarted.resolve();
+        await releaseStatus.promise;
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    try {
+      await runtime.receive(message("9221", routeA, "/status"));
+      await statusStarted.promise;
+      expect(store.output("9221:head-control")?.state).toBe("sending");
+
+      // /main on DM B settles via settleTopicControl (without awaiting priorityTail) and wakes route B directly.
+      await runtime.receive(message("9222", dmB, "/main"));
+      await messenger.whenSent(1);
+      await Bun.sleep(20);
+      expect(store.output("9222:topic")?.state).toBe("sent");
+      expect(store.output("9221:head-control")?.state).toBe("sending");
+    } finally {
+      releaseStatus.resolve();
+    }
+    await messenger.whenSent(2);
+    await Bun.sleep(20);
+    expect(store.output("9221:head-control")?.state).toBe("sent");
+  });
+
+  test("flushing across many routes partitions once without rescanning the full pending outbox per worker", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4", "5", "6", "7", "8", "9", "10", "11"] };
+    await runtime.start();
+    const routes = ["4", "5", "6", "7", "8", "9", "10", "11"].map(ch => route(null, { channelId: ch }));
+    for (const [index, dest] of routes.entries()) {
+      const id = `batch-src-${index}`;
+      store.receive(message(id, dest), "main");
+      store.settle(id, "done");
+      store.queueOutput({ id: `batch-out-${index}`, sourceId: id, route: dest, text: `msg-${index}` });
+    }
+    const outputsSpy = spyOn(store, "outputs");
+    try {
+      await runtime.kick();
+      await messenger.whenSent(8);
+      await Bun.sleep(20);
+      const calls = outputsSpy.mock.calls.map(([arg]) => arg);
+      // Partitioning does not scale linearly with the number of pending routes;
+      // route workers query only their own physical route on subsequent loops.
+      const unfilteredCalls = calls.filter(arg => arg === undefined);
+      const filteredCalls = calls.filter((arg): arg is string => typeof arg === "string");
+      expect(unfilteredCalls.length).toBeLessThanOrEqual(2);
+      expect(new Set(filteredCalls).size).toBe(8);
+    } finally {
+      outputsSpy.mockRestore();
+    }
+  });
+
+  test("same-route flush queued at worker exit never joins a stopping worker without attempting the new output", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4"] };
+    const dest = route(null, { channelId: "4" });
+    const destKey = physicalRouteKey(dest);
+    const secondStarted = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      if (output.id === "end-gap-2") {
+        secondStarted.resolve();
+        await releaseSecond.promise;
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    const timer = (runtime as unknown as { timer?: ReturnType<typeof setInterval> }).timer;
+    if (timer) clearInterval(timer);
+
+    store.receive(message("gap-1", dest), "main");
+    store.settle("gap-1", "done", { id: "end-gap-1", text: "first" });
+
+    let injected = false;
+    let followUpFlush: Promise<void> | undefined;
+    let followUpSettled = false;
+    const origOutputs = store.outputs.bind(store);
+    const outputsSpy = spyOn(store, "outputs").mockImplementation((routeArg?: string) => {
+      const rows = origOutputs(routeArg);
+      if (!injected && routeArg === destKey && rows.length === 0 && store.output("end-gap-1")?.state === "sent") {
+        injected = true;
+        queueMicrotask(() => {
+          store.receive(message("gap-2", dest), "main");
+          store.settle("gap-2", "done", { id: "end-gap-2", text: "second" });
+          followUpFlush = (runtime as unknown as { flushOutputs(target?: string): Promise<void> })
+            .flushOutputs(destKey)
+            .then(() => { followUpSettled = true; });
+        });
+      }
+      return rows;
+    });
+
+    try {
+      await (runtime as unknown as { flushOutputs(target?: string): Promise<void> }).flushOutputs(destKey);
+      expect(injected).toBe(true);
+      await secondStarted.promise;
+      await Promise.resolve();
+      expect(followUpSettled).toBe(false);
+      expect(store.output("end-gap-2")?.state).toBe("sending");
+    } finally {
+      releaseSecond.resolve();
+      outputsSpy.mockRestore();
+    }
+    await followUpFlush;
+    expect(followUpSettled).toBe(true);
+    expect(store.output("end-gap-2")?.state).toBe("sent");
+    expect(messenger.sent.map(output => output.id)).toEqual(["end-gap-1", "end-gap-2"]);
   });
 });

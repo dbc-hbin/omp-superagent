@@ -1,4 +1,7 @@
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { getProjectAgentDir, MAIN_CONFIG_FILENAMES, normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { IsStandardObject as isRecord } from "@sinclair/typebox/value";
 import { acquireModelRoleMutation, getModelPreset, getModelPresetNames, isValidModelPresetName } from "@oh-my-pi/pi-coding-agent/config/model-presets";
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
@@ -10,6 +13,7 @@ import { editNativeGlobalConfig, hasUnresolvedNativeLegacy, readNativeSettings }
 
 export type NativeModel = Awaited<ReturnType<ExtensionContext["models"]["list"]>>[number];
 export type BootstrapName = (typeof MODEL_PRESET_NAMES)[number];
+export type PresetSyncOutcome = "applied" | "deferred";
 type PresetSource = "runtime" | "overlay" | "project" | "global";
 export type NativePresetChoices = Partial<Record<BootstrapName, { model: LaneModel; reason: string }>>;
 const followingRoles = { high: "slow", middle: "default", low: "smol" } as const;
@@ -67,6 +71,24 @@ export class NativePresetManager {
       throw new Error("Native presets require the persistent native base settings");
     }
     this.source = settings;
+  }
+
+  watchedPaths(): string[] {
+    const agentDir = this.settings.getAgentDir();
+    const paths = [
+      ...MAIN_CONFIG_FILENAMES.map(filename => join(agentDir, filename)),
+      join(agentDir, "settings.json"),
+    ];
+    const cwd = resolve(this.settings.getCwd());
+    if (normalizePathForComparison(cwd) !== normalizePathForComparison(homedir())) {
+      const projectDir = getProjectAgentDir(cwd);
+      paths.push(
+        ...MAIN_CONFIG_FILENAMES.map(filename => join(projectDir, filename)),
+        join(projectDir, "settings.json"),
+      );
+    }
+    paths.push(...this.settings.getConfigFiles());
+    return [...new Set(paths)];
   }
 
   private async reload(): Promise<void> {
@@ -167,11 +189,11 @@ export class NativePresetManager {
 
   /** Follow persistent native roles without changing the active native session. */
   async syncRoles(store: Pick<StorePort, "getMeta" | "setMeta">, canWrite: () => boolean,
-    reloadCatalog?: () => Promise<void>): Promise<void> {
+    reloadCatalog?: () => Promise<void>): Promise<PresetSyncOutcome> {
     const release = await acquireModelRoleMutation();
     try {
       await this.reload();
-      if (!canWrite()) return;
+      if (!canWrite()) return "deferred";
       const settings = this.settings;
       const base = this.capture();
       const before = store.getMeta(followedPresets);
@@ -195,10 +217,10 @@ export class NativePresetManager {
       }
       const roles = JSON.stringify(resolved.map(({ selector, defaultSelector }) => [selector ?? null, defaultSelector]));
       // A temporarily unavailable configured role is not a new policy.
-      if (resolved.some(({ selector, defaultSelector }) => selector && !defaultSelector)) return;
+      if (resolved.some(({ selector, defaultSelector }) => selector && !defaultSelector)) return "deferred";
       const edits: { name: BootstrapName; snapshot: LanePresetSnapshot }[] = [];
       for (const { name, model, defaultSelector } of resolved) {
-        if (!canWrite()) break;
+        if (!canWrite()) return "deferred";
         const tracked = ownership[name];
         if (tracked === null) continue; // A manual edit/deletion releases management.
         const owned = settings.getOwnedModelPreset(name);
@@ -228,16 +250,21 @@ export class NativePresetManager {
         if (Bun.deepEquals(preset, next)) ownership[name] = { preset, roles };
         else edits.push({ name, snapshot: next });
       }
+      let deferred = false;
       if (edits.length) {
         const applied = await editNativeGlobalConfig(settings, edits.map(({ name, snapshot }) => ({
           path: `modelPresets.${name}`, value: snapshot,
         })), actual => canWrite() && edits.every(({ name }) => actual.getOwnedModelPreset(name)?.source === "global")
           && Bun.deepEquals(actual.getModelRoles(), base.modelRoles)
           && cfgDefaultThinkingLevel.get(actual) === base.defaultThinkingLevel);
-        for (const [index, { name, snapshot }] of edits.entries()) if (applied[index]) ownership[name] = { preset: snapshot, roles };
+        for (const [index, { name, snapshot }] of edits.entries()) {
+          if (applied[index]) ownership[name] = { preset: snapshot, roles };
+          else deferred = true;
+        }
       }
       const saved = JSON.stringify(ownership);
       if (saved !== (before ?? "{}")) store.setMeta(followedPresets, saved);
+      return deferred ? "deferred" : "applied";
     } finally { release(); }
   }
 
