@@ -3211,6 +3211,16 @@ export class Superagent {
       throw new Error("Workflow selection requires an original authorized user source, not internal data");
     }
     const handoffId = `handoff:${sourceId}:${id}`;
+    if (sourceId.startsWith(intakeWorkPrefix)) {
+      const round = this.prReviews.laneRound(id);
+      if (!round?.automation || round.source !== sourceId || round.inputId !== handoffId || workflow)
+        throw new PrControlError("전용 검토 작업 영수증이 일치하지 않습니다.");
+      this.prReviews.assertActive(round);
+      const queued = this.store.receivePrWork({ id: handoffId, route: lane.route, receivedAt: original.receivedAt, messageId: null,
+        attachments: [], text }, id, round);
+      if (queued) this.background(this.syncLaneThreadTitle(lane));
+      return handoffId;
+    }
     const queued = this.store.receive({
       id: handoffId, route: lane.route, messageId: original.messageId,
       ...(original.interactionId === undefined ? {} : { interactionId: original.interactionId }),
