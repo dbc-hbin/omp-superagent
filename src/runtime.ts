@@ -368,12 +368,20 @@ interface ShellRun {
   readonly controller: AbortController;
   done: Promise<void>;
   stopRequested: boolean;
+  groupConfirmed: boolean;
 }
 
 const CRON_SHELL_TIMEOUT_MS = 30_000;
 const CRON_SHELL_MAX_BYTES = 1 << 20;
 const CRON_SHELL_FORCE_KILL_MS = 500;
 const CRON_SHELL_STOP_WAIT_MS = 5_000;
+const CRON_SHELL_GROUP_POLL_MS = 20;
+const CRON_SHELL_GROUP_WAIT_MS = 5_500;
+
+function isProcessGroupAlive(pid: number): boolean {
+  try { process.kill(-pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException | undefined)?.code !== "ESRCH"; }
+}
 
 function killProcessGroup(pid: number, signal: NodeJS.Signals, exited: boolean): void {
   try { process.kill(-pid, signal); }
@@ -5310,7 +5318,7 @@ export class Superagent {
             Promise.allSettled(activeShellRuns.map(run => run.done)),
             Bun.sleep(CRON_SHELL_STOP_WAIT_MS),
           ]);
-          if (activeShellRuns.some(run => this.shellRuns.has(`cron-shell:${run.inputId}`))) {
+          if (activeShellRuns.some(run => this.shellRuns.has(`cron-shell:${run.inputId}`) || !run.groupConfirmed)) {
             failures.push(new Error("Running cron shell job did not confirm exit"));
           }
         }
@@ -5857,7 +5865,7 @@ export class Superagent {
   private async dispatchCronShell(
     live: Live,
     input: InputRecord,
-    shell: { readonly jobId: string; readonly command: string },
+    shell: { readonly jobId: string; readonly revision: string | null; readonly command: string },
   ): Promise<void> {
     if (this.stopped || this.restartFence() || this.headRecoveryActive() || this.headStopping > 0
       || this.headCompaction || this.pendingHeadModel() || this.initializationHoldsHead()
@@ -5887,18 +5895,22 @@ export class Superagent {
     const env = { ...process.env };
     for (const name of credentialEnvNames(this.config)) delete env[name];
     const controller = new AbortController();
-    const run: ShellRun = { inputId: input.id, controller, stopRequested: false, done: Promise.resolve() };
+    const run: ShellRun = { inputId: input.id, controller, stopRequested: false, groupConfirmed: false, done: Promise.resolve() };
     const done = (async () => {
       try {
-        const result = await this.executeCronShell(shell.command, env, controller.signal);
+        const { result, groupConfirmed } = await this.executeCronShell(shell.command, env, controller.signal);
+        run.groupConfirmed = groupConfirmed;
         if (this.stopped || run.stopRequested || this.store.input(input.id)?.state !== "submitted") return;
-        const outcome = this.cronJobs.shellOutcome(shell.jobId, result);
-        this.store.settle(input.id, "done", outcome.text === null ? undefined : { id: `${input.id}:cron-shell`, text: outcome.text });
-        if (outcome.hash !== null && this.store.input(input.id)?.state === "done") this.cronJobs.recordShellHash(shell.jobId, outcome.hash);
+        const outcome = this.cronJobs.shellOutcome(shell.jobId, shell.revision, result);
+        const outputId = `${input.id}:cron-shell`;
+        if (outcome.text !== null && outcome.hash !== null) {
+          this.cronJobs.stageShellOutputHash(outputId, shell.jobId, shell.revision, outcome.hash);
+        }
+        this.store.settle(input.id, "done", outcome.text === null ? undefined : { id: outputId, text: outcome.text });
       } finally {
         this.shellRuns.delete(opId);
         if (!this.stopped) {
-          this.background(this.flushOutputs());
+          this.background(this.flushOutputs(physicalRouteKey(input.route)));
           if (this.ready) this.background(this.kick());
         }
       }
@@ -5912,10 +5924,12 @@ export class Superagent {
     command: string,
     env: Record<string, string | undefined>,
     signal: AbortSignal,
-  ): Promise<CronShellResult> {
+  ): Promise<{ readonly result: CronShellResult; readonly groupConfirmed: boolean }> {
     const abortSignal = AbortSignal.any([this.stopSignal.signal, signal]);
-    if (abortSignal.aborted) return { exitCode: null, stdout: "", stderr: "", error: "Aborted before spawn" };
-    return await new Promise<CronShellResult>(resolve => {
+    if (abortSignal.aborted) {
+      return { result: { exitCode: null, stdout: "", stderr: "", error: "Aborted before spawn" }, groupConfirmed: true };
+    }
+    return await new Promise<{ readonly result: CronShellResult; readonly groupConfirmed: boolean }>(resolve => {
       const child = spawn("/bin/sh", ["-c", command], {
         cwd: this.config.headCwd,
         env,
@@ -5928,17 +5942,21 @@ export class Superagent {
       let stderrBytes = 0;
       let exited = false;
       let closed = false;
+      let terminated = false;
+      let settled = false;
       let abortError: string | undefined;
       let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
       let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+      let groupPollTimer: ReturnType<typeof setTimeout> | undefined;
 
       const terminate = (reason?: string) => {
         if (reason && abortError === undefined) abortError = reason;
-        if (closed || !child.pid) return;
+        terminated = true;
+        if (settled || !child.pid) return;
         killProcessGroup(child.pid, "SIGTERM", exited);
         if (!forceKillTimer) {
           forceKillTimer = setTimeout(() => {
-            if (!closed && child.pid) killProcessGroup(child.pid, "SIGKILL", exited);
+            if (!settled && child.pid) killProcessGroup(child.pid, "SIGKILL", exited);
           }, CRON_SHELL_FORCE_KILL_MS);
           forceKillTimer.unref?.();
         }
@@ -5956,23 +5974,54 @@ export class Superagent {
       };
 
       const onAbort = () => terminate();
-      const finish = (code: number | null, signalName: NodeJS.Signals | null) => {
-        if (closed) return;
-        closed = true;
+      const finalize = (code: number | null, signalName: NodeJS.Signals | null, groupConfirmed: boolean) => {
+        if (settled) return;
+        settled = true;
         if (timeoutTimer) clearTimeout(timeoutTimer);
         if (forceKillTimer) clearTimeout(forceKillTimer);
+        if (groupPollTimer) clearTimeout(groupPollTimer);
         abortSignal.removeEventListener("abort", onAbort);
         const stdout = Buffer.concat(stdoutChunks).toString("utf8");
         const stderr = Buffer.concat(stderrChunks).toString("utf8");
-        if (abortError !== undefined) {
-          resolve({ exitCode: code, stdout, stderr, error: abortError });
+        const result: CronShellResult = abortError !== undefined
+          ? { exitCode: code, stdout, stderr, error: abortError }
+          : code !== null
+          ? { exitCode: code, stdout, stderr }
+          : { exitCode: null, stdout, stderr, error: signalName ? `terminated by ${signalName}` : "terminated unexpectedly" };
+        resolve({ result, groupConfirmed });
+      };
+
+      const onClose = (code: number | null, signalName: NodeJS.Signals | null) => {
+        if (closed) return;
+        closed = true;
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (!child.pid) {
+          finalize(code, signalName, true);
           return;
         }
-        if (code !== null) {
-          resolve({ exitCode: code, stdout, stderr });
+        if (abortSignal.aborted) terminate();
+        if (!terminated) {
+          finalize(code, signalName, true);
           return;
         }
-        resolve({ exitCode: null, stdout, stderr, error: signalName ? `terminated by ${signalName}` : "terminated unexpectedly" });
+        // Keep ownership until the entire detached process group has exited,
+        // even if a descendant with independent stdio outlives the shell.
+        const deadline = Date.now() + CRON_SHELL_GROUP_WAIT_MS;
+        const pid = child.pid;
+        const checkGroup = () => {
+          if (settled) return;
+          if (!isProcessGroupAlive(pid)) {
+            finalize(code, signalName, true);
+            return;
+          }
+          if (Date.now() >= deadline) {
+            finalize(code, signalName, false);
+            return;
+          }
+          groupPollTimer = setTimeout(checkGroup, CRON_SHELL_GROUP_POLL_MS);
+          groupPollTimer.unref?.();
+        };
+        checkGroup();
       };
 
       child.stdout?.on("data", (chunk: Buffer) => { stdoutBytes = appendChunk(stdoutChunks, stdoutBytes, chunk); });
@@ -5980,9 +6029,9 @@ export class Superagent {
       child.on("exit", () => { exited = true; });
       child.on("error", error => {
         if (abortError === undefined) abortError = error.message;
-        finish(null, null);
+        onClose(null, null);
       });
-      child.on("close", (code, signalName) => finish(code, signalName));
+      child.on("close", (code, signalName) => onClose(code, signalName));
 
       timeoutTimer = setTimeout(() => terminate("Cron shell command timed out after 30s"), CRON_SHELL_TIMEOUT_MS);
       timeoutTimer.unref?.();
@@ -7645,6 +7694,7 @@ export class Superagent {
         }
         // Persist a successful remote send without reinterpreting a local failure.
         this.store.finishOutput(output.id, "sent", remoteId);
+        if (output.id.endsWith(":cron-shell")) this.cronJobs.confirmShellOutputSent(output.id);
         if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
         delivered = true;
       }

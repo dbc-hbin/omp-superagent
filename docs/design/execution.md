@@ -372,13 +372,14 @@ discarding custom commands or enabling disabled extensions.
   running `/bin/sh -c` in an asynchronous detached process group (credential env
   removed, 30 s cap) instead of a model turn, then settles with stdout while
   holding HEAD without blocking independent lanes. Empty or `[SILENT]` output posts
-  nothing; only the
-  SHA-256 of the last posted output is persisted, and an identical hash suppresses
-  the post. The hash is recorded after the settlement, so a crash can repeat one
-  post but never lose one. Non-zero exit or timeout is always reported and leaves the
-  hash alone. Active `/stop head` terminates the shell process group and confirms
-  exit before reporting stop completion; a run interrupted mid-spawn across restart
-  becomes uncertain and is never replayed.
+  nothing; only the SHA-256 of the last confirmed `sent` output is persisted and
+  bound to its command revision, and an identical hash suppresses the post. Rejected
+  or unconfirmed posts do not suppress the next run, and an in-flight older
+  revision cannot overwrite the hash after `/cron edit`. Non-zero exit or timeout
+  is always reported and leaves the hash alone. Active `/stop head` terminates the
+  shell process group and confirms the entire process group exit before reporting
+  stop completion (reporting an uncertain stop if group exit is unconfirmed); a run
+  interrupted mid-spawn across restart becomes uncertain and is never replayed.
   Only the owner command creates these; `cron_create` cannot. See the [operator reference](../OPERATIONS.md#예약-작업-cron)
   for schedule syntax and controls.
 - [Repository PR intake](../../src/cron-pr-intake.ts) is a typed cron job, not
