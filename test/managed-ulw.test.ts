@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { activeManagedUlw, managedUlwLaunch, managedUlwLaunchExtensions, managedUlwStatus, updateManagedUlw, type UlwManifest } from "../src/managed-ulw";
@@ -683,16 +683,24 @@ sleep 4 &
 
 test("a late manifest builder cannot cross the worker launch fence", async () => {
   const manifest = Promise.withResolvers<object>();
+  const clock = spyOn(performance, "now");
   let fenced = false;
-  await expect(managedUlwLaunch(mockLaunchOptions(`
+  try {
+    await expect(managedUlwLaunch(mockLaunchOptions(`
 IFS= read -r _input
 printf '\nMANAGED_ULW_LAUNCH {"extensionPaths":[],"noExtensions":true,"memoryWriteDir":null}\n'
 cat >/dev/null
 `), {
-    stderr: 2, timeoutMs: 100, manifest: () => manifest.promise,
-    beforeManifest: () => { fenced = true; },
-  })).rejects.toThrow("Native session preparation timed out");
-  manifest.resolve({});
-  await Bun.sleep(0);
-  expect(fenced).toBe(false);
+      stderr: 2, timeoutMs: 100,
+      manifest: () => {
+        // Model a timer firing before the clock reaches the absolute deadline.
+        clock.mockReturnValue(performance.now());
+        return manifest.promise;
+      },
+      beforeManifest: () => { fenced = true; },
+    })).rejects.toThrow("Native session preparation timed out");
+    manifest.resolve({});
+    await Bun.sleep(0);
+    expect(fenced).toBe(false);
+  } finally { clock.mockRestore(); }
 });

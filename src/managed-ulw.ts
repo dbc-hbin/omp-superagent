@@ -214,14 +214,23 @@ const LAUNCH_OUTPUT_LIMIT = 16 * 1024 * 1024; // Same bound as the Rust Gateway.
 const LAUNCH_MARKER = "MANAGED_ULW_LAUNCH ";
 const LAUNCH_ERROR_MARKER = "MANAGED_ULW_LAUNCH_ERROR ";
 
-async function launchPhase<T>(deadline: number, message: string, run: () => Promise<T>): Promise<T> {
+async function launchPhase<T>(deadline: number, message: string, run: (assertActive: () => void) => Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const assertActive = () => {
+    if (timedOut || performance.now() >= deadline) throw new Error(message);
+  };
   try {
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), Math.max(0, deadline - performance.now()));
+      timer = setTimeout(() => {
+        // Once reported, timeout is final even if a caller observes the clock
+        // before the absolute deadline (timer granularity or rounding).
+        timedOut = true;
+        reject(new Error(message));
+      }, Math.max(0, Math.ceil(deadline - performance.now())));
     });
-    const result = await Promise.race([timeout, run()]);
-    if (performance.now() >= deadline) throw new Error(message);
+    const result = await Promise.race([timeout, run(assertActive)]);
+    assertActive();
     return result;
   } finally { clearTimeout(timer); }
 }
@@ -297,10 +306,10 @@ export async function managedUlwLaunch(options: ManagedUlwLaunchOptions, prepare
     const deadline = performance.now() + Math.max(1, prepare.timeoutMs);
     const timeout = "Native session preparation timed out";
     bytes = Buffer.byteLength(output);
-    const prepared = await launchPhase(deadline, timeout, async () => {
+    const prepared = await launchPhase(deadline, timeout, async assertActive => {
       const payload = JSON.stringify(await prepare.manifest(composition));
       // A timed-out manifest builder must never cross the worker launch fence.
-      if (performance.now() >= deadline) throw new Error(timeout);
+      assertActive();
       prepare.beforeManifest?.();
       child.stdin.write(payload);
       child.stdin.end();
