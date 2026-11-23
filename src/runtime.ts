@@ -6742,15 +6742,16 @@ export class Superagent {
     const existing = this.routeOutbounds.get(routeKeyValue);
     if (existing) return existing;
     let delivered = false;
+    const release = () => {
+      if (this.routeOutbounds.get(routeKeyValue) === worker) this.routeOutbounds.delete(routeKeyValue);
+    };
     let worker: Promise<void>;
     worker = Promise.resolve().then(async () => {
-      try { delivered = await this.flushOutputRoute(routeKeyValue, initialBatch); }
-      finally {
-        if (this.routeOutbounds.get(routeKeyValue) === worker) this.routeOutbounds.delete(routeKeyValue);
-      }
+      try { delivered = await this.flushOutputRoute(routeKeyValue, release, initialBatch); }
+      finally { release(); }
       // A successful uncertainty notice changes the effect evidence. Wake the
       // finite recovery drain on that event, not the ordinary maintenance timer.
-      if (!this.stopped && delivered && !this.recoveryReconciliation) await this.reconcileHeadRecovery();
+      if (!this.stopped && delivered && !this.recoveryReconciliation) this.background(this.reconcileHeadRecovery());
     });
     this.routeOutbounds.set(routeKeyValue, worker);
     return worker;
@@ -6778,14 +6779,23 @@ export class Superagent {
     }
   }
 
-  private async flushOutputRoute(routeKeyValue: string, initialBatch?: OutputRecord[]): Promise<boolean> {
+  private async flushOutputRoute(routeKeyValue: string, release: () => void, initialBatch?: OutputRecord[]): Promise<boolean> {
     const deferredLaneNotices = new Set<string>();
     let delivered = false;
     let batch = initialBatch;
-    while (!this.stopped) {
+    for (;;) {
+      if (this.stopped) {
+        release();
+        return delivered;
+      }
       const outputs = batch ?? this.filterFlushable(this.store.outputs(routeKeyValue));
       batch = undefined;
-      if (outputs.every(output => deferredLaneNotices.has(output.id))) break;
+      if (outputs.every(output => deferredLaneNotices.has(output.id))) {
+        // Release route ownership synchronously with the final empty-queue read so
+        // no microtask producer can join a draining worker after it stopped reading.
+        release();
+        return delivered;
+      }
       for (const output of outputs) {
         if (isLaneWatchNotice(output.id)) {
           if (deferredLaneNotices.has(output.id)) continue;
@@ -6840,7 +6850,6 @@ export class Superagent {
         delivered = true;
       }
     }
-    return delivered;
   }
 
   private async flushOutputs(targetRouteKey?: string): Promise<void> {

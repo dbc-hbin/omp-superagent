@@ -11291,4 +11291,62 @@ describe("per-route outbox flushing", () => {
       outputsSpy.mockRestore();
     }
   });
+
+  test("same-route flush queued at worker exit never joins a stopping worker without attempting the new output", async () => {
+    const { runtime, config, store, messenger } = fixture();
+    config.discord = { tokenEnv: "TEST_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4"] };
+    const dest = route(null, { channelId: "4" });
+    const destKey = physicalRouteKey(dest);
+    const secondStarted = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
+    const origSend = messenger.send.bind(messenger);
+    messenger.send = async output => {
+      if (output.id === "end-gap-2") {
+        secondStarted.resolve();
+        await releaseSecond.promise;
+      }
+      return origSend(output);
+    };
+    await runtime.start();
+    const timer = (runtime as unknown as { timer?: ReturnType<typeof setInterval> }).timer;
+    if (timer) clearInterval(timer);
+
+    store.receive(message("gap-1", dest), "main");
+    store.settle("gap-1", "done", { id: "end-gap-1", text: "first" });
+
+    let injected = false;
+    let followUpFlush: Promise<void> | undefined;
+    let followUpSettled = false;
+    const origOutputs = store.outputs.bind(store);
+    const outputsSpy = spyOn(store, "outputs").mockImplementation((routeArg?: string) => {
+      const rows = origOutputs(routeArg);
+      if (!injected && routeArg === destKey && rows.length === 0 && store.output("end-gap-1")?.state === "sent") {
+        injected = true;
+        queueMicrotask(() => {
+          store.receive(message("gap-2", dest), "main");
+          store.settle("gap-2", "done", { id: "end-gap-2", text: "second" });
+          followUpFlush = (runtime as unknown as { flushOutputs(target?: string): Promise<void> })
+            .flushOutputs(destKey)
+            .then(() => { followUpSettled = true; });
+        });
+      }
+      return rows;
+    });
+
+    try {
+      await (runtime as unknown as { flushOutputs(target?: string): Promise<void> }).flushOutputs(destKey);
+      expect(injected).toBe(true);
+      await secondStarted.promise;
+      await Promise.resolve();
+      expect(followUpSettled).toBe(false);
+      expect(store.output("end-gap-2")?.state).toBe("sending");
+    } finally {
+      releaseSecond.resolve();
+      outputsSpy.mockRestore();
+    }
+    await followUpFlush;
+    expect(followUpSettled).toBe(true);
+    expect(store.output("end-gap-2")?.state).toBe("sent");
+    expect(messenger.sent.map(output => output.id)).toEqual(["end-gap-1", "end-gap-2"]);
+  });
 });
