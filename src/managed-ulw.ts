@@ -201,9 +201,10 @@ type ManagedUlwLaunchOptions = {
   launchArgs: string[];
   env: Record<string, string | undefined>;
   bunCommand: string[];
+  discoveryTimeoutMs?: number;
   worker?: Pick<WorkerHostProfile, "extensionPaths">;
 };
-export type ManagedUlwLaunchInput = Omit<ManagedUlwLaunchOptions, "env" | "bunCommand">;
+export type ManagedUlwLaunchInput = Omit<ManagedUlwLaunchOptions, "env" | "bunCommand" | "discoveryTimeoutMs">;
 export type ManagedUlwLaunchComposition = { extensionPaths: string[]; noExtensions: boolean; memoryWriteDir: string | null };
 
 const LAUNCH_DISCOVERY_TIMEOUT_MS = 30_000;
@@ -228,18 +229,30 @@ export async function managedUlwLaunch(options: ManagedUlwLaunchOptions, prepare
   manifest: (composition: ManagedUlwLaunchComposition) => unknown;
 }): Promise<{ composition: ManagedUlwLaunchComposition; prepared?: string }> {
   if (!options.bunCommand.length) throw new Error("Managed ULW discovery requires the launcher's Bun command");
-  const { env, bunCommand, ...input } = options;
+  const { env, bunCommand, discoveryTimeoutMs = LAUNCH_DISCOVERY_TIMEOUT_MS, ...input } = options;
   const helper = fileURLToPath(new URL("./host-sdk-helper.ts", import.meta.url));
   const child = Bun.spawn([...bunCommand, ...(input.worker ? ["--no-install"] : []), helper, "launch"], {
     cwd: input.worker ? dirname(options.configPath) : options.cwd,
     env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)),
     stdin: "pipe", stdout: "pipe", stderr: prepare?.stderr ?? "pipe",
-    timeout: LAUNCH_DISCOVERY_TIMEOUT_MS + (prepare?.timeoutMs ?? 0), killSignal: "SIGKILL",
   });
   const stderr = typeof child.stderr === "number" || !child.stderr ? Promise.resolve("") : new Response(child.stderr).text();
   const reader = child.stdout.getReader();
   const decoder = new TextDecoder();
   let output = "";
+  let discoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  let prepareTimer: ReturnType<typeof setTimeout> | undefined;
+  let timedOutPhase: "discovery" | "prepare" | undefined;
+  const timedOut = () => timedOutPhase;
+  const armPhase = (phase: "discovery" | "prepare", ms: number) => {
+    const timer = setTimeout(() => {
+      timedOutPhase = phase;
+      child.stdin.end();
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, Math.max(1, ms));
+    timer.unref?.();
+    return timer;
+  };
   const fail = async (message: string): Promise<never> => {
     child.stdin.end();
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -247,6 +260,7 @@ export async function managedUlwLaunch(options: ManagedUlwLaunchOptions, prepare
     throw new Error(`${message} (${code})${diagnostic ? `: ${diagnostic.slice(-2000)}` : ""}`);
   };
   try {
+    discoveryTimer = armPhase("discovery", discoveryTimeoutMs);
     child.stdin.write(`${JSON.stringify(input)}\n`);
     child.stdin.flush();
     let line: string | undefined;
@@ -255,26 +269,61 @@ export async function managedUlwLaunch(options: ManagedUlwLaunchOptions, prepare
       const index = lines.slice(0, -1).findIndex(entry => entry.startsWith(LAUNCH_MARKER) || entry.startsWith(LAUNCH_ERROR_MARKER));
       if (index >= 0) { line = lines[index]!; output = lines.slice(index + 1).join("\n"); break; }
       const chunk = await reader.read();
-      if (chunk.done) return await fail("Stock OMP discovery did not return a launch composition");
+      if (chunk.done) {
+        if (timedOut() === "discovery") {
+          await Promise.all([child.exited, stderr]);
+          throw new Error("Stock OMP discovery timed out");
+        }
+        return await fail("Stock OMP discovery did not return a launch composition");
+      }
       output += decoder.decode(chunk.value, { stream: true });
     }
+    if (timedOut() === "discovery") {
+      await Promise.all([child.exited, stderr]);
+      throw new Error("Stock OMP discovery timed out");
+    }
     if (line.startsWith(LAUNCH_ERROR_MARKER)) {
+      clearTimeout(discoveryTimer);
+      discoveryTimer = undefined;
       child.stdin.end();
       await child.exited;
       throw new Error(JSON.parse(line.slice(LAUNCH_ERROR_MARKER.length)));
     }
     const composition: ManagedUlwLaunchComposition = JSON.parse(line.slice(LAUNCH_MARKER.length));
-    if (prepare) child.stdin.write(JSON.stringify(await prepare.manifest(composition)));
+    if (prepare) {
+      clearTimeout(discoveryTimer);
+      discoveryTimer = undefined;
+      prepareTimer = armPhase("prepare", prepare.timeoutMs);
+      let manifestPayload: string;
+      try {
+        manifestPayload = JSON.stringify(await prepare.manifest(composition));
+        if (timedOut() === "prepare") {
+          await child.exited;
+          throw new Error("Native session preparation timed out");
+        }
+        child.stdin.write(manifestPayload);
+      } catch (error) {
+        if (timedOut() === "prepare") {
+          await child.exited;
+          throw new Error("Native session preparation timed out");
+        }
+        throw error;
+      }
+    }
     child.stdin.end();
     for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) output += decoder.decode(chunk.value, { stream: true });
     output += decoder.decode();
     const code = await child.exited;
+    if (timedOut() === "discovery") throw new Error("Stock OMP discovery timed out");
+    if (timedOut() === "prepare") throw new Error("Native session preparation timed out");
     if (code !== 0) {
       if (prepare) throw new Error("Native session preparation failed");
       return await fail("Stock OMP discovery failed");
     }
     return prepare ? { composition, prepared: output } : { composition };
   } finally {
+    clearTimeout(discoveryTimer);
+    clearTimeout(prepareTimer);
     if (child.exitCode === null && child.signalCode === null) {
       // A caller refusal before the manifest leaves the helper unprepared; never let it continue.
       child.kill("SIGKILL");

@@ -274,6 +274,24 @@ else process.exit(8);
     expect(await calls()).toBe(8);
   });
 
+  test("invalidates cached inspection when PATH removes a script's shebang interpreter", async () => {
+    const f = await executable();
+    const interpDir = mkdtempSync(join(tmpdir(), "superagent-interp-"));
+    const emptyDir = mkdtempSync(join(tmpdir(), "superagent-empty-"));
+    dirs.push(interpDir, emptyDir);
+    const interpName = "omp-custom-bun-interp";
+    symlinkSync(process.execPath, join(interpDir, interpName));
+    const scriptBody = await Bun.file(f.command).text();
+    writeFileSync(f.command, scriptBody.replace(/^#!.*\n/, `#!/usr/bin/env ${interpName}\n`));
+    const envWithInterp = { PATH: `${interpDir}:/usr/bin:/bin` };
+    const envWithoutInterp = { PATH: `${emptyDir}:/usr/bin:/bin` };
+
+    const first = await inspectInstalledOmp([f.command], [], envWithInterp);
+    expect(first.version).toBe(testedVersion);
+    await expect(inspectInstalledOmp([f.command], [], envWithoutInterp)).rejects.toThrow("failed");
+    await expect(inspectInstalledOmp([f.command], [], envWithInterp)).resolves.toEqual(first);
+  });
+
   test.each(["18.22.2", "20.0.0", `${testedVersion}-preview`])("reports OMP %s when the CLI exposes the required capabilities", async version => {
     const f = await executable(version);
     await expect(inspectInstalledOmp([f.command])).resolves.toMatchObject({ version, executable: f.command });

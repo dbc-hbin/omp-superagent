@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { activeManagedUlw, managedUlwLaunchExtensions, managedUlwStatus, updateManagedUlw, type UlwManifest } from "../src/managed-ulw";
+import { activeManagedUlw, managedUlwLaunch, managedUlwLaunchExtensions, managedUlwStatus, updateManagedUlw, type UlwManifest } from "../src/managed-ulw";
 import { connect, startHost, type HostOptions } from "../src/host";
 import { getExtensionNameFromPath } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { stopHostFixtures } from "./fixtures/host-fixture-processes";
@@ -598,3 +598,27 @@ console.log('locked'); await Bun.stdin.text();`], { cwd: f.root, stdin: "pipe", 
     expect(managedUlwStatus(f.options).error).toBeNull();
   } finally { owner.kill("SIGKILL"); await owner.exited; }
 }, 90_000);
+
+test("managedUlwLaunch enforces discovery timeout independently of preparation timeout", async () => {
+  const f = await launchFixture();
+  let manifestCalled = false;
+  await expect(managedUlwLaunch({
+    cwd: f.root,
+    managedUlwPath: f.remote,
+    extensionPaths: [],
+    configPath: f.configPath,
+    commandArgs: [],
+    launchArgs: ["--mode", "rpc-ui", "--cwd", f.root, "-e", f.remote, "--config", f.configPath],
+    env: { PATH: process.env.PATH, HOME: f.home, PI_CODING_AGENT_DIR: f.agentDir, XDG_CONFIG_HOME: join(f.home, "config"), CI: "true" },
+    bunCommand: [process.execPath, "--no-env-file"],
+    discoveryTimeoutMs: 1,
+  }, {
+    stderr: 2,
+    timeoutMs: 30_000,
+    manifest: () => {
+      manifestCalled = true;
+      return {};
+    },
+  })).rejects.toThrow("Stock OMP discovery timed out");
+  expect(manifestCalled).toBe(false);
+});

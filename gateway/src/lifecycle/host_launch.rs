@@ -12,11 +12,14 @@ use std::{
     fs::{self, DirBuilder, File},
     os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
+    process::Stdio,
     time::Duration,
 };
 use tokio::{
-    process::{Child, Command},
-    time::{Instant, sleep, timeout},
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    task::JoinHandle,
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use uuid::Uuid;
 
@@ -25,7 +28,7 @@ use super::{
     host_rpc::Probe,
     process::{ChildKind, detached, host_owner_executable},
     rotation::{self, Rotation},
-    stock_ops::{bun, capture, inspect_omp, session_id, tagged_output},
+    stock_ops::{OUTPUT_LIMIT, bun, inspect_omp, session_id},
     ulw::Ulw,
 };
 use crate::store::Store;
@@ -99,6 +102,216 @@ struct HeadLaunch {
     environment: BTreeMap<OsString, OsString>,
 }
 
+struct LaunchHelper {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: ChildStdout,
+    stderr_drain: JoinHandle<()>,
+    leftover: Vec<u8>,
+    phase1_deadline: Instant,
+    discovery: Discovery,
+}
+
+impl Drop for LaunchHelper {
+    fn drop(&mut self) {
+        self.stderr_drain.abort();
+    }
+}
+
+async fn kill_wait(child: &mut Child, stderr_drain: &mut JoinHandle<()>) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = stderr_drain.await;
+}
+
+impl LaunchHelper {
+    async fn start(
+        mut command: Command,
+        input: &Value,
+        phase1_timeout: Duration,
+    ) -> Result<Self> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Could not start Host SDK launch helper")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("Host SDK launch input was not piped")?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("Host SDK launch output was not piped")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Host SDK launch stderr was not piped")?;
+        // Drain stderr concurrently up to OUTPUT_LIMIT so private child output
+        // never stalls the helper pipe or enters logs.
+        let mut stderr_drain = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stderr.take(OUTPUT_LIMIT), &mut tokio::io::sink()).await;
+        });
+
+        let phase1_deadline = Instant::now() + phase1_timeout;
+        let mut discovery_line = serde_json::to_vec(input)?;
+        discovery_line.push(b'\n');
+
+        let outcome = timeout_at(phase1_deadline, async {
+            stdin.write_all(&discovery_line).await?;
+            stdin.flush().await?;
+            let mut buffer = Vec::new();
+            let mut scan_from = 0usize;
+            let mut chunk = [0u8; 4096];
+            loop {
+                while let Some(rel_nl) = buffer[scan_from..].iter().position(|&byte| byte == b'\n') {
+                    let line_end = scan_from + rel_nl;
+                    let line = buffer[scan_from..line_end]
+                        .strip_suffix(b"\r")
+                        .unwrap_or(&buffer[scan_from..line_end]);
+                    if let Some(payload) = line.strip_prefix(b"MANAGED_ULW_LAUNCH ") {
+                        let discovery: Discovery = serde_json::from_slice(payload)?;
+                        let leftover = buffer.split_off(line_end + 1);
+                        return Ok::<_, anyhow::Error>(Ok((discovery, leftover)));
+                    }
+                    if let Some(payload) = line.strip_prefix(b"MANAGED_ULW_LAUNCH_ERROR ") {
+                        let message: String = serde_json::from_slice(payload)?;
+                        return Ok(Err(anyhow::anyhow!(message)));
+                    }
+                    scan_from = line_end + 1;
+                }
+                let read = stdout.read(&mut chunk).await?;
+                if read == 0 {
+                    return Ok(Err(anyhow::anyhow!(
+                        "Stock OMP discovery did not return a launch composition"
+                    )));
+                }
+                let next_len = buffer.len().saturating_add(read);
+                ensure!(
+                    u64::try_from(next_len)? <= OUTPUT_LIMIT,
+                    "Stock OMP discovery output exceeded its bound"
+                );
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+        })
+        .await;
+
+        match outcome {
+            Err(_) => {
+                drop(stdin);
+                kill_wait(&mut child, &mut stderr_drain).await;
+                anyhow::bail!("Native launch discovery timed out");
+            }
+            Ok(Err(error)) => {
+                drop(stdin);
+                kill_wait(&mut child, &mut stderr_drain).await;
+                Err(error)
+            }
+            Ok(Ok(Err(error))) => {
+                drop(stdin);
+                if timeout(Duration::from_secs(1), child.wait()).await.is_err() {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+                let _ = (&mut stderr_drain).await;
+                Err(error)
+            }
+            Ok(Ok(Ok((discovery, leftover)))) => Ok(Self {
+                child,
+                stdin: Some(stdin),
+                stdout,
+                stderr_drain,
+                leftover,
+                phase1_deadline,
+                discovery,
+            }),
+        }
+    }
+
+    async fn finish_discovery(mut self) -> Result<Discovery> {
+        // Closing stdin without writing a manifest selects discovery-only EOF mode.
+        drop(self.stdin.take());
+        match timeout_at(self.phase1_deadline, self.child.wait()).await {
+            Err(_) => {
+                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                anyhow::bail!("Native launch discovery timed out");
+            }
+            Ok(Err(error)) => {
+                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                Err(error.into())
+            }
+            Ok(Ok(status)) => {
+                let _ = (&mut self.stderr_drain).await;
+                ensure!(
+                    status.success(),
+                    "Stock OMP operation failed; private diagnostics suppressed"
+                );
+                Ok(std::mem::replace(
+                    &mut self.discovery,
+                    Discovery {
+                        extension_paths: Vec::new(),
+                        no_extensions: false,
+                        memory_write_dir: None,
+                    },
+                ))
+            }
+        }
+    }
+
+    async fn prepare(mut self, payload: &[u8], phase2_timeout: Duration) -> Result<(Instant, Preparation)> {
+        let deadline = Instant::now() + phase2_timeout;
+        let outcome = timeout_at(deadline, async {
+            let mut stdin = self
+                .stdin
+                .take()
+                .context("Host SDK launch input was already closed")?;
+            stdin.write_all(payload).await?;
+            stdin.flush().await?;
+            drop(stdin);
+
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = self.stdout.read(&mut chunk).await?;
+                if read == 0 {
+                    break;
+                }
+                let next_len = self.leftover.len().saturating_add(read);
+                ensure!(
+                    u64::try_from(next_len)? <= OUTPUT_LIMIT,
+                    "Stock OMP output exceeded its bound"
+                );
+                self.leftover.extend_from_slice(&chunk[..read]);
+            }
+            let status = self.child.wait().await?;
+            let _ = (&mut self.stderr_drain).await;
+            ensure!(
+                status.success(),
+                "Stock OMP operation failed; private diagnostics suppressed"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+
+        match outcome {
+            Err(_) => {
+                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                anyhow::bail!("Native session preparation timed out");
+            }
+            Ok(Err(error)) => {
+                kill_wait(&mut self.child, &mut self.stderr_drain).await;
+                Err(error)
+            }
+            Ok(Ok(())) => {
+                let flags: Preparation = serde_json::from_slice(&self.leftover)
+                    .context("Native session preparation did not confirm tool selection")?;
+                Ok((deadline, flags))
+            }
+        }
+    }
+}
+
 impl HeadLaunch {
     fn new(config: &LifecycleConfig, ulw: &Ulw) -> Result<Self> {
         let package = ulw.package()?;
@@ -132,16 +345,20 @@ impl HeadLaunch {
         Ok(Self { package, extensions, environment })
     }
 
-    async fn discover(&self, config: &LifecycleConfig, files: (Option<&Path>, &Path)) -> Result<Discovery> {
+    async fn start_launch(&self, config: &LifecycleConfig, files: (Option<&Path>, &Path)) -> Result<LaunchHelper> {
         let default_args = host_args(config, files, &self.extensions, false);
         let (_, prefix) = config.command.split_first().context("No OMP executable provided")?;
         let input = json!({
             "cwd": config.cwd, "managedUlwPath": self.package, "extensionPaths": self.extensions,
             "commandArgs": prefix, "launchArgs": prefix.iter().chain(default_args.iter()).collect::<Vec<_>>(),
         });
-        let mut discover = bun(config, &self.environment);
-        discover.arg(config.root.join("src/managed-ulw.ts")).arg("--launch-extensions").arg(input.to_string());
-        tagged_output(&capture(discover, None, START_TIMEOUT).await?, "MANAGED_ULW_LAUNCH ")
+        let mut launch = bun(config, &self.environment);
+        launch.arg(config.root.join("src/host-sdk-helper.ts")).arg("launch");
+        LaunchHelper::start(launch, &input, START_TIMEOUT).await
+    }
+
+    async fn discover(&self, config: &LifecycleConfig, files: (Option<&Path>, &Path)) -> Result<Discovery> {
+        self.start_launch(config, files).await?.finish_discovery().await
     }
 }
 
@@ -210,13 +427,13 @@ impl PreparedHost {
         let log = owned::log(&config.head_log)?;
         let config_data = settings_config(config, settings.as_ref(), restoring)?;
         owned::private_json(&config_path, &config_data)?;
-        let discovery = launch.discover(config, (Some(&config_path), &session_file)).await?;
+        let launch_helper = launch.start_launch(config, (Some(&config_path), &session_file)).await?;
         let HeadLaunch { package, mut environment, .. } = launch;
         let args = host_args(
             config,
             (Some(&config_path), &session_file),
-            &discovery.extension_paths,
-            discovery.no_extensions,
+            &launch_helper.discovery.extension_paths,
+            launch_helper.discovery.no_extensions,
         );
         let socket_id = Uuid::new_v4().simple().to_string();
         let native_socket = run_dir.join(format!(".n-{}.sock", &socket_id[..8]));
@@ -224,19 +441,14 @@ impl PreparedHost {
         let mut manifest = json!({
             "options": { "command": command, "cwd": config.cwd, "sessionFile": session_file, "managedUlwPath": package,
                 "socketPath": config.head_socket, "modelSettings": settings.as_ref().map(|saved| &saved.settings) },
-            "args": args, "configPath": config_path, "memoryWriteDir": discovery.memory_write_dir, "processBackend": backend,
+            "args": args, "configPath": config_path, "memoryWriteDir": launch_helper.discovery.memory_write_dir, "processBackend": backend,
             "helperPath": helper, "nativeSocket": native_socket,
         });
         if let Some(plan) = rotation {
             manifest["headRotationSelection"] = serde_json::to_value(&plan.attestation.selection)?;
         }
-        let deadline = Instant::now() + START_TIMEOUT;
-        let mut prepare = bun(config, &environment);
-        prepare.arg(helper).arg("prepare");
         let payload = serde_json::to_vec(&manifest)?;
-        let flags: Preparation =
-            serde_json::from_slice(&capture(prepare, Some(&payload), START_TIMEOUT).await?)
-                .context("Native session preparation did not confirm tool selection")?;
+        let (deadline, flags) = launch_helper.prepare(&payload, START_TIMEOUT).await?;
         manifest["toolsExplicitlySelected"] = json!(flags.tools_explicitly_selected);
         manifest["noTools"] = json!(flags.no_tools);
         manifest["inventory"] = json!(flags.inventory);
@@ -441,4 +653,96 @@ fn host_args(
         args.extend(["--config".into(), overlay.to_string_lossy().into_owned()]);
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    fn mock_launch_command(script: &Path) -> Command {
+        Command::new(script)
+    }
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn launch_helper_supports_discovery_only_prepare_errors_and_phase_timeout() {
+        let tmp = tempdir().unwrap();
+
+        let discovery_only = write_script(
+            tmp.path(),
+            "discovery-only.sh",
+            r#"
+IFS= read -r _input
+printf '\nMANAGED_ULW_LAUNCH {"extensionPaths":["/ext/a"],"noExtensions":true,"memoryWriteDir":"/mem"}\n'
+rest=$(cat)
+if [ -n "$rest" ]; then exit 9; fi
+"#,
+        );
+        let helper = LaunchHelper::start(mock_launch_command(&discovery_only), &json!({"ok":true}), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let discovery = helper.finish_discovery().await.unwrap();
+        assert_eq!(discovery.extension_paths, vec![PathBuf::from("/ext/a")]);
+        assert!(discovery.no_extensions);
+        assert_eq!(discovery.memory_write_dir, Some(PathBuf::from("/mem")));
+
+        let full_prepare = write_script(
+            tmp.path(),
+            "full-prepare.sh",
+            r#"
+IFS= read -r _input
+printf '\nMANAGED_ULW_LAUNCH {"extensionPaths":[],"noExtensions":false,"memoryWriteDir":null}\n{"toolsExplicitlySelected":true,'
+rest=$(cat)
+case "$rest" in
+  *'"phase":"two"'*) printf '"noTools":false}\n' ;;
+  *) exit 8 ;;
+esac
+"#,
+        );
+        let helper = LaunchHelper::start(mock_launch_command(&full_prepare), &json!({"phase":"one"}), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let (_deadline, prep) = helper.prepare(br#"{"phase":"two"}"#, Duration::from_secs(5)).await.unwrap();
+        assert!(prep.tools_explicitly_selected);
+        assert!(!prep.no_tools);
+
+        let refused = write_script(
+            tmp.path(),
+            "refused.sh",
+            r#"
+IFS= read -r _input
+printf '\nMANAGED_ULW_LAUNCH_ERROR "custom discovery refusal"\n'
+exit 1
+"#,
+        );
+        let err = LaunchHelper::start(mock_launch_command(&refused), &json!({}), Duration::from_secs(5))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("custom discovery refusal"), "{err}");
+
+        let slow = write_script(
+            tmp.path(),
+            "slow.sh",
+            r#"
+IFS= read -r _input
+sleep 5
+"#,
+        );
+        let err = LaunchHelper::start(mock_launch_command(&slow), &json!({}), Duration::from_millis(50))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("Native launch discovery timed out"), "{err}");
+    }
 }
