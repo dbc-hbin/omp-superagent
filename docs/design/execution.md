@@ -359,9 +359,10 @@ discarding custom commands or enabling disabled extensions.
   requires explicit per-job resume. Pause and removal can cancel a queued
   run, not interrupt submitted or uncertain work. Delivery uses the normal
   head outbox. A job created with `/cron add shell` is a verbatim shell job: its
-  run is admitted like any other, but the pump claims it as submitted and runs
-  `/bin/sh -c` alone (credential env removed, 30 s cap) instead of a model turn,
-  then settles with stdout. Empty or `[SILENT]` output posts nothing; only the
+  run is admitted like any other and passes the same ordered dispatch, live-route
+  (`assertRoute`), and stop/recovery fences before being claimed as submitted and
+  running `/bin/sh -c` alone (credential env removed, 30 s cap) instead of a model
+  turn, then settles with stdout. Empty or `[SILENT]` output posts nothing; only the
   SHA-256 of the last posted output is persisted, and an identical hash suppresses
   the post. The hash is recorded after the settlement, so a crash can repeat one
   post but never lose one. Non-zero exit or timeout is always reported and leaves the

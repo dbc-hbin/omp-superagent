@@ -1150,8 +1150,9 @@ test("cron controls scope job management to the original thread and send one HEA
 });
 
 test("verbatim shell cron jobs post stdout without a model turn, suppress silent and repeated output, and always report failures", async () => {
-  const { runtime, main, store, errors, directory } = fixture();
+  const { runtime, messenger, main, store, errors, directory } = fixture();
   const origin = route("11");
+  messenger.assertRoute = () => {};
   await runtime.start();
   const mode = join(directory, "shell-mode");
   writeFileSync(mode, "alpha");
@@ -1179,6 +1180,79 @@ test("verbatim shell cron jobs post stdout without a model turn, suppress silent
   await admit(runtime, message("309", origin, `/cron edit ${id} prompt sh -c 'echo broken >&2; exit 3'`));
   expect(await trigger(310)).toContain("failed (exit code 3).\nbroken");
   expect(await trigger(311)).toContain("failed (exit code 3)"); // failures are never deduplicated
+  expect(main.prompts).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("timer-due verbatim shell cron jobs run at the ordered dispatch boundary without submitting a model prompt", async () => {
+  const { runtime, messenger, main, store, errors, directory } = fixture();
+  const origin = route("11");
+  messenger.assertRoute = () => {};
+  let now = Date.parse("2026-11-23T00:00:00.000Z");
+  const clock = spyOn(Date, "now").mockImplementation(() => now);
+  try {
+    await runtime.start();
+    const marker = join(directory, "timer-ran");
+    const add = message("321", origin, `/cron add shell "every 1m" sh -c 'echo timer-ok; touch ${marker}'`);
+    await admit(runtime, add);
+    const id = store.output(`${add.id}:head-control`)?.text.match(/[0-9a-f-]{36}/)?.[0];
+    if (!id) throw new Error("Cron registration did not return a job ID");
+    expect(existsSync(marker)).toBe(false);
+
+    now += 61_000;
+    await runtime.kick();
+    expect(existsSync(marker)).toBe(true);
+    expect(main.prompts).toEqual([]);
+    const sent = messenger.sent.find(output => output.id.startsWith(`cron-run:${id}:`) && output.id.endsWith(":cron-shell"));
+    expect(sent?.text).toBe("timer-ok\n");
+    expect(errors).toEqual([]);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("verbatim shell cron jobs enforce messenger.assertRoute and earlier uncertain HEAD fences", async () => {
+  const { runtime, messenger, main, store, errors, directory } = fixture();
+  const origin = route("11");
+  let routeVerified = false;
+  messenger.assertRoute = async () => {
+    if (!routeVerified) throw new Error("Messenger account not verified");
+  };
+  await runtime.start();
+  const marker = join(directory, "fenced-shell");
+  const add = message("331", origin, `/cron add shell "every 2h" sh -c 'touch ${marker}; echo fenced-ok'`);
+  await admit(runtime, add);
+  const id = store.output(`${add.id}:head-control`)?.text.match(/[0-9a-f-]{36}/)?.[0];
+  if (!id) throw new Error("Cron registration did not return a job ID");
+
+  // 1. Failing assertRoute prevents claiming or spawning the shell command.
+  await admit(runtime, message("332", origin, `/cron run ${id}`));
+  const runId = `cron-run:${id}:332`;
+  expect(store.input(runId)?.state).toBe("pending");
+  expect(existsSync(marker)).toBe(false);
+  expect(main.prompts).toEqual([]);
+
+  // 2. An earlier uncertain HEAD input also fences execution even once the route is verified.
+  await admit(runtime, message("332b", origin, `/cron pause ${id}`));
+  expect(store.input(runId)?.state).toBe("cancelled");
+  const uncertain = headMessage("330-uncertain", origin, "Hold HEAD before cron");
+  store.receive(uncertain, "main", { [`user-source:${uncertain.id}`]: "true" });
+  store.submit(uncertain.id, "req-uncertain-330", 0);
+  store.settle(uncertain.id, "uncertain");
+  await admit(runtime, message("332c", origin, `/cron resume ${id}`));
+  await admit(runtime, message("333", origin, `/cron run ${id}`));
+  const fencedRunId = `cron-run:${id}:333`;
+  routeVerified = true;
+  await runtime.kick();
+  expect(store.input(fencedRunId)?.state).toBe("pending");
+  expect(existsSync(marker)).toBe(false);
+
+  // 3. Once the uncertain HEAD input is resolved, the shell job runs without a model turn.
+  await admit(runtime, message("334", origin, `/resolve ${uncertain.id}`));
+  await runtime.kick();
+  expect(store.input(fencedRunId)?.state).toBe("done");
+  expect(existsSync(marker)).toBe(true);
+  expect(messenger.sent.some(output => output.id === `${fencedRunId}:cron-shell` && output.text === "fenced-ok\n")).toBe(true);
   expect(main.prompts).toEqual([]);
   expect(errors).toEqual([]);
 });

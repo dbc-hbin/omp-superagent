@@ -362,6 +362,7 @@ export class Superagent {
   private readonly pauseRevisions = new Map<string, number>();
   private readonly modelChanges = new Map<string, Promise<unknown>>();
   private readonly tasks = new Set<Promise<unknown>>();
+  private readonly shellRuns = new Map<string, Promise<void>>();
   private readonly activeReactions = new Map<string, string>();
   private readonly reactionQueues = new Map<string, Promise<void>>();
   private readonly threadEditQueues = new Map<string, Promise<unknown>>();
@@ -810,7 +811,7 @@ export class Superagent {
   private recoveryControllerIdle(): boolean {
     return !this.stopped && !this.headStopping && !this.headCompaction && !this.restartFence()
       && !this.restartActive && !this.bootstrapActive && !this.initializationHoldsHead()
-      && !this.laneMutations && this.operations.size === 0 && this.modelChanges.size === 0;
+      && !this.laneMutations && this.operations.size === 0 && this.modelChanges.size === 0 && this.shellRuns.size === 0;
   }
 
   private recoveryPromptMatches(entries: unknown[], attempt: HeadRecoveryAttempt): boolean {
@@ -4127,7 +4128,7 @@ export class Superagent {
     // Pending/uncertain inputs and resident lane execution are durable state to
     // recover, not reasons to refuse a service lifecycle operation.
     return this.headUsageResetActive || this.connecting.size > 0 || this.operations.size > 0 || this.laneMutations > 0
-      || this.modelChanges.size > 0 || this.callbacks.size > 0 || this.groups?.busy === true
+      || this.modelChanges.size > 0 || this.shellRuns.size > 0 || this.callbacks.size > 0 || this.groups?.busy === true
       || [...this.live.values()].some(live => live.preparing > 0 || !!live.releasing);
   }
 
@@ -4255,7 +4256,7 @@ export class Superagent {
     head.running = false;
     head.assistantOutcome = undefined;
     head.text = "";
-    await Promise.all([...this.operations.values(), ...this.modelChanges.values(), this.headStopTail]);
+    await Promise.all([...this.operations.values(), ...this.modelChanges.values(), ...this.shellRuns.values(), this.headStopTail]);
     this.assertRestartCurrent(restart);
     const actual = await this.state(head);
     this.assertRestartCurrent(restart);
@@ -5434,24 +5435,59 @@ export class Superagent {
     }
   }
 
-  // A verbatim shell run has no model turn. Claim it as submitted before the
-  // spawn so a crash leaves it uncertain (never re-run), then settle with the
-  // verbatim stdout, or with nothing when the job's output is silent or unchanged.
-  private async cronShell(input: InputRecord, shell: { readonly jobId: string; readonly command: string }): Promise<void> {
-    if (!this.store.submit(input.id, `cron-shell-${key(input.id)}`, 0)) return;
+  // A verbatim shell run has no model turn. Verify live route, queue and
+  // stop/recovery fences at the ordered dispatch boundary, claim as submitted
+  // before spawning so a crash leaves it uncertain (never re-run), then settle
+  // with verbatim stdout or nothing when silent or unchanged.
+  private async dispatchCronShell(
+    live: Live,
+    input: InputRecord,
+    shell: { readonly jobId: string; readonly command: string },
+  ): Promise<void> {
+    if (this.stopped || this.restartFence() || this.headRecoveryActive() || this.headStopping > 0
+      || this.headCompaction || this.pendingHeadModel() || this.initializationHoldsHead()
+      || this.kickoffHeld("main")) return;
+    // A stored route is not proof the same bot is still authenticated.
+    if (!this.messenger.assertRoute) return;
+    try { await this.messenger.assertRoute(input.route); }
+    catch (error) {
+      // A socket/response failure is also not proof of the route.
+      if (!(error instanceof Error)) this.report(error);
+      return;
+    }
+    const confirmed = await this.state(live);
+    const confirmedInput = this.store.input(input.id);
+    const earlierHeld = this.store.inputs("main").some(candidate =>
+      candidate.id !== input.id && (candidate.state === "submitted" || candidate.state === "uncertain"));
+    if (this.stopped || !this.current(live) || live.input || live.busy
+      || !confirmed.isSettled || confirmed.isStreaming || confirmed.isCompacting
+      || confirmed.pendingUiRequests?.length || this.store.approvals("main").length
+      || this.restartFence() || this.headRecoveryActive() || this.headStopping > 0
+      || this.headCompaction || this.pendingHeadModel() || this.initializationHoldsHead()
+      || this.kickoffHeld("main") || earlierHeld
+      || confirmedInput?.state !== "pending" || confirmedInput.target !== "main") return;
+    const opId = `cron-shell:${input.id}`;
+    if (this.shellRuns.has(opId)) return;
+    if (!this.store.submit(input.id, `cron-shell-${key(input.id)}`, live.generation)) return;
     const env = { ...process.env };
     for (const name of credentialEnvNames(this.config)) delete env[name];
-    const result = await new Promise<CronShellResult>(resolve => {
-      execFile("/bin/sh", ["-c", shell.command], { cwd: this.config.headCwd, env, timeout: 30_000, maxBuffer: 1 << 20 },
-        (error, stdout, stderr) => {
-          const code = error ? (error as { code?: unknown }).code : 0;
-          resolve({ exitCode: typeof code === "number" ? code : null, stdout, stderr,
-            ...(error && typeof code !== "number" ? { error: error.message } : {}) });
-        });
-    });
-    const outcome = this.cronJobs.shellOutcome(shell.jobId, result);
-    this.store.settle(input.id, "done", outcome.text === null ? undefined : { id: `${input.id}:cron-shell`, text: outcome.text });
-    if (outcome.hash !== null && this.store.input(input.id)?.state === "done") this.cronJobs.recordShellHash(shell.jobId, outcome.hash);
+    const operation = (async () => {
+      const result = await new Promise<CronShellResult>(resolve => {
+        execFile("/bin/sh", ["-c", shell.command], { cwd: this.config.headCwd, env, timeout: 30_000, maxBuffer: 1 << 20, signal: this.stopSignal.signal },
+          (error, stdout, stderr) => {
+            const code = error ? (error as { code?: unknown }).code : 0;
+            resolve({ exitCode: typeof code === "number" ? code : null, stdout, stderr,
+              ...(error && typeof code !== "number" ? { error: error.message } : {}) });
+          });
+      });
+      if (this.stopped) return;
+      const outcome = this.cronJobs.shellOutcome(shell.jobId, result);
+      this.store.settle(input.id, "done", outcome.text === null ? undefined : { id: `${input.id}:cron-shell`, text: outcome.text });
+      if (outcome.hash !== null && this.store.input(input.id)?.state === "done") this.cronJobs.recordShellHash(shell.jobId, outcome.hash);
+    })();
+    this.shellRuns.set(opId, operation);
+    try { await operation; }
+    finally { this.shellRuns.delete(opId); }
   }
 
   private cronControl(id: string, argument: string): void {
@@ -5740,11 +5776,6 @@ export class Superagent {
             this.cronControl(input.id, control.argument);
             continue;
           }
-          const shell = input.target === "main" ? this.cronJobs.shellRun(input) : null;
-          if (shell) {
-            if (!this.restartFence() && this.headStopping === 0 && !this.initializationHoldsHead()) await this.cronShell(input, shell);
-            continue;
-          }
           if (control?.name === "stop") {
             const target = this.stopTarget(input, control);
             if (target && this.controls.has(input.id)) {
@@ -5873,6 +5904,15 @@ export class Superagent {
                 continue;
               }
             }
+            const shell = live.id === "main" ? this.cronJobs.shellRun(input) : null;
+            if (shell) {
+              if (!steering) {
+                await this.dispatchCronShell(live, input, shell);
+                const state = this.store.input(input.id)?.state;
+                if (state === "submitted" || state === "uncertain") heldTargets.add("main");
+              }
+              continue;
+            }
             // Eligibility and order are decided anew on each drain. A hint being
             // prepared for steering does not reserve the next standalone turn.
             if (live.id === "main" && !this.prepareHeadRouting(input)) {
@@ -5969,7 +6009,7 @@ export class Superagent {
     if (this.restartFence() || live.id === "main" && this.headRecoveryActive() || !owner || !live.running || live.releasing || !this.current(live)
       || this.store.input(owner.id)?.state !== "submitted"
       || input.state !== "pending" || input.target !== live.id || owner.workflow || input.workflow
-      || routeKey(owner.route) !== routeKey(input.route) || this.headCommand(input)
+      || routeKey(owner.route) !== routeKey(input.route) || this.headCommand(input) || this.cronJobs.shellRun(input)
       || this.requestText(input).trimStart().startsWith("/") || this.store.approvals(live.id).length
       || this.modelChanges.has(live.id) || this.blocked.has(live.id)) return false;
     const inputs = this.store.inputs(live.id);
@@ -6000,6 +6040,7 @@ export class Superagent {
 
   private async dispatch(live: Live, input: InputRecord, steering = false): Promise<void> {
     if (this.restartFence() || live.id === "main" && this.headRecoveryActive()) return;
+    if (this.cronJobs.shellRun(input)) return;
     const owner = live.input;
     if (steering && !this.canSteer(live, input)) return;
     live.preparing++;
@@ -6825,7 +6866,7 @@ export class Superagent {
     for (const live of this.live.values()) {
       for (const { input } of live.admitted.values()) this.activity(input, false);
     }
-    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values()]);
+    await Promise.allSettled([this.groups?.stop(), this.prObservation, this.laneWatchObservation, this.presetSync, this.pumping, this.outbound, this.catchupTask, ...this.tasks, ...this.operations.values(), ...this.shellRuns.values()]);
     await this.messenger.stop();
     await Promise.allSettled([...this.live.values()].map(async live => { live.unsubscribe(); await live.connection.close(); }));
     this.live.clear();
