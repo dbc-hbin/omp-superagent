@@ -146,6 +146,9 @@ impl Channel {
     pub fn is_thread(&self) -> bool {
         matches!(self.kind, 10..=12)
     }
+    pub fn is_thread_owned_by(&self, account: &str) -> bool {
+        self.is_thread() && self.owner_id.as_deref() == Some(account)
+    }
     pub fn is_forum(&self) -> bool {
         matches!(self.kind, 15 | 16)
     }

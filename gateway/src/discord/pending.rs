@@ -182,13 +182,13 @@ impl Pending {
                 }
                 match live {
                     Some(wire) if wire.data.get("author").is_some() => {
-                        state.verify_wire(&wire.data, self.create, &route, addressing).await?
+                        state.verify_wire(&wire.data, self.create, &route, &channel, addressing).await?
                     }
                     _ => state.hydrate_source(&self.id, &route, self.create, revision, addressing).await?,
                 }
             }
             Evidence::Wire { route: expected, source } if *expected == route => {
-                state.verify_wire(source, self.create, &route, addressing).await?
+                state.verify_wire(source, self.create, &route, &channel, addressing).await?
             }
             Evidence::Verified { route: expected, message } if *expected == route => {
                 Some(message.as_ref().clone())
