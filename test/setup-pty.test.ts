@@ -591,7 +591,7 @@ ptyTest("actual traced setup wrapper prepares all messengers privately; explicit
     expect([config.maxHosts, config.maxSubagents, config.idleMs]).toEqual([4, 8, 300000]);
     expect(config.discord).toEqual({
       tokenEnv: defaultNames[0], ownerId: "123456789", allowedGuildIds: ["11111", "22222"],
-      allowedChannelIds: ["33333"], requireAddressing: false,
+      allowedChannelIds: ["33333"], requireAddressing: false, editProgressInPlace: false,
     });
     expect(config.telegram).toEqual({ tokenEnv: defaultNames[1], ownerId: "246813579", allowedChatIds: ["-97531"] });
     expect(config.slack).toEqual({ botTokenEnv: defaultNames[2], appTokenEnv: defaultNames[3], ownerId: "UOWNER123", teamId: "TTEAM123", allowedChannelIds: ["CCHANNEL123"] });

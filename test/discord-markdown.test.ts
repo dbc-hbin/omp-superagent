@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "../src/discord-markdown.ts";
 
 describe("Discord markdown table rendering", () => {
-  test("converts a pipe table into one aligned fenced block", () => {
+  test("renders labeled rows with blank boundaries next to prose", () => {
     expect(renderDiscordMarkdown([
       "Before text.",
       "| Name | Count |",
@@ -14,53 +14,53 @@ describe("Discord markdown table rendering", () => {
       "After text.",
     ].join("\n"), Infinity)).toBe([
       "Before text.",
-      "```",
-      "| Name   | Count |",
-      "| ------ | ----- |",
-      "| a      |    12 |",
-      "| longer |     3 |",
-      "```",
+      "",
+      "- Name: a",
+      "  - Count: 12",
+      "",
+      "- Name: longer",
+      "  - Count: 3",
+      "",
       "After text.",
     ].join("\n"));
   });
 
-  test("pads every column to its widest cell and honours alignment markers", () => {
+  test("accepts alignment markers and rows without outer pipes", () => {
     expect(renderDiscordMarkdown([
-      "| left | center | right |",
-      "| :--- | :----: | ----: |",
-      "| a | b | c |",
-      "| wide cell | mid | d |",
+      "   left | center | right",
+      "   :--- | :----: | ----:",
+      "   a | b | c",
     ].join("\n"), Infinity)).toBe([
-      "```",
-      "| left      | center | right |",
-      "| --------- | ------ | ----- |",
-      "| a         |   b    |     c |",
-      "| wide cell |  mid   |     d |",
-      "```",
+      "- left: a",
+      "  - center: b",
+      "  - right: c",
     ].join("\n"));
   });
 
-  test("pads by display width so CJK columns align with ASCII", () => {
-    const rendered = renderDiscordMarkdown([
-      "| 이름 | 값 |",
+  test("preserves links and emphasis in Korean Markdown cells", () => {
+    expect(renderDiscordMarkdown([
+      "| 이름 | 설명 |",
       "| --- | --- |",
-      "| 한글 | 1 |",
-      "| ab | 22 |",
-    ].join("\n"), Infinity);
-    const lines = rendered.split("\n");
-    expect(lines[0]).toBe("```");
-    expect(lines.at(-1)).toBe("```");
-    // Every fenced line occupies the same number of display columns, which is
-    // only true when padding counts CJK glyphs as two cells rather than one unit.
-    expect(new Set(lines.slice(1, -1).map(line => Bun.stringWidth(line))).size).toBe(1);
-    expect(lines).toEqual([
-      "```",
-      "| 이름 | 값  |",
-      "| ---- | --- |",
-      "| 한글 | 1   |",
-      "| ab   | 22  |",
-      "```",
-    ]);
+      "| [한글](https://example.invalid/korean) | **중요**한 *설명* |",
+    ].join("\n"), Infinity)).toBe("- 이름: [한글](https://example.invalid/korean)\n  - 설명: **중요**한 *설명*");
+  });
+
+  test("uses positional labels and empty values for ragged rows", () => {
+    expect(renderDiscordMarkdown([
+      "| Name |   | Status |",
+      "| --- | --- | --- |",
+      "| One | | Ready | extra |",
+      "| Two | note |",
+    ].join("\n"), Infinity)).toBe([
+      "- Name: One",
+      "  - Column 2:",
+      "  - Status: Ready",
+      "  - Column 4: extra",
+      "",
+      "- Name: Two",
+      "  - Column 2: note",
+      "  - Status:",
+    ].join("\n"));
   });
 
   test("leaves a pipe table without a delimiter row untouched", () => {
@@ -96,18 +96,31 @@ describe("Discord markdown table rendering", () => {
     expect(renderDiscordMarkdown(source, Infinity)).toBe(source);
   });
 
-  test("does not split a row on an escaped pipe or a pipe inside inline code", () => {
-    const lines = renderDiscordMarkdown([
+  test("only splits structural pipes and preserves the displayed inline code", () => {
+    expect(renderDiscordMarkdown([
       "| expr | note |",
       "| --- | --- |",
-      "| a \\| b | `x | y` |",
-    ].join("\n"), Infinity).split("\n");
-    // Two source cells stay two cells: the escaped pipe and the fenced-looking
-    // pipe are content, so the separator row never grows past two columns.
-    expect(lines).toHaveLength(5);
-    expect(lines[0]).toBe("```");
-    expect(lines[2]).toBe("| ----- | ------- |");
-    expect(lines[4]).toBe("```");
+      "| a \\| b | `x \\| y` |",
+      "| \\`literal | backslash \\\\|",
+      "| `x\\` | tail |",
+      "| ``a `b | c` `` | end |",
+      "| `` 미완료 `ok` 로그 | 정상 |",
+    ].join("\n"), Infinity)).toBe([
+      "- expr: a \\| b",
+      "  - note: `x | y`",
+      "",
+      "- expr: \\`literal",
+      "  - note: backslash \\\\",
+      "",
+      "- expr: `x\\`",
+      "  - note: tail",
+      "",
+      "- expr: ``a `b | c` ``",
+      "  - note: end",
+      "",
+      "- expr: \\`\\` 미완료 `ok` 로그",
+      "  - note: 정상",
+    ].join("\n"));
   });
 
   test("is idempotent: an already converted table is not converted again", () => {
@@ -115,11 +128,9 @@ describe("Discord markdown table rendering", () => {
     expect(renderDiscordMarkdown(once, Infinity)).toBe(once);
   });
 
-  test("always emits a closed fence", () => {
-    const rendered = renderDiscordMarkdown(["| a | b |", "|---|---|", "| 1 | 2 |"].join("\n"), Infinity);
-    expect(rendered.startsWith("```\n")).toBe(true);
-    expect(rendered.endsWith("\n```")).toBe(true);
-    expect(rendered.split("```")).toHaveLength(3);
+  test("emits one item with empty values for header-only tables and preserves existing blank lines", () => {
+    const source = "Before\n\n \t\n| | Name |\n|---|---|\n\n\nAfter\n";
+    expect(renderDiscordMarkdown(source, Infinity)).toBe("Before\n\n \t\n- Column 1:\n  - Name:\n\n\nAfter\n");
   });
 
   test.each([
@@ -134,10 +145,43 @@ describe("Discord markdown table rendering", () => {
     "###### next | heading",
   ])("ends a table before the next block: %s", block => {
     const source = ["| a | b |", "|---|---|", "| 1 | 2 |", block, "following text"].join("\n");
-    const table = renderDiscordMarkdown("| a | b |\n|---|---|\n| 1 | 2 |", Infinity);
-    expect(renderDiscordMarkdown(source, Infinity)).toBe(`${table}\n${block}\nfollowing text`);
+    expect(renderDiscordMarkdown(source, Infinity)).toBe(`- a: 1\n  - b: 2\n\n${block}\nfollowing text`);
     const nonTable = `${block}\n|---|---|`;
     expect(renderDiscordMarkdown(nonTable, Infinity)).toBe(nonTable);
+  });
+
+  test.each(["    ", "\t", "  \t"])("preserves indented code and does not use indented delimiters (%j)", indent => {
+    const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+    const code = `${indent}| code | sample |\n${indent}|---|---|`;
+    const invalid = `| c | d |\n${indent}|---|---|`;
+    expect(renderDiscordMarkdown(`${table}\n${code}\n\n${invalid}`, Infinity)).toBe(`- a: 1\n  - b: 2\n\n---\n\n${code}\n\n${invalid}`);
+  });
+
+  test("renders list-relative tables without changing nearby code blocks", () => {
+    const code = "10. ```markdown\n    A | B\n    --- | ---\n    x | y\n    ```";
+    const indented = "        A | B\n        --- | ---\n        x | y";
+    const source = `${code}\n\n11. Results\n\n    Name | Status\n    - | -\n    build | pass\n\n${indented}`;
+    const rendered = `${code}\n\n11. Results\n\n    - Name: build\n      - Status: pass\n\n    ---\n\n${indented}`;
+    expect(renderDiscordMarkdown(source, Infinity)).toBe(rendered);
+    expect(renderDiscordMarkdown(rendered, Infinity)).toBe(rendered);
+    const breakAndCode = "- - -\n\n    A | B\n    --- | ---\n    x | y";
+    expect(renderDiscordMarkdown(breakAndCode, Infinity)).toBe(breakAndCode);
+  });
+
+  test("keeps fences open across tab-indented lines at a list margin", () => {
+    const code = "- Example\n\n  ~~~md\n\tintro\n  A | B\n  --- | ---\n  x | y\n\t~~~";
+    expect(renderDiscordMarkdown(`${code}\n\n| A | B |\n|-|-|\n| 1 | 2 |`, Infinity)).toBe(`${code}\n\n- A: 1\n  - B: 2`);
+  });
+
+  test("does not pair literal backticks around a cell link", () => {
+    const source = "| `Tag |\n| --- |\n| [release](https://example.invalid/)` |";
+    expect(renderDiscordMarkdown(source, Infinity)).toBe("- \\`Tag: [release](https://example.invalid/)\\`");
+  });
+
+  test("keeps inline backticks in a row and stops at an actual fence opener", () => {
+    const code = "```js | file\n| c | d |\n|---|---|\n```";
+    const source = `| a | b |\n|---|---|\n\`\`\`x | y\`\`\` | z\n${code}\n| e | f |\n|---|---|\n| 3 | 4 |`;
+    expect(renderDiscordMarkdown(source, Infinity)).toBe(`- a: \`\`\`x | y\`\`\`\n  - b: z\n\n${code}\n\n- e: 3\n  - f: 4`);
   });
 
   test.each(["```js", "   ```` trailing text", "~~~text", "``", "~~~~"])("does not close a backtick fence at %s", line => {
@@ -148,27 +192,23 @@ describe("Discord markdown table rendering", () => {
   test("requires whitespace after a closing tilde fence and resumes after a valid close", () => {
     const code = ["~~~markdown", "~~~~text", "| a | b |", "|---|---|", "| 1 | 2 |", "   ~~~~ \t"].join("\n");
     const table = "| c | d |\n|---|---|\n| 3 | 4 |";
-    expect(renderDiscordMarkdown(`${code}\n${table}`, Infinity)).toBe(`${code}\n${renderDiscordMarkdown(table, Infinity)}`);
+    expect(renderDiscordMarkdown(`${code}\n${table}`, Infinity)).toBe(`${code}\n\n- c: 3\n  - d: 4`);
   });
 
-  test("counts UTF-8 bytes, surrounding prose, and multiple tables against one budget", () => {
-    const table = "| 이름 | 값 |\n|---|---|\n| 한글 | 1 |";
+  test("counts UTF-8 bytes, surrounding prose, and table boundaries against one budget", () => {
+    const table = "| 이름 | 상세 설명 |\n|---|---|\n| 한글 | 1 |\n| 두 번째 | 2 |";
+    const list = "- 이름: 한글\n  - 상세 설명: 1\n\n- 이름: 두 번째\n  - 상세 설명: 2";
     const source = `앞 문장\n${table}\n\n${table}\n뒤 문장`;
-    const rendered = renderDiscordMarkdown(source, Infinity);
+    const rendered = `앞 문장\n\n${list}\n\n${list}\n\n뒤 문장`;
     const bytes = Buffer.byteLength(rendered, "utf8");
-    expect(rendered).not.toBe(source);
     expect(renderDiscordMarkdown(source, bytes)).toBe(rendered);
     expect(renderDiscordMarkdown(source, bytes - 1)).toBe(source);
   });
 
-  test("keeps sparse tables original before allocating disproportionate padding", () => {
-    const source = ["| a | b |", "|---|---|", `| ${"x".repeat(10_000)} | y |`, ...Array(1000).fill("| 1 | 2 |")].join("\n");
-    expect(renderDiscordMarkdown(source, Buffer.byteLength(source, "utf8"))).toBe(source);
-  });
-
   test("handles many short rows without spreading them into function arguments", () => {
-    const source = ["| a | b |", "|---|---|", ...Array(150_000).fill("| 1 | 2 |")].join("\n");
-    expect(renderDiscordMarkdown(source, Buffer.byteLength(source, "utf8"))).toBe(source);
+    const source = `| a | b |\n|---|---|${"\n| 1 | 2 |".repeat(150_000)}`;
+    const rendered = `${"- a: 1\n  - b: 2\n\n".repeat(149_999)}- a: 1\n  - b: 2`;
+    expect(renderDiscordMarkdown(source, Buffer.byteLength(rendered, "utf8"))).toBe(rendered);
   });
 
   test("accounts ragged tables by present cells and rejects over-budget grids cleanly", () => {

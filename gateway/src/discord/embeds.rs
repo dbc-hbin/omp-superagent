@@ -10,7 +10,9 @@ use std::collections::HashSet;
 
 use serde_json::{Map, Value, json};
 
-use super::markdown::{Align, closes, opens, table_utf16};
+use unicode_width::UnicodeWidthStr;
+
+use super::markdown::{closes, indent_columns, list_margin, opens, relative_line};
 use super::model::utf16;
 
 // Discord's documented embed limits, counted in UTF-16 units like message text.
@@ -23,6 +25,56 @@ const FIELD_NAME: usize = 256;
 const FIELD_VALUE: usize = 1_024;
 const IMAGE_URL: usize = 2_048;
 const CARD_DEPTH: usize = 16;
+
+/// Budget the final UTF-16 length before padding the grid.
+fn table_utf16(rows: &[Vec<String>], budget: usize) -> Option<String> {
+    let mut widths = vec![3usize; rows.first()?.len()];
+    let mut extra = 0usize;
+    let mut less = 0usize;
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            let columns = cell.width();
+            *width = (*width).max(columns);
+            let units = utf16(cell);
+            if units >= columns {
+                extra = extra.checked_add(units - columns)?;
+            } else {
+                less = less.checked_add(columns - units)?;
+            }
+        }
+    }
+    let sum = widths.iter().try_fold(0usize, |sum, &width| sum.checked_add(width))?;
+    let row_len = widths.len().checked_mul(3)?.checked_add(2)?.checked_add(sum)?;
+    // A line per row plus the separator, surrounded by fenced code markers.
+    let planned = rows.len().checked_add(1)?.checked_mul(row_len)?.checked_add(7)?
+        .checked_sub(less)?.checked_add(extra)?;
+    if planned > budget {
+        return None;
+    }
+    let mut out = String::with_capacity(planned);
+    out.push_str("```\n");
+    for (index, row) in rows.iter().enumerate() {
+        out.push('|');
+        for (&width, cell) in widths.iter().zip(row) {
+            out.push(' ');
+            out.push_str(cell);
+            out.extend(std::iter::repeat_n(' ', width - cell.width() + 1));
+            out.push('|');
+        }
+        out.push('\n');
+        if index == 0 {
+            out.push('|');
+            for &width in &widths {
+                out.push(' ');
+                out.extend(std::iter::repeat_n('-', width));
+                out.push_str(" |");
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str("```");
+    Some(out)
+}
 
 struct Invalid;
 type Card<T> = Result<T, Invalid>;
@@ -175,7 +227,6 @@ impl<'a> Walk<'a> {
                     }
                     grid.push(row);
                 }
-                let aligns = vec![Align::Left; grid[0].len()];
                 let used = self
                     .embed
                     .parts
@@ -186,7 +237,7 @@ impl<'a> Walk<'a> {
                 let remaining = EMBED_DESCRIPTION.saturating_sub(used);
                 self.embed
                     .parts
-                    .push(table_utf16(&grid, &aligns, remaining).ok_or(Invalid)?);
+                    .push(table_utf16(&grid, remaining).ok_or(Invalid)?);
             }
             "Divider" => self.embed.parts.push("\u{2500}".repeat(16)),
             "Image" => {
@@ -248,22 +299,43 @@ pub(super) fn extract(text: &str) -> (Cow<'_, str>, Vec<Value>) {
     let mut embeds = Vec::new();
     let mut total = 0;
     let mut fenced = None;
+    let mut margins = Vec::new();
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
         index += 1;
-        if let Some((ch, length)) = fenced {
-            if closes(line, ch, length) {
+        let columns = indent_columns(line);
+        if fenced.is_some_and(|(_, _, margin)| columns < margin) && !line.trim().is_empty() {
+            fenced = None;
+        }
+        if let Some((ch, length, margin)) = fenced {
+            if (margin..margin + 4).contains(&columns)
+                && closes(line.trim_start_matches([' ', '\t']), ch, length)
+            {
                 fenced = None;
             }
             out.push(line);
             continue;
         }
-        let Some((ch, length, info)) = opens(line) else {
+        if !line.trim().is_empty() {
+            while margins.last().is_some_and(|&margin| relative_line(line, margin).is_none()) {
+                margins.pop();
+            }
+        }
+        let margin = margins.last().copied().unwrap_or(0);
+        let scoped = relative_line(line, margin).unwrap_or(line);
+        let Some((ch, length, info)) = opens(scoped) else {
+            if let Some(indent) = list_margin(scoped) {
+                let item_margin = margin + indent;
+                margins.push(item_margin);
+                if let Some((ch, length, _)) = scoped.get(indent..).and_then(opens) {
+                    fenced = Some((ch, length, item_margin));
+                }
+            }
             out.push(line);
             continue;
         };
-        if info.trim_matches([' ', '\t', '\r']) == "card"
+        if margin == 0 && info.trim_matches([' ', '\t', '\r']) == "card"
             && embeds.len() < EMBEDS_PER_MESSAGE
             && let Some(end) = (index..lines.len()).find(|at| closes(lines[*at], ch, length))
             && let Ok(embed) = card(&lines[index..end].join("\n"))
@@ -274,14 +346,16 @@ pub(super) fn extract(text: &str) -> (Cow<'_, str>, Vec<Value>) {
             index = end + 1;
             continue;
         }
-        fenced = Some((ch, length));
+        fenced = Some((ch, length, margin));
         out.push(line);
     }
     if embeds.is_empty() {
         return (Cow::Borrowed(text), embeds);
     }
-    let joined = out.join("\n");
-    (Cow::Owned(joined.trim_matches([' ', '\t', '\r', '\n']).to_owned()), embeds)
+    let occupied = |line: &&str| !line.trim_matches([' ', '\t', '\r']).is_empty();
+    let start = out.iter().position(occupied).unwrap_or(out.len());
+    let end = out.iter().rposition(occupied).map_or(start, |index| index + 1);
+    (Cow::Owned(out[start..end].join("\n")), embeds)
 }
 
 #[cfg(test)]
@@ -326,10 +400,9 @@ mod tests {
         assert!(embeds.is_empty());
 
         let boundary_rows = vec![vec!["이름".to_owned(), "값".to_owned()], vec!["가".to_owned(), "1".to_owned()]];
-        let aligns = vec![super::Align::Left; 2];
-        let rendered = super::table_utf16(&boundary_rows, &aligns, usize::MAX).unwrap();
+        let rendered = super::table_utf16(&boundary_rows, usize::MAX).unwrap();
         let exact = rendered.encode_utf16().count();
-        assert!(super::table_utf16(&boundary_rows, &aligns, exact).is_some());
-        assert!(super::table_utf16(&boundary_rows, &aligns, exact - 1).is_none());
+        assert!(super::table_utf16(&boundary_rows, exact).is_some());
+        assert!(super::table_utf16(&boundary_rows, exact - 1).is_none());
     }
 }

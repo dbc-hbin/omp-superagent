@@ -103,15 +103,15 @@ impl Payload {
     /// Valid ```card fences become embeds on the last payload.
     fn split(text: &str, cards: Vec<Value>, nonce: &str, parts: usize) -> Effect<Vec<Self>> {
         let rendered = markdown::render(text, FILE_LIMIT);
-        if rendered.len() > FILE_LIMIT {
+        if rendered.text.len() > FILE_LIMIT {
             return Err(EffectError::rejected(
                 "Discord text attachment exceeds the safe 8 MiB upload limit",
             ));
         }
-        let mut payloads = if rendered.is_empty() {
+        let mut payloads = if rendered.text.is_empty() {
             vec![Self::text(if cards.is_empty() { "(empty output)".to_owned() } else { String::new() })]
-        } else if utf16(&rendered) <= MESSAGE_LIMIT {
-            vec![Self::text(rendered.into_owned())]
+        } else if utf16(&rendered.text) <= MESSAGE_LIMIT {
+            vec![Self::text(rendered.text.into_owned())]
         } else if let Some(chunks) = markdown::split(&rendered, MESSAGE_LIMIT, parts) {
             chunks.into_iter().map(Self::text).collect()
         } else {
@@ -119,7 +119,7 @@ impl Payload {
             vec![Self::attachment(
                 "Full text is attached (exceeds Discord's message limit).",
                 name,
-                rendered.into_owned().into_bytes(),
+                rendered.text.into_owned().into_bytes(),
             )]
         };
         if !cards.is_empty()

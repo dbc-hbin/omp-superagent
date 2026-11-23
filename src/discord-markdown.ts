@@ -2,190 +2,185 @@
  * Markdown table rendering for the Discord transport.
  *
  * Discord has no pipe-table support: a table sent verbatim arrives as literal
- * `| a | b |` rows. Discord does render fenced blocks in a monospaced font, so a
- * table is converted into an aligned fenced block before it leaves this package.
- *
- * Column padding uses display width, not string length, so CJK and other wide
- * characters line up. Bun.stringWidth supplies the display width directly;
- * no OMP source checkout or private module is needed.
- *
- * A ```card fence holding a json-render spec becomes a Discord embed instead.
- * The Rust Gateway (gateway/src/discord/embeds.rs) implements the same contract;
- * test/fixtures/discord-cards.json pins both to identical results.
+ * `| a | b |` rows. Labeled lists preserve inline Markdown and wrap on
+ * narrow screens without requiring horizontal scrolling.
  */
-
-type Align = "left" | "center" | "right";
 
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
 const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t\r]*$/;
 const BLOCK_START = /^ {0,3}(?:>|#{1,6}(?:[ \t]|$)|(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$))/;
+const INDENTED_CODE = /^(?: {4}| {0,3}\t)/;
 const DELIMITER_CELL = /^:?-+:?$/;
+const LIST_MARKER = /^ {0,3}(?:[-+*]|\d{1,9}[.)])(?=[ \t]|$)/;
+const THEMATIC_BREAK = /^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,})\r?$/;
+
+function opensFence(line: string): string | undefined {
+  const match = FENCE_OPEN.exec(line);
+  const marker = match?.[1];
+  // An info string containing backticks makes a backtick opener inline code.
+  if (match && marker?.startsWith("`") && line.slice(match[0].length).includes("`")) return undefined;
+  return marker;
+}
+
+function relativeLine(line: string | undefined, margin: number): string | undefined {
+  const indent = line?.match(/^ */)?.[0].length ?? 0;
+  return indent >= margin ? line?.slice(margin) : undefined;
+}
+
+function listMargin(line: string): number | undefined {
+  const marker = LIST_MARKER.exec(line)?.[0];
+  if (!marker || THEMATIC_BREAK.test(line)) return undefined;
+  const spaces = line.slice(marker.length).match(/^ */)?.[0].length ?? 0;
+  return marker.length + (spaces >= 1 && spaces <= 4 ? spaces : 1);
+}
+
+function indentColumns(line: string): number {
+  let columns = 0;
+  for (const char of line) {
+    if (char === " ") columns++;
+    else if (char === "\t") columns += 4 - columns % 4;
+    else break;
+  }
+  return columns;
+}
 
 /**
- * Split one table row into trimmed cells.
- * Returns null when the line carries no unescaped pipe, so callers can end a
- * table body. `\|` and pipes inside backtick spans never split a cell, matching
- * how GFM reads a row.
+ * Split on structural pipes only. Inside inline code a table's pipe escape
+ * becomes a literal pipe; outside code Discord still interprets the escape.
  */
-function splitRow(line: string): string[] | null {
+function splitRow(line: string | undefined): string[] | null {
+  if (line === undefined || !line.includes("|") || INDENTED_CODE.test(line)) return null;
+  // Unmatched backtick runs are literal prose and must not hide separators.
+  const lastTicks = new Map<number, number>();
+  for (const match of line.matchAll(/`+/g)) lastTicks.set(match[0].length, match.index);
   const cells: string[] = [];
-  let cell = "";
+  let start = 0;
   let pipe = false;
-  let leading = false;
-  let tick = 0;
+  let decoded = "";
+  let ticks = 0;
   for (let index = 0; index < line.length; index++) {
-    const char = line[index]!;
-    if (char === "\\" && line[index + 1] === "|") {
-      // A GFM escaped pipe is cell content, not a separator: inside the fence
-      // it stays the literal `|` the author asked to display.
-      cell += "|";
+    const char = line[index];
+    const following = line[index + 1];
+    if (ticks === 0 && char === "\\" && (following === "|" || following === "`" || following === "\\")) {
       index++;
-      continue;
-    }
-    if (char === "`") {
-      let run = 1;
-      while (line[index + run] === "`") run++;
-      tick = tick === run ? 0 : tick === 0 ? run : tick;
-      cell += "`".repeat(run);
-      index += run - 1;
-      continue;
-    }
-    if (char === "|" && tick === 0) {
-      if (!pipe) leading = cell.trim() === "";
+    } else if (ticks !== 0 && char === "\\" && following === "|") {
+      decoded += line.slice(start, index) + "|";
+      index++;
+      start = index + 1;
+    } else if (char === "`") {
+      const first = index;
+      while (line[index + 1] === "`") index++;
+      const run = index - first + 1;
+      if (ticks === run) ticks = 0;
+      else if (ticks === 0) {
+        if ((lastTicks.get(run) ?? first) > first) ticks = run;
+        else {
+          decoded += line.slice(start, first) + "\\`".repeat(run);
+          start = index + 1;
+        }
+      }
+    } else if (char === "|" && ticks === 0) {
+      const cell = (decoded + line.slice(start, index)).trim();
+      if (pipe || cell !== "") cells.push(cell);
       pipe = true;
-      cells.push(cell);
-      cell = "";
-      continue;
+      decoded = "";
+      start = index + 1;
     }
-    cell += char;
   }
   if (!pipe) return null;
-  cells.push(cell);
-  if (leading) cells.shift();
-  if (cells.length > 0 && cells[cells.length - 1]!.trim() === "") cells.pop();
-  return cells.length > 0 ? cells.map(value => value.trim()) : null;
-}
-
-/** The delimiter row must have the same cell count as the header, as in GFM. */
-function parseDelimiter(line: string): Align[] | null {
-  const cells = splitRow(line);
-  if (!cells) return null;
-  const aligns: Align[] = [];
-  for (const cell of cells) {
-    if (!DELIMITER_CELL.test(cell)) return null;
-    const left = cell.startsWith(":");
-    const right = cell.endsWith(":");
-    aligns.push(left && right ? "center" : right ? "right" : "left");
-  }
-  return aligns;
-}
-
-function pad(value: string, width: number, align: Align): string {
-  const missing = width - Bun.stringWidth(value);
-  if (missing <= 0) return value;
-  if (align === "right") return " ".repeat(missing) + value;
-  if (align === "center") {
-    const left = Math.floor(missing / 2);
-    return " ".repeat(left) + value + " ".repeat(missing - left);
-  }
-  return value + " ".repeat(missing);
-}
-
-/** Check the byte or UTF-16 budget before allocating any padded cells or separators. */
-function formatTable(
-  rows: string[][],
-  aligns: Align[],
-  budget: { kind: "bytes" | "utf16"; max: number },
-): { lines: string[]; bytes: number; utf16: number } | null {
-  const widths = aligns.map(() => 3);
-  let extraBytes = 0;
-  let lessBytes = 0;
-  let extraUtf16 = 0;
-  let lessUtf16 = 0;
-  for (const row of rows) {
-    for (let column = 0; column < row.length; column++) {
-      const cell = row[column]!;
-      const width = Bun.stringWidth(cell);
-      widths[column] = Math.max(widths[column] ?? 3, width);
-      const cellBytes = Buffer.byteLength(cell, "utf8");
-      if (cellBytes >= width) extraBytes += cellBytes - width;
-      else lessBytes += width - cellBytes;
-      const cellUtf16 = cell.length;
-      if (cellUtf16 >= width) extraUtf16 += cellUtf16 - width;
-      else lessUtf16 += width - cellUtf16;
-    }
-  }
-  const alignOf = (column: number): Align => aligns[column] ?? "left";
-  const fence = "```";
-  const widthSum = widths.reduce((sum, width) => sum + width, 0);
-  // 7 accounts for "```\n" (4) + "```" (3); separator and base rows share `sepLen`.
-  const sepLen = 2 + 3 * widths.length + widthSum;
-  const base = 7 + (rows.length + 1) * sepLen;
-  const bytes = base - lessBytes + extraBytes;
-  const utf16 = base - lessUtf16 + extraUtf16;
-  if (!Number.isSafeInteger(bytes) || !Number.isSafeInteger(utf16)) return null;
-  if ((budget.kind === "bytes" ? bytes : utf16) > budget.max) return null;
-  const line = (cells: string[]) =>
-    `| ${widths.map((width, column) => pad(cells[column] ?? "", width, alignOf(column))).join(" | ")} |`;
-  // Pure dashes keep the grid exact; alignment is already visible in the padded
-  // cells, and `:` markers would only shift every following column by one.
-  const separator = `| ${widths.map(width => "-".repeat(width)).join(" | ")} |`;
-  const lines = [fence, line(rows[0]!), separator];
-  for (let index = 1; index < rows.length; index++) lines.push(line(rows[index]!));
-  lines.push(fence);
-  return { lines, bytes, utf16 };
+  const tail = (decoded + line.slice(start)).trim();
+  if (tail !== "") cells.push(tail);
+  return cells.length > 0 ? cells : null;
 }
 
 /**
- * Rewrite markdown pipe tables as aligned fenced blocks.
+ * Rewrite Markdown pipe tables as one labeled list item per row.
  *
- * Everything else passes through byte for byte: prose, lists, headings, links,
- * blockquotes, inline code, and existing fenced blocks. Pipes inside a fence are
- * never treated as a table, and an already-converted table stays inside its own
- * fence, so the transform is idempotent. If alignment would exceed the complete
- * message's byte budget, return the original text for the existing delivery path.
+ * Everything else passes through byte for byte. If the complete message would
+ * exceed the byte budget, return the original text for the existing delivery path.
  */
 export function renderDiscordMarkdown(text: string, maxBytes: number): string {
-  if (!text.includes("|")) return text;
-  let bytes = Buffer.byteLength(text, "utf8");
-  if (bytes > maxBytes) return text;
+  if (!text.includes("|") || Buffer.byteLength(text, "utf8") > maxBytes) return text;
   const lines = text.split("\n");
   const out: string[] = [];
-  let fence: { char: string; length: number } | null = null;
+  let remaining = maxBytes;
+  const append = (line: string): boolean => {
+    const bytes = Buffer.byteLength(line, "utf8") + (out.length === 0 ? 0 : 1);
+    if (bytes > remaining) return false;
+    remaining -= bytes;
+    out.push(line);
+    return true;
+  };
+  const margins: number[] = [];
+  let fence: { readonly marker: string; readonly margin: number } | undefined;
   for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]!;
-    const marker = FENCE_OPEN.exec(line)?.[1];
+    const line = lines[index];
     if (fence) {
-      out.push(line);
-      const close = FENCE_CLOSE.exec(line)?.[1];
-      if (close && close[0] === fence.char && close.length >= fence.length) fence = null;
-      continue;
+      const columns = indentColumns(line);
+      if (columns < fence.margin && line.trim()) {
+        fence = undefined; // The containing list item ended.
+      } else {
+        const close = columns >= fence.margin && columns < fence.margin + 4
+          ? FENCE_CLOSE.exec(line.replace(/^[ \t]*/, ""))?.[1]
+          : undefined;
+        if (close && close[0] === fence.marker[0] && close.length >= fence.marker.length) fence = undefined;
+        if (!append(line)) return text;
+        continue;
+      }
     }
+    if (line.trim()) {
+      let margin = margins.at(-1);
+      while (margin !== undefined && relativeLine(line, margin) === undefined) {
+        margins.pop();
+        margin = margins.at(-1);
+      }
+    }
+    const margin = margins.at(-1) ?? 0;
+    const scoped = relativeLine(line, margin) ?? line;
+    const marker = opensFence(scoped);
+    const indent = listMargin(scoped);
     if (marker) {
-      fence = { char: marker[0]!, length: marker.length };
-      out.push(line);
+      fence = { marker, margin };
+    } else if (indent !== undefined) {
+      const itemMargin = margin + indent;
+      margins.push(itemMargin);
+      const itemFence = opensFence(scoped.slice(indent));
+      if (itemFence) fence = { marker: itemFence, margin: itemMargin };
+    }
+    const delimiter = !marker && indent === undefined && scoped.includes("|") && !BLOCK_START.test(scoped)
+      ? splitRow(relativeLine(lines[index + 1], margin))
+      : null;
+    const header = delimiter?.every(cell => DELIMITER_CELL.test(cell)) ? splitRow(scoped) : null;
+    if (!header || header.length !== delimiter?.length) {
+      if (!append(line)) return text;
       continue;
     }
-    const delimiter = !BLOCK_START.test(line) && index + 1 < lines.length ? parseDelimiter(lines[index + 1]!) : null;
-    const header = delimiter ? splitRow(line) : null;
-    if (!delimiter || !header || header.length !== delimiter.length) {
-      out.push(line);
-      continue;
-    }
-    const rows = [header];
-    let sourceBytes = Buffer.byteLength(line, "utf8") + 1 + Buffer.byteLength(lines[index + 1]!, "utf8");
-    let next = index + 2;
-    for (; next < lines.length; next++) {
-      if (FENCE_OPEN.test(lines[next]!) || BLOCK_START.test(lines[next]!)) break;
-      const row = splitRow(lines[next]!);
-      if (!row) break;
-      rows.push(row);
-      sourceBytes += 1 + Buffer.byteLength(lines[next]!, "utf8");
-    }
-    const table = formatTable(rows, delimiter, { kind: "bytes", max: maxBytes - bytes + sourceBytes });
-    if (!table) return text;
-    bytes += table.bytes - sourceBytes;
-    for (const rendered of table.lines) out.push(rendered);
+    if (out.at(-1)?.trim() && !append("")) return text;
+    const indentation = line.slice(0, line.length - scoped.length);
+    const first = index + 2;
+    const bodyRow = (at: number) => {
+      const row = relativeLine(lines[at], margin);
+      return row === undefined || BLOCK_START.test(row) || opensFence(row) ? null : splitRow(row);
+    };
+    let next = first;
+    let row = bodyRow(next);
+    do {
+      if (next !== first && !append("")) return text;
+      const columns = Math.max(header.length, row?.length ?? 0);
+      for (let column = 0; column < columns; column++) {
+        const prefix = column === 0 ? "- " : "  - ";
+        const label = header[column] || `Column ${column + 1}`;
+        const value = row?.[column];
+        if (!append(`${indentation}${prefix}${label}:${value ? ` ${value}` : ""}`)) return text;
+      }
+      if (row) row = bodyRow(++next);
+    } while (row);
+    let following = next;
+    while (following < lines.length && !lines[following]?.trim()) following++;
+    const firstFollowing = lines[following];
+    if (firstFollowing !== undefined && indentColumns(firstFollowing) >= margin + 4
+      && (!append("") || !append(`${indentation}---`))) return text;
+    if (lines[next]?.trim() && !append("")) return text;
     index = next - 1;
   }
   return out.join("\n");
@@ -286,10 +281,9 @@ function cardEmbed(source: string): DiscordEmbed {
           || !Array.isArray(rows) || !rows.every(row => Array.isArray(row) && row.length === columns.length
             && row.every(cell => typeof cell === "string"))) throw new InvalidCard();
         const used = parts.reduce((sum, part) => sum + part.length, 0) + parts.length;
-        const table = formatTable([columns as string[], ...rows as string[][]], columns.map(() => "left"),
-          { kind: "utf16", max: EMBED_DESCRIPTION - used });
+        const table = cardTable([columns as string[], ...rows as string[][]], EMBED_DESCRIPTION - used);
         if (!table) throw new InvalidCard();
-        parts.push(table.lines.join("\n"));
+        parts.push(table);
         break;
       }
       case "Divider": parts.push(DIVIDER); break;
@@ -313,8 +307,25 @@ function cardEmbed(source: string): DiscordEmbed {
   return embed;
 }
 
-function trimLines(value: string): string {
-  return value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+function cardTable(rows: string[][], budget: number): string | null {
+  const widths = rows[0]!.map(() => 3);
+  let delta = 0;
+  for (const row of rows) {
+    for (const [i, cell] of row.entries()) {
+      const columns = Bun.stringWidth(cell);
+      widths[i] = Math.max(widths[i]!, columns);
+      delta += cell.length - columns;
+    }
+  }
+  const rowLength = 2 + 3 * widths.length + widths.reduce((sum, width) => sum + width, 0);
+  if (7 + (rows.length + 1) * rowLength + delta > budget) return null;
+  const lines = ["```"];
+  for (const [i, row] of rows.entries()) {
+    lines.push("| " + row.map((cell, column) => cell + " ".repeat(widths[column]! - Bun.stringWidth(cell))).join(" | ") + " |");
+    if (i === 0) lines.push("| " + widths.map(width => "-".repeat(width)).join(" | ") + " |");
+  }
+  lines.push("```");
+  return lines.join("\n");
 }
 
 /**
@@ -331,16 +342,25 @@ export function extractDiscordCards(source: string): { text: string; embeds: Dis
   const out: string[] = [];
   const embeds: DiscordEmbed[] = [];
   let total = 0;
-  let fence: { char: string; length: number } | null = null;
+  const margins: number[] = [];
+  let fence: { marker: string; margin: number } | undefined;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!;
+    const columns = indentColumns(line);
+    if (fence && columns < fence.margin && line.trim()) fence = undefined;
     if (fence) {
+      const close = columns >= fence.margin && columns < fence.margin + 4
+        ? FENCE_CLOSE.exec(line.replace(/^[ \t]*/, ""))?.[1] : undefined;
+      if (close && close[0] === fence.marker[0] && close.length >= fence.marker.length) fence = undefined;
       out.push(line);
-      const close = FENCE_CLOSE.exec(line)?.[1];
-      if (close && close[0] === fence.char && close.length >= fence.length) fence = null;
       continue;
     }
-    const card = CARD_OPEN.exec(line)?.[1];
+    if (line.trim()) {
+      while (margins.length && relativeLine(line, margins.at(-1)!) === undefined) margins.pop();
+    }
+    const margin = margins.at(-1) ?? 0;
+    const scoped = relativeLine(line, margin) ?? line;
+    const card = margin === 0 ? CARD_OPEN.exec(scoped)?.[1] : undefined;
     if (card) {
       let end = index + 1;
       for (; end < lines.length; end++) {
@@ -359,9 +379,21 @@ export function extractDiscordCards(source: string): { text: string; embeds: Dis
         } catch (error) { if (!(error instanceof InvalidCard)) throw error; }
       }
     }
-    const marker = FENCE_OPEN.exec(line)?.[1];
-    if (marker) fence = { char: marker[0]!, length: marker.length };
+    const marker = opensFence(scoped);
+    if (marker) fence = { marker, margin };
+    else {
+      const indent = listMargin(scoped);
+      if (indent !== undefined) {
+        const itemMargin = margin + indent;
+        margins.push(itemMargin);
+        const itemFence = opensFence(scoped.slice(indent));
+        if (itemFence) fence = { marker: itemFence, margin: itemMargin };
+      }
+    }
     out.push(line);
   }
-  return embeds.length === 0 ? { text: source, embeds } : { text: trimLines(out.join("\n")), embeds };
+  if (embeds.length === 0) return { text: source, embeds };
+  const occupied = (line: string) => !/^[ \t\r]*$/.test(line);
+  const start = out.findIndex(occupied);
+  return { text: start < 0 ? "" : out.slice(start, out.findLastIndex(occupied) + 1).join("\n"), embeds };
 }

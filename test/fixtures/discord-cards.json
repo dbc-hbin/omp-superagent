@@ -131,5 +131,25 @@
     "text": "```card\n{\"root\":\"card\",\"elements\":{\"card\":{\"type\":\"Card\",\"children\":[\"item\"]},\"item\":{\"type\":\"Field\",\"props\":{\"label\":\"x\",\"value\":\"v\",\"inline\":null}}}}\n```",
     "content": "```card\n{\"root\":\"card\",\"elements\":{\"card\":{\"type\":\"Card\",\"children\":[\"item\"]},\"item\":{\"type\":\"Field\",\"props\":{\"label\":\"x\",\"value\":\"v\",\"inline\":null}}}}\n```",
     "embeds": []
+  },
+  {
+    "name": "list-nested code still shows its literal card beside a top-level card",
+    "text": "- Example\n\n  ~~~~md\n  ```card\n  {\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"Nested example\"}}}}\n  ```\n  ~~~~\n\n```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"Only\"}}}}\n```",
+    "content": "- Example\n\n  ~~~~md\n  ```card\n  {\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"Nested example\"}}}}\n  ```\n  ~~~~",
+    "embeds": [
+      {
+        "title": "Only"
+      }
+    ]
+  },
+  {
+    "name": "extracting a card does not unindent the remaining code",
+    "text": "```card\n{\"root\": \"card\", \"elements\": {\"card\": {\"type\": \"Card\", \"props\": {\"title\": \"Only\"}}}}\n```\n\n    keep four spaces",
+    "content": "    keep four spaces",
+    "embeds": [
+      {
+        "title": "Only"
+      }
+    ]
   }
 ]

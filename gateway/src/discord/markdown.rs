@@ -1,74 +1,109 @@
 use std::borrow::Cow;
-
-use unicode_width::UnicodeWidthStr;
+use std::collections::HashMap;
+use std::ops::Range;
 
 use super::model::utf16;
 
-#[derive(Clone, Copy)]
-pub(super) enum Align {
-    Left,
-    Center,
-    Right,
+fn finish_cell<'a>(decoded: &mut String, tail: &'a str) -> Cow<'a, str> {
+    if decoded.is_empty() {
+        Cow::Borrowed(tail.trim())
+    } else {
+        decoded.push_str(tail);
+        Cow::Owned(std::mem::take(decoded).trim().to_owned())
+    }
 }
 
-fn split_row(line: &str) -> Option<Vec<String>> {
+fn split_row(line: &str) -> Option<Vec<Cow<'_, str>>> {
+    let line = unindent(line)?;
+    if !line.contains('|') {
+        return None;
+    }
+    // A run without a same-length closer is literal prose, not a code span.
+    // Index the last raw run of each length so checking closers stays linear.
+    let mut last_ticks = HashMap::new();
+    if line.contains('`') {
+        let mut bytes = line.bytes().enumerate().peekable();
+        while let Some((at, _)) = bytes.find(|&(_, byte)| byte == b'`') {
+            let mut run = 1;
+            while bytes.next_if(|&(_, byte)| byte == b'`').is_some() {
+                run += 1;
+            }
+            last_ticks.insert(run, at);
+        }
+    }
     let mut cells = Vec::new();
-    let mut cell = String::new();
-    let mut input = line.chars().peekable();
+    let mut start = 0;
+    let mut decoded = String::new();
+    let mut input = line.char_indices().peekable();
     let mut ticks = 0;
-    while let Some(ch) = input.next() {
+    while let Some((at, ch)) = input.next() {
         match ch {
-            '\\' if input.next_if_eq(&'|').is_some() => cell.push('|'),
+            '\\' if ticks == 0 => {
+                // Skip structural meaning, not the original Markdown bytes.
+                input.next_if(|&(_, next)| matches!(next, '\\' | '|' | '`'));
+            }
+            '\\' if input.next_if(|&(_, next)| next == '|').is_some() => {
+                // The table escape is not part of the inline code value.
+                decoded.push_str(&line[start..at]);
+                decoded.push('|');
+                start = at + 2;
+            }
             '`' => {
                 let mut run = 1;
-                cell.push('`');
-                while input.next_if_eq(&'`').is_some() {
-                    cell.push('`');
+                while input.next_if(|&(_, next)| next == '`').is_some() {
                     run += 1;
                 }
                 if ticks == run {
                     ticks = 0;
                 } else if ticks == 0 {
-                    ticks = run;
+                    if last_ticks.get(&run).is_some_and(|&last| last > at) {
+                        ticks = run;
+                    } else {
+                        // A literal run must not pair with another cell's run
+                        // once the label and value are on the same line.
+                        decoded.push_str(&line[start..at]);
+                        for _ in 0..run {
+                            decoded.push_str("\\`");
+                        }
+                        start = at + run;
+                    }
                 }
             }
-            '|' if ticks == 0 => cells.push(std::mem::take(&mut cell)),
-            _ => cell.push(ch),
+            '|' if ticks == 0 => {
+                cells.push(finish_cell(&mut decoded, &line[start..at]));
+                start = at + 1;
+            }
+            _ => {}
         }
     }
     if cells.is_empty() {
         return None;
     }
-    if cells.first().is_some_and(|s| s.trim().is_empty()) {
+    if cells.first().is_some_and(|cell| cell.is_empty()) {
         cells.remove(0);
     }
-    if !cell.trim().is_empty() {
+    let cell = finish_cell(&mut decoded, &line[start..]);
+    if !cell.is_empty() {
         cells.push(cell);
     }
-    (!cells.is_empty()).then(|| cells.into_iter().map(|s| s.trim().to_owned()).collect())
+    (!cells.is_empty()).then_some(cells)
 }
 
-fn delimiters(line: &str) -> Option<Vec<Align>> {
-    split_row(line)?
+fn delimiter_columns(line: &str) -> Option<usize> {
+    let cells = split_row(line)?;
+    cells
         .iter()
-        .map(|cell| {
-            let middle = cell.strip_prefix(':').unwrap_or(cell);
+        .all(|cell| {
+            let middle = cell.strip_prefix(':').unwrap_or(cell.as_ref());
             let middle = middle.strip_suffix(':').unwrap_or(middle);
-            if middle.is_empty() || !middle.bytes().all(|b| b == b'-') {
-                return None;
-            }
-            Some(match (cell.starts_with(':'), cell.ends_with(':')) {
-                (true, true) => Align::Center,
-                (false, true) => Align::Right,
-                (_, false) => Align::Left,
-            })
+            !middle.is_empty() && middle.bytes().all(|b| b == b'-')
         })
-        .collect()
+        .then_some(cells.len())
 }
 
 fn unindent(line: &str) -> Option<&str> {
     let trimmed = line.trim_start_matches(' ');
-    (line.len() - trimmed.len() <= 3).then_some(trimmed)
+    (line.len() - trimmed.len() <= 3 && !trimmed.starts_with('\t')).then_some(trimmed)
 }
 
 fn fence(line: &str) -> Option<(u8, usize, &str)> {
@@ -93,184 +128,243 @@ pub(super) fn closes(line: &str, ch: u8, length: usize) -> bool {
     })
 }
 
-fn block_start(line: &str) -> bool {
-    let Some(line) = unindent(line) else {
-        return false;
-    };
-    let Some(first) = line.as_bytes().first() else {
-        return false;
-    };
-    let marker = match first {
-        b'>' => return true,
-        b'#' => {
-            let length = line.bytes().take_while(|b| *b == b'#').count();
-            if length > 6 {
-                return false;
-            }
-            length
-        }
+fn list_marker(line: &str) -> Option<usize> {
+    let marker = match *line.as_bytes().first()? {
         b'-' | b'+' | b'*' => 1,
         b'0'..=b'9' => {
             let length = line.bytes().take_while(u8::is_ascii_digit).count();
             if length > 9 || !matches!(line.as_bytes().get(length), Some(b'.' | b')')) {
-                return false;
+                return None;
             }
             length + 1
         }
-        _ => return false,
+        _ => return None,
     };
-    matches!(line.as_bytes().get(marker), None | Some(b' ' | b'\t'))
+    matches!(line.as_bytes().get(marker), None | Some(b' ' | b'\t')).then_some(marker)
 }
 
-enum TableBudget {
-    Bytes(usize),
-    Utf16(usize),
+fn block_start(line: &str) -> bool {
+    let Some(line) = unindent(line) else {
+        return false;
+    };
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    line.starts_with('>')
+        || ((1..=6).contains(&hashes)
+            && matches!(line.as_bytes().get(hashes), None | Some(b' ' | b'\t')))
+        || list_marker(line).is_some()
 }
 
-fn render_table(rows: &[Vec<String>], aligns: &[Align], budget: TableBudget) -> Option<String> {
-    let mut widths = vec![3usize; aligns.len()];
-    let mut extra_bytes = 0usize;
-    let mut less_bytes = 0usize;
-    let mut extra_utf16 = 0usize;
-    let mut less_utf16 = 0usize;
-    for row in rows {
-        for (column, cell) in row.iter().enumerate() {
-            let width = cell.width();
-            if let Some(previous) = widths.get_mut(column) {
-                *previous = width.max(*previous);
+pub(super) fn relative_line(line: &str, margin: usize) -> Option<&str> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    (indent >= margin).then(|| &line[margin..])
+}
+
+pub(super) fn indent_columns(line: &str) -> usize {
+    line.bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .fold(0, |column, byte| {
+            if byte == b'\t' {
+                column + (4 - column % 4)
             } else {
-                widths.push(width.max(3));
+                column + 1
             }
-            let cell_bytes = cell.len();
-            if cell_bytes >= width {
-                extra_bytes = extra_bytes.checked_add(cell_bytes - width)?;
-            } else {
-                less_bytes = less_bytes.checked_add(width - cell_bytes)?;
-            }
-            if matches!(budget, TableBudget::Utf16(_)) {
-                let cell_utf16 = utf16(cell);
-                if cell_utf16 >= width {
-                    extra_utf16 = extra_utf16.checked_add(cell_utf16 - width)?;
-                } else {
-                    less_utf16 = less_utf16.checked_add(width - cell_utf16)?;
-                }
-            }
-        }
+        })
+}
+
+pub(super) fn list_margin(line: &str) -> Option<usize> {
+    let item = unindent(line)?;
+    if let Some(&marker @ (b'-' | b'*')) = item.as_bytes().first()
+        && item.bytes().filter(|&byte| byte == marker).count() >= 3
+        && item.bytes().all(|byte| byte == marker || matches!(byte, b' ' | b'\t' | b'\r'))
+    {
+        return None; // A thematic break does not open a list.
     }
-    let width_sum = widths
-        .iter()
-        .try_fold(0usize, |sum, &width| sum.checked_add(width))?;
-    let sep_len = widths
-        .len()
-        .checked_mul(3)?
-        .checked_add(2)?
-        .checked_add(width_sum)?;
-    // 7 accounts for "```\n" (4) + "```" (3); each row and the separator share
-    // the base frame/padding width `sep_len`, adjusted only for present cells.
-    let base = rows
-        .len()
-        .checked_add(1)?
-        .checked_mul(sep_len)?
-        .checked_add(7)?;
-    let total_bytes = base.checked_sub(less_bytes)?.checked_add(extra_bytes)?;
-    let exceeded = match budget {
-        TableBudget::Bytes(max) => total_bytes > max,
-        TableBudget::Utf16(max) => {
-            let total_utf16 = base.checked_sub(less_utf16)?.checked_add(extra_utf16)?;
-            total_utf16 > max
-        }
-    };
-    if exceeded {
-        return None;
-    }
-    let mut out = String::with_capacity(total_bytes);
-    out.push_str("```\n");
-    for (index, row) in rows.iter().enumerate() {
-        out.push('|');
-        for (column, width) in widths.iter().copied().enumerate() {
-            let cell = row.get(column).map_or("", String::as_str);
-            let missing = width.saturating_sub(cell.width());
-            let left = match aligns.get(column).copied().unwrap_or(Align::Left) {
-                Align::Left => 0,
-                Align::Center => missing / 2,
-                Align::Right => missing,
-            };
-            out.extend(std::iter::repeat_n(' ', left + 1));
-            out.push_str(cell);
-            out.extend(std::iter::repeat_n(' ', missing - left + 1));
-            out.push('|');
-        }
+    let content = &item[list_marker(item)?..];
+    let spaces = content.bytes().take_while(|b| *b == b' ').count();
+    let padding = if (1..=4).contains(&spaces) { spaces } else { 1 };
+    Some(line.len() - content.len() + padding)
+}
+
+fn table(
+    header: &[Cow<'_, str>],
+    rows: &[Vec<Cow<'_, str>>],
+    (before, after): (bool, bool),
+    indent: &str,
+    before_indented_code: bool,
+    budget: usize,
+) -> Option<String> {
+    let mut out = String::new();
+    if before {
         out.push('\n');
-        if index == 0 {
-            out.push('|');
-            for &width in &widths {
-                out.push(' ');
-                out.extend(std::iter::repeat_n('-', width));
-                out.push_str(" |");
+    }
+    // Header-only tables still show their column labels.
+    let rows = rows
+        .iter()
+        .map(Vec::as_slice)
+        .chain(rows.is_empty().then_some(&[][..]));
+    for (index, row) in rows.enumerate() {
+        if index > 0 {
+            out.push_str("\n\n");
+        }
+        for column in 0..header.len().max(row.len()) {
+            let prefix = if column == 0 { "- " } else { "  - " };
+            if column > 0 {
+                out.push('\n');
             }
-            out.push('\n');
+            let label = match header.get(column).filter(|label| !label.is_empty()) {
+                Some(label) => Cow::Borrowed(label.as_ref()),
+                None => Cow::Owned(format!("Column {}", column + 1)),
+            };
+            let value = row.get(column).map_or("", Cow::as_ref);
+            let space = if value.is_empty() { "" } else { " " };
+            if out.len() + indent.len() + prefix.len() + label.len() + 1 + space.len() + value.len()
+                > budget
+            {
+                return None;
+            }
+            out.push_str(indent);
+            out.push_str(prefix);
+            out.push_str(&label);
+            out.push(':');
+            out.push_str(space);
+            out.push_str(value);
         }
     }
-    out.push_str("```");
-    Some(out)
+    if before_indented_code {
+        // Otherwise the next verbatim code block can become a continuation of
+        // the generated list. A thematic break closes it without editing code.
+        out.push_str("\n\n");
+        out.push_str(indent);
+        out.push_str("---");
+    }
+    if after {
+        out.push('\n');
+    }
+    (out.len() <= budget).then_some(out)
 }
 
-pub(super) fn table(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Option<String> {
-    render_table(rows, aligns, TableBudget::Bytes(budget))
+pub(super) struct Rendered<'a> {
+    pub text: Cow<'a, str>,
+    tables: Vec<Range<usize>>,
 }
 
-pub(super) fn table_utf16(rows: &[Vec<String>], aligns: &[Align], budget: usize) -> Option<String> {
-    render_table(rows, aligns, TableBudget::Utf16(budget))
+impl<'a> Rendered<'a> {
+    fn plain(text: &'a str) -> Self {
+        Self {
+            text: Cow::Borrowed(text),
+            tables: Vec::new(),
+        }
+    }
 }
 
-pub(super) fn render(text: &str, budget: usize) -> Cow<'_, str> {
+pub(super) fn render(text: &str, budget: usize) -> Rendered<'_> {
     if !text.contains('|') || text.len() > budget {
-        return Cow::Borrowed(text);
+        return Rendered::plain(text);
     }
     let mut lines = text.split('\n').peekable();
     let mut pieces = Vec::new();
-    let mut bytes = text.len();
+    let mut tables = Vec::new();
+    let mut bytes = 0;
     let mut fenced = None;
+    let mut margins = Vec::new();
     while let Some(line) = lines.next() {
-        if let Some((ch, length)) = fenced {
-            if closes(line, ch, length) {
+        let offset = bytes + usize::from(!pieces.is_empty());
+        if fenced.is_some_and(|(_, _, margin)| indent_columns(line) < margin)
+            && !line.trim().is_empty()
+        {
+            fenced = None; // The containing list item ended.
+        }
+        if let Some((ch, length, margin)) = fenced {
+            let columns = indent_columns(line);
+            if (margin..margin + 4).contains(&columns)
+                && closes(line.trim_start_matches([' ', '\t']), ch, length)
+            {
                 fenced = None;
             }
-        } else if let Some((ch, length, _)) = opens(line) {
-            fenced = Some((ch, length));
-        } else if !block_start(line)
-            && let Some(delimiter) = lines.peek().copied()
-            && let Some(aligns) = delimiters(delimiter)
-            && let Some(header) = split_row(line)
-            && aligns.len() == header.len()
-        {
-            lines.next();
-            let mut rows = vec![header];
-            let mut old_bytes = line.len() + 1 + delimiter.len();
-            while let Some(next) = lines.peek().copied() {
-                if block_start(next) || fence(next).is_some() {
-                    break;
+        } else {
+            if !line.trim().is_empty() {
+                while margins
+                    .last()
+                    .is_some_and(|&margin| relative_line(line, margin).is_none())
+                {
+                    margins.pop();
                 }
-                let Some(row) = split_row(next) else {
-                    break;
-                };
-                lines.next();
-                rows.push(row);
-                old_bytes += 1 + next.len();
             }
-            let Some(rendered) = table(&rows, &aligns, budget - bytes + old_bytes) else {
-                return Cow::Borrowed(text);
-            };
-            bytes = bytes - old_bytes + rendered.len();
-            pieces.push(Cow::Owned(rendered));
-            continue;
+            // Four spaces may be a list's content margin rather than code.
+            let margin = margins.last().copied().unwrap_or(0);
+            let scoped = relative_line(line, margin).unwrap_or(line);
+            if let Some((ch, length, _)) = opens(scoped) {
+                fenced = Some((ch, length, margin));
+            } else if let Some(indent) = list_margin(scoped) {
+                let item_margin = margin + indent;
+                margins.push(item_margin);
+                if let Some((ch, length, _)) = scoped.get(indent..).and_then(opens) {
+                    fenced = Some((ch, length, item_margin));
+                }
+            } else if scoped.contains('|')
+                && !block_start(scoped)
+                && let Some(delimiter) = lines
+                    .peek()
+                    .copied()
+                    .and_then(|line| relative_line(line, margin))
+                && let Some(columns) = delimiter_columns(delimiter)
+                && let Some(header) = split_row(scoped)
+                && columns == header.len()
+            {
+                lines.next();
+                let mut rows = Vec::new();
+                while let Some(next) = lines
+                    .peek()
+                    .copied()
+                    .and_then(|line| relative_line(line, margin))
+                {
+                    if block_start(next) || opens(next).is_some() {
+                        break;
+                    }
+                    let Some(row) = split_row(next) else {
+                        break;
+                    };
+                    lines.next();
+                    rows.push(row);
+                }
+                let boundaries = (
+                    pieces
+                        .last()
+                        .is_some_and(|line: &Cow<'_, str>| !line.trim().is_empty()),
+                    lines.peek().is_some_and(|line| !line.trim().is_empty()),
+                );
+                let Some(remaining) = budget.checked_sub(offset) else {
+                    return Rendered::plain(text);
+                };
+                let indent = &line[..line.len() - scoped.len()];
+                let before_indented_code = lines
+                    .clone()
+                    .find(|line| !line.trim().is_empty())
+                    .is_some_and(|line| indent_columns(line) >= margin + 4);
+                let Some(rendered) =
+                    table(&header, &rows, boundaries, indent, before_indented_code, remaining)
+                else {
+                    return Rendered::plain(text);
+                };
+                bytes = offset + rendered.len();
+                tables.push(offset..bytes);
+                pieces.push(Cow::Owned(rendered));
+                continue;
+            }
+        }
+        bytes = offset + line.len();
+        if bytes > budget {
+            return Rendered::plain(text);
         }
         pieces.push(Cow::Borrowed(line));
     }
-    if pieces.iter().all(|piece| matches!(piece, Cow::Borrowed(_))) {
-        Cow::Borrowed(text)
+    if tables.is_empty() {
+        Rendered::plain(text)
     } else {
-        Cow::Owned(pieces.join("\n"))
+        Rendered {
+            text: Cow::Owned(pieces.join("\n")),
+            tables,
+        }
     }
 }
 
@@ -320,12 +414,20 @@ fn cut(text: &str, budget: usize) -> (&str, &str) {
 /// UTF-16 units. A code fence crossing a boundary is closed at the end of one
 /// part and reopened with its original opening line (and language) in the next.
 /// Returns `None` when the text needs more parts or cannot be split cleanly.
-pub(super) fn split(text: &str, limit: usize, parts: usize) -> Option<Vec<String>> {
+pub(super) fn split(rendered: &Rendered<'_>, limit: usize, parts: usize) -> Option<Vec<String>> {
+    let text = rendered.text.as_ref();
     let mut chunks = Vec::new();
     let mut rest = text;
     let mut open: Open<'_> = None;
     while !rest.trim().is_empty() {
         if chunks.len() == parts {
+            return None;
+        }
+        let offset = text.len() - rest.len();
+        // A nested table field at the start of a new message would lose
+        // its parent list and become an indented code block.
+        if rest.starts_with("    ") && rendered.tables.iter().any(|table| table.contains(&offset))
+        {
             return None;
         }
         let prefix = open.map_or(0, |(_, _, opener)| utf16(opener) + 1);
@@ -337,6 +439,11 @@ pub(super) fn split(text: &str, limit: usize, parts: usize) -> Option<Vec<String
             let (body, next) = cut(rest, budget);
             if !next.is_empty() && !rest[body.len()..].starts_with('\n') {
                 let line_start = body.rfind('\n').map_or(0, |at| at + 1);
+                // Rows can split between labeled fields, but not inside one:
+                // a space or hard cut could destroy its link or inline Markdown.
+                if rendered.tables.iter().any(|table| table.contains(&(offset + line_start))) {
+                    return None;
+                }
                 let original = rest[line_start..].split('\n').next().unwrap_or_default();
                 let tail = next.split('\n').next().unwrap_or_default();
                 let head = &body[line_start..];
