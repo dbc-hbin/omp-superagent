@@ -96,6 +96,15 @@ pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<
     if worker && !worker_rpc::allows(&command.name, &command.frame) {
         return command.worker_refusal(peer);
     }
+    if owner.pr_review_only() && !allows_pr_review(&command) {
+        return command.respond(
+            peer,
+            json!({
+                "success": false, "code": "pr_review_rpc_forbidden",
+                "error": "Command or arguments are not allowed on a static PR review Host",
+            }),
+        );
+    }
     let mut state = owner.state()?;
     match command.name.as_str() {
         "extension_ui_response" => {
@@ -289,6 +298,37 @@ pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<
         }
     });
     Ok(())
+}
+
+fn allows_pr_review(command: &Command) -> bool {
+    match command.name.as_str() {
+        "prompt" => {
+            command.frame.as_object().is_some_and(|fields| {
+                fields.keys().all(|key| matches!(key.as_str(), "type" | "id" | "message"))
+            }) && command.frame["message"].as_str().is_some_and(|message| {
+                // Prefix is controller-owned; the entire remainder is a JSON
+                // string/record, with native reference sigils escaped.
+                message.strip_prefix("Static PR review input:\n").is_some_and(|data| {
+                    !data.contains(['@', '^', '\r', '\n'])
+                        && serde_json::from_str::<Value>(data).is_ok_and(|value| value.is_object())
+                })
+            })
+        }
+        "get_session_stats" => command.frame.as_object().is_some_and(|fields| {
+            fields.keys().all(|key| matches!(key.as_str(), "id" | "type"))
+        }),
+        "negotiate_protocol"
+        | "set_host_message_updates"
+        | "get_host_admission"
+        | "get_state"
+        | "get_journal_cursor"
+        | "get_entries"
+        | "get_subagents"
+        | "abort"
+        | "abort_and_restore_queue"
+        | "shutdown_host" => worker_rpc::allows(&command.name, &command.frame),
+        _ => false,
+    }
 }
 
 struct Admitted {

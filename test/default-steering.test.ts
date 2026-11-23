@@ -115,7 +115,7 @@ afterEach(async () => {
     rmSync(fixture.directory, { recursive: true, force: true });
   }
 });
-function fixture(maxHosts = 1, requestRestart?: RuntimeAdapters["requestRestart"]) {
+function fixture(maxHosts = 1, requestRestart?: RuntimeAdapters["requestRestart"], topicMemory?: RuntimeAdapters["topicMemory"]) {
   const directory = realpathSync(mkdtempSync("/tmp/default-steering-"));
   const config: Config = { path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
     command: [process.execPath], maxHosts, maxSubagents: 4, idleMs: 60_000,
@@ -129,6 +129,7 @@ function fixture(maxHosts = 1, requestRestart?: RuntimeAdapters["requestRestart"
   const errors: unknown[] = [];
   const runtime = new Superagent(config, store, messenger, join(directory, "extension.ts"), error => errors.push(error), {
     requestRestart,
+    topicMemory,
     connect: async path => {
       const host = hosts.get(path);
       if (!host || host.disconnected) throw new Error("Host is not accepting connections");
@@ -158,7 +159,7 @@ async function drain(runtime: Superagent): Promise<void> {
   await after.promise;
 }
 
-describe("explicit HEAD and topic steering", () => {
+describe("HEAD and topic steering", () => {
   test("restart checkpoints joined native work without creating another steering ticket or replaying either prompt", async () => {
     let restartCalls = 0;
     const f = fixture(1, async request => {
@@ -197,8 +198,8 @@ describe("explicit HEAD and topic steering", () => {
     await runtime.start();
     await receive(runtime, headInbound("100"));
     await receive(runtime, headInbound("101", route("11")));
-    await receive(runtime, headInbound("102"));
-    await receive(runtime, headInbound("102"));
+    await receive(runtime, inbound("102"));
+    await receive(runtime, inbound("102"));
     expect(main.prompts).toHaveLength(2);
     expect(main.prompts[1]!.command.streamingBehavior).toBe("steer");
     expect(main.prompts[1]!.command.message).toContain("sourceId: 102");
@@ -224,42 +225,77 @@ describe("explicit HEAD and topic steering", () => {
     expect(messenger.sent).toHaveLength(1);
   });
 
-  test("an ordinary DM topic and its followups use a separate Host while internal reports wait for HEAD", async () => {
+  test.each([false, true])("ordinary topic followups join a separate Host while internal reports wait for HEAD (physical thread: %s)", async physical => {
     const { runtime, main, store, hosts, directory, messenger } = fixture(2);
-    messenger.supported = false; // Discord owner DMs use a logical topic, not a native DM thread.
+    messenger.supported = physical;
     await runtime.start();
-    const dm = route(null, { guildId: null });
-    await receive(runtime, headInbound("200", dm));
-    store.receive(inbound("report:internal", dm, "Internal lane report: untrusted"), "main");
-    await receive(runtime, inbound("201", dm, `/new cwd: ${directory}\nUnrelated repository request`));
+    const origin = physical ? route(null) : route(null, { guildId: null });
+    await receive(runtime, headInbound("200", origin));
+    store.receive(inbound("report:internal", origin, "Internal lane report: untrusted"), "main");
+    await receive(runtime, inbound("201", origin, `/new cwd: ${directory}\nUnrelated repository request`));
     const [lane] = store.lanes();
-    if (!lane) throw new Error("Expected an independent DM topic");
+    if (!lane) throw new Error("Expected an independent topic");
     const worker = hosts.get(lane.socketPath);
     if (!worker) throw new Error("Expected the topic Host to launch alongside HEAD");
-    await receive(runtime, inbound("202", dm));
+    await receive(runtime, inbound("202", physical ? lane.route : origin));
     expect(main.prompts).toHaveLength(1);
     expect(store.input("report:internal")).toMatchObject({ target: "main", state: "pending" });
-    expect(store.input("201")).toMatchObject({ target: null, route: lane.route, state: "done" });
+    expect(store.input("201")).toMatchObject({ target: null, route: physical ? origin : lane.route, state: "done" });
     expect(store.input("202")).toMatchObject({ target: null, route: lane.route, state: "done" });
     expect(store.input(`handoff:202:${lane.id}`)).toMatchObject({ target: lane.id, state: "submitted" });
     expect(worker.prompts).toHaveLength(2);
     expect(worker.prompts[1]?.command.streamingBehavior).toBe("steer");
   });
 
-  test("requires an observed active run and holds followups behind approvals", async () => {
+  test("keeps ordinary followups queued while a native approval is pending", async () => {
     const { runtime, main, store } = fixture();
     main.emitStart = false;
     await runtime.start();
     await receive(runtime, headInbound("300"));
-    await receive(runtime, headInbound("301"));
+    await receive(runtime, inbound("301"));
     expect(main.prompts).toHaveLength(1);
-    main.emit({ type: "agent_start" });
     main.state.pendingUiRequests = [{ id: "approval", method: "confirm" }];
-    await runtime.kick();
+    main.emit({ type: "agent_start" });
+    await drain(runtime);
     expect(store.input("301")?.state).toBe("pending");
     main.state.pendingUiRequests = [];
     await runtime.kick();
     expect(main.prompts).toHaveLength(2);
+  });
+
+  test("a pending HEAD reply steers when its first native turn starts without another inbound event", async () => {
+    const { runtime, main, store } = fixture();
+    main.emitStart = false;
+    await runtime.start();
+    await receive(runtime, inbound("310", route(null)));
+    await receive(runtime, inbound("311", route(null)));
+    expect(store.input("311")?.state).toBe("pending");
+
+    main.emit({ type: "agent_start" });
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(store.input("311")?.state).toBe("submitted");
+    expect(main.prompts[1]?.command.streamingBehavior).toBe("steer");
+  });
+
+  test("an ordinary HEAD followup doesn't wait for advisory memory about other sessions", async () => {
+    const recall = Promise.withResolvers<Awaited<ReturnType<NonNullable<RuntimeAdapters["topicMemory"]>["search"]>>>();
+    const { runtime, main, store, directory } = fixture(2, undefined, {
+      status: async () => ({ backend: "mnemopi", active: true, searchable: true, writable: true }),
+      search: () => recall.promise,
+    });
+    try {
+      await runtime.start();
+      await receive(runtime, inbound("320", route("10"), `cwd: ${directory}\nInspect this workspace`));
+      expect(store.laneForRoute(route("10"))?.sessionId).toBeTruthy();
+      await receive(runtime, headInbound("321", route(null)));
+      await receive(runtime, inbound("322", route(null), "Check the migration error handling first"));
+
+      expect(store.input("322")?.state).toBe("submitted");
+      expect(main.prompts[1]?.command.streamingBehavior).toBe("steer");
+    } finally {
+      recall.resolve({ backend: "mnemopi", query: "", items: [], count: 0 });
+    }
   });
 
   test("disconnect marks all admitted inputs uncertain without replay or duplicate notices", async () => {
@@ -316,12 +352,111 @@ describe("explicit HEAD and topic steering", () => {
     expect(messenger.sent).toEqual([expect.objectContaining({ id: "600:kickoff", sourceId: "handoff:600:lane", route: lane.route })]);
     expect(main.prompts).toHaveLength(2);
   });
+
+  test("a bound thread reply cannot join a manager handoff whose answer belongs to another thread", async () => {
+    const { runtime, store, hosts, select } = fixture(2);
+    await runtime.start();
+    await receive(runtime, headInbound("610", route("10")));
+    const destination = route("11");
+    const lane = await runtime.startLane(select("610", destination));
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected the explicitly selected lane");
+
+    await receive(runtime, inbound("611", destination));
+
+    const handoffId = `handoff:611:${lane.id}`;
+    expect(store.input(handoffId)).toMatchObject({ route: destination, state: "pending" });
+    expect(worker.prompts).toHaveLength(1);
+    worker.yield("Manager task completed");
+    worker.result(0);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(store.input("report:handoff:610:lane")?.route).toEqual(route("10"));
+    expect(store.input(handoffId)?.state).toBe("submitted");
+    expect(worker.prompts[1]?.command.streamingBehavior).toBeUndefined();
+  });
+
+  test("ordinary /head text in an active lane's thread steers HEAD, not the lane", async () => {
+    const { runtime, store, main, hosts, directory } = fixture(2);
+    const destination = route("10");
+    await runtime.start();
+    await receive(runtime, inbound("620", destination, `cwd: ${directory}\nOpen this workspace`));
+    const lane = store.laneForRoute(destination);
+    if (!lane) throw new Error("Expected a lane bound to the work thread");
+    await receive(runtime, headInbound("621", destination));
+    await receive(runtime, headInbound("622", destination, "Adjust the coordination request"));
+
+    expect(store.input("622")).toMatchObject({ target: "main", route: destination, state: "submitted" });
+    expect(main.prompts[1]?.command.streamingBehavior).toBe("steer");
+    expect(hosts.get(lane.socketPath)?.prompts).toHaveLength(1);
+  });
+
+  test("a joined bound reply keeps its run's manager report in the thread after HEAD opens a sibling for the source", async () => {
+    const { runtime, store, hosts, select } = fixture(3);
+    const destination = route("10");
+    await runtime.start();
+    await receive(runtime, headInbound("630", destination));
+    const lane = await runtime.startLane(select("630"));
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected the original work-thread Host");
+    worker.yield("First task completed");
+    worker.result(0);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+
+    await receive(runtime, headInbound("631", destination));
+    await runtime.messageLane(lane.id, "Work on the parser", "631");
+    await receive(runtime, inbound("632", destination, "Use the revised parsing requirement"));
+    expect(store.input(`handoff:632:${lane.id}`)?.state).toBe("submitted");
+    const sibling = await runtime.startLane(select("631", route(null)));
+    expect(sibling.route.threadId).toBe("900");
+    worker.yield("Combined result");
+    worker.result(1);
+    worker.result(2);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+
+    expect(store.input(`report:handoff:631:${lane.id}`)).toMatchObject({ route: destination });
+    expect(store.input(`handoff:632:${lane.id}`)?.state).toBe("done");
+  });
 });
 
 describe("native topic binding", () => {
   const slackDm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DDIRECT" });
   const telegramDm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
   const source = (id: string, destination: Route) => ({ ...headInbound(id, destination), messageId: destination.platform === "slack" ? "1750000000.000001" : id });
+
+  test("a logical DM reply joins a manager run on its bound native topic without moving the answer", async () => {
+    const { runtime, store, hosts, directory } = fixture(2);
+    await runtime.start();
+    await receive(runtime, inbound("710", telegramDm, `/new cwd: ${directory}\nInspect the workspace`));
+    const [lane] = store.lanes();
+    const worker = lane && hosts.get(lane.socketPath);
+    if (!lane || !worker) throw new Error("Expected a native topic Host");
+    worker.yield("Initial scan complete");
+    worker.result(0);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+
+    await receive(runtime, headInbound("711", telegramDm));
+    await runtime.messageLane(lane.id, "Check the restore path", "711");
+    await receive(runtime, inbound("712", telegramDm, "Use the saved restore settings"));
+
+    const owner = store.input("711");
+    const joined = `handoff:712:${lane.id}`;
+    expect(owner?.route).toMatchObject({ threadId: null, topicId: expect.any(String) });
+    expect(store.input(joined)).toMatchObject({ route: lane.route, state: "submitted" });
+    expect(worker.prompts[2]?.command.streamingBehavior).toBe("steer");
+    worker.yield("Combined restore result");
+    worker.result(1);
+    worker.result(2);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(store.input(`report:handoff:711:${lane.id}`)?.route).toEqual(owner?.route);
+    expect(store.input(joined)?.state).toBe("done");
+  });
 
   test.each([true, false])("Slack slash /new delegates real work without an invocation-based native thread source, native supported: %s", async supported => {
     const { runtime, store, messenger, main, hosts, directory } = fixture(2);
