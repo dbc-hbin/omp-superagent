@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { createHash } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { basename, delimiter, dirname, join } from "node:path";
 import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, LaneModel, LanePresetSnapshot, ResolvedLanePreset, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
 import { physicalRouteKey, routeKey } from "../src/contracts";
@@ -11125,16 +11125,17 @@ describe("preset role watcher and HEAD rotation threshold", () => {
       presetRolePaths: () => [configFile],
       syncPresetRoles: async () => {
         calls++;
-        if (calls >= 2) synced.resolve();
+        if (calls >= 3) synced.resolve();
       },
     });
     try {
       await runtime.start();
-      expect(calls).toBe(1);
+      // 1 initial sync in initializeHead + 1 post-watcher reconcile.
+      expect(calls).toBe(2);
       // Advancing past 30s and 120s must not trigger periodic polling while fs.watch is active.
       clock.mockReturnValue(now + 130_000);
       await Bun.sleep(30);
-      expect(calls).toBe(1);
+      expect(calls).toBe(2);
 
       // Burst writes on the watched file coalesce into a single debounced sync.
       writeFileSync(configFile, "modelRoles:\n  slow: a\n");
@@ -11144,7 +11145,7 @@ describe("preset role watcher and HEAD rotation threshold", () => {
       renameSync(tmpFile, configFile);
       await synced.promise;
       await Bun.sleep(200);
-      expect(calls).toBe(2);
+      expect(calls).toBe(3);
     } finally {
       clock.mockRestore();
       await runtime.stop();
@@ -11162,17 +11163,17 @@ describe("preset role watcher and HEAD rotation threshold", () => {
     });
     try {
       await runtime.start();
-      expect(calls).toBe(1);
+      expect(calls).toBe(2);
       // 30s must not trigger the slow fallback poll.
       clock.mockReturnValue(now + 35_000);
       await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
       await Bun.sleep(10);
-      expect(calls).toBe(1);
+      expect(calls).toBe(2);
       // At 120s without a restart fence, the slow fallback poll runs.
       clock.mockReturnValue(now + 120_000);
       await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
       await Bun.sleep(10);
-      expect(calls).toBe(2);
+      expect(calls).toBe(3);
       // Restart fence blocks sync even when due.
       store.setMeta("head:restart-fence", JSON.stringify({
         inputId: "r-1", requestId: "req-1", ackOutputId: "ack-1",
@@ -11182,11 +11183,159 @@ describe("preset role watcher and HEAD rotation threshold", () => {
       clock.mockReturnValue(now + 240_000);
       await (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
       await Bun.sleep(10);
-      expect(calls).toBe(2);
+      expect(calls).toBe(3);
     } finally {
       clock.mockRestore();
     }
   });
+
+  test("retains fallback and wakes when a missing project .omp directory is created alongside an existing global dir", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/sa-preset-mixed-"));
+    const globalDir = join(root, "global");
+    mkdirSync(globalDir);
+    const globalConfig = join(globalDir, "config.yml");
+    const projectOmp = join(root, "project", ".omp");
+    mkdirSync(join(root, "project"));
+    const projectConfig = join(projectOmp, "config.yml");
+    writeFileSync(globalConfig, "modelRoles: {}\n");
+    let calls = 0;
+    const synced = Promise.withResolvers<void>();
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [globalConfig, projectConfig],
+      syncPresetRoles: async () => {
+        calls++;
+        if (calls >= 3 && existsSync(projectConfig)) synced.resolve();
+      },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(2);
+      // Mixed coverage (global exists, project .omp missing) retains fallback polling.
+      clock.mockReturnValue(now + 120_000);
+      (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(20);
+      expect(calls).toBe(3);
+
+      // Creating .omp and .omp/config.yml later wakes the ancestor watcher and arms .omp directly.
+      mkdirSync(projectOmp);
+      writeFileSync(projectConfig, "modelRoles:\n  slow: a\n");
+      await synced.promise;
+      await Bun.sleep(200);
+      const countAfterCreate = calls;
+      expect(countAfterCreate).toBeGreaterThanOrEqual(4);
+
+      // Once .omp exists and is watched, fallback polling turns off while subsequent edits still trigger.
+      clock.mockReturnValue(now + 300_000);
+      (runtime as unknown as { observePresetRoles(): void }).observePresetRoles();
+      await Bun.sleep(20);
+      expect(calls).toBe(countAfterCreate);
+
+      const edited = Promise.withResolvers<void>();
+      const prevCalls = calls;
+      writeFileSync(projectConfig, "modelRoles:\n  slow: b\n");
+      for (let i = 0; i < 40 && calls === prevCalls; i++) await Bun.sleep(25);
+      expect(calls).toBeGreaterThan(prevCalls);
+      edited.resolve();
+    } finally {
+      clock.mockRestore();
+      await runtime.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("watches symlink targets in other directories when replaced atomically", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/sa-preset-symlink-"));
+    const linkDir = join(root, "agent");
+    const targetDir = join(root, "shared");
+    mkdirSync(linkDir);
+    mkdirSync(targetDir);
+    const realTarget = join(targetDir, "config.yml");
+    const linkPath = join(linkDir, "config.yml");
+    writeFileSync(realTarget, "modelRoles: {}\n");
+    symlinkSync(realTarget, linkPath);
+    let calls = 0;
+    const synced = Promise.withResolvers<void>();
+    const { runtime } = fixture(3, undefined, {
+      presetRolePaths: () => [linkPath],
+      syncPresetRoles: async () => {
+        calls++;
+        if (calls >= 3) synced.resolve();
+      },
+    });
+    try {
+      await runtime.start();
+      expect(calls).toBe(2);
+      const tmp = join(targetDir, "config.yml.tmp");
+      writeFileSync(tmp, "modelRoles:\n  slow: updated\n");
+      renameSync(tmp, realTarget);
+      await synced.promise;
+      expect(calls).toBeGreaterThanOrEqual(3);
+    } finally {
+      await runtime.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("reconciles changes in the startup gap and retries transient sync failures with bounded backoff", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-retry-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "v1");
+    let seenDuringStart = "";
+    let attempts = 0;
+    const recovered = Promise.withResolvers<void>();
+    const { runtime, errors } = fixture(3, undefined, {
+      presetRolePaths: () => {
+        // Simulate an edit arriving after initial initializeHead sync but before watchers register.
+        writeFileSync(configFile, "v2-startup-gap");
+        return [configFile];
+      },
+      syncPresetRoles: async () => {
+        attempts++;
+        seenDuringStart = readFileSync(configFile, "utf8");
+        if (attempts === 2) throw new Error("transient lock contention");
+        if (attempts >= 3) recovered.resolve();
+      },
+    });
+    try {
+      await runtime.start();
+      // Attempt 1: initial sync (v1); Attempt 2: post-watcher reconcile sees v2-startup-gap and fails transiently.
+      expect(seenDuringStart).toBe("v2-startup-gap");
+      expect(attempts).toBe(2);
+      // Bounded retry recovers automatically without a second file edit.
+      await recovered.promise;
+      expect(attempts).toBe(3);
+      expect(errors).toHaveLength(1);
+    } finally {
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("stops retrying after the bounded retry limit on persistent sync failures", async () => {
+    const watchDir = realpathSync(mkdtempSync("/tmp/sa-preset-cap-"));
+    const configFile = join(watchDir, "config.yml");
+    writeFileSync(configFile, "v1");
+    let attempts = 0;
+    const { runtime, errors } = fixture(3, undefined, {
+      presetRolePaths: () => [configFile],
+      syncPresetRoles: async () => {
+        attempts++;
+        throw new Error("persistent failure");
+      },
+    });
+    try {
+      await runtime.start();
+      // Initial sync (1) + post-watcher reconcile (2) both ran; retry 1..5 run at 100+200+400+800+1600ms = 3100ms.
+      await Bun.sleep(3_600);
+      expect(attempts).toBe(7);
+      expect(errors).toHaveLength(7);
+    } finally {
+      await runtime.stop();
+      rmSync(watchDir, { recursive: true, force: true });
+    }
+  }, 10_000);
 
   test("attestHeadRotation enforces 50% context threshold, idle window, and stop/restart guards", async () => {
     const { runtime, config, store, main } = fixture();

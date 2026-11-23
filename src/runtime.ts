@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
 import type { MemoryRuntimeContext } from "@oh-my-pi/pi-coding-agent/memory-backend";
@@ -45,6 +45,9 @@ import type { RemotePlacement, WorkerProbe, WorkerRegistration, WorkerSelector }
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 const presetSyncFallbackIntervalMs = 120_000;
 const presetSyncDebounceMs = 150;
+const presetSyncRetryBaseMs = 100;
+const presetSyncRetryMaxMs = 1_600;
+const presetSyncMaxRetries = 5;
 // Idle HEAD rotation keeps the 50% context threshold to rotate before stock
 // auto-compaction fires, matching host-extension.ts, Gateway rotation.rs, and DESIGN.md.
 const HEAD_ROTATION_CONTEXT_PERCENT = 50;
@@ -411,6 +414,10 @@ export class Superagent {
   private presetSyncDirty = false;
   private presetWatchFallback = false;
   private presetWatchDebounce?: NodeJS.Timeout;
+  private presetSyncRetryTimer?: NodeJS.Timeout;
+  private presetSyncRetryCount = 0;
+  private presetWatchPaths: readonly string[] = [];
+  private presetWatchSnapshot = "";
   private readonly presetWatchers: FSWatcher[] = [];
   private readonly remoteReconnect = new Map<string, RemoteRetry>();
   private readonly remoteAttaching = new Map<string, Promise<Live>>();
@@ -577,7 +584,11 @@ export class Superagent {
       await this.kick();
       this.observePrs();
       await this.startPresetWatcher();
+      // Reconcile once after installing watchers so changes in the gap after
+      // initial startup sync are never left unapplied.
+      this.presetSyncDirty = true;
       this.observePresetRoles();
+      await this.presetSync;
     } catch (error) {
       await this.stop();
       throw error;
@@ -3358,8 +3369,84 @@ export class Superagent {
       .finally(() => { this.prObservation = undefined; });
   }
 
+  private clearPresetSyncRetry(): void {
+    if (this.presetSyncRetryTimer) {
+      clearTimeout(this.presetSyncRetryTimer);
+      this.presetSyncRetryTimer = undefined;
+    }
+  }
+
+  private presetWatchState(paths: readonly string[]): {
+    direct: Map<string, Set<string>>;
+    ancestors: Map<string, Set<string>>;
+    uncovered: boolean;
+    snapshot: string;
+  } {
+    const direct = new Map<string, Set<string>>();
+    const ancestors = new Map<string, Set<string>>();
+    const add = (map: Map<string, Set<string>>, dir: string, name: string) => {
+      let names = map.get(dir);
+      if (!names) { names = new Set(); map.set(dir, names); }
+      names.add(name);
+    };
+    const addAncestor = (missingDir: string): boolean => {
+      let child = missingDir;
+      let parent = dirname(child);
+      while (parent !== child && !existsSync(parent)) {
+        child = parent;
+        parent = dirname(child);
+      }
+      if (parent !== child && existsSync(parent)) {
+        add(ancestors, parent, basename(child));
+        return true;
+      }
+      return false;
+    };
+    let uncovered = false;
+    const entries: string[] = [];
+    for (const target of paths) {
+      const directory = dirname(target);
+      const name = basename(target);
+      if (!existsSync(directory)) {
+        uncovered = true;
+        const watched = addAncestor(directory);
+        entries.push(`${target}|missing|${watched}`);
+        continue;
+      }
+      add(direct, directory, name);
+      let resolved: string | null = null;
+      let covered = true;
+      try {
+        lstatSync(target);
+        try {
+          const real = realpathSync(target);
+          resolved = real;
+          if (real !== target) {
+            const realDir = dirname(real);
+            if (existsSync(realDir)) add(direct, realDir, basename(real));
+            else covered = false;
+          }
+        } catch {
+          // Dangling symlink or unresolvable target: watch link target's parent/ancestor if possible and keep fallback active.
+          covered = false;
+          try {
+            const linkDest = resolve(directory, readlinkSync(target));
+            const linkDir = dirname(linkDest);
+            if (existsSync(linkDir)) add(direct, linkDir, basename(linkDest));
+            else addAncestor(linkDir);
+          } catch {}
+        }
+      } catch {
+        // File does not exist yet inside an existing directory: directory watch covers creation.
+      }
+      if (!covered) uncovered = true;
+      entries.push(`${target}|exists|${resolved ?? ""}|${covered}`);
+    }
+    return { direct, ancestors, uncovered, snapshot: entries.join("\n") };
+  }
+
   private async startPresetWatcher(): Promise<void> {
-    this.stopPresetWatcher();
+    this.stopPresetWatcher(false);
     this.presetWatchFallback = false;
     if (!this.adapters.syncPresetRoles) return;
     if (!this.adapters.presetRolePaths) {
@@ -3377,25 +3464,39 @@ export class Superagent {
       this.presetWatchFallback = true;
       return;
     }
-    const byDirectory = new Map<string, Set<string>>();
-    for (const target of paths) {
-      const directory = dirname(target);
-      const name = basename(target);
-      let names = byDirectory.get(directory);
-      if (!names) { names = new Set(); byDirectory.set(directory, names); }
-      names.add(name);
-    }
-    for (const [directory, names] of byDirectory) {
-      if (!existsSync(directory)) continue;
+    this.presetWatchPaths = paths;
+    const state = this.presetWatchState(paths);
+    this.presetWatchSnapshot = state.snapshot;
+    let uncovered = state.uncovered;
+    const directories = new Set([...state.direct.keys(), ...state.ancestors.keys()]);
+    for (const directory of directories) {
+      const directNames = state.direct.get(directory);
+      const ancestorNames = state.ancestors.get(directory);
       try {
         const watcher = watch(directory, { persistent: false }, (_event, filename) => {
           if (this.stopped) return;
-          if (filename !== null && !names.has(String(filename))) return;
+          if (filename !== null) {
+            const name = String(filename);
+            if (!directNames?.has(name) && !ancestorNames?.has(name)) return;
+          } else if (!directNames?.size && ancestorNames?.size
+            && ![...ancestorNames].some(name => existsSync(join(directory, name)))) {
+            return;
+          }
           if (this.presetWatchDebounce) clearTimeout(this.presetWatchDebounce);
           this.presetWatchDebounce = setTimeout(() => {
             this.presetWatchDebounce = undefined;
-            this.presetSyncDirty = true;
-            this.observePresetRoles();
+            void (async () => {
+              if (this.stopped) return;
+              if (this.presetWatchPaths.length
+                && this.presetWatchState(this.presetWatchPaths).snapshot !== this.presetWatchSnapshot) {
+                await this.startPresetWatcher();
+              }
+              if (this.stopped) return;
+              this.presetSyncRetryCount = 0;
+              this.clearPresetSyncRetry();
+              this.presetSyncDirty = true;
+              this.observePresetRoles();
+            })().catch(this.report);
           }, presetSyncDebounceMs);
           this.presetWatchDebounce.unref?.();
         });
@@ -3409,14 +3510,15 @@ export class Superagent {
         });
         this.presetWatchers.push(watcher);
       } catch (error) {
-        this.presetWatchFallback = true;
+        uncovered = true;
         this.report(error);
       }
     }
-    if (!this.presetWatchers.length) this.presetWatchFallback = true;
+    if (uncovered || !this.presetWatchers.length) this.presetWatchFallback = true;
   }
 
-  private stopPresetWatcher(): void {
+  private stopPresetWatcher(clearRetry = true): void {
+    if (clearRetry) this.clearPresetSyncRetry();
     if (this.presetWatchDebounce) {
       clearTimeout(this.presetWatchDebounce);
       this.presetWatchDebounce = undefined;
@@ -3435,11 +3537,31 @@ export class Superagent {
     const dueFallback = this.presetWatchFallback && Date.now() >= this.nextPresetSync;
     if (!this.presetSyncDirty && !dueFallback) return;
     this.presetSyncDirty = false;
+    this.clearPresetSyncRetry();
     if (this.presetWatchFallback) this.nextPresetSync = Date.now() + presetSyncFallbackIntervalMs;
-    this.presetSync = sync(canWrite).catch(this.report).finally(() => {
-      this.presetSync = undefined;
-      if (this.presetSyncDirty) this.observePresetRoles();
-    });
+    let failed = false;
+    this.presetSync = sync(canWrite)
+      .then(() => { this.presetSyncRetryCount = 0; })
+      .catch(error => {
+        failed = true;
+        this.report(error);
+      })
+      .finally(() => {
+        this.presetSync = undefined;
+        if (this.stopped) return;
+        if (this.presetSyncDirty) {
+          this.observePresetRoles();
+        } else if (failed && this.presetSyncRetryCount < presetSyncMaxRetries) {
+          const delay = Math.min(presetSyncRetryBaseMs * 2 ** this.presetSyncRetryCount, presetSyncRetryMaxMs);
+          this.presetSyncRetryCount++;
+          this.presetSyncRetryTimer = setTimeout(() => {
+            this.presetSyncRetryTimer = undefined;
+            this.presetSyncDirty = true;
+            this.observePresetRoles();
+          }, delay);
+          this.presetSyncRetryTimer.unref?.();
+        }
+      });
   }
 
   async inspectThread(sourceId: string, laneId?: string): Promise<ThreadInfo> {
