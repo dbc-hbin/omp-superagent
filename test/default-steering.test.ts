@@ -353,6 +353,40 @@ describe("HEAD and topic steering", () => {
     expect(main.prompts).toHaveLength(2);
   });
 
+  test("parent handoffs steer only the matching manager conversation even when another run reports to the same thread", async () => {
+    const { runtime, store, hosts, select } = fixture(2);
+    const parent = route(null);
+    await runtime.start();
+    await receive(runtime, headInbound("605"));
+    const lane = await runtime.startLane(select("605"));
+    await runtime.kick();
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected the original work-thread Host");
+
+    await receive(runtime, headInbound("606", parent));
+    const reopened = await runtime.messageLane(lane.id, "Check the follow-up.", "606");
+    expect(reopened.state).toBe("pending");
+    expect(worker.prompts).toHaveLength(1);
+    worker.yield("The thread-origin task finished.");
+    worker.result(0);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(worker.prompts[1]?.command.streamingBehavior).toBeUndefined();
+
+    await receive(runtime, headInbound("607", parent));
+    const joined = await runtime.messageLane(lane.id, "Include the edge case.", "607");
+    expect(worker.prompts.map(prompt => prompt.command.streamingBehavior)).toEqual([undefined, undefined, "steer"]);
+    worker.yield("Both parent follow-ups are verified.");
+    worker.result(2);
+    worker.result(1);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(store.input(joined.inputId)?.state).toBe("done");
+    expect(store.input(`report:${joined.inputId}`)).toBeNull();
+    expect(store.input(`report:${reopened.inputId}`)).toMatchObject({ route: lane.route,
+      text: expect.stringContaining("Both parent follow-ups are verified.") });
+  });
+
   test("a bound thread reply cannot join a manager handoff whose answer belongs to another thread", async () => {
     const { runtime, store, hosts, select } = fixture(2);
     await runtime.start();

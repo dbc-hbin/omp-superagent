@@ -295,10 +295,18 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   threads, not edits, quoted text or attachments. DM and other adapters retain
   their existing topic behavior.
 - `/head <request>` explicitly addresses the shared coordination model (Slack:
-  `!head` or `/superagent-head`). Its manager handoffs keep the original review
-  path. Bound-topic commentary and final answers instead pass through the
-  controller's source-bound outbox without a synthesis turn. Approval cards
-  also stay with their original native session and authorized route.
+  `!head` or `/superagent-head`). Manager handoffs keep HEAD's review path.
+  When HEAD explicitly uses `lane_message` to continue an existing physical
+  Discord work thread from its exact authorized guild parent, the controller
+  records that thread as the handoff's progress and final report route. It
+  does not change the original input or borrow its parent message as a thread
+  reply. Replays preserve the recorded destination and do not send a parent
+  copy. Native approvals during HEAD's review still use the original parent
+  route, not the report's destination. Other routes, logical topics and
+  `/resume` retain their existing rules. Bound-topic commentary and final
+  answers instead pass through the controller's source-bound outbox without a
+  synthesis turn. Approval cards stay with their original native session and
+  authorized route.
 - Thread-first work sends a short kickoff to the selected topic. The durable
   `sent` receipt gates new lane dispatch and steering for that input. A missing
   or uncertain delivery is not a successful kickoff.
@@ -316,10 +324,12 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   If a follow-up arrives before the native start event, that event rechecks
   pending inputs. An idle destination receives a new prompt.
   Match the full route including account, authority, thread and topic. A bound
-  reply can join the kickoff initiated elsewhere only if the existing verified
-  delivery route is this exact thread. A manager handoff keeps its HEAD review
-  mode, with the verified reply route fixed for the joined run, including logical
-  topics backed by native threads. Keep each source and native receipt distinct
+  reply can join a manager run initiated elsewhere only if its verified delivery
+  route is this exact thread. When steering another manager handoff into or from
+  a parent-origin thread follow-up, both source conversations and report routes
+  must match. A manager handoff keeps its HEAD review mode, with the verified
+  reply route fixed for the joined run, including logical topics backed by native
+  threads. Keep each source and native receipt distinct
   and deliver one result for a jointly handled cohort. History lookup verifies
   a joined reply's topic ownership and its own completed native receipt, not the
   manager's instructions or completion.

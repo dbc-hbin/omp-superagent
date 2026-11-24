@@ -3498,6 +3498,12 @@ export class Superagent {
       if (queued) this.background(this.syncLaneThreadTitle(lane));
       return handoffId;
     }
+    // Pin only an original HEAD input from this physical thread's exact parent.
+    // Do not rebind the inbound message, topic, or source of native callbacks.
+    const reportInThread = original.target === "main" && !original.pickerSelection
+      && this.store.getMeta(`user-source:${original.id}`) === "true"
+      && discordWorkThread(lane.route) && lane.route.topicId === undefined
+      && routeKey(original.route) === routeKey({ ...lane.route, threadId: null });
     const queued = this.store.receive({
       id: handoffId, route: lane.route, messageId: original.messageId,
       ...(original.interactionId === undefined ? {} : { interactionId: original.interactionId }),
@@ -3506,7 +3512,10 @@ export class Superagent {
       ...(original.discordContext === undefined ? {} : { discordContext: original.discordContext }),
       text, receivedAt: original.receivedAt,
       attachments: original.attachments,
-    }, id, { [`handoff-source:${handoffId}`]: sourceId }, workflow);
+    }, id, {
+      [`handoff-source:${handoffId}`]: sourceId,
+      ...(reportInThread ? { [`handoff-reply:${handoffId}`]: routeKey(lane.route) } : {}),
+    }, workflow);
     if (queued) this.background(this.syncLaneThreadTitle(lane));
     return handoffId;
   }
@@ -6851,7 +6860,13 @@ export class Superagent {
       const activeTopic = this.store.topicDelivery(owner.id);
       const nextTopic = this.store.topicDelivery(input.id);
       const activeReply = routeKey(activeTopic?.route ?? this.store.laneReplyRoute(owner, activeSource));
-      if (!nextTopic) return !activeTopic && activeReply === routeKey(this.store.laneReplyRoute(input, nextSource));
+      if (!nextTopic) {
+        if (activeTopic || activeReply !== routeKey(this.store.laneReplyRoute(input, nextSource))) return false;
+        // A parent handoff and a thread-origin handoff can now report to the
+        // same thread without belonging to the same manager conversation.
+        return routeKey(activeSource.route) === routeKey(nextSource.route)
+          || this.store.getMeta(`handoff-reply:${owner.id}`) === null && this.store.getMeta(`handoff-reply:${input.id}`) === null;
+      }
       // A verified kickoff can originate in the parent conversation, but its
       // cohort must still answer on the exact thread of the ordinary followup.
       const nextReply = routeKey(nextTopic.route);
@@ -7466,7 +7481,11 @@ export class Superagent {
       return;
     }
     const topic = !persisted && live.input ? this.store.topicDelivery(live.input.id) : null;
-    const route = persisted?.route ?? topic?.route ?? live.input?.route ?? this.store.lane(live.id)?.route;
+    const reportApprovalSource = !persisted && live.id === "main" && live.input
+      ? this.store.getMeta(`report-approval-source:${live.input.id}`) : null;
+    const route = persisted?.route ?? (reportApprovalSource === null
+      ? topic?.route ?? live.input?.route ?? this.store.lane(live.id)?.route
+      : this.store.input(reportApprovalSource)?.route);
     if (route && groupRoom(this.config, route)) {
       if (persisted) this.store.resolveApproval(persisted.id, live.generation, "cancelled");
       live.connection.uiResponse(frame.id, { cancelled: true });
