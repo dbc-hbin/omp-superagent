@@ -34,6 +34,8 @@ use super::{
 };
 use crate::store::Store;
 
+pub(crate) mod private_paths;
+
 pub(super) struct SocketIdentity {
     path: PathBuf,
     dev: u64,

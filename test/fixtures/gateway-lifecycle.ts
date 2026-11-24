@@ -5,7 +5,8 @@ import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "../../src/config";
-import type { GatewayRestartRecord, Inbound, Messenger, Route } from "../../src/contracts";
+import type { GatewayRestartRecord, Inbound, Route } from "../../src/contracts";
+import type { DownloadMessenger as Messenger } from "./inbound-attachments";
 import { startGateway, type GatewayOptions } from "../oracles/bun-gateway/gateway";
 import { gatewayCall, gatewayPaths } from "../../src/gateway-protocol";
 import { processAlive, type RestartPlan } from "../oracles/bun-gateway/gateway-restart";

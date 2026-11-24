@@ -1,6 +1,6 @@
 import { Type, type Static } from "@sinclair/typebox/type";
 import { parsePrRef } from "./pr-github";
-import { loginSchema, parseWire, PrReadError } from "./pr-github-schema";
+import { loginSchema, parseWire, PrReadError, sha40 as sha } from "./pr-github-schema";
 import { openIntakeGitHubSession, type IntakeRepositoryIdentity } from "./pr-intake-github";
 import { openIntakeTree, readIntakeBlob } from "./pr-intake-tree";
 
@@ -11,7 +11,6 @@ const maxReviewBlobBytes = 96 * 1024;
 export const intakeEvidenceDeadlineMs = 90_000;
 const count = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 const id = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
-const sha = Type.String({ pattern: "^[0-9a-f]{40}$" });
 const login = loginSchema.properties.login;
 const actor = Type.Object({ id, login, type: Type.Literal("User") });
 const repo = Type.Object({ id, full_name: Type.String({ minLength: 3, maxLength: 140 }), owner: Type.Object({ id, login }) });

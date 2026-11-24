@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "@sinclair/typebox/type";
 import { Value } from "@sinclair/typebox/value";
 import { stagePrivateFile } from "./credentials";
+import { workerBridgePaths } from "./worker-bridge";
 import {
   checkWorkerFile, readWorkerFile, shellWord, withWorkerWriteLock, workerDirectory,
   workerHash, workerPublicKey, WorkerRegistrationError,
@@ -48,7 +49,7 @@ function policyAt(path: string) {
 function enrollmentAuthorization(path: string, key: string, repos: WorkerPolicy["repos"]): string {
   trustedWorkerPath(workerInstallRoot, repos, "directory");
   const cli = trustedWorkerPath(fileURLToPath(new URL("./cli.ts", import.meta.url)), repos, "file");
-  const bun = trustedWorkerPath(realpathSync(process.execPath), repos, "file");
+  const { bun } = workerBridgePaths(repos);
   const argv = [bun, "--no-env-file", cli, "worker", "serve", "--policy", path].map(shellWord);
   const command = `exec ${argv.join(" ")}`.replaceAll('"', '\\"');
   return `restrict,command="${command}" ${key} omp-sa-worker`;

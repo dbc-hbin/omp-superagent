@@ -1,12 +1,13 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { Readable, Writable } from "node:stream";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync,
+  symlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
+import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { reserveCheckout } from "../src/worker-checkout";
 import { WorkerLedger } from "../src/worker-ledger";
 import { workerLaunchProfile } from "../src/worker-profile";
-import { serveWorker } from "../src/worker-service";
 import { workerRepositoryIdentity } from "../src/worker-repository";
 import { remoteLanePaths, type WorkerLaneRef, type WorkerPolicy } from "../src/worker-wire";
 
@@ -14,9 +15,10 @@ async function fixture(startupFile?: string) {
   const root = mkdtempSync(join(realpathSync("/tmp"), "ow-"));
   try {
     const cwd = join(root, "checkout");
-    const stateDir = join(root, "state");
+    const fingerprint = "a".repeat(64);
+    const stateDir = join(root, ".omp-sa-worker", fingerprint.slice(0, 16));
     mkdirSync(cwd, { mode: 0o700 });
-    mkdirSync(stateDir, { mode: 0o700 });
+    mkdirSync(stateDir, { mode: 0o700, recursive: true });
     const git = (...args: string[]) => execFileSync("/usr/bin/git", ["-C", cwd, ...args], {
       encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
       env: { PATH: "/usr/bin:/bin", HOME: root, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
@@ -34,7 +36,9 @@ async function fixture(startupFile?: string) {
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture");
     const repoId = await workerRepositoryIdentity(cwd);
     if (!repoId) throw new Error("Fixture Git identity is missing");
-    const policy: WorkerPolicy = { stateDir, workerId: "head-one", capacity: 1, command: ["/usr/bin/false"], repos: [{ cwd, id: repoId }] };
+    const policy: WorkerPolicy = { stateDir, workerId: "worker-11111111-1111-4111-8111-111111111111",
+      capacity: 1, command: ["/usr/bin/false"], repos: [{ cwd, id: repoId }] };
+    writeFileSync(join(stateDir, "policy.json"), JSON.stringify({ fingerprint, ...policy }), { mode: 0o600 });
     const ref: WorkerLaneRef = { laneId: "lane-service-test", repoId, revision: git("rev-parse", "HEAD"), subdir: "src", generation: 1 };
     return { root, cwd, policy, ref };
   } catch (error) {
@@ -43,12 +47,18 @@ async function fixture(startupFile?: string) {
   }
 }
 
-async function request(policy: WorkerPolicy, payload: object): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  const input = Readable.from(Buffer.from(`${JSON.stringify({ version: 1, ...payload })}\n`));
-  const output = new Writable({ write(chunk: Buffer, _encoding, callback) { chunks.push(chunk); callback(); } });
-  await serveWorker(policy, input, output);
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+async function request(policy: WorkerPolicy, payload: object, extra = ""): Promise<unknown> {
+  const home = dirname(dirname(policy.stateDir));
+  const child = Bun.spawn([process.execPath, "--no-env-file", resolve(import.meta.dir, "../src/cli.ts"),
+    "worker", "serve", "--policy", join(policy.stateDir, "policy.json")], {
+    cwd: home, env: { ...process.env, HOME: home, SSH_ORIGINAL_COMMAND: "omp-sa-worker-v1" },
+    stdin: Buffer.from(`${JSON.stringify({ version: 1, ...payload })}\n${extra}`), stdout: "pipe", stderr: "pipe", timeout: 20_000,
+  });
+  const [status, output, error] = await Promise.all([
+    child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+  ]);
+  if (status !== 0) throw new Error(`Fixture worker forced command exited ${status}: ${error}`);
+  return JSON.parse(output);
 }
 
 test("worker requests use data schemas even under the native OMP extension loader", () => {
@@ -257,3 +267,71 @@ test("a journal file not bound by a worker receipt cannot be opened or attached"
     expect(await request(policy, { ...bound, op: "attach" })).toMatchObject({ ok: false });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test.each(["stale attempt", "wrong session", "replaced journal"] as const)(
+  "the native attach socket refuses %s after admission without forwarding pipelined work", async drift => {
+    const { root, cwd, policy, ref } = await fixture();
+    const { socketPath, sessionFile } = remoteLanePaths(policy, ref.laneId);
+    const sessionId = "fixture-session";
+    const journal = `${JSON.stringify({ type: "session", version: 3, id: sessionId, cwd })}\n`;
+    mkdirSync(dirname(socketPath), { mode: 0o700 });
+    mkdirSync(dirname(sessionFile), { mode: 0o700, recursive: true });
+    writeFileSync(sessionFile, journal, { mode: 0o600 });
+
+    const ledger = new WorkerLedger(policy);
+    const reservation = ledger.reserve(ref, { repoRoot: cwd, gitDir: join(cwd, ".git"), launchDigest: "a".repeat(64) }, null);
+    reserveCheckout(reservation);
+    const native = Bun.spawn(["/bin/sleep", "60"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const ready = { type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2] };
+    const launch = { hostPid: native.pid, adapterOwnerPid: process.pid, sessionFile, sessionId, workerAttempt: reservation.attempt };
+    const peers = new Set<Socket>();
+    const receivedAfterAdmission: string[] = [];
+    let connections = 0;
+    const server = createServer(socket => {
+      peers.add(socket);
+      socket.on("close", () => peers.delete(socket));
+      socket.on("error", () => socket.destroy());
+      const admission = ++connections === 1;
+      const lines = createInterface({ input: socket });
+      lines.on("line", line => {
+        if (!admission) { receivedAfterAdmission.push(line); return; }
+        const command: unknown = JSON.parse(line);
+        if (!command || typeof command !== "object" || !("id" in command) || !("type" in command)) return;
+        const data = command.type === "negotiate_protocol" ? { protocolVersion: 2 }
+          : { ...launch, adapterProtocol: "owned-stock-stdio-v1", loadedSuperkitPath: root };
+        socket.write(`${JSON.stringify({ type: "response", id: command.id, command: command.type, success: true, data })}\n`);
+      });
+      if (admission) { socket.write(`${JSON.stringify(ready)}\n`); return; }
+      if (drift === "replaced journal") {
+        writeFileSync(`${sessionFile}.replacement`, journal, { mode: 0o600 });
+        renameSync(`${sessionFile}.replacement`, sessionFile);
+      }
+      const workerIdentity = {
+        ...launch,
+        ...(drift === "stale attempt" && { workerAttempt: crypto.randomUUID() }),
+        ...(drift === "wrong session" && { sessionId: "other-fixture-session" }),
+      };
+      socket.write(`${JSON.stringify({ ...ready, workerIdentity })}\n`);
+    });
+
+    try {
+      await new Promise<void>((done, fail) => { server.once("error", fail).listen(socketPath, done); });
+      chmodSync(socketPath, 0o600);
+      const { dev, ino } = lstatSync(socketPath);
+      expect(ledger.transition(reservation, { ...reservation, phase: "live", sessionId,
+        identity: { dev, ino, pid: native.pid, ownerPid: process.pid, sessionId, sessionFile } })).toBe(true);
+      const prompt = `${JSON.stringify({ type: "prompt", id: "must-not-reach-host", message: "Do not submit this turn" })}\n`;
+      expect(await request(policy, { op: "attach", workerId: policy.workerId, ref }, prompt))
+        .toEqual({ ok: false, error: "Worker lane changed before attach" });
+      expect(connections).toBe(2);
+      expect(receivedAfterAdmission).toEqual([]);
+    } finally {
+      ledger.close();
+      native.kill();
+      await native.exited;
+      for (const socket of peers) socket.destroy();
+      if (server.listening) await new Promise<void>(done => server.close(() => done()));
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);

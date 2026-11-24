@@ -28,9 +28,9 @@ console.log(`CI: Bun ${Bun.version}; ULW ${ulw}`);
 const bun = [process.execPath, "--no-env-file"];
 const commands = [
   [...bun, "run", "check"],
-  [...bun, "run", "build:native"],
-  ["cargo", "build", "--locked", "--manifest-path", "gateway/Cargo.toml",
-    "--example", "gateway-differential", "--example", "gateway-lifecycle-fixture"],
+  ["cargo", "test", "--locked", "--manifest-path", "host-owner/Cargo.toml"],
+  // Cargo's default test targets build the Gateway examples used by the Bun fixtures.
+  ["cargo", "test", "--locked", "--manifest-path", "gateway/Cargo.toml"],
   [...bun, "test", "--parallel=2", "test"],
 ];
 for (const command of commands) {

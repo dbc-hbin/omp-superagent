@@ -1,7 +1,7 @@
 // Finite native prompt-composition gate, not a model turn or workflow execution.
 import assert from "node:assert/strict";
 import { mkdir, readFile, realpath } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { getBundledModel, getBundledProviders } from "@oh-my-pi/pi-catalog";
 import { ModelRegistry, Settings, AuthStorage, SessionManager, createAgentSession } from "@oh-my-pi/pi-coding-agent";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -10,6 +10,7 @@ import { buildAvailableSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-com
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { WORKFLOW_NAMES } from "./contracts";
 import { readManagedUlwPackage } from "./managed-ulw";
+import { canonicalSuperkitSkills, hasCanonicalSuperkitSkills, legacySuperkitSkills, superkitWorkflows as workflows } from "./superkit-skills";
 import { advertisedWorkflow } from "./workflow";
 
 const packageArg = process.argv[2];
@@ -23,18 +24,13 @@ let networkAttempts = 0;
 const refuseNetwork = () => { networkAttempts++; throw new Error("Managed Superkit probe forbids network and provider calls"); };
 globalThis.fetch = Object.assign(async () => refuseNetwork(), { preconnect: refuseNetwork });
 
-// Public command names changed; installed skill IDs (also legacy commands,
-// except ultrawork) and the prompt/journal protocol did not.
-const workflows = [
-  ["super-plan", "ulw-plan"],
-  ["super-run", "ulw-execute"],
-  ["super-loop", "ulw-loop"],
-  ["super-graph", "mass-ulw"],
-  ["super-research", "ulw-research"],
-] as const;
 const skillPath = (id: string) => join(packagePath, "skills", id, "SKILL.md");
-const directive = /<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>/.exec(await readFile(skillPath("ultrawork"), "utf8"))?.[1];
-assert(directive?.trim(), "Managed Superkit must ship a directive in its installed ultrawork skill");
+const canonicalLayout = hasCanonicalSuperkitSkills(packagePath);
+const directiveId = (canonicalLayout ? canonicalSuperkitSkills : legacySuperkitSkills)[0];
+const directivePath = await realpath(skillPath(directiveId));
+assert(directivePath.startsWith(packagePath + sep), `Managed Superkit skill leaves its package: ${directiveId}`);
+const directive = /<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>/.exec(await readFile(directivePath, "utf8"))?.[1];
+assert(directive?.trim(), `Managed Superkit must ship a directive in its installed ${directiveId} skill`);
 
 const modules = await listPackageExtensionModules([packagePath], process.cwd(), { plugins: false });
 assert.deepEqual(await Promise.all(modules.map(module => realpath(module.path))), extensionFiles,
@@ -113,7 +109,7 @@ try {
       if (workflow) {
         const policy = /<omp-ulw-policy>\s*<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>\s*<\/omp-ulw-policy>/.exec(text)?.[1];
         assert(policy && policy.trim().length > 200, "Activated SUPER policy must contain the workflow directive");
-        assert.equal(policy, directive, "Activated SUPER policy must use the installed ultrawork directive");
+        assert.equal(policy, directive, `Activated SUPER policy must use the installed ${directiveId} directive`);
         assert(!nativeBase.join("\n\n").includes(policy), "Workflow policy must come from the candidate hook");
       }
       assert.deepEqual(errors, [], "Managed Superkit native hooks failed");
@@ -129,11 +125,15 @@ try {
         typeof message === "object" && "customType" in message && message.customType === "omo-ultrawork:directive" ? [message] : []);
       assert.equal(pointers.length, selected ? 1 : 0, "Only an explicitly selected specialized SUPER invocation may add a workflow directive");
       if (selected) {
-        const [command, skill] = selected;
+        const [command, legacyId] = selected;
+        const skill = canonicalLayout ? command : legacyId;
+        const path = skillPath(skill);
         const content = pointers[0]?.content;
-        assert(typeof content === "string" && content.startsWith(`<omp-${skill}-pointer>`) && content.endsWith(`</omp-${skill}-pointer>`)
-          && content.includes(command) && content.includes(skillPath(skill)),
-          `SUPER command /${command} must point to its installed ${skill} skill`);
+        // In the canonical layout the path already contains the command name.
+        // Check the invocation separately without prescribing pointer formatting.
+        assert(typeof content === "string" && content.startsWith(`<omp-${legacyId}-pointer>`) && content.endsWith(`</omp-${legacyId}-pointer>`)
+          && content.includes(path) && content.split(path).some(part => part.includes(command)),
+          `SUPER directive must name /${command} and point to its installed ${skill} skill`);
       }
       return blocks;
     };
@@ -190,18 +190,20 @@ try {
       }
       assert(resources.getEnabledToolNames().includes("read"), "Native read must remain available");
       assert(resources.getEnabledToolNames().includes("task"), "Native task must remain available");
-      const skills = resources.skills.filter(skill => skill.filePath.startsWith(packagePath + "/"));
-      for (const id of ["ultrawork", ...workflows.map(([, skill]) => skill)]) {
+      const skills = resources.skills.filter(skill => skill.filePath.startsWith(packagePath + sep));
+      for (const id of canonicalLayout ? [...canonicalSuperkitSkills, ...legacySuperkitSkills] : legacySuperkitSkills) {
         assert.equal(skills.find(skill => skill.name === id)?.filePath, skillPath(id),
           `Native Superkit skill discovery must retain skill://${id} and its installed path`);
       }
       const read = resources.getToolByName("read");
       assert(read, "Native read tool must be resolvable");
       for (const skill of skills) {
+        const target = await realpath(skill.filePath);
+        assert(target.startsWith(packagePath + sep), `Managed Superkit skill leaves its package: ${skill.name}`);
         const uri = `skill://${skill.name}:raw`;
         const output = await read.execute(`managed-ulw-resource-${resourceReads.length}`, { path: uri });
         const text = output.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
-        assert.equal(text, await readFile(skill.filePath, "utf8"), `Native resource differs from ${skill.filePath}`);
+        assert.equal(text, await readFile(target, "utf8"), `Native resource differs from ${skill.filePath}`);
         resourceReads.push(uri);
       }
       assert.equal(resources.isStreaming, false);

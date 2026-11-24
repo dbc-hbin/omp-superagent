@@ -17,6 +17,8 @@ export class PrReadError extends Error {
 
 const id = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
 export const sha = Type.String({ pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" });
+// PR intake accepts SHA-1 only; general GitHub reads also accept SHA-256.
+export const sha40 = Type.String({ pattern: "^[0-9a-f]{40}$" });
 const nullableText = Type.Union([Type.String(), Type.Null()]);
 const user = Type.Union([Type.Object({
   login: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9-]*(\\[bot\\])?$", maxLength: 100 }),

@@ -3,7 +3,7 @@ import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { type Config, hostPaths } from "../src/config";
-import type { Approval, Attachment, DialogResponse, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, Inbound, Messenger, OutputRecord, Route } from "../src/contracts";
+import type { Approval, DialogResponse, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, Inbound, Messenger, OutputRecord, Route } from "../src/contracts";
 import { authorizeDiscordPurpose, changeDiscordPurpose, discordPurposeNotes, discordPurposeRequest } from "../src/discord-context";
 import { DeliveryError } from "../src/delivery";
 import { Superagent, type RuntimeHost, type RuntimeState } from "../src/runtime";
@@ -30,7 +30,7 @@ class ContextMessenger implements Messenger {
   async dismissApproval(_approval: Approval): Promise<void> { throw new Error("Unexpected approval dismissal"); }
   async createThread(_route: Route, _title: string): Promise<Route> { throw new Error("Unexpected thread creation"); }
   async fetchAfter(_route: Route, _messageId: string): Promise<Inbound[]> { return []; }
-  async openAttachment(_route: Route, _attachment: Attachment, _signal: AbortSignal): Promise<Response> { throw new Error("Unexpected attachment"); }
+  async openAttachment(): Promise<never> { throw new Error("Unexpected attachment"); }
   async stop(): Promise<void> {}
   async inspectDiscordContext(destination: Route): Promise<DiscordContext> {
     this.inspected.push(destination);

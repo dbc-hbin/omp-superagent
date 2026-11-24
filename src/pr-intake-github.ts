@@ -1,11 +1,10 @@
 import { execFile } from "node:child_process";
 import { Type, type Static, type TSchema } from "@sinclair/typebox/type";
 import { parsePrRef, readGitHubApi } from "./pr-github";
-import { PrReadError, checkPageSchema, loginSchema, pages, parseWire, statusSchema } from "./pr-github-schema";
+import { PrReadError, checkPageSchema, loginSchema, pages, parseWire, sha40 as sha, statusSchema } from "./pr-github-schema";
 
 // allow: SIZE_OK — One wire adapter; preflight and the single mutation share the authenticated session.
 const id = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
-const sha = Type.String({ pattern: "^[0-9a-f]{40}$" });
 const nodeId = Type.String({ pattern: "^[A-Za-z0-9_+/=-]{1,256}$" });
 const utcTimestamp = Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{3})?Z$" });
 const actor = Type.Object({ id, login: loginSchema.properties.login, type: Type.Literal("User") });

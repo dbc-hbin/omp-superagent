@@ -51,14 +51,14 @@ substitute or unobserved activation.
   actually activated, and a goal exists. Plain SUPER selects no specialty mode and
   RPC activation alone creates no goal.
 
-| `workflow.name` | Installed skill |
-| --- | --- |
-| `super` | `skill://ultrawork` |
-| `super-plan` | `skill://ulw-plan` |
-| `super-run` | `skill://ulw-execute` |
-| `super-loop` | `skill://ulw-loop` |
-| `super-research` | `skill://ulw-research` |
-| `super-graph` | `skill://mass-ulw` |
+| `workflow.name` | Installed skill | Fallback when the legacy revision has no canonical skill |
+| --- | --- | --- |
+| `super` | `skill://super` | `skill://ultrawork` |
+| `super-plan` | `skill://super-plan` | `skill://ulw-plan` |
+| `super-run` | `skill://super-run` | `skill://ulw-execute` |
+| `super-loop` | `skill://super-loop` | `skill://ulw-loop` |
+| `super-research` | `skill://super-research` | `skill://ulw-research` |
+| `super-graph` | `skill://super-graph` | `skill://mass-ulw` |
 
 ## Implement and verify
 

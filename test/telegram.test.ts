@@ -685,6 +685,7 @@ describe("Telegram approvals and exact-card interaction", () => {
     const messenger = new TelegramMessenger({ token, ownerId: owner, allowedChatIds: ["-100"], store: gateway,
       fetch: http.fetch, onError: error => errors.push(error) });
     const server = new GatewayServer({ socketPath: gatewayPaths(config).socketPath, store: gateway, messenger,
+      downloadAttachment: messenger.openAttachment.bind(messenger),
       authorizeHead: async pid => { if (pid !== process.pid) throw new Error("Foreign fixture head"); },
       status: (): GatewayStatus => ({ gateway: { pid: process.pid, ready: true, admissionReady: server.ready,
         pendingEvents: gateway.pending(), stopping: false }, head: { pid: process.pid, ready: server.headReady,

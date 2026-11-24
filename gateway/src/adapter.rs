@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio_util::task::TaskTracker;
 
@@ -25,6 +26,18 @@ use crate::{
     },
     telegram::Telegram,
 };
+
+/// Retains the token on existing cards by encoding the route key as a JSON string.
+pub(crate) fn approval_token(
+    id: &str,
+    generation: u64,
+    target: &str,
+    request_id: &str,
+    route_key: &str,
+) -> String {
+    let identity = json!([id, generation, target, request_id, route_key]).to_string();
+    hex::encode(&Sha256::digest(identity.as_bytes())[..12])
+}
 
 #[derive(Debug)]
 pub struct EffectError {
@@ -62,6 +75,13 @@ pub trait Adapter: Send + Sync {
     async fn start(&self) -> Result<()>;
     async fn stop(&self) -> Result<()>;
     async fn effect(&self, operation: &str, args: &[Value]) -> Result<Value, EffectError>;
+    async fn send_result_attachment(
+        &self,
+        _: &Value,
+        _: crate::result_attachment::VerifiedResultAttachment,
+    ) -> Result<Value, EffectError> {
+        Err(EffectError::rejected("Configured adapter does not support result attachments"))
+    }
     async fn messenger_presence(&self, _: &str, _: &Value) -> Result<Value, EffectError> {
         Err(EffectError::rejected(
             "Configured adapter does not support messenger presence",
@@ -432,6 +452,15 @@ impl Hub {
     pub(crate) async fn send_group(&self, output: Value) -> Result<Value, EffectError> {
         let adapter = self.for_route(&output["route"])?;
         adapter.effect("sendGroup", &[output]).await
+    }
+
+    pub(crate) async fn send_result_attachment(
+        &self,
+        output: &Value,
+        file: crate::result_attachment::VerifiedResultAttachment,
+    ) -> Result<Value, EffectError> {
+        let route = self.authorize_effect("send", std::slice::from_ref(output))?;
+        self.for_route(route)?.send_result_attachment(output, file).await
     }
 
     pub(crate) async fn messenger_presence(

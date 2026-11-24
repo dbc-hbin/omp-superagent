@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     group::Reply as GroupReply,
+    result_attachment::{LegacyPayload, Reference, Snapshot, VerifiedResultAttachment},
     store::{EffectStart, PHYSICAL_ROUTE_FIELDS, discord_presence::OPERATION as PRESENCE, js_trim},
 };
 
@@ -65,21 +66,14 @@ impl Hub {
             self.adapters.authorize_effect(&operation, &args)?;
             None
         };
-        // The controller outbox owns the immutable staged file. The Gateway
-        // needs only an exact attempt fingerprint and receipt, not another
-        // durable copy of the disclosed bytes.
-        let digest = if matches!((operation.as_str(), args.as_slice()),
-            ("send", [output]) if output.get("resultAttachment").is_some())
+        let attachment = if let ("send", [output]) = (operation.as_str(), args.as_mut_slice())
+            && output.get("resultAttachment").is_some()
         {
-            for arg in &mut args {
-                arg.sort_all_objects();
-            }
-            let encoded = serde_json::to_vec(&args).map_err(anyhow::Error::from)?;
-            Some([json!({ "resultAttachmentEffectSha256": hex::encode(Sha256::digest(encoded)) })])
+            Some(self.claim_result_attachment(&id, output)?)
         } else {
             None
         };
-        let ledger_args = digest.as_ref().map_or(args.as_slice(), |value| value.as_slice());
+        let ledger_args = attachment.as_ref().map_or(args.as_slice(), |attempt| attempt.fingerprint.as_slice());
         if !presence
             && let EffectStart::Previous(result) = self.store.begin_effect(&id, &operation, ledger_args)?
         {
@@ -97,7 +91,10 @@ impl Hub {
                     .messenger_presence(&id, &args[0])
                     .await
                     .map_err(Fault::from),
-                None => hub.dispatch_effect(&operation, &args).await,
+                None => match attachment {
+                    Some(attempt) => hub.dispatch_result_attachment(&args[0], attempt.payload).await,
+                    None => hub.dispatch_effect(&operation, &args).await,
+                },
             };
             let result = match dispatched {
                 Ok(value)
@@ -117,6 +114,59 @@ impl Hub {
             drop(send.send(receipt));
         }));
         Ok(result.await.map_err(anyhow::Error::from)??)
+    }
+
+    fn claim_result_attachment(&self, effect_id: &str, output: &mut Value) -> WireResult<AttachmentAttempt> {
+        validate_reply(output)?;
+        let invalid = || rejected("Result attachment does not match the claimed outbox receipt");
+        let wire = output.get("resultAttachment").ok_or_else(invalid)?;
+        let reference = Reference::deserialize(wire).map_err(|_| invalid())?;
+        let output_id = output["id"].as_str().ok_or_else(invalid)?;
+        let key = serde_json::to_vec(&["result-attachment", output_id]).map_err(anyhow::Error::from)?;
+        let hash = Sha256::digest(key);
+        let mut uuid = [0; 16];
+        uuid.copy_from_slice(&hash[..16]);
+        if uuid::Uuid::from_bytes(uuid).hyphenated().to_string() != effect_id {
+            return Err(invalid());
+        }
+        let (mut saved_output, stored) = self.store.claimed_result_output(output_id)?.ok_or_else(invalid)?;
+        saved_output["resultAttachment"] = wire.clone();
+        saved_output.sort_all_objects();
+        output.sort_all_objects();
+        if *output != saved_output {
+            return Err(invalid());
+        }
+        let payload = match reference {
+            Reference::Snapshot(snapshot) if stored == output["resultAttachment"] => {
+                AttachmentPayload::Snapshot(snapshot)
+            }
+            Reference::Snapshot(_) => return Err(invalid()),
+            Reference::Legacy(reference) => {
+                let payload = LegacyPayload::deserialize(&stored).map_err(|_| invalid())?;
+                if !reference.legacy || reference.name != payload.name {
+                    return Err(invalid());
+                }
+                // Reconstruct exactly the sorted argument the pre-spool
+                // Gateway hashed. A previously attempted upload stays closed.
+                saved_output["resultAttachment"] = stored;
+                saved_output.sort_all_objects();
+                AttachmentPayload::Legacy(payload)
+            }
+        };
+        let encoded = serde_json::to_vec(&[saved_output]).map_err(anyhow::Error::from)?;
+        let fingerprint = [json!({"resultAttachmentEffectSha256":hex::encode(Sha256::digest(encoded))})];
+        Ok(AttachmentAttempt { fingerprint, payload })
+    }
+
+    async fn dispatch_result_attachment(&self, output: &Value, payload: AttachmentPayload) -> WireResult<Value> {
+        let state_dir = self.store.state_dir().to_path_buf();
+        let file = tokio::task::spawn_blocking(move || -> Result<VerifiedResultAttachment, _> {
+            match payload {
+                AttachmentPayload::Snapshot(snapshot) => snapshot.load(&state_dir),
+                AttachmentPayload::Legacy(payload) => payload.verify(),
+            }
+        }).await.map_err(anyhow::Error::from)??;
+        self.adapters.send_result_attachment(output, file).await.map_err(Fault::from)
     }
 
     async fn dispatch_effect(&self, operation: &str, args: &[Value]) -> WireResult<Value> {
@@ -149,6 +199,16 @@ impl Hub {
             .await
             .map_err(Fault::from)
     }
+}
+
+struct AttachmentAttempt {
+    fingerprint: [Value; 1],
+    payload: AttachmentPayload,
+}
+
+enum AttachmentPayload {
+    Snapshot(Snapshot),
+    Legacy(LegacyPayload),
 }
 
 /// A reply, status message, or in-place status edit belongs to a plain Discord

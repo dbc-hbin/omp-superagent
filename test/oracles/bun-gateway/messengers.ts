@@ -1,6 +1,7 @@
 import type { Config } from "../../../src/config";
 import { credentialEnvNames, requireMessengerCredentials, voiceApiKeyEnv } from "../../../src/config";
-import type { Approval, Attachment, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Platform, Route, StorePort, ThreadInfo, ThreadUpdate } from "../../../src/contracts";
+import type { Approval, Attachment, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, Inbound, MessageActivity, MessageReference, OutputRecord, Platform, Route, StorePort, ThreadInfo, ThreadUpdate } from "../../../src/contracts";
+import type { DownloadMessenger as Messenger } from "../../fixtures/inbound-attachments";
 import { physicalRouteKey } from "../../../src/contracts";
 import { DeliveryError } from "../../../src/delivery";
 import { DiscordMessenger } from "./discord";

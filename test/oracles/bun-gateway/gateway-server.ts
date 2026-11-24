@@ -1,19 +1,21 @@
-import { once } from "node:events";
 import { chmod, lstat, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
+import { dirname } from "node:path";
 import type { Approval, Attachment, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageReference, Messenger, OutputRecord, Route, ThreadUpdate } from "../../../src/contracts";
 import { DeliveryError } from "../../../src/delivery";
 import { discordPurposeRequest } from "../../../src/discord-context";
-import { MAX_GATEWAY_ATTACHMENT, readGatewayJson, type GatewayResult } from "../../../src/gateway-protocol";
+import { MAX_GATEWAY_ATTACHMENT, MAX_GATEWAY_ATTACHMENT_BATCH, readGatewayJson, type GatewayResult } from "../../../src/gateway-protocol";
 import { GatewayStore } from "./gateway-store";
 import type { GatewayStatus } from "../../../src/gateway-wire";
+import { fixtureAttachmentSpool, type AttachmentDownload } from "../../fixtures/inbound-attachments";
 
 interface HeadClient { id: string; pid: number; ready: boolean; resumed: boolean; reconciled: boolean; events?: ServerResponse; sequence?: number; reconciliation?: string }
 interface ServerOptions {
   socketPath: string;
   store: GatewayStore;
-  messenger: Messenger;
+  messenger: Omit<Messenger, "openAttachment">;
+  downloadAttachment?: AttachmentDownload;
   authorizeHead(pid: number): Promise<void>;
   status(): GatewayStatus;
   stop(): Promise<void>;
@@ -378,49 +380,28 @@ export class GatewayServer {
   }
 
   private async attachment(data: Record<string, unknown>, response: ServerResponse): Promise<void> {
-    const attachment = record(data.attachment) as unknown as Attachment;
-    if (attachment.size !== null && (!Number.isSafeInteger(attachment.size) || attachment.size < 0 || attachment.size > MAX_GATEWAY_ATTACHMENT))
-      throw new DeliveryError("Invalid attachment size", "rejected");
+    const { inputId, route, attachments } = data;
+    if (typeof inputId !== "string" || !inputId || !Array.isArray(attachments) || !attachments.length || attachments.length > 10
+      || Object.keys(data).some(key => !["inputId", "route", "attachments"].includes(key)))
+      throw new DeliveryError("Invalid attachment request", "rejected");
+    const files = attachments.map(value => record(value) as unknown as Attachment);
+    let declared = 0;
+    for (const attachment of files) {
+      if (attachment.size !== null && (!Number.isSafeInteger(attachment.size) || attachment.size < 0 || attachment.size > MAX_GATEWAY_ATTACHMENT))
+        throw new DeliveryError("Invalid attachment size", "rejected");
+      declared += attachment.size ?? 0;
+    }
+    if (declared > MAX_GATEWAY_ATTACHMENT_BATCH) throw new DeliveryError("Attachment request exceeds the size limit", "rejected");
+    const download = this.options.downloadAttachment;
+    if (!download) throw new DeliveryError("Fixture is missing an attachment adapter", "rejected");
     const controller = new AbortController();
-    let cancelRead: (() => Promise<void>) | undefined;
-    const abort = () => { controller.abort(); void cancelRead?.().catch(() => {}); };
+    const abort = () => controller.abort();
     response.on("close", abort);
     try {
-      const upstream = await this.options.messenger.openAttachment(data.route as Route, attachment, controller.signal);
-      if (!upstream.body) throw new DeliveryError("Attachment response has no body", "rejected");
-      const length = upstream.headers.get("content-length");
-      if (length !== null && (!/^\d+$/.test(length) || Number(length) > (attachment.size ?? MAX_GATEWAY_ATTACHMENT)))
-        throw new DeliveryError("Attachment response exceeds declared size", "rejected");
-      const expectedSize = attachment.size ?? (length === null ? null : Number(length));
-      response.writeHead(upstream.status, {
-        "content-type": upstream.headers.get("content-type") ?? "application/octet-stream",
-        "x-gateway-attachment-protocol": "1",
-        ...(length === null ? {} : { "x-gateway-attachment-length": length }),
-      });
-      response.flushHeaders();
-      const reader = upstream.body.getReader();
-      cancelRead = () => reader.cancel();
-      let bytes = 0;
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        bytes += chunk.value.byteLength;
-        if (bytes > (attachment.size ?? MAX_GATEWAY_ATTACHMENT) || bytes > MAX_GATEWAY_ATTACHMENT) throw new Error("Attachment stream exceeds declared size");
-        if (!chunk.value.byteLength) continue;
-        // Socket closure alone is not a completion receipt: some HTTP stacks
-        // expose a destroyed response as an empty/truncated successful body.
-        const frame = Buffer.allocUnsafe(4);
-        frame.writeUInt32BE(chunk.value.byteLength);
-        if (!response.write(frame)) await once(response, "drain", { signal: controller.signal });
-        if (!response.write(chunk.value)) await once(response, "drain", { signal: controller.signal });
-      }
-      if (expectedSize !== null && bytes !== expectedSize) throw new Error("Attachment stream was truncated");
-      response.end(Buffer.alloc(4));
-    } finally {
-      response.off("close", abort);
-      controller.abort();
-      await cancelRead?.().catch(() => {});
-    }
+      const receipt = await fixtureAttachmentSpool(dirname(dirname(this.options.socketPath)),
+        { inputId, route: route as Route, attachments: files }, controller.signal, download);
+      json(response, { ok: true, value: receipt });
+    } finally { response.off("close", abort); }
   }
 
   async close(): Promise<void> {

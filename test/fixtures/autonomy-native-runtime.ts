@@ -12,6 +12,7 @@ import { nativeDisabledProviders } from "./native-extension";
 import { autonomyModel } from "./autonomy-native-extension";
 import { nativeTestCommand } from "./native-command";
 import { offlineMnemopi } from "./native-memory";
+import { fixtureAttachmentSpool } from "./inbound-attachments";
 
 async function within<T>(promise: Promise<T>, label: string): Promise<T> {
   const timeout = Promise.withResolvers<never>();
@@ -34,6 +35,7 @@ class RecordingMessenger implements Messenger {
   readonly sent: OutputRecord[] = [];
   readonly downloads: Array<{ route: Route; attachment: Attachment }> = [];
   private nextThreadId = 8001;
+  constructor(private readonly stateDir: string) {}
   async start(): Promise<void> {}
   async send(output: OutputRecord): Promise<string> {
     this.sent.push(structuredClone(output));
@@ -44,11 +46,12 @@ class RecordingMessenger implements Messenger {
   async showApproval(_approval: Approval): Promise<string> { throw new Error("Unexpected native autonomy approval"); }
   async dismissApproval(): Promise<void> {}
   async fetchAfter(): Promise<Inbound[]> { return []; }
-  async openAttachment(route: Route, attachment: Attachment): Promise<Response> {
-    if (attachment.url !== "adapter-file:resume-correction") throw new Error("Unexpected native fixture attachment");
-    this.downloads.push({ route, attachment });
-    return new Response("Apply the exact owner correction.\n");
-  }
+  openAttachment: Messenger["openAttachment"] = (batch, signal) =>
+    fixtureAttachmentSpool(this.stateDir, batch, signal, async (route, attachment) => {
+      if (attachment.url !== "adapter-file:resume-correction") throw new Error("Unexpected native fixture attachment");
+      this.downloads.push({ route, attachment });
+      return new Response("Apply the exact owner correction.\n");
+    });
   async stop(): Promise<void> {}
 }
 
@@ -96,7 +99,7 @@ export async function nativeAutonomyRuntime(): Promise<void> {
   };
   await fs.writeFile(config.path, JSON.stringify(config), { mode: 0o600 });
   const store = new Store(path.join(root, "coordination.sqlite"));
-  const messenger = new RecordingMessenger();
+  const messenger = new RecordingMessenger(root);
   const connections = new Set<HostConnection>();
   const owned = new Map<string, number>();
   const frames: Array<{ socketPath: string; frame: Record<string, unknown> }> = [];

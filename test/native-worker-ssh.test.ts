@@ -7,12 +7,14 @@ import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { hostPaths, loadConfig, type Config } from "../src/config";
 import { HostConnection, startHost } from "../src/host";
+import { hostOwnerExecutable } from "../src/host-owner-path";
 import { Superagent } from "../src/runtime";
 import { Store } from "../src/store";
 import { DecisionParityMessenger, verifyWorkerDecisionParity } from "./fixtures/native-worker-decision-parity";
 import { waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
 import { selectWorkerPlacement } from "../src/worker-placement";
-import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, type WorkerLaneRef } from "../src/worker-wire";
+import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, type WorkerLaneRef,
+  type WorkerRegistration } from "../src/worker-wire";
 import { nativeTestArgv } from "./fixtures/native-command";
 import { nativeDisabledProviders } from "./fixtures/native-extension";
 import { offlineMnemopi } from "./fixtures/native-memory";
@@ -33,6 +35,56 @@ async function shutdownFixture(host: HostConnection) {
     // alone doesn't mean the owner has finished writing its exit receipt.
     await waitForFixtureProcessExit([state.hostPid, state.adapterOwnerPid]);
   } finally { await host.close(); }
+}
+
+async function verifyNativeBridge(options: {
+  readonly ssh: string; readonly known: string; readonly port: number; readonly worker: WorkerRegistration;
+  readonly ref: WorkerLaneRef; readonly pid: number;
+}) {
+  const { ssh, known, port, worker, ref, pid } = options;
+  const child = Bun.spawn([ssh, "-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+    "-o", `UserKnownHostsFile=${known}`, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+    "-p", `${port}`, "-i", worker.identityFile, `${userInfo().username}@127.0.0.1`, "omp-sa-worker-v1"], {
+    stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  });
+  const diagnostics = new Response(child.stderr).text();
+  const lines = createInterface({ input: Readable.fromWeb(child.stdout) });
+  const upstream = lines[Symbol.asyncIterator]();
+  const frame = async (label: string): Promise<unknown> => {
+    const next = await within(upstream.next(), label);
+    if (next.done) throw new Error(`SSH detached before ${label}: ${await diagnostics}`);
+    return JSON.parse(next.value);
+  };
+  const rpc = { type: "get_state", id: "pipelined-state" };
+  try {
+    // One write puts work beyond the request newline before either worker reply.
+    const attach = { version: 1, op: "attach", workerId: worker.description.workerId, ref };
+    await child.stdin.write(`${JSON.stringify(attach)}\n${JSON.stringify(rpc)}\n`);
+    await child.stdin.flush();
+    expect(await frame("worker reply")).toMatchObject({ ok: true, value: { pid } });
+    expect(await frame("native ready")).toMatchObject({ type: "ready" });
+    expect(await frame("pipelined response")).toMatchObject({ type: "response", id: rpc.id, success: true, data: { hostPid: pid } });
+
+    // Read live process evidence while this exact SSH stream is still open.
+    const policy = join(worker.description.stateDir, "policy.json");
+    const processes = execFileSync("/bin/ps", ["-ww", "-ax", "-o", "pid=", "-o", "ppid=", "-o", "comm=", "-o", "args="],
+      { encoding: "utf8" }).split("\n").filter(line => line.includes(policy));
+    expect(processes).toHaveLength(1);
+    expect(processes[0]).toContain(`${hostOwnerExecutable} --worker-serve `);
+    expect(processes[0]).not.toMatch(/\bbun(?:-dev)? \S*--no-env-file/);
+
+    // A duplicate delivery of the first pipelined RPC would arrive before
+    // this later request and fail the exact correlation check.
+    await child.stdin.write(`${JSON.stringify({ ...rpc, id: "after-handoff" })}\n`);
+    await child.stdin.flush();
+    expect(await frame("post-handoff response")).toMatchObject({ type: "response", id: "after-handoff", success: true });
+    await child.stdin.end();
+    expect(await within(child.exited, "native bridge detach")).toBe(0);
+  } finally {
+    lines.close();
+    if (child.exitCode === null) child.kill();
+    await child.exited;
+  }
 }
 
 /** Real head controller + stock OMP; only the external messenger and inference
@@ -197,6 +249,7 @@ sshTest("enroll via the CLI, launch once over SSH, reconnect to the same stock O
     const { pid } = await workerOpen(reg, ref, launch);
     owned = { ...remoteLanePaths(placement, ref.laneId), pid };
     expect(await workerOpen(reg, ref, launch)).toMatchObject({ pid });
+    await verifyNativeBridge({ ssh, known, port, worker: reg, ref, pid });
     live = await workerConnect(reg, ref);
     const first = await live.client.getState();
     expect(first).toMatchObject({ hostPid: pid, sessionFile: owned.sessionFile, model: { provider: "socket-host-smoke", id: "local" } });

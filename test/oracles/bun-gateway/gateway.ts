@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { RpcCommandError } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { credentialEnvNames, hostPaths, loadConfig, privateDirectory, requireMessengerCredentials, type Config } from "../../../src/config";
-import type { GatewayRestartRecord, GatewayRestartRequest, LanePresetSnapshot, Messenger } from "../../../src/contracts";
+import type { GatewayRestartRecord, GatewayRestartRequest, LanePresetSnapshot } from "../../../src/contracts";
+import type { DownloadMessenger as Messenger } from "../../fixtures/inbound-attachments";
 import { DeliveryError } from "../../../src/delivery";
 import { gatewayCall, gatewayPaths, gatewayStatus } from "../../../src/gateway-protocol";
 import type { GatewayStatus } from "../../../src/gateway-wire";
@@ -126,6 +127,7 @@ export class GatewayService {
       this.messenger = options.messenger ?? createMessenger(config, this.store, this.report);
       this.server = new GatewayServer({
         socketPath: gatewayPaths(config).socketPath, store: this.store, messenger: this.messenger,
+        downloadAttachment: this.messenger.openAttachment.bind(this.messenger),
         authorizeHead: pid => this.authorizeHead(pid), status: () => this.status(), onError: this.report,
         restart: request => this.restart(request), runRestart: requestId => this.runRestart(requestId),
         stop: async () => {

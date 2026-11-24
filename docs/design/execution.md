@@ -51,7 +51,7 @@ references](../../skills/head/SKILL.md) for operating policy.
 | Tools | Authority and outcome |
 | --- | --- |
 | `lane_start` | Requires a durable user source, title, existing absolute cwd, exact model or native preset, model reason and kickoff. Accepts a bounded brief, acceptance criteria, and an authorized destination or workflow. At most one new lane per source. Returns the durable ID and admission state, not an execution or completion receipt. |
-| `lane_message` | Explicit follow-up with a real authorized `sourceId` and the target lane. Deduplicate by source and lane; check destination, attachment/quote scope and identity compatibility. The same source may reach existing lanes only where those routes and reporting are authorized. |
+| `lane_message` | Explicit follow-up with a real authorized `sourceId` and the target lane. Deduplicate by source and lane; check destination, attachment/quote scope and identity compatibility. For a physical Discord work thread and a source from its exact guild parent, pin the HEAD-reviewed report route to that thread per handoff. This does not rebind the source or resume a paused lane. The same source may reach existing lanes only where those routes and reporting are authorized. |
 | `lane_inspect` | Lists records without a live probe; inspecting a specific lane adds live status where observable, model readback, queue blockers and observed progress. Null actual state is unknown, not a match. |
 | `lane_pause` | Takes a managed lane ID. Persists pause intent and requests an interrupt without claiming owned services or earlier effects are gone. |
 | `lane_resume` | Takes a managed lane ID and an authorized original `sourceId`. May reopen a paused native goal after checking native state; never releases an uncertain submission or revives cancelled work. |
@@ -60,12 +60,14 @@ references](../../skills/head/SKILL.md) for operating policy.
 | `thread_inspect`, `lane_thread_update` and the `decision_*` tools | Use the [messaging and authority contract](messaging.md) for scope, original thread/approval identities and readback. |
 
 Send only the original task, relevant evidence, constraints and acceptance
-criteria to a lane; never copy the full head transcript. A new topic starts
-with the exact observed head model, not its conversation; subsequent work uses
-the topic's own saved model and session. A topic lane replies in the operator's
-language through the controller outbox. Explicit manager handoffs and their
-internal reports use English. No lane gains messenger credentials. Distinguish dispatch acceptance, actual
-execution, native settlement, verified acceptance criteria, and user delivery.
+criteria to a lane; never copy the full head transcript. Controller-created
+topics start with the exact observed head model, while explicit manager
+handoffs use the model or preset selected at `lane_start`. Subsequent work
+uses the topic's own saved model and session. Ordinary bound-topic work replies
+in the operator's language through the controller outbox. Explicit manager
+handoffs and their internal reports use English. No lane gains messenger
+credentials. Distinguish dispatch acceptance, actual execution, native
+settlement, verified acceptance criteria, and user delivery.
 
 The [`lane_report` tool](../../src/lane-extension.ts) records evidence in the
 native journal. It hashes selected files in bounded chunks, verifying their identity
@@ -119,6 +121,9 @@ queue restoration uses the SDK's reassembled-frame byte limit: this is the value
 [`maxResponseBytes` in OMP 19.0](https://github.com/can1357/oh-my-pi/blob/v19.0.0/packages/coding-agent/src/modes/rpc/rpc-frame.ts#L341-L347)
 and [`maxIntactFrameBytes` in 19.1](https://github.com/can1357/oh-my-pi/blob/v19.1.0/packages/coding-agent/src/modes/rpc/rpc-frame.ts#L341-L347).
 An intact queue must not be reported as truncated. No second Bun runtime stays resident per Host.
+For SSH workers the enrolled forced command hands its stdio to the Rust relay.
+Admission and Host attestation can use a short-lived helper; no Bun process
+stays just to forward bytes. SSH EOF detaches only that connection.
 Gateway supervision reads the exact session, process and socket identity from a fresh handshake
 instead of fetching the same full state again on the new connection.
 
@@ -225,7 +230,9 @@ entries still under management; do not switch existing sessions. Preset role
 synchronization watches the configured native preset/role files, parent
 directories (so replaced directories with new inodes rebind cleanly), and
 every symlink hop (`fs.watch`, debounced), watches surviving ancestors for
-uncreated directories, and reconciles once after installing watchers. Errors
+uncreated directories, and reconciles once after installing watchers. On macOS
+the maintenance tick also checks file metadata to recover changes missed during
+FSEvents registration. Unchanged files do not trigger a preset reload. Errors
 and explicit `"deferred"` outcomes get bounded backoff retries. Deferred work
 continues at a slow interval after those retries so late model availability
 can apply without another config edit. Slow periodic polling also stays
@@ -310,19 +317,21 @@ keyword interpretation; keep generated metadata fenced. Selection is
 serialized, not injected as steering. A conflict or missing advertised
 capability does not silently downgrade a selected SUPER request to ordinary work.
 
-SUPER's command, skill and native-keyword contracts are based on
+SUPER's commands and defaults are based on
 [omp-superkit `c11a6e4e185f9c31f484a05a13528ef724337bc1`](https://github.com/dbc-hbin/omp-superkit/tree/c11a6e4e185f9c31f484a05a13528ef724337bc1).
+[Revision `e8825367bed06985ccb1ee1e635dce850e22bbb9`](https://github.com/dbc-hbin/omp-superkit/tree/e8825367bed06985ccb1ee1e635dce850e22bbb9)
+moved the workflow instructions into canonical skills and retained the original IDs as aliases.
 Use a leading invocation; the `/` is optional in request text. These are OMP
 extension commands, not registered messenger controls.
 
-| OMP command | `workflow.name` | Discoverable OMP skill | Default native keyword |
-| --- | --- | --- | --- |
-| `/super` | `super` | `skill://ultrawork` | None |
-| `/super-plan` | `super-plan` | `skill://ulw-plan` | `ultrathink` |
-| `/super-run` | `super-run` | `skill://ulw-execute` | `orchestrate` |
-| `/super-loop` | `super-loop` | `skill://ulw-loop` | `orchestrate` |
-| `/super-research` | `super-research` | `skill://ulw-research` | `workflowz` |
-| `/super-graph` | `super-graph` | `skill://mass-ulw` | `workflowz` |
+| OMP command | `workflow.name` | Canonical OMP skill | Legacy skill | Default native keyword |
+| --- | --- | --- | --- | --- |
+| `/super` | `super` | `skill://super` | `skill://ultrawork` | None |
+| `/super-plan` | `super-plan` | `skill://super-plan` | `skill://ulw-plan` | `ultrathink` |
+| `/super-run` | `super-run` | `skill://super-run` | `skill://ulw-execute` | `orchestrate` |
+| `/super-loop` | `super-loop` | `skill://super-loop` | `skill://ulw-loop` | `orchestrate` |
+| `/super-research` | `super-research` | `skill://super-research` | `skill://ulw-research` | `workflowz` |
+| `/super-graph` | `super-graph` | `skill://super-graph` | `skill://mass-ulw` | `workflowz` |
 
 Plain SUPER arms the session without selecting a specialty workflow or implicitly
 creating a goal in RPC. SUPER Graph selects the graph workflow, not plain SUPER
@@ -351,7 +360,10 @@ detection recognize both `omp-superkit` and the legacy `omp-ulw` package ID.
 Stage the observed revision and its dependencies in a project-owned immutable
 package. Ignore arbitrary dependency lifecycle scripts; run defined
 materialization and an [offline native prompt-composition probe](../../src/managed-ulw-probe.ts)
-for ordinary and explicitly activated operation. Serialize preparation via
+for ordinary and explicitly activated operation. For the canonical layout the probe
+checks that the hook uses the canonical directive and pointer paths and that native
+discovery resolves both canonical skills and legacy aliases. An older revision
+uses the full legacy skills instead. Serialize preparation via
 the update lock and atomically publish `active.json` only after validation.
 Once installed, activate only fast-forward revisions from the same source;
 retain the last valid active revision and report failures. Do not delete older
@@ -394,8 +406,12 @@ discarding custom commands or enabling disabled extensions.
   approval authority. An unresolved run is not repeated; a head stop fence
   requires explicit per-job resume. Pause and removal can cancel a queued
   run, not interrupt submitted or uncertain work. Delivery uses the normal
-  head outbox. See the [operator reference](../OPERATIONS.md#예약-작업-cron)
-  for schedule syntax and controls.
+  head outbox. Direct shell schedules are disabled: an authenticated route and
+  scrubbed credentials are not a runtime capability boundary. Legacy shell
+  jobs remain inspectable and removable; pending runs are cancelled rather
+  than forwarded to a model, and queued shell output is not sent. Verify any
+  previously started legacy run on its original host before resolving it.
+  See the [operator reference](../OPERATIONS.md#예약-작업-cron) for syntax and controls.
 - [Repository PR intake](../../src/cron-pr-intake.ts) is a typed cron job, not
   an executable prompt. Only original configured-owner Discord guild parent
   controls enroll a repository. Discovery pins the authenticated GitHub owner

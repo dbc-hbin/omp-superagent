@@ -1,12 +1,4 @@
-import { MESSENGER_COMMANDS } from "./messenger-commands";
-
-/** Slack reserves /help and /status, so every supported picker entry is namespaced. */
-export const SLACK_COMMANDS = MESSENGER_COMMANDS.map(command => ({
-  command: `/superagent-${command.name}`,
-  description: command.description,
-  ...(command.text !== undefined ? { usage_hint: command.text } : {}),
-  should_escape: false,
-}));
+import { MESSENGER_COMMANDS } from "../../../src/messenger-commands";
 
 /** Only registered names are accepted; invalid no-argument invocations are not commands. */
 export function parseSlackCommand(name: string, text: string): string | null {

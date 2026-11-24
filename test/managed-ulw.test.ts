@@ -37,6 +37,21 @@ async function promptExtension(revision: string, defect = "none"): Promise<strin
   return source.replace('const defect: string = "none";', `const defect: string = ${JSON.stringify(defect)};`)
     + `\nexport const revision = ${JSON.stringify(revision)};\n`;
 }
+async function moveWorkflowSkills(remote: string): Promise<void> {
+  for (const [oldId, newId] of [
+    ["ultrawork", "super"], ["ulw-plan", "super-plan"], ["ulw-execute", "super-run"],
+    ["ulw-loop", "super-loop"], ["mass-ulw", "super-graph"], ["ulw-research", "super-research"],
+  ]) {
+    const oldDirectory = join(remote, "skills", oldId);
+    const newDirectory = join(remote, "skills", newId);
+    await rename(oldDirectory, newDirectory);
+    const target = join(newDirectory, "SKILL.md");
+    await writeFile(target, (await readFile(target, "utf8")).replace(`name: ${oldId}\n`, `name: ${newId}\n`));
+    await mkdir(oldDirectory);
+    await writeFile(join(oldDirectory, "SKILL.md"),
+      `---\nname: ${oldId}\ndescription: Legacy skill alias.\n---\nRead [${newId}](../${newId}/SKILL.md).\n`);
+  }
+}
 async function fixture(packageName = "omp-ulw") {
   const root = await mkdtemp(join(await realpath("/tmp"), "omu-"));
   const starting: ReturnType<typeof startHost>[] = [];
@@ -408,7 +423,7 @@ test("real preparation CLI accepts reworded policy, preserves provenance and ski
   expect(await command(["git", "status", "--porcelain"], f.remote)).toBe("");
 }, 60_000);
 
-test("changed remote activates atomically; unchanged remote and failed updates retain current immutable files", async () => {
+test("upgrade to canonical SUPER skills activates atomically and retains immutable legacy files", async () => {
   const f = await fixture();
   await updateManagedUlw(f.options);
   const firstPath = activeManagedUlw(f.options);
@@ -420,6 +435,7 @@ test("changed remote activates atomically; unchanged remote and failed updates r
   const manifestPath = join(f.remote, "package.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   await writeFile(manifestPath, JSON.stringify({ ...manifest, name: "omp-superkit" }));
+  await moveWorkflowSkills(f.remote);
   await writeFile(join(f.remote, "index.ts"), await promptExtension("v2"));
   const second = await f.commit();
   const updated = await updateManagedUlw(f.options);
@@ -463,18 +479,34 @@ for (const [defect, rejection] of [
   ["quoted-workflow", "Ordinary or quoted text must not activate SUPER policy"],
   ["plain-pointer", "Only an explicitly selected specialized SUPER invocation may add a workflow directive"],
   ["renamed-skill", "Native Superkit skill discovery must retain skill://ulw-execute and its installed path"],
+  ["legacy-pointer", "SUPER directive must name /super-graph and point to its installed super-graph skill"],
+  ["wrong-pointer-command", "SUPER directive must name /super-graph and point to its installed super-graph skill"],
+  ["joined-pointer-command", "SUPER directive must name /super-graph and point to its installed mass-ulw skill"],
+  ["hidden-canonical-skill", "Native Superkit skill discovery must retain skill://super-run and its installed path"],
+  ["escaped-canonical-skill", "Managed ULW resource symlink leaves its package"],
 ] as const) {
-  test(`loadable ${defect} candidate fails native prompt composition before changing the active pointer`, async () => {
+  test(`rejects ${defect} candidate before changing the active pointer`, async () => {
     const f = await fixture();
     await updateManagedUlw(f.options);
     const active = activeManagedUlw(f.options);
     const pointer = await readFile(join(f.managed, "active.json"), "utf8");
     const installed = await readFile(join(active, "index.ts"), "utf8");
     await writeFile(join(f.remote, "index.ts"), await promptExtension("incompatible", defect));
-    if (defect === "renamed-skill") {
-      const path = join(f.remote, "skills/ulw-execute/SKILL.md");
+    if (defect === "legacy-pointer" || defect === "wrong-pointer-command" ||
+        defect === "hidden-canonical-skill" || defect === "escaped-canonical-skill") {
+      await moveWorkflowSkills(f.remote);
+    }
+    if (defect === "renamed-skill" || defect === "hidden-canonical-skill") {
+      const id = defect === "renamed-skill" ? "ulw-execute" : "super-run";
+      const path = join(f.remote, "skills", id, "SKILL.md");
       const original = await readFile(path, "utf8");
-      await writeFile(path, original.replace("name: ulw-execute", "name: super-run"));
+      await writeFile(path, original.replace(`name: ${id}`, "name: different-workflow"));
+    }
+    if (defect === "escaped-canonical-skill") {
+      const skill = join(f.remote, "skills/super/SKILL.md");
+      const outside = join(f.root, "external-skill.md");
+      await rename(skill, outside);
+      await symlink(outside, skill);
     }
     const candidate = await f.commit();
     await expect(updateManagedUlw(f.options)).rejects.toThrow("previous active revision retained");

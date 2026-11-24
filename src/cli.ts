@@ -87,7 +87,8 @@ Owner controls in chat (not shell commands):
   Send /help in Discord or Telegram. In Slack messages replace / with ! (e.g. !help, !status);
   registered Slack commands use /superagent-* (e.g. /superagent-status).
   /status, /context, /usage     Inspect HEAD state, context or usage without starting a model turn.
-  /usage reset                 List saved reset tickets; choose an account then confirm to spend one.
+  /usage-reset (Discord)       List saved reset tickets; choose an account then confirm to spend one.
+                               Telegram: /usage reset. Slack: !usage reset or /superagent-usage reset.
   /model [list|provider/id]     Inspect or select the shared HEAD model; changes require an idle HEAD.
   /model preset [list|NAME]     Inspect or select a preset. Only NAME --global also saves future defaults.
   /effort [LEVEL]               Inspect or change HEAD thinking effort; existing lanes keep their settings.
@@ -247,9 +248,8 @@ async function workerCommand(args: string[]): Promise<void> {
         throw new Error("Worker serve requires the enrolled SSH forced command");
       const { readWorkerPolicy } = await import("./worker-enrollment");
       const policy = readWorkerPolicy(homedir(), path);
-      const { serveWorker } = await import("./worker-service");
-      await serveWorker(policy);
-      return;
+      const { execWorkerBridge } = await import("./worker-bridge");
+      return execWorkerBridge(policy, path);
     }
     default:
       throw new Error("Usage: omp-sa worker add|init|list|doctor (see omp-sa worker --help)");

@@ -1,12 +1,11 @@
 import { createHash } from "node:crypto";
 import { Type, type Static, type TSchema } from "@sinclair/typebox/type";
 import { parsePrRef } from "./pr-github";
-import { loginSchema, parseWire, PrReadError } from "./pr-github-schema";
+import { loginSchema, parseWire, PrReadError, sha40 as sha } from "./pr-github-schema";
 import { openIntakeGitHubSession, queryIntakeGitHub, type IntakeMergeIdentity } from "./pr-intake-github";
 import { intakeEvidenceDeadlineMs } from "./pr-intake-material";
 
 const id = Type.String({ pattern: "^[A-Za-z0-9_+/=-]{1,256}$" });
-const sha = Type.String({ pattern: "^[0-9a-f]{40}$" });
 const databaseId = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
 const user = Type.Object({ login: loginSchema.properties.login, databaseId });
 const actor = Type.Object({ login: Type.String(), databaseId: Type.Optional(Type.Union([databaseId, Type.Null()])) });

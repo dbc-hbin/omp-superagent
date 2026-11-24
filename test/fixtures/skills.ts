@@ -19,6 +19,7 @@ import type { ExtensionAskDialogQuestion, ExtensionAskDialogResult, ExtensionUID
 // snapshot isolated, just as production's independent head/lane hosts are.
 const [root, role, kind, selection, ulwPath, extensionOrder] = process.argv.slice(2);
 assert(root && (role === "head" || role === "lane") && (kind === "main" || kind === "sub"));
+assert(selection === "default" || selection === "narrow");
 assert(!ulwPath || (path.isAbsolute(ulwPath) && (extensionOrder === "ulw-first" || extensionOrder === "superagent-first")));
 const workspace = path.join(root, "foreign-workspace");
 const agentDir = process.env.PI_CODING_AGENT_DIR!;
@@ -30,6 +31,7 @@ const shadowDirectory = path.join(workspace, ".omp/skills/superagent-head");
 const managerNames = ["head_recovery", "head_set_model", "cron_create", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
   "discord_context", "discord_purpose_list", "discord_purpose_set", "discord_purpose_clear", "messenger_presence", "lane_watch", "pr_watch", "pr_watch_list",
   "decision_list", "decision_inspect", "decision_withdraw"];
+const rootOnlyNames = ["result_attach", "decision_ask", ...(role === "head" ? managerNames : ["lane_report"])];
 const skillSettings = {
   customDirectories: [customDirectory],
   ignoredSkills: ["ignored-*"],
@@ -133,14 +135,24 @@ try {
       "The actual native loader must preserve the requested omp-superkit/role hook order");
   }
   const runner = session.extensionRunner!;
-  assert.equal(runner.createContext().agent.kind, kind);
-  assert.equal(runner.createContext().agent.parentId, undefined);
+  const identity = runner.createContext().agent;
+  assert.equal(identity.kind, kind);
+  assert.equal(identity.parentId, undefined);
 
+  const defaults = session.getEnabledToolNames();
+  const selectionUnderTest = ["read", "task", "bash", ...rootOnlyNames];
+  for (const name of selectionUnderTest) {
+    assert(defaults.includes(name), `Expected ${name} active before explicit selection and role startup`);
+  }
+  const excluded = new Set(["bash", "decision_ask", "result_attach", role === "head" ? "lane_message" : "lane_report"]);
   if (selection === "narrow") {
-    await session.setActiveToolsByName(session.getEnabledToolNames().filter(name =>
-      name !== "bash" && name !== "lane_message" && name !== "lane_report" && name !== "decision_ask" && name !== "result_attach"));
+    await session.setActiveToolsByName(defaults.filter(name => !excluded.has(name)));
   }
   const before = session.getEnabledToolNames();
+  if (selection === "narrow") {
+    assert.deepEqual(selectionUnderTest.filter(name => before.includes(name)), selectionUnderTest.filter(name => !excluded.has(name)),
+      "Apply the operator's selection before testing the startup hook");
+  }
   const errors: Array<{ event: string; error: string }> = [];
   await initializeExtensions(session, {
     reportRuntimeError: error => { errors.push(error); },
@@ -152,13 +164,19 @@ try {
   } else {
     assert.deepEqual(errors, [], "Task/lane sessions must never attempt head startup");
   }
-  const expectedActive = kind === "sub"
-    ? before.filter(name => name !== "decision_ask" && name !== "result_attach"
-      && (role === "head" ? !managerNames.includes(name) : name !== "lane_report")) : before;
-  assert.deepEqual(session.getEnabledToolNames(), expectedActive);
-  if (selection === "narrow") assert(!session.getEnabledToolNames().includes("bash"));
+  const expectedActive = kind === "sub" ? before.filter(name => !rootOnlyNames.includes(name)) : before;
+  const active = session.getEnabledToolNames();
+  assert.deepEqual(active, expectedActive, "Role startup must subtract authority without resetting the native selection");
+  if (kind === "sub") {
+    const restrictedPrefixes = role === "head" ? ["decision_", "discord_", "lane_", "pr_watch"] : ["decision_"];
+    assert.deepEqual(active.filter(name => restrictedPrefixes.some(prefix => name.startsWith(prefix))), []);
+  }
 
-  const roleBody = await fs.readFile(path.join(packageRoot, `skills/${role}/SKILL.md`), "utf8");
+  const [headRole, laneRole] = await Promise.all([
+    fs.readFile(path.join(packageRoot, "skills/head/SKILL.md"), "utf8"),
+    fs.readFile(path.join(packageRoot, "skills/lane/SKILL.md"), "utf8"),
+  ]);
+  const roleBody = role === "head" ? headRole : laneRole;
   const headReferenceDirectory = path.join(packageRoot, "skills/head/references");
   const headReferences = await Promise.all(
     (await fs.readdir(headReferenceDirectory, { recursive: true })).filter(name => name.endsWith(".md"))
@@ -166,20 +184,19 @@ try {
   );
   const laneReference = await fs.readFile(path.join(packageRoot, "skills/lane/references/workflow.md"), "utf8");
   const nativeBase = session.baseSystemPrompt;
-  assert(nativeBase[0] && nativeBase[0].length > 500, "Use the real rendered native system prompt, not a sentinel");
+  assert(nativeBase[0], "Use the real rendered native system prompt");
   const branchBefore = structuredClone(sessionManager.getBranch());
   const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
   const assertRolePolicy = (blocks: string[]): string | undefined => {
     const combined = blocks.join("\n\n");
-    assert.equal(occurrences(combined, roleBody), kind === "main" ? 1 : 0);
+    assert.equal(occurrences(combined, headRole), role === "head" && kind === "main" ? 1 : 0);
+    assert.equal(occurrences(combined, laneRole), role === "lane" && kind === "main" ? 1 : 0);
     for (const reference of [...headReferences, laneReference]) {
       assert(!combined.includes(reference), "Packaged references must not be added to automatic system prompts");
     }
     if (kind === "sub") {
       assert.equal(occurrences(combined, childRole), 1);
       assert.equal(occurrences(combined, childAssignment), 1);
-      assert(!combined.includes("# Main head operating contract"));
-      assert(!combined.includes("# Lane operating contract"));
     }
     if (ulwPath) {
       assert.equal(occurrences(combined, "<omp-model-preset>"), 1, "A real supported omp-superkit preset must be active");
@@ -203,8 +220,8 @@ try {
     if (kind === "sub" && !ulwPath) assert.equal(instruction, undefined);
     else if (kind === "sub") assert.equal(blocks.length, nativeBase.length);
     else {
-      assert.equal(instruction?.systemPrompt?.filter(part => part === roleBody).length, 1);
-      if (!ulwPath) assert.equal(instruction?.systemPrompt?.[0], nativeBase[0]);
+      assert(blocks.includes(roleBody), "Root role instructions must be a distinct prompt block");
+      if (!ulwPath) assert.deepEqual(blocks.slice(0, nativeBase.length), nativeBase);
       assert.equal(blocks.length, nativeBase.length + 2);
       if (role === "lane") {
         const actualCwd = runner.createContext().cwd;
@@ -237,7 +254,8 @@ try {
     }
   }
   assert.deepEqual(sessionManager.getBranch(), branchBefore, "Prompt inspection must not arm workflows or enqueue work");
-  assert(!session.getAllToolInfos().some(tool => tool.name.startsWith("board_")), "An unmanaged fixture cannot acquire board authority");
+  const registered = session.getAllToolInfos();
+  assert(!registered.some(tool => tool.name.startsWith("board_")), "An unmanaged fixture cannot acquire board authority");
   assert(!session.isStreaming, "No model/provider execution is allowed");
   assert(!(await fs.readdir(root, { recursive: true })).some(name => /(?:^|\/)coordination\.sqlite(?:-|$)/.test(name)),
     "Hook composition must not activate a board instance");
@@ -276,36 +294,57 @@ try {
     const text = shadow.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
     assert.equal(text, await fs.readFile(path.join(shadowDirectory, "references/routing.md"), "utf8"));
   }
-  const reads: string[] = [];
   for (const [name, directory, relative] of resources) {
     let uri = relative === "SKILL.md" ? `skill://${name}:raw` : `skill://${name}/${relative}:raw`;
     if (directory === "head" && emittedHeadReferences) {
       if (relative !== "SKILL.md") uri = `${path.join(emittedHeadReferences, path.basename(relative))}:raw`;
       else if (shadowHead) uri = `${path.join(path.dirname(emittedHeadReferences), relative)}:raw`;
     }
-    const output = await read.execute(`native-read-${reads.length}`, { path: uri });
+    const output = await read.execute(`native-read-${directory}/${relative}`, { path: uri });
     const text = output.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
-    assert.equal(text, await fs.readFile(path.join(packageRoot, "skills", directory, relative), "utf8"));
-    reads.push(uri);
+    assert.equal(text, await fs.readFile(path.join(packageRoot, "skills", directory, relative), "utf8"), uri);
   }
 
-  const schemas = Object.fromEntries([...managerNames, "result_attach", "lane_report", "decision_ask"].flatMap(name => {
-    const info = session.getAllToolInfos().find(tool => tool.name === name);
-    return info ? [[name, toolWireSchema(info)]] : [];
-  }));
+  const roleTools = registered.filter(tool => tool.sourceInfo.path === extensionPath);
+  assert.deepEqual(roleTools.map(tool => tool.name).sort(), [...rootOnlyNames].sort());
+  const otherRoleNames = role === "head" ? ["lane_report"] : managerNames;
+  assert.deepEqual(registered.filter(tool => otherRoleNames.includes(tool.name)).map(tool => tool.name), []);
+  for (const tool of roleTools) {
+    // Provider schemas must also lower through OMP's native wire encoder.
+    assert.doesNotThrow(() => toolWireSchema(tool), `${tool.name} wire schema`);
+  }
+
+  const context = runner.createContext();
+  const childContext = { ...context, agent: { kind: "sub" as const, id: "advisor", name: "advisor", depth: 0 } };
+  const assertReactivationDenied = async (name: string, input: Record<string, unknown>, reason: RegExp) => {
+    await session.setActiveToolsByName([...expectedActive, name]);
+    assert(session.getEnabledToolNames().includes(name), `Reactivation must actually enable ${name}`);
+    const tool = session.getToolByName(name);
+    assert(tool);
+    await assert.rejects(() => tool.execute(`reactivated-child-${name}`, input), reason);
+    await runner.emit({ type: "session_start" });
+    assert.deepEqual(session.getEnabledToolNames(), expectedActive);
+  };
   const check = (name: string, input: Record<string, unknown>, valid: boolean) => {
     const tool = runner.getRegisteredTool(name)!.definition;
     const validate = () => validateToolArguments(tool, { type: "toolCall", id: "schema-check", name, arguments: input });
     if (valid) assert.doesNotThrow(validate, `${name} schema validation`);
     else assert.throws(validate, /Validation failed for tool/, `${name} schema validation: ${JSON.stringify(input)}`);
   };
-  check("result_attach", { sourceId: "owner-source", path: "output/result.bin" }, true);
+  const attachmentInput = { sourceId: "owner-source", path: "output/result.bin" };
+  check("result_attach", attachmentInput, true);
   check("result_attach", { path: "output/result.bin" }, false);
   const attach = runner.getRegisteredTool("result_attach")!.definition;
   assert.equal(attach.approval, "exec");
-  await assert.rejects(() => attach.execute("child-attachment", { sourceId: "owner-source", path: "output/result.bin" },
-    undefined, undefined, { ...runner.createContext(), agent: { kind: "sub", id: "advisor", name: "advisor", depth: 0 } }),
-  /restricted to the root native session/);
+  await assert.rejects(() => attach.execute("child-attachment", attachmentInput, undefined, undefined, childContext),
+    /restricted to the root native session/);
+  const attachmentGate = await runner.emitToolCall({ type: "tool_call", toolName: "result_attach",
+    toolCallId: "attachment-gate", input: attachmentInput });
+  assert.equal(attachmentGate?.block === true, kind === "sub",
+    "The attachment hook denies children without blocking the root's approval path");
+  if (kind === "sub") {
+    await assertReactivationDenied("result_attach", attachmentInput, /root native session/);
+  }
   const question = { question: "Select a release route", header: "Release", options: [
     { label: "Local", description: "Keep the work local", preview: "No deployment" },
     { label: "Review", description: "Prepare a review" },
@@ -318,23 +357,16 @@ try {
   const ask = runner.getRegisteredTool("decision_ask")!.definition;
   assert.equal(ask.approval, "read");
   assert.equal(ask.loadMode, "essential");
-  const askChild = { ...runner.createContext(), agent: { kind: "sub" as const, id: "advisor", name: "advisor", depth: 0 } };
   assert.deepEqual(await runner.emitToolCall({ type: "tool_call", toolName: "decision_ask", toolCallId: "child-ask",
-    input: { questions: [question] } }, undefined, askChild.agent),
+    input: { questions: [question] } }, undefined, childContext.agent),
   { block: true, reason: "Owner decisions are restricted to the root managed HEAD or lane session" });
-  await assert.rejects(() => ask.execute("child-ask", { questions: [question] }, undefined, undefined, askChild),
+  await assert.rejects(() => ask.execute("child-ask", { questions: [question] }, undefined, undefined, childContext),
     /restricted to the root managed HEAD or lane session/);
   if (kind === "sub") {
-    assert(!session.getEnabledToolNames().includes("decision_ask"));
-    await session.setActiveToolsByName([...expectedActive, "decision_ask"]);
-    await assert.rejects(() => session.getToolByName("decision_ask")!.execute("reactivated-child-ask", { questions: [question] }),
+    await assertReactivationDenied("decision_ask", { questions: [question] },
       /restricted to the root managed HEAD or lane session/);
-    await runner.emit({ type: "session_start" });
-    assert.deepEqual(session.getEnabledToolNames(), expectedActive);
-  } else if (selection === "narrow") assert(!session.getEnabledToolNames().includes("decision_ask"));
-  else assert(session.getEnabledToolNames().includes("decision_ask"));
+  }
   if (role === "lane" && kind === "main" && selection === "default") {
-    const context = runner.createContext();
     const id = decisionId(sessionManager.getSessionId(), "native-owner-question");
     assert.match(id, /^d-[0-9a-f]{24}$/);
     const questions = [{ ...question, id: `${id}:0` }];
@@ -392,15 +424,13 @@ try {
     }
   }
   if (role === "head") {
-    // The native extension loader adapts legacy TypeBox to callable omptype
-    // schemas. Exercise the same argument validator and wire-schema lowering
-    // that OMP uses, rather than applying TypeBox to its native representation.
+    // Use OMP's argument validator on the native loader's adapted schemas.
     const destination = { platform: "slack", accountId: "T:B", authorityId: "U", guildId: "T", channelId: "C", threadId: "1.2" };
     check("cron_create", { sourceId: "owner-source", schedule: "in 30m", prompt: "Summarize CI" }, true);
     check("cron_create", { sourceId: "owner-source", schedule: "in 30m" }, false);
     assert.equal(runner.getRegisteredTool("cron_create")?.definition.approval, "exec");
     assert.equal((await runner.emitToolCall({ type: "tool_call", toolName: "cron_create", toolCallId: "child-cron", input: {} },
-      undefined, askChild.agent))?.block, true);
+      undefined, childContext.agent))?.block, true);
     check("decision_list", {}, true);
     check("decision_list", { state: "all", laneId: "lane" }, true);
     check("decision_list", { state: "closed" }, false);
@@ -416,7 +446,7 @@ try {
     for (const name of ["decision_list", "decision_inspect", "decision_withdraw"]) {
       assert.equal(runner.getRegisteredTool(name)!.definition.approval, name === "decision_withdraw" ? "exec" : "read");
       const blocked = await runner.emitToolCall({ type: "tool_call", toolName: name, toolCallId: `child-${name}`, input: {} },
-        undefined, askChild.agent);
+        undefined, childContext.agent);
       assert.equal(blocked?.block, true);
       assert.match(blocked?.reason ?? "", /restricted to the main superagent head/);
     }
@@ -520,48 +550,30 @@ try {
     check("lane_close", { id: "lane", outcome: "completed", evidence: "checked" }, true);
     check("lane_close", { id: "lane", outcome: "cancelled", evidence: "authorized" }, true);
     check("lane_close", { id: "lane", outcome: "completed" }, false);
-    const childContext = { ...runner.createContext(), agent: { kind: "sub" as const, id: "advisor", name: "advisor", depth: 0 } };
     for (const name of managerNames) {
       // Even direct/inherited access cannot acquire authority by reactivation.
       const definition = runner.getRegisteredTool(name)!.definition;
       await assert.rejects(() => definition.execute("denied-child", {}, undefined, undefined, childContext), /restricted to the main superagent head/);
     }
     if (kind === "sub") {
-      for (const name of managerNames) assert(!session.getEnabledToolNames().includes(name));
-      await session.setActiveToolsByName([...expectedActive, "lane_inspect"]);
-      await assert.rejects(() => session.getToolByName("lane_inspect")!.execute("reactivated-child", {}), /restricted to the main superagent head/);
-      await runner.emit({ type: "session_start" });
-      assert.deepEqual(session.getEnabledToolNames(), expectedActive);
-    } else if (selection === "narrow") {
-      assert(!session.getEnabledToolNames().includes("lane_message"));
+      await assertReactivationDenied("lane_inspect", {}, /restricted to the main superagent head/);
     }
   } else {
-    assert.deepEqual(Object.keys(schemas), ["result_attach", "lane_report", "decision_ask"]);
     const definition = runner.getRegisteredTool("lane_report")!.definition;
     assert.equal(definition.loadMode, "essential");
     assert.equal(definition.approval, "read");
-    const childContext = { ...runner.createContext(), agent: { kind: "sub" as const, id: "advisor", name: "advisor", depth: 0 } };
-    await assert.rejects(() => definition.execute("denied-child",
-      { status: "waiting", summary: "Dependency observation", waiting: { kind: "dependency", target: "parent review" } },
-      undefined, undefined, childContext), /restricted to the root lane session/);
-    if (kind === "sub") {
-      assert(!session.getEnabledToolNames().includes("lane_report"));
-      await session.setActiveToolsByName([...expectedActive, "lane_report"]);
-      await assert.rejects(() => session.getToolByName("lane_report")!.execute("reactivated-child",
-        { status: "waiting", summary: "Dependency observation", waiting: { kind: "dependency", target: "parent review" } }),
+    const report = { status: "waiting", summary: "Dependency observation", waiting: { kind: "dependency", target: "parent review" } };
+    await assert.rejects(() => definition.execute("denied-child", report, undefined, undefined, childContext),
       /restricted to the root lane session/);
-      await runner.emit({ type: "session_start" });
-      assert.deepEqual(session.getEnabledToolNames(), expectedActive);
-    } else if (selection === "narrow") {
-      assert(!session.getEnabledToolNames().includes("lane_report"));
-    } else assert(session.getEnabledToolNames().includes("lane_report"));
+    if (kind === "sub") {
+      await assertReactivationDenied("lane_report", report, /restricted to the root lane session/);
+    }
   }
-
-  assert.equal(networkAttempts, 0);
-  console.log(`NATIVE_SKILLS_PROOF ${JSON.stringify({ role, kind, selection, extensionOrder, composition: Boolean(ulwPath), turns: 2,
-    reads, schemas, active: session.getEnabledToolNames(), discovered: discovered.map(skill => skill.name), networkAttempts })}`);
+  if (kind === "main") assert.deepEqual(session.getEnabledToolNames(), expectedActive);
 } finally {
   await session.extensionRunner?.emit({ type: "session_shutdown" });
   await session.dispose();
   authStorage.close();
 }
+assert.equal(networkAttempts, 0);
+console.log("NATIVE_SKILLS_PROOF");

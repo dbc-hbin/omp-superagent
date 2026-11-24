@@ -196,7 +196,8 @@ async fn dispatch(hub: &Arc<Hub>, finish: OnFinish, request: Request) -> WireRes
         }
         "/attachment" => {
             hub.state()?.controller(revision)?;
-            return hub.attachment(&data).await;
+            let receipt = hub.attachment(revision, data).await?;
+            return Ok(Json(json!({"ok": true, "value": receipt})).into_response());
         }
         _ => return Err(rejected("Unknown Gateway operation")),
     }

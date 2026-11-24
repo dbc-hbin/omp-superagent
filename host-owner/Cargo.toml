@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 # Stock RPC v1 keeps the first object fields when a large event must be shrunk.
 serde_json = { version = "1", features = ["preserve_order"] }

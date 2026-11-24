@@ -19,3 +19,54 @@ fn normalizes_only_exact_owner_command_spellings() {
     assert_eq!(slash_text("/superagent-status", "not accepted"), None);
     assert_eq!(slash_text("/status", ""), None);
 }
+
+#[test]
+fn slash_ingress_accepts_only_the_registered_names_and_argument_contract() {
+    for command in crate::commands::catalog() {
+        let name = format!("/superagent-{}", command.name);
+        assert_eq!(
+            slash_text(&name, " \n "),
+            Some(format!("/{}", command.name))
+        );
+        assert_eq!(
+            slash_text(&name, "input"),
+            command.text.map(|_| format!("/{} input", command.name))
+        );
+        assert_eq!(slash_text(&format!("/{}", command.name), ""), None);
+        assert_eq!(slash_text(&format!("!{}", command.name), ""), None);
+    }
+    for name in [
+        "/hermes",
+        "/superagent-models",
+        "/superagent-help extra",
+        "/SUPERAGENT-help",
+        "superagent-help",
+    ] {
+        assert_eq!(slash_text(name, ""), None);
+    }
+    for (name, input, expected) in [
+        (
+            "/superagent-model",
+            "  --global provider/model  ",
+            "/model --global provider/model",
+        ),
+        ("/superagent-usage", " reset ", "/usage reset"),
+        (
+            "/superagent-compact",
+            "  first line\nsecond line  ",
+            "/compact first line\nsecond line",
+        ),
+        (
+            "/superagent-new",
+            "start\nwith context",
+            "/new start\nwith context",
+        ),
+        (
+            "/superagent-stop",
+            "actual-lane-id",
+            "/stop actual-lane-id",
+        ),
+    ] {
+        assert_eq!(slash_text(name, input).as_deref(), Some(expected));
+    }
+}

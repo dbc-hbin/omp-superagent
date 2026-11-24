@@ -10,11 +10,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::adapter::EffectError;
+use crate::adapter::{EffectError, approval_token};
 
 use self::dialog::{Answer, Dialog, Response};
 use super::Inner;
-use super::wire::{Route, Ts, short_hash};
+use super::wire::{Route, Ts};
 
 const UNSUPPORTED: &str = "Request cancelled: this dialog cannot be represented safely in Slack. Use the local OMP interface; secret input is never collected here.";
 
@@ -48,13 +48,13 @@ struct Decision {
 
 impl Approval {
     fn token(&self) -> String {
-        short_hash(&json!([
-            self.id,
+        approval_token(
+            &self.id,
             self.generation,
-            self.target,
-            self.request_id,
-            self.route.key()
-        ]))
+            &self.target,
+            &self.request_id,
+            &self.route.key(),
+        )
     }
 }
 

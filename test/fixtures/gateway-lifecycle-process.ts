@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, requireMessengerCredentials } from "../../src/config";
 import { loadCredentials } from "../../src/credentials";
-import type { Inbound, Messenger } from "../../src/contracts";
+import type { Inbound } from "../../src/contracts";
+import type { DownloadMessenger as Messenger } from "./inbound-attachments";
 import { runGatewayRestart } from "../oracles/bun-gateway/gateway-restart";
 
 const arg = (name: string) => { const at = process.argv.indexOf(name); return at < 0 ? undefined : process.argv[at + 1]; };

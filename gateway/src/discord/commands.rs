@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::commands::accepts_text;
+use crate::commands::discord_accepts_text;
 
 use super::{
     Effect, State,
@@ -31,7 +31,7 @@ fn command(data: &Value) -> Option<String> {
     if command.kind != 1 {
         return None;
     }
-    let accepts_argument = accepts_text(&command.name)?;
+    let accepts_argument = discord_accepts_text(&command.name)?;
     match command.options.as_slice() {
         [] => Some(format!("/{}", command.name)),
         [option] if accepts_argument && option.kind == 3 && option.name == "text" => {

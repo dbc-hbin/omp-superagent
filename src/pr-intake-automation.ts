@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Type, type Static } from "@sinclair/typebox/type";
 import type { StorePort } from "./contracts";
-import { PrReadError, parseWire } from "./pr-github-schema";
+import { PrReadError, parseWire, sha40 as sha } from "./pr-github-schema";
 import { inspectIntakeComment, publishIntakeComment } from "./pr-intake-comment";
 import { applyIntakeFix, parseIntakeFix, reconcileIntakeFix } from "./pr-intake-fix";
 import { inspectIntakeMerge, mergeIntakePull } from "./pr-intake-github";
@@ -12,7 +12,6 @@ import type { ReviewRound } from "./pr-intake-review";
 // allow: SIZE_OK - This state machine owns the PR-wide ledger and its single write fence.
 const maxHeads = 3;
 const rank = { review: 0, fix: 1, merge: 2 } as const;
-const sha = Type.String({ pattern: "^[a-f0-9]{40}$" });
 const hash = Type.String({ pattern: "^[a-f0-9]{64}$" });
 const nonempty = Type.String({ minLength: 1 });
 const materialSchema = Type.Object({ digest: hash, baseRef: nonempty, baseSha: sha, headRef: nonempty });

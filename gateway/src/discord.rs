@@ -146,6 +146,14 @@ impl Adapter for Discord {
         Ok(())
     }
 
+    async fn send_result_attachment(
+        &self,
+        output: &Value,
+        file: crate::result_attachment::VerifiedResultAttachment,
+    ) -> Effect<Value> {
+        self.state.send_result_attachment(&read(output)?, file).await.map(Value::String)
+    }
+
     async fn effect(&self, operation: &str, args: &[Value]) -> Effect<Value> {
         let state = &self.state;
         match (operation, args) {

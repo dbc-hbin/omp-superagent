@@ -66,7 +66,7 @@ class RecordingMessenger implements Messenger {
   async showApproval(_approval: Approval): Promise<string> { throw new Error("Unexpected native steering approval"); }
   async dismissApproval(): Promise<void> { throw new Error("Unexpected native steering approval dismissal"); }
   async fetchAfter(): Promise<Inbound[]> { return []; }
-  async openAttachment(): Promise<Response> { throw new Error("Native steering fixture has no attachments"); }
+  async openAttachment(): Promise<never> { throw new Error("Native steering fixture has no attachments"); }
   async stop(): Promise<void> { this.handlers = undefined; }
 }
 

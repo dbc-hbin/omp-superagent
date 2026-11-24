@@ -1,10 +1,9 @@
 import type { IncomingMessage } from "node:http";
-import { Readable, Transform } from "node:stream";
 import type { Config } from "./config";
 import { createHash } from "node:crypto";
-import type { Approval, Attachment, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "./contracts";
+import type { Approval, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartRecord, GatewayRestartRequest, Inbound, InboundAttachmentBatch, InboundAttachmentReceipt, MessageActivity, MessageReference, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "./contracts";
 import { DeliveryError } from "./delivery";
-import { gatewayCall, gatewayPaths, gatewayRequest, MAX_GATEWAY_ATTACHMENT, MAX_GATEWAY_FRAME, readGatewayJson, type GatewayResult } from "./gateway-protocol";
+import { gatewayCall, gatewayPaths, gatewayRequest, MAX_GATEWAY_FRAME, parseInboundAttachmentReceipt, readGatewayJson, type GatewayResult } from "./gateway-protocol";
 import type { GatewayReceipt, QueuedEvent } from "./gateway-wire";
 import type { GroupReply } from "./group-policy";
 import type { DiscordPresenceStatus, MessengerPresenceRequest } from "./contracts";
@@ -156,9 +155,12 @@ class GatewayMessenger implements GatewayHeadMessenger {
     // Stable across client reattachment; the Gateway journals the one attempt.
     const hash = createHash("sha256").update(JSON.stringify(["result-attachment", output.id])).digest("hex");
     const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
-    // The adapter needs bytes and filename, not filesystem paths or native IDs.
+    // Transfer only a receipt; the old persisted payload is read by the Gateway
+    // itself so its original attempt fingerprint can still be reconciled.
+    const { payload } = resultAttachment;
     return this.call<string>("/effect", { id, operation: "send", args: [{
-      id: output.id, route: output.route, text: output.text, replyTo: output.replyTo, resultAttachment: resultAttachment.payload,
+      id: output.id, route: output.route, text: output.text, replyTo: output.replyTo,
+      resultAttachment: "data" in payload ? { name: payload.name, legacy: true } : payload,
     }] });
   }
   assertRoute(route: Route, purpose?: "history"): Promise<void> {
@@ -185,62 +187,12 @@ class GatewayMessenger implements GatewayHeadMessenger {
   discordPurpose(request: DiscordPurposeRequest): Promise<readonly DiscordPurposeNote[]> { return this.effect("discordPurpose", [request]); }
   fetchAfter(route: Route, messageId: string): Promise<Inbound[] | null> { return this.effect("fetchAfter", [route, messageId]); }
 
-  async openAttachment(route: Route, attachment: Attachment, signal: AbortSignal): Promise<Response> {
+  async openAttachment(batch: InboundAttachmentBatch, signal: AbortSignal): Promise<InboundAttachmentReceipt> {
     if (this.stopped) throw new DeliveryError("Gateway client is stopped", "rejected");
-    if (attachment.size !== null && (!Number.isSafeInteger(attachment.size) || attachment.size < 0 || attachment.size > MAX_GATEWAY_ATTACHMENT))
-      throw new DeliveryError("Invalid attachment size", "rejected");
-    const incoming = await gatewayRequest(this.socketPath, "/attachment", { route, attachment }, { ...this.options(), signal });
-    if (incoming.headers["x-gateway-attachment-protocol"] !== "1") {
-      const result = await readGatewayJson(incoming) as GatewayResult;
-      throw new DeliveryError(result.error ?? "Attachment rejected", result.certainty ?? "uncertain");
-    }
-    let bytes = 0;
-    const header = Buffer.allocUnsafe(4);
-    let headerBytes = 0;
-    let remaining = 0;
-    let complete = false;
-    const bounded = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        let offset = 0;
-        while (offset < chunk.length) {
-          if (complete) { callback(new Error("Attachment data followed its completion frame")); return; }
-          if (!remaining) {
-            const count = Math.min(4 - headerBytes, chunk.length - offset);
-            chunk.copy(header, headerBytes, offset, offset + count);
-            headerBytes += count;
-            offset += count;
-            if (headerBytes < 4) continue;
-            remaining = header.readUInt32BE();
-            headerBytes = 0;
-            if (!remaining) { complete = true; continue; }
-            if (bytes + remaining > (attachment.size ?? MAX_GATEWAY_ATTACHMENT) || bytes + remaining > MAX_GATEWAY_ATTACHMENT) {
-              callback(new Error("Attachment stream exceeds declared size"));
-              return;
-            }
-          }
-          const count = Math.min(remaining, chunk.length - offset);
-          if (count) this.push(chunk.subarray(offset, offset + count));
-          offset += count;
-          remaining -= count;
-          bytes += count;
-        }
-        callback();
-      },
-      flush(callback) {
-        callback(!complete || remaining || headerBytes || attachment.size !== null && bytes !== attachment.size
-          ? new Error("Attachment stream ended without a complete delivery receipt") : undefined);
-      },
+    const result = await gatewayCall<unknown>(this.socketPath, "/attachment", batch, {
+      ...this.options(), signal, timeoutMs: 30_000 * Math.min(batch.attachments.length, 10) + 1000,
     });
-    incoming.on("error", error => bounded.destroy(error));
-    incoming.on("aborted", () => bounded.destroy(new Error("Attachment stream was interrupted")));
-    bounded.on("close", () => incoming.destroy());
-    incoming.pipe(bounded);
-    const headers = new Headers();
-    const contentType = incoming.headers["content-type"];
-    const contentLength = incoming.headers["x-gateway-attachment-length"];
-    if (typeof contentType === "string") headers.set("content-type", contentType);
-    if (typeof contentLength === "string") headers.set("content-length", contentLength);
-    return new Response(Readable.toWeb(bounded) as ReadableStream<Uint8Array>, { status: incoming.statusCode ?? 502, headers });
+    return parseInboundAttachmentReceipt(this.socketPath, batch, result);
   }
 
   async stop(): Promise<void> {

@@ -181,8 +181,10 @@ export default function hostExtension(pi: ExtensionAPI): void {
     if (!Array.isArray(enabled) || enabled.length)
       throw new ReviewIsolationError("Static PR review cannot establish an empty native enabled tool set");
     // OMP 19.1 calls its separately mounted tool surface tool commands.
-    const mounted: unknown = "getMountedToolCommandNames" in session && typeof session.getMountedToolCommandNames === "function"
-      ? session.getMountedToolCommandNames() : session.getMountedXdevToolNames?.();
+    const mounted: unknown = typeof session.getMountedToolCommandNames === "function"
+      ? session.getMountedToolCommandNames()
+      : "getMountedXdevToolNames" in session && typeof session.getMountedXdevToolNames === "function"
+        ? session.getMountedXdevToolNames() : undefined;
     if (!Array.isArray(mounted) || mounted.length)
       throw new ReviewIsolationError("Static PR review cannot establish an empty native device tool set");
     if (!Array.isArray(session.agent.state.tools) || session.agent.state.tools.length ||
@@ -488,7 +490,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
       return {
         model: session.model, thinkingLevel: session.thinkingLevel,
         ...(command.thinkingLevels === true ? {
-          configuredThinkingLevel: session.configuredThinkingLevel() ?? null,
+          configuredThinkingLevel: session.configuredThinkingLevel(),
           thinkingLevels: session.getAvailableEffortSelectors(),
         } : {}),
         isStreaming: session.isStreaming, isCompacting: session.isCompacting,

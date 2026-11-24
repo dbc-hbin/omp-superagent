@@ -2,12 +2,13 @@ import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { Api, InputFile } from "grammy";
 import type { CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update, UserFromGetMe } from "grammy/types";
-import { physicalRouteKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type ReplyContext, type Route, type StorePort } from "../../../src/contracts.ts";
+import { physicalRouteKey, type Approval, type Attachment, type DialogResponse, type Inbound, type MessageActivity, type MessageReference, type OutputRecord, type ReplyContext, type Route, type StorePort } from "../../../src/contracts.ts";
+import type { DownloadMessenger as Messenger } from "../../fixtures/inbound-attachments";
 import { parseDialog, type Dialog } from "../../../src/dialog.ts";
 import { validateDecisionAnswer, validateDecisionResponse } from "../../../src/decisions";
 import { approvalCardToken, DeliveryError } from "../../../src/delivery.ts";
 import { MESSENGER_COMMANDS } from "../../../src/messenger-commands.ts";
-import { withTelegramSignal } from "../../../src/telegram-signal";
+import { withTelegramSignal } from "./telegram-signal";
 
 // grammY Api has no retry transformer installed. Only getUpdates is retried.
 // Bot API: https://core.telegram.org/bots/api#getupdates (24-hour retention),

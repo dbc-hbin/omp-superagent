@@ -2087,6 +2087,7 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "opus2",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

@@ -155,6 +155,14 @@ impl Adapter for Slack {
         result
     }
 
+    async fn send_result_attachment(
+        &self,
+        output: &Value,
+        file: crate::result_attachment::VerifiedResultAttachment,
+    ) -> Result<Value, EffectError> {
+        self.inner.send_result_attachment(decode(output)?, file).await.map(Value::String)
+    }
+
     async fn effect(&self, operation: &str, args: &[Value]) -> Result<Value, EffectError> {
         match (operation, args) {
             ("assertRoute", [route]) => {

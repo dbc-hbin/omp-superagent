@@ -1,19 +1,15 @@
-import { expect, test } from "bun:test";
+import { test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-const scenarios = [
-  ["head", "main", "default"], ["head", "main", "narrow"],
-  ["head", "sub", "default"], ["head", "sub", "narrow"],
-  ["lane", "main", "default"], ["lane", "main", "narrow"], ["lane", "sub", "default"], ["lane", "sub", "narrow"],
-] as const;
-// Ordinary tests need no external extension checkout. The parent explicitly
-// supplies a local read-only entrypoint when proving real ULW composition.
 const ulwPath = process.env.OMP_TEST_ULW_EXTENSION ? path.resolve(process.env.OMP_TEST_ULW_EXTENSION) : undefined;
-const compositionScenarios = ulwPath ? (["ulw-first", "superagent-first"] as const).flatMap(order =>
-  (["head", "lane"] as const).flatMap(role => (["main", "sub"] as const).map(kind =>
-    [role, kind, "default", order] as const))) : [];
-const cases = [...scenarios.map(([role, kind, selection]) => [role, kind, selection, "standalone"] as const), ...compositionScenarios];
+// Each composition run already verifies the default tool selection. Keep the
+// standalone run for explicit exclusions and native prompts without Superkit.
+const defaultOrders = ulwPath ? ["ulw-first", "superagent-first"] as const : ["standalone"] as const;
+const cases = (["head", "lane"] as const).flatMap(role => (["main", "sub"] as const).flatMap(kind => [
+  [role, kind, "narrow", "standalone"] as const,
+  ...defaultOrders.map(order => [role, kind, "default", order] as const),
+]));
 
 test.each(cases)("native packaged skills, scoped tools, and preserved selections: %s/%s/%s/%s", async (role, kind, selection, order) => {
   const root = await fs.mkdtemp(path.join(await fs.realpath("/tmp"), "oss-"));
@@ -39,51 +35,11 @@ test.each(cases)("native packaged skills, scoped tools, and preserved selections
   const timeout = setTimeout(() => child.kill("SIGKILL"), 45_000);
   try {
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-    if (code !== 0 || stderr) throw new Error(`Native skills fixture ${role}/${kind}/${selection}/${order} exited ${code}\n${stderr}\n${stdout}`);
-    const line = stdout.split("\n").find(line => line.startsWith("NATIVE_SKILLS_PROOF "));
-    expect(line).toBeDefined();
-    const proof = JSON.parse(line!.slice("NATIVE_SKILLS_PROOF ".length)) as {
-      role: string; kind: string; reads: string[]; schemas: Record<string, unknown>;
-      active: string[]; discovered: string[]; networkAttempts: number;
-      composition: boolean; extensionOrder?: string; turns: number;
-    };
-    expect(proof.role).toBe(role);
-    expect(proof.kind).toBe(kind);
-    expect(proof.composition).toBe(order !== "standalone");
-    expect(proof.extensionOrder).toBe(order === "standalone" ? undefined : order);
-    expect(proof.turns).toBe(2);
-    expect(proof.reads).toHaveLength(6);
-    expect(proof.discovered).toContain("project-existing");
-    expect(proof.discovered).toContain("user-existing");
-    expect(proof.discovered).toContain("custom-existing");
-    expect(proof.active).toContain("read");
-    expect(proof.active).toContain("task");
-    expect(proof.networkAttempts).toBe(0);
-    if (selection === "narrow") expect(proof.active).not.toContain("bash");
-    else expect(proof.active).toContain("bash");
-    if (role === "lane") {
-      expect(Object.keys(proof.schemas)).toEqual(["result_attach", "lane_report", "decision_ask"]);
-      if (kind === "sub" || selection === "narrow") expect(proof.active).not.toContain("lane_report");
-      else expect(proof.active).toContain("lane_report");
-    } else {
-      expect(Object.keys(proof.schemas).sort()).toEqual(["cron_create", "decision_ask", "decision_inspect", "decision_list", "decision_withdraw", "discord_context", "discord_purpose_clear", "discord_purpose_list", "discord_purpose_set", "head_recovery", "head_set_model", "lane_close", "lane_init_presets", "lane_inspect", "lane_message", "lane_models", "lane_pause", "lane_resume", "lane_review_decision", "lane_set_model", "lane_start", "lane_thread_update", "lane_watch", "messenger_presence", "pr_watch", "pr_watch_list", "result_attach", "thread_inspect"]);
-      if (kind === "sub") expect(proof.active).not.toContain("head_recovery");
-      if (kind === "sub") expect(proof.active).not.toContain("head_set_model");
-      else expect(proof.active).toContain("head_set_model");
-      if (kind === "sub") expect(proof.active).not.toContain("cron_create");
-      else expect(proof.active).toContain("cron_create");
-      if (kind === "sub") expect(proof.active).not.toContain("thread_inspect");
-      if (kind === "sub") expect(proof.active.some(name => name.startsWith("discord_"))).toBe(false);
-      if (kind === "sub") expect(proof.active.some(name => name.startsWith("pr_watch"))).toBe(false);
-      if (kind === "sub") expect(proof.active.some(name => name.startsWith("lane_"))).toBe(false);
-      else if (selection === "narrow") expect(proof.active).not.toContain("lane_message");
-      else expect(proof.active).toContain("lane_message");
-    }
-    if (kind === "sub" || selection === "narrow") expect(proof.active).not.toContain("decision_ask");
-    else expect(proof.active).toContain("decision_ask");
-    if (kind === "sub") expect(proof.active.some(name => name.startsWith("decision_"))).toBe(false);
-    if (kind === "sub" || selection === "narrow") expect(proof.active).not.toContain("result_attach");
-    else expect(proof.active).toContain("result_attach");
+    // The fixture asserts on native state directly. The marker distinguishes
+    // completing those checks from an extension exiting the process early.
+    const completed = stdout.split("\n").includes("NATIVE_SKILLS_PROOF");
+    if (code !== 0 || stderr || !completed)
+      throw new Error(`Native skills fixture ${role}/${kind}/${selection}/${order} exited ${code} (completed: ${completed})\n${stderr}\n${stdout}`);
   } finally {
     clearTimeout(timeout);
     if (child.exitCode === null) child.kill("SIGKILL");

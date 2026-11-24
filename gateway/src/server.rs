@@ -26,7 +26,7 @@ mod protocol;
 mod restart;
 #[cfg(test)]
 pub(crate) mod tests;
-mod transport;
+pub(crate) mod transport;
 
 use restart::RestartCall;
 use transport::SocketIdentity;
@@ -196,7 +196,12 @@ impl Server {
         transport::private_directory(socket_path)?;
         let listener = UnixListener::bind(socket_path).context("Binding private Gateway socket")?;
         let socket = SocketIdentity::capture(socket_path)?;
-        if let Err(error) = socket.secure(&hub.store) {
+        // The Store holds the lifetime lock, and no attachment handler can
+        // enter until the listener task starts. Status-only paths never sweep.
+        let startup = attachments::recover(hub.store.state_dir())
+            .context("Recovering the private inbound attachment spool")
+            .and_then(|()| socket.secure(&hub.store));
+        if let Err(error) = startup {
             if socket.unlink().is_err() {
                 eprintln!("Gateway socket startup cleanup failed");
             }

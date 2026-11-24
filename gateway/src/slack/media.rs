@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::adapter::EffectError;
 use crate::picker::Picker;
-use crate::result_attachment::ResultAttachment;
+use crate::result_attachment::VerifiedResultAttachment;
 
 use super::Inner;
 use super::api::secure_url;
@@ -23,7 +23,6 @@ pub(super) struct Output {
     route: Route,
     text: String,
     picker: Option<Picker>,
-    result_attachment: Option<ResultAttachment>,
 }
 
 #[derive(Deserialize)]
@@ -130,15 +129,18 @@ impl Inner {
         Ok(receipt.ts)
     }
 
+    pub(super) async fn send_result_attachment(
+        &self, output: Output, file: VerifiedResultAttachment,
+    ) -> Result<String, EffectError> {
+        if output.route.authority_id != self.owner || output.picker.is_some() || !output.text.is_empty() {
+            return Err(EffectError::rejected("Slack result attachments require owner authority and a standalone file"));
+        }
+        self.destination(&output.route).await?;
+        self.upload(&output.route, file.name, file.bytes).await
+    }
+
     pub(super) async fn send(&self, output: Output) -> Result<String, EffectError> {
         self.destination(&output.route).await?;
-        if let Some(file) = output.result_attachment {
-            if output.route.authority_id != self.owner || output.picker.is_some() || !output.text.is_empty() {
-                return Err(EffectError::rejected("Slack result attachments require owner authority and a standalone file"));
-            }
-            let bytes = file.bytes()?;
-            return self.upload(&output.route, file.name, bytes).await;
-        }
         if output.text.len() > FILE_LIMIT {
             return Err(EffectError::rejected(
                 "Slack text output exceeds the safe 8 MiB upload limit",

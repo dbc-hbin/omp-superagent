@@ -5,13 +5,14 @@ import {
   Routes, TextInputBuilder, TextInputStyle,
   type ChatInputCommandInteraction, type ForumChannel, type Interaction, type MediaChannel, type Message, type MessageCreateOptions, type PartialMessage, type PermissionsBitField,
 } from "discord.js";
-import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type DiscordContext, type DiscordPurposeNote, type DiscordPurposeRequest, type Inbound, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type ReplyContext, type Route, type StorePort, type ThreadInfo, type ThreadUpdate } from "../../../src/contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type DiscordContext, type DiscordPurposeNote, type DiscordPurposeRequest, type Inbound, type MessageActivity, type MessageReference, type OutputRecord, type ReplyContext, type Route, type StorePort, type ThreadInfo, type ThreadUpdate } from "../../../src/contracts.ts";
+import type { DownloadMessenger as Messenger } from "../../fixtures/inbound-attachments";
 import { changeDiscordPurpose, discordPurposeNotes, discordPurposeRequest } from "../../../src/discord-context";
 import { validateDecisionAnswer, validateDecisionResponse } from "../../../src/decisions";
 import { parseDialog, type Dialog } from "../../../src/dialog.ts";
 import { approvalCardToken, DeliveryError } from "../../../src/delivery.ts";
-import { parseDiscordCommand } from "../../../src/discord-commands.ts";
-import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "../../../src/discord-markdown.ts";
+import { parseDiscordCommand } from "./discord-commands.ts";
+import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "./discord-markdown.ts";
 import { DiscordVoice } from "./discord-voice";
 import { VOICE_DRAFT_HEADER } from "./discord-voice-draft";
 import type { DiscordVoiceConfig } from "../../../src/config";

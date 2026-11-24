@@ -1,6 +1,6 @@
 {
   "name": "omp-superagent",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "One messenger-connected OMP head with independent work sessions",
   "license": "MIT",
   "author": "dbc-hbin",
@@ -14,7 +14,9 @@
   "packageManager": "bun@1.4.4",
   "files": [
     "src/",
-    "scripts/",
+    "scripts/build-host-owner.ts",
+    "scripts/prepare-ulw.ts",
+    "scripts/setup.sh",
     "skills/",
     "host-owner/bin/",
     "gateway/bin/",
@@ -33,8 +35,8 @@
     "build:owner": "bun --no-env-file scripts/build-host-owner.ts --owner",
     "build:native": "bun --no-env-file scripts/build-host-owner.ts",
     "check": "tsc --noEmit",
-    "test": "bun run build:native && bun test --parallel=2 test",
-    "test:ci": "bun --no-env-file scripts/ci.ts",
+    "test": "bun run build:native && cargo build --locked --manifest-path gateway/Cargo.toml --example operator-loopback && bun test --parallel=2 test",
+    "test:ci": "bun run build:native && bun --no-env-file scripts/ci.ts",
     "test:baseline": "bash scripts/test-omp.sh",
     "release": "bun --no-env-file scripts/release.ts",
     "start": "bun --no-env-file src/cli.ts start",
@@ -47,24 +49,24 @@
     "bun": ">=1.4.4"
   },
   "dependencies": {
-    "@oh-my-pi/pi-ai": "19.0.0",
-    "@oh-my-pi/pi-catalog": "19.0.0",
-    "@oh-my-pi/pi-coding-agent": "19.0.0",
-    "@oh-my-pi/pi-natives": "19.0.0",
-    "@oh-my-pi/pi-tui": "19.0.0",
-    "@oh-my-pi/pi-utils": "19.0.0",
-    "@slack/web-api": "^8.3.0",
+    "@oh-my-pi/pi-ai": "19.1.1",
+    "@oh-my-pi/pi-catalog": "19.1.1",
+    "@oh-my-pi/pi-coding-agent": "19.1.1",
+    "@oh-my-pi/pi-natives": "19.1.1",
+    "@oh-my-pi/pi-tui": "19.1.1",
+    "@oh-my-pi/pi-utils": "19.1.1",
     "@sinclair/typebox": "^0.34.41",
-    "abort-controller": "3.0.0",
-    "cron-parser": "5.10.6",
-    "discord.js": "^14.25.1",
-    "grammy": "^1.46.0"
+    "cron-parser": "5.10.6"
   },
   "devDependencies": {
     "@discordjs/voice": "0.19.2",
     "@noble/ciphers": "2.4.0",
     "@slack/socket-mode": "^3.2.0",
+    "@slack/web-api": "^8.3.0",
     "@types/bun": "^1.3.0",
+    "abort-controller": "3.0.0",
+    "discord.js": "^14.25.1",
+    "grammy": "^1.46.0",
     "opusscript": "0.0.8",
     "typescript": "^7.0.2"
   }

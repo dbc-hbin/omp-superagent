@@ -7,8 +7,8 @@ import { basename, join } from "node:path";
 import { Client, Collection, type ClientUser, type Message } from "discord.js";
 import { DEFERRED_ROUTING_META, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type Lane, type LaneModel, type Route } from "../src/contracts.ts";
 import { DiscordMessenger } from "./oracles/bun-gateway/discord.ts";
+import { extractDiscordCards } from "./oracles/bun-gateway/discord-markdown.ts";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
-import { extractDiscordCards } from "../src/discord-markdown.ts";
 import { Store } from "../src/store.ts";
 import { lanePlacement, readLaneRows } from "../src/lane-rows";
 import { TOPIC_CHOICE_WAIT_MS } from "../src/topic-request";
@@ -1711,6 +1711,33 @@ describe("durable coordination store", () => {
     reopened.finishOutput("inflight", "sent", "reconciled-receipt");
     expect(storedOutput(path, "inflight")).toEqual({ state: "sent", remote_id: "reconciled-receipt" });
     expect(reopened.input("source-lane")?.state).toBe("submitted");
+  });
+
+  test("pre-spool base64 result rows are recoverable but can never be newly admitted or retried", () => {
+    const { store, path } = fixture();
+    const sourceId = "discord:2:1001:original";
+    const id = `result-attachment:${sourceId}`;
+    const destination = route();
+    const resultAttachment = {
+      sourceId, inputId: sourceId, requestId: "native-result", generation: 0,
+      sessionId: "native-session", sessionFile: "/private/session.jsonl", toolCallId: "native-tool",
+      payload: { name: "result.bin", data: "AEJDCg==" },
+    };
+    expect(() => store.queueOutput({ id, sourceId, route: destination, text: "", resultAttachment }))
+      .toThrow("requires a native snapshot receipt");
+    store.close();
+    const legacyDb = new Database(path);
+    try {
+      legacyDb.query("INSERT INTO outputs (id, source_id, route, physical_route, text, result_attachment) VALUES (?, ?, ?, ?, '', ?)")
+        .run(id, sourceId, JSON.stringify(destination), physicalRouteKey(destination), JSON.stringify(resultAttachment));
+    } finally { legacyDb.close(); }
+    const reopened = open(path);
+    expect(reopened.outputs()).toMatchObject([{ id, state: "pending", resultAttachment }]);
+    expect(reopened.claimOutput(id)).toBe(true);
+    reopened.recoverDeliveries();
+    expect(reopened.output(id)).toMatchObject({ state: "uncertain", resultAttachment });
+    expect(() => reopened.finishOutput(id, "pending")).toThrow("never retried");
+    expect(reopened.claimOutput(id)).toBe(false);
   });
 
   test("a known failed/uncertain send retries only after an explicit transition", () => {

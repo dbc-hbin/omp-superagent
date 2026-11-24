@@ -2,11 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Routes, type REST, type RESTOptions } from "discord.js";
+import { Routes } from "discord.js";
+import { homepage, version } from "../package.json";
 import { main } from "../src/cli";
 import type { Config } from "../src/config";
-import { DISCORD_COMMANDS } from "../src/discord-commands";
 import { registerDiscordCommands } from "../src/discord-command-registration";
+import { DISCORD_COMMANDS } from "./fixtures/discord-commands";
+import { loopbackOperator } from "./fixtures/operator";
 
 const applicationId = "100000000000000001";
 const guildId = "200000000000000002";
@@ -50,7 +52,12 @@ interface Step {
   method: "get" | "put";
   path: string;
   value?: unknown;
-  error?: unknown;
+  error?: number | "incomplete";
+  headers?: Record<string, string>;
+}
+
+function exhaustedBucket(bucket: string): Record<string, string> {
+  return { "x-ratelimit-bucket": bucket, "x-ratelimit-remaining": "0", "x-ratelimit-reset-after": "120.5" };
 }
 
 function inspection(global: unknown = [], guilds: { id: string; commands: unknown }[] = []): Step[] {
@@ -65,25 +72,34 @@ function inspection(global: unknown = [], guilds: { id: string; commands: unknow
 function transport(steps: Step[]) {
   const pending = [...steps];
   const calls: { method: string; path: string; body?: unknown }[] = [];
-  let settings: Partial<RESTOptions> | undefined;
   let credential: string | undefined;
-  function request(method: "get" | "put", path: string, body?: unknown): unknown {
+  const run = loopbackOperator(async request => {
+    const url = new URL(request.url);
+    expect(url.pathname).toStartWith("/api/v10/");
+    const path = url.pathname.slice("/api/v10".length);
+    const method = request.method.toLowerCase();
+    const body: unknown = method === "put" ? await request.json() : undefined;
     calls.push({ method, path, ...(body === undefined ? {} : { body }) });
+    const authorization = request.headers.get("authorization");
+    expect(authorization).toStartWith("Bot ");
+    expect(request.headers.get("user-agent")).toBe(`DiscordBot (${homepage}, ${version})`);
+    credential = authorization?.slice("Bot ".length);
     const step = pending.shift();
     if (!step) throw new Error("Unexpected transport call");
     expect({ method, path }).toEqual({ method: step.method, path: step.path });
-    if (step.error !== undefined) throw step.error;
-    return step.value;
-  }
-  const rest: Pick<REST, "get" | "put"> = {
-    async get(path) { return request("get", path); },
-    async put(path, options) { return request("put", path, options?.body); },
-  };
+    if (step.error === "incomplete") {
+      return new Response("[", { headers: { "content-type": "application/json", "content-length": "200", connection: "close" } });
+    }
+    if (step.error === 307) return Response.redirect(new URL("/api/v10/must-not-follow", request.url).href, 307);
+    if (step.error !== undefined) {
+      return Response.json({ message: `401 https://discord.com/api/webhooks/123/${token} Authorization: Bot ${token}` },
+        { status: step.error, headers: { "retry-after": "1" } });
+    }
+    return Response.json(step.value, { headers: step.headers });
+  });
   return {
-    calls, pending,
-    get settings() { return settings; },
+    calls, pending, run,
     get credential() { return credential; },
-    createRest(options: Partial<RESTOptions>, value: string) { settings = options; credential = value; return rest; },
   };
 }
 
@@ -140,7 +156,7 @@ describe("explicit Discord global command registration", () => {
     expect(result.status).toBe("dry-run");
     expect(result.applicationId).toBe(applicationId);
     expect(result.botId).toBe(applicationId);
-    expect(result.plannedGlobal).toEqual(DISCORD_COMMANDS);
+    expect<readonly unknown[]>(result.plannedGlobal).toEqual(DISCORD_COMMANDS);
     expect(result.obsoleteGlobal).toEqual([{ id: "400000000000000004", type: 1, name: "hermes" }]);
     expect(result.guilds).toEqual([{ guildId, registrations: [], shadowing: [] }]);
     expect(result.note).toContain("deleting all other global registrations");
@@ -148,11 +164,6 @@ describe("explicit Discord global command registration", () => {
     expect(rest.calls.every(call => call.method === "get")).toBe(true);
     expect(rest.pending).toHaveLength(0);
     expect(rest.credential).toBe(token);
-    expect(rest.settings?.retries).toBe(0);
-    const reject = rest.settings?.rejectOnRateLimit;
-    if (typeof reject !== "function") throw new Error("Rate-limit rejection must be configured");
-    expect(await reject({} as Parameters<typeof reject>[0])).toBe(true);
-    expect(rest.settings?.version).toBe("10");
   });
 
   test("approved apply replaces only global commands with the exact catalog and verifies GET", async () => {
@@ -214,12 +225,77 @@ describe("explicit Discord global command registration", () => {
     expect(rest.calls.filter(call => call.path === guildPath)).toHaveLength(1);
   });
 
+  test.each([globalPath, guildPath])("a JSON-shaped text/plain inspection receipt from %s cannot authorize PUT", async path => {
+    const config = fixture([guildId]);
+    const steps = inspection([], [{ id: guildId, commands: [] }]);
+    const position = steps.findIndex(step => step.path === path);
+    const rest = transport(steps.slice(0, position + 1).map(step => step.path === path
+      ? { ...step, headers: { "content-type": "text/plain" } } : step));
+    await expect(registerDiscordCommands(config, { ...rest, apply: true })).rejects.toThrow("No mutation was attempted");
+    expect(rest.calls.at(-1)).toEqual({ method: "get", path });
+    expect(rest.pending).toHaveLength(0);
+  });
+
+  test("exhaustion advertised on one allowed guild GET stops the next GET in that bucket and prevents PUT", async () => {
+    const config = fixture([guildId, "200000000000000009"]);
+    const rest = transport(inspection([], [{ id: guildId, commands: [] }]).map(step =>
+      step.path === guildPath ? { ...step, headers: exhaustedBucket("guild-commands") } : step));
+    await expect(registerDiscordCommands(config, { ...rest, apply: true })).rejects.toThrow("No mutation was attempted");
+    expect(rest.calls.at(-1)).toEqual({ method: "get", path: guildPath });
+    expect(rest.calls.filter(call => call.path.includes("/guilds/"))).toHaveLength(1);
+    expect(rest.pending).toHaveLength(0);
+  });
+
+  test("known global GET exhaustion allows a read-only report but not an overwrite without available readback", async () => {
+    const config = fixture();
+    for (const apply of [false, true]) {
+      const rest = transport(inspection().map(step => step.path === globalPath
+        ? { ...step, headers: exhaustedBucket("global-commands") } : step));
+      const result = registerDiscordCommands(config, { ...rest, apply });
+      if (apply) await expect(result).rejects.toThrow("No mutation was attempted");
+      else expect((await result).status).toBe("dry-run");
+      expect(rest.calls.at(-1)).toEqual({ method: "get", path: globalPath });
+      expect(rest.pending).toHaveLength(0);
+    }
+  });
+
+  test("guild bucket exhaustion does not block unrelated global PUT or readback", async () => {
+    const config = fixture([guildId]);
+    const rest = transport([
+      ...inspection([], [{ id: guildId, commands: [] }]).map(step =>
+        step.path === guildPath ? { ...step, headers: exhaustedBucket("guild-commands") } : step),
+      { method: "put", path: globalPath, value: [] },
+      { method: "get", path: globalPath, value: authoritativeCommands() },
+    ]);
+    expect((await registerDiscordCommands(config, { ...rest, apply: true })).status).toBe("applied");
+    expect(rest.pending).toHaveLength(0);
+  });
+
+  test("successful PUT that exhausts its shared GET bucket is unresolved, without readback transmission", async () => {
+    const config = fixture();
+    const rest = transport([
+      ...inspection().map(step => step.path === globalPath
+        ? { ...step, headers: { "x-ratelimit-bucket": "shared-global", "x-ratelimit-remaining": "1" } } : step),
+      { method: "put", path: globalPath, value: [], headers: exhaustedBucket("shared-global") },
+    ]);
+    await expect(registerDiscordCommands(config, { ...rest, apply: true })).rejects.toThrow("unresolved: authoritative GET");
+    expect(rest.calls.at(-1)?.method).toBe("put");
+    expect(rest.pending).toHaveLength(0);
+  });
+
   test("loads only the configured Discord credential, using the existing nonempty env precedence", async () => {
     const config = fixture();
     config.telegram = { tokenEnv: otherTokenName, ownerId: "1", allowedChatIds: [] };
+    const voiceKey = "DISCORD_REGISTRATION_VOICE_KEY";
+    if (!config.discord) throw new Error("Discord fixture missing policy");
+    config.discord.voice = {
+      apiKeyEnv: voiceKey, channelId: "123", textChannelId: "456", voice: "default",
+      model: "test-model", backendModel: "test-backend", maxSessionSeconds: 60,
+    };
     setEnvironment(otherTokenName);
+    setEnvironment(voiceKey);
     setEnvironment("UNRELATED_REGISTRATION_KEY");
-    writeFileSync(`${config.path}.env`, `${tokenName}=file-discord-token\n${otherTokenName}=other-platform-secret\nUNRELATED_REGISTRATION_KEY=not-loaded\n`, { mode: 0o600 });
+    writeFileSync(`${config.path}.env`, `${tokenName}=file-discord-token\n${otherTokenName}=other-platform-secret\n${voiceKey}=voice-secret\nUNRELATED_REGISTRATION_KEY=not-loaded\n`, { mode: 0o600 });
     const shell = transport(inspection());
     await registerDiscordCommands(config, shell);
     expect(shell.credential).toBe(token);
@@ -228,7 +304,9 @@ describe("explicit Discord global command registration", () => {
     const file = transport(inspection());
     await registerDiscordCommands(config, file);
     expect(file.credential).toBe("file-discord-token");
+    expect(process.env[tokenName]).toBe("");
     expect(process.env[otherTokenName]).toBeUndefined();
+    expect(process.env[voiceKey]).toBeUndefined();
     expect(process.env.UNRELATED_REGISTRATION_KEY).toBeUndefined();
   });
 
@@ -238,7 +316,6 @@ describe("explicit Discord global command registration", () => {
     await expect(registerDiscordCommands({ ...config, discord: undefined }, rest)).rejects.toThrow("requires configured Discord");
     setEnvironment(tokenName);
     await expect(registerDiscordCommands(config, rest)).rejects.toThrow("credential is missing");
-    expect(rest.settings).toBeUndefined();
     expect(rest.calls).toHaveLength(0);
   });
 
@@ -247,9 +324,9 @@ describe("explicit Discord global command registration", () => {
     const rest = transport([]);
     setEnvironment(tokenName, `${token}\ninvalid`);
     await expect(registerDiscordCommands(config, rest)).rejects.toThrow("credential is invalid; value suppressed");
+    setEnvironment(tokenName, token);
     writeFileSync(`${config.path}.env`, `${tokenName}=${token}`, { mode: 0o644 });
     await expect(registerDiscordCommands(config, rest)).rejects.toThrow("Cannot safely load");
-    expect(rest.settings).toBeUndefined();
     expect(rest.calls).toHaveLength(0);
   });
 
@@ -281,10 +358,22 @@ describe("explicit Discord global command registration", () => {
     expect(guild.calls.filter(call => call.method === "put")).toHaveLength(0);
   });
 
-  test("SDK errors never expose credentials or URLs and are not retried", async () => {
+  test("summaries redact credentials and URLs in remote names without changing registration IDs", async () => {
+    const config = fixture([guildId]);
+    setEnvironment(tokenName, "short-token");
+    const rest = transport(inspection(
+      [command("short-token")],
+      [{ id: guildId, commands: [command("Go HTTPS://x.test/short-token", { guild_id: guildId })] }],
+    ));
+    const report = await registerDiscordCommands(config, rest);
+    expect(report.currentGlobal).toEqual([{ id: "400000000000000004", type: 1, name: "[redacted]" }]);
+    expect(report.obsoleteGlobal).toEqual(report.currentGlobal);
+    expect(report.guilds[0]?.registrations).toEqual([{ id: "400000000000000004", type: 1, name: "Go [redacted-url]" }]);
+  });
+
+  test("API errors never expose credentials or URLs and are not retried", async () => {
     const config = fixture();
-    for (const error of [new Error(`401 https://discord.com/api/webhooks/123/${token} Authorization: Bot ${token}`),
-      { message: token, url: `https://discord.com/${token}`, status: 429 }, `${token}`]) {
+    for (const error of [401, 429, 500]) {
       const rest = transport([{ method: "get", path: Routes.user("@me"), error }]);
       let message = "";
       try { await registerDiscordCommands(config, { ...rest, apply: true }); }
@@ -297,19 +386,19 @@ describe("explicit Discord global command registration", () => {
     }
   });
 
-  test("REST initialization failures cannot leak an SDK error or credential", async () => {
+  test("REST does not forward credentials by following a redirect", async () => {
     const config = fixture();
-    await expect(registerDiscordCommands(config, {
-      createRest() { throw new Error(`https://discord.com/${token}`); },
-    })).rejects.toThrow("Discord REST initialization failed; details suppressed");
+    const rest = transport([{ method: "get", path: Routes.user("@me"), error: 307 }]);
+    await expect(registerDiscordCommands(config, rest)).rejects.toThrow("No mutation was attempted");
+    expect(rest.calls).toEqual([{ method: "get", path: Routes.user("@me") }]);
   });
 
   test("failed/ambiguous PUT is unresolved, redacted, and never automatically retried or read back", async () => {
     const config = fixture();
-    for (const failure of ["timeout", "429", "500", "401"]) {
+    for (const failure of ["incomplete", 429, 500, 401] as const) {
       const rest = transport([
         ...inspection(),
-        { method: "put", path: globalPath, error: new Error(`${failure} https://discord.com/${token}`) },
+        { method: "put", path: globalPath, error: failure },
       ]);
       let message = "";
       try { await registerDiscordCommands(config, { ...rest, apply: true }); }
@@ -328,11 +417,22 @@ describe("explicit Discord global command registration", () => {
     const config = fixture();
     const rest = transport([
       ...inspection(), { method: "put", path: globalPath, value: authoritativeCommands() },
-      { method: "get", path: globalPath, error: new Error(`https://discord.com/${token}`) },
+      { method: "get", path: globalPath, error: 500 },
     ]);
     await expect(registerDiscordCommands(config, { ...rest, apply: true })).rejects.toThrow("unresolved: authoritative GET");
     expect(rest.calls.filter(call => call.method === "put")).toHaveLength(1);
     expect(rest.calls).toHaveLength(5);
+    expect(rest.pending).toHaveLength(0);
+  });
+
+  test("JSON-shaped non-JSON readback after PUT is unresolved", async () => {
+    const config = fixture();
+    const rest = transport([
+      ...inspection(), { method: "put", path: globalPath, value: [] },
+      { method: "get", path: globalPath, value: authoritativeCommands(), headers: { "content-type": "text/plain" } },
+    ]);
+    await expect(registerDiscordCommands(config, { ...rest, apply: true })).rejects.toThrow("unresolved: authoritative GET");
+    expect(rest.calls.filter(call => call.method === "put")).toHaveLength(1);
     expect(rest.pending).toHaveLength(0);
   });
 

@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { Config } from "../src/config";
-import type { Approval, Attachment, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageActivity, MessageReference, Messenger, OutputRecord, Route } from "../src/contracts";
+import type { Approval, Attachment, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, MessageActivity, MessageReference, OutputRecord, Route } from "../src/contracts";
+import type { DownloadMessenger as Messenger } from "./fixtures/inbound-attachments";
 import { DeliveryError } from "../src/delivery";
 import { changeDiscordPurpose } from "../src/discord-context";
 import { MessengerHub } from "./oracles/bun-gateway/messengers";
@@ -86,6 +87,7 @@ async function fixture(options: {
   const messenger = new FakeMessenger();
   let stopRequests = 0;
   const server = new GatewayServer({ socketPath: gatewayPaths(config).socketPath, store, messenger,
+    downloadAttachment: messenger.openAttachment.bind(messenger),
     authorizeHead: options.authorizeHead ?? (async pid => { if (pid !== process.pid) throw new DeliveryError("Foreign native owner", "rejected"); }),
     status: (): GatewayStatus => ({ gateway: { pid: process.pid, ready: true, admissionReady: server.ready,
       pendingEvents: store.pending(), stopping: false }, head: { pid: process.pid, ready: server.headReady,
@@ -820,28 +822,30 @@ test("mutations retain certainty/retry-after and duplicate request ids never rep
   await expect(gatewayCall(socket, "/effect", { ...effect, operation: "prompt" }, options)).rejects.toMatchObject({ certainty: "rejected" });
 });
 
-test("attachment IPC streams before completion, forwards abort, and rejects oversized streams", async () => {
+test("attachment IPC waits for a committed spool receipt, forwards abort, and rejects oversized streams", async () => {
   const f = await fixture();
   const client = f.client();
   await client.start({ message: async () => {}, answer: async () => {} });
   const attachment: Attachment = { id: "F1", name: "test.bin", url: "slack-file:F1", size: 4 };
-  let upstreamSignal: AbortSignal | undefined;
+  const batch = { inputId: "one-source", route, attachments: [attachment] };
+  const reading = Promise.withResolvers<void>();
+  const cancelled = Promise.withResolvers<void>();
   f.messenger.download = signal => {
-    upstreamSignal = signal;
-    return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([1, 2])); } }));
+    signal.addEventListener("abort", () => cancelled.resolve(), { once: true });
+    return new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array([1, 2])); },
+      pull() { reading.resolve(); },
+    }));
   };
   const abort = new AbortController();
-  const response = await client.openAttachment(route, attachment, abort.signal);
-  const reader = response.body!.getReader();
-  expect((await reader.read()).value).toEqual(new Uint8Array([1, 2]));
+  const pending = client.openAttachment(batch, abort.signal);
+  await reading.promise;
+  expect((await readdir(join(f.config.stateDir, "attachments"))).filter(name => !name.startsWith("."))).toEqual([]);
   abort.abort();
-  await eventually(() => !!upstreamSignal?.aborted);
-  await reader.cancel().catch(() => {});
+  await expect(pending).rejects.toThrow();
+  await cancelled.promise;
   f.messenger.download = () => new Response(new Uint8Array([1, 2, 3, 4, 5]));
-  await expect((async () => {
-    const oversized = await client.openAttachment(route, attachment, AbortSignal.timeout(2000));
-    await oversized.arrayBuffer();
-  })()).rejects.toThrow();
+  await expect(client.openAttachment(batch, AbortSignal.timeout(2000))).rejects.toThrow();
   f.messenger.download = () => new Response(new ReadableStream({
     start(controller) {
       controller.enqueue(new Uint8Array([1, 2, 3, 4]));
@@ -849,40 +853,32 @@ test("attachment IPC streams before completion, forwards abort, and rejects over
       controller.close();
     },
   }));
-  await expect((async () => {
-    const lateOverflow = await client.openAttachment(route, attachment, AbortSignal.timeout(2000));
-    await lateOverflow.arrayBuffer();
-  })()).rejects.toThrow();
+  await expect(client.openAttachment(batch, AbortSignal.timeout(2000))).rejects.toThrow();
   f.messenger.download = () => new Response(new Uint8Array([1, 2]));
-  await expect((async () => {
-    const truncated = await client.openAttachment(route, attachment, AbortSignal.timeout(2000));
-    await truncated.arrayBuffer();
-  })()).rejects.toThrow();
+  await expect(client.openAttachment(batch, AbortSignal.timeout(2000))).rejects.toThrow();
   f.messenger.download = () => new Response(new Uint8Array([1, 2, 3, 4]));
-  const complete = await client.openAttachment(route, attachment, AbortSignal.timeout(2000));
-  expect(new Uint8Array(await complete.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3, 4]));
+  const complete = await client.openAttachment(batch, AbortSignal.timeout(2000));
+  const destination = join(f.config.stateDir, "attachments", complete.receipt, "0");
+  expect(complete.files).toEqual([{ path: destination, size: 4, mimeType: "application/octet-stream",
+    sha256: Bun.SHA256.hash(new Uint8Array([1, 2, 3, 4]), "hex") }]);
+  expect(await readFile(destination)).toEqual(Buffer.from([1, 2, 3, 4]));
 });
 
-test("unknown-size attachment IPC requires bounded bytes and a complete framed delivery", async () => {
+test("unknown-size attachment IPC requires bounded bytes and a complete delivery receipt", async () => {
   const f = await fixture();
   const client = f.client();
   await client.start({ message: async () => {}, answer: async () => {} });
   const attachment: Attachment = { id: "file", name: "voice.ogg", url: "telegram-file:file", size: null };
+  const batch = { inputId: "unknown-size", route, attachments: [attachment] };
   for (const headers of [{}, { "content-length": "4" }]) {
     f.messenger.download = () => new Response("OggS", { headers });
-    const response = await client.openAttachment(route, attachment, AbortSignal.timeout(2000));
-    expect(await response.text()).toBe("OggS");
+    const response = await client.openAttachment(batch, AbortSignal.timeout(2000));
+    expect(await readFile(join(f.config.stateDir, "attachments", response.receipt, "0"), "utf8")).toBe("OggS");
   }
   f.messenger.download = () => new Response("OggS", { headers: { "content-length": "5" } });
-  await expect((async () => {
-    const response = await client.openAttachment(route, attachment, AbortSignal.timeout(2000));
-    await response.arrayBuffer();
-  })()).rejects.toThrow();
+  await expect(client.openAttachment(batch, AbortSignal.timeout(2000))).rejects.toThrow();
   f.messenger.download = () => new Response("OggS");
-  await expect((async () => {
-    const response = await client.openAttachment(route, { ...attachment, size: 0 }, AbortSignal.timeout(2000));
-    await response.arrayBuffer();
-  })()).rejects.toThrow();
+  await expect(client.openAttachment({ ...batch, attachments: [{ ...attachment, size: 0 }] }, AbortSignal.timeout(2000))).rejects.toThrow();
   f.messenger.download = () => {
     let remaining = 21;
     const chunk = new Uint8Array(1024 * 1024);
@@ -893,10 +889,7 @@ test("unknown-size attachment IPC requires bounded bytes and a complete framed d
       },
     }));
   };
-  await expect((async () => {
-    const response = await client.openAttachment(route, attachment, AbortSignal.timeout(4000));
-    await response.arrayBuffer();
-  })()).rejects.toThrow();
+  await expect(client.openAttachment(batch, AbortSignal.timeout(4000))).rejects.toThrow();
 });
 
 test("only supervised head may attach and explicit stop is a service request, not native RPC forwarding", async () => {

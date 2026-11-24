@@ -1,15 +1,14 @@
 import { createHash } from "node:crypto";
+import { lstatSync, type Stats } from "node:fs";
 import { dirname } from "node:path";
-import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { startHost } from "./host";
 import { boundWorkspace, enrolledRepo, privateWorkerDirectory, reserveCheckout } from "./worker-checkout";
-import { absentWorkerHost, attestWorkerHost, inspectWorkerHost, rawWorkerSocket, readWorkerFiles,
+import { absentWorkerHost, attestWorkerHost, inspectWorkerHost, readWorkerFiles,
   WORKER_ATTEMPT_ENV, WORKER_SESSION_ENV, workerPaths } from "./worker-host";
 import { WorkerLedger, type WorkerReceipt } from "./worker-ledger";
 import { assertWorkerGitStartup, requireWorkerStartupFlags, workerLaunchProfile, workerManagedUlwPath } from "./worker-profile";
 import { parseWorkerPolicy, parseWorkerRequest, WorkerRefusal } from "./worker-request";
-import { bridgeWorker, workerHeader, workerReply } from "./worker-stdio";
 import type { WorkerDescription, WorkerLaneRef, WorkerLaunch, WorkerPolicy, WorkerProbe, WorkerRepo } from "./worker-wire";
 
 type WorkerLane = {
@@ -18,6 +17,23 @@ type WorkerLane = {
   readonly paths: ReturnType<typeof workerPaths>;
 };
 type Workspace = Pick<WorkerLaneRef, "repoId" | "revision" | "subdir">;
+type WorkerFileIdentity = Pick<Stats, "dev" | "ino">;
+type AttachPermit = {
+  readonly generation: number; readonly workerAttempt: string;
+  readonly socketPath: string; readonly sessionFile: string; readonly sessionId: string;
+  readonly pid: number; readonly ownerPid: number;
+  readonly socket: { readonly dev: string; readonly ino: string };
+  readonly journal: { readonly dev: string; readonly ino: string };
+};
+type WorkerReply = { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: string };
+type WorkerPreparation = { readonly kind: "reply"; readonly reply: WorkerReply } | ({ readonly kind: "attach" } & AttachPermit);
+
+function exactInode(path: string, expected: WorkerFileIdentity) {
+  const { dev, ino } = lstatSync(path, { bigint: true });
+  if (Number(dev) !== expected.dev || Number(ino) !== expected.ino)
+    throw new WorkerRefusal("Worker socket or journal changed before attach");
+  return { dev: dev.toString(), ino: ino.toString() };
+}
 
 function validateStorage(policy: WorkerPolicy): void {
   if (!privateWorkerDirectory(policy.stateDir)) throw new WorkerRefusal("Private worker storage is missing");
@@ -167,7 +183,7 @@ class WorkerService {
     }
   }
 
-  async attach(ref: WorkerLaneRef) {
+  async attach(ref: WorkerLaneRef): Promise<AttachPermit> {
     const lane = this.#lane(ref);
     const observed = this.#receipt(lane);
     if (observed?.generation !== ref.generation) throw new WorkerRefusal("No worker launch receipt for this generation");
@@ -176,55 +192,43 @@ class WorkerService {
     if (receipt?.attempt !== observed.attempt || receipt.phase !== "live" ||
       !probe.socket || !probe.pidAlive || !probe.ownerAlive)
       throw new WorkerRefusal("Worker lane does not have an attachable native Host");
-    const identity = await attestWorkerHost(lane.paths, await readWorkerFiles(lane.paths), receipt);
-    const socket = await rawWorkerSocket(lane.paths.socketPath, identity);
+    const files = await readWorkerFiles(lane.paths);
+    if (!files.session) throw new WorkerRefusal("No owned worker socket/journal/checkout");
+    const { pid, ownerPid, sessionId, sessionFile, ...identity } = await attestWorkerHost(lane.paths, files, receipt);
+    const { socketPath } = lane.paths;
+    const socket = exactInode(socketPath, identity);
+    const journal = exactInode(sessionFile, files.session);
     const current = this.#receipt(lane);
-    if (current?.phase !== "live" || current.attempt !== receipt.attempt) {
-      socket.destroy();
+    if (current?.phase !== "live" || current.generation !== ref.generation || current.attempt !== receipt.attempt)
       throw new WorkerRefusal("Worker lane changed before attach");
-    }
-    return { socket, value: { pid: identity.pid, sessionId: identity.sessionId, sessionFile: identity.sessionFile } };
+    return { generation: receipt.generation, workerAttempt: receipt.attempt,
+      socketPath, sessionFile, sessionId, pid, ownerPid, socket, journal };
   }
 }
 
-/** One authorized forced-command invocation; never reads commands after the header except an attested native bridge. */
-export async function serveWorker(policy: WorkerPolicy, input: Readable = process.stdin, output: Writable = process.stdout): Promise<void> {
+/** A bounded admission step; only the native worker transport receives post-header bytes. */
+export async function prepareWorker(policy: WorkerPolicy, header: Buffer): Promise<WorkerPreparation> {
   let service: WorkerService | undefined;
-  let attach: Awaited<ReturnType<WorkerService["attach"]>> | undefined;
-  let reply: Parameters<typeof workerReply>[1];
-  // Broken SSH output is handled by the write callback or the bridge. It is
-  // never a death signal to the detached native processes.
-  const outputLost = () => input.pause();
-  input.on("error", outputLost);
-  output.on("error", outputLost);
   try {
-    try {
-      const request = parseWorkerRequest(await workerHeader(input));
-      const bound = parseWorkerPolicy(policy);
-      if (request.op !== "describe" && request.workerId !== bound.workerId)
-        throw new WorkerRefusal("Worker request names a different enrollment");
-      validateStorage(bound);
-      if (request.op === "describe") reply = { ok: true, value: await describeWorker(bound, request.workspace) };
-      else {
-        service = new WorkerService(bound);
-        switch (request.op) {
-          case "probe": reply = { ok: true, value: await service.probe(request.ref, request.reconcile) }; break;
-          case "open": reply = { ok: true, value: await service.open(request.ref, request.launch) }; break;
-          case "attach":
-            attach = await service.attach(request.ref);
-            reply = { ok: true, value: attach.value };
-            break;
-        }
+    const request = parseWorkerRequest(header);
+    const bound = parseWorkerPolicy(policy);
+    if (request.op !== "describe" && request.workerId !== bound.workerId)
+      throw new WorkerRefusal("Worker request names a different enrollment");
+    validateStorage(bound);
+    if (request.op === "describe")
+      return { kind: "reply", reply: { ok: true, value: await describeWorker(bound, request.workspace) } };
+    service = new WorkerService(bound);
+    switch (request.op) {
+      case "probe": return { kind: "reply", reply: { ok: true, value: await service.probe(request.ref, request.reconcile) } };
+      case "open": return { kind: "reply", reply: { ok: true, value: await service.open(request.ref, request.launch) } };
+      case "attach": return { kind: "attach", ...await service.attach(request.ref) };
+      default: {
+        request satisfies never;
+        throw new WorkerRefusal("Invalid worker request");
       }
-    } catch (error) {
-      reply = { ok: false, error: error instanceof WorkerRefusal ? error.message : "Worker could not verify the operation" };
-    } finally { service?.close(); }
-    await workerReply(output, reply);
-    if (attach) await bridgeWorker(input, output, attach.socket);
-  } finally {
-    attach?.socket.destroy();
-    input.pause();
-    input.off("error", outputLost);
-    output.off("error", outputLost);
-  }
+    }
+  } catch (error) {
+    return { kind: "reply", reply: { ok: false,
+      error: error instanceof WorkerRefusal ? error.message : "Worker could not verify the operation" } };
+  } finally { service?.close(); }
 }

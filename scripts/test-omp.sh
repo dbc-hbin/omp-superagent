@@ -40,4 +40,5 @@ if [[ $actual != "omp/${tag#v}" ]]; then
   echo "OMP release $tag reported '$actual'; refusing to test a different version." >&2
   exit 1
 fi
-PATH="$directory:$PATH" bun run test:ci
+# The frozen source install above already built and staged both native binaries.
+PATH="$directory:$PATH" bun --no-env-file scripts/ci.ts

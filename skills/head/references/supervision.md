@@ -24,7 +24,9 @@ No polling, duty model, aggregate goal for lanes, or follow-up just for a report
 - For a result, compare the lane evidence to the actual acceptance and scope.
   A native `done` or subtask `completed` says execution yielded, not that its
   claimed artifacts, checks, or delivery are correct. Correct a verified gap or
-  advance authorized remaining work. Hold only what is blocked. For multiple lanes,
+  advance authorized remaining work. Report only on the receipt's recorded work
+  route, even if HEAD originally received the request in its Discord parent.
+  Hold only what is blocked. For multiple lanes,
   assess each track separately and check their shared integration/acceptance if any;
   don't close siblings, relay another lane's authority, or wait on an unrelated
   track before reporting a verified result.

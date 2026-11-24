@@ -9,6 +9,7 @@ import { parsePrModeControl, prModeArgument, prModeEffects, type PrIntakeMode } 
 
 const jobsKey = "cron:jobs";
 export const CRON_RUN_PREFIX = "cron-run:";
+const shellDisabled = "Direct shell cron jobs are disabled. Use /cron add with a scheduled HEAD prompt, which keeps the usual approval checks.";
 const manualPrEffects = "manual: discovery only; use the explicit owner commands for review, fix, or merge when the native checks allow";
 const approvalFallback = "Work above the selected mode still needs an explicit owner command and must pass the native checks.";
 const stalePrOrder = "This PR intake command predates a newer control. No PR intake settings were changed.";
@@ -39,6 +40,8 @@ interface PromptJob extends JobTiming {
   readonly kind?: "prompt"; // Older prompt jobs have no discriminant.
   readonly schedule: CronSchedule;
   readonly prompt: string;
+  /** Legacy records are kept for inspection/removal, never executed or converted to prompts. */
+  readonly shell?: true;
 }
 
 export interface CronPrJob extends JobTiming {
@@ -356,13 +359,15 @@ export class CronJobs {
 
   private status(job: CronJob, proposedMode?: PrIntakeMode): string {
     const last = job.lastRunId ? this.store.input(job.lastRunId)?.state ?? "missing" : "none";
-    const state = job.kind === "pr-intake" && job.removed ? "removed"
+    const disabled = job.kind !== "pr-intake" && job.shell === true;
+    const nextAt = disabled ? null : job.nextAt;
+    const state = disabled ? "shell disabled" : job.kind === "pr-intake" && job.removed ? "removed"
       : last === "uncertain" || last === "missing" ? "held (reconcile the original HEAD input)"
       : job.paused ? "paused" : job.stopBoundary !== this.store.getMeta("head:stop-boundary") ? "held by HEAD stop"
       : job.nextAt === null ? "no next run" : "scheduled";
     const intake = job.kind === "pr-intake" ? `; PR intake ${job.repository}` : "";
     const policy = job.kind === "pr-intake" ? `\n${this.prModeStatus(job, proposedMode)}` : "";
-    return `${job.id} — ${state}${intake}; ${describeCronSchedule(job.schedule)}; next: ${job.nextAt === null ? "none" : new Date(job.nextAt).toISOString()}; last: ${last}${job.lastRunId ? ` (${job.lastRunId})` : ""}${policy}`;
+    return `${job.id} — ${state}${intake}; ${describeCronSchedule(job.schedule)}; next: ${nextAt === null ? "none" : new Date(nextAt).toISOString()}; last: ${last}${job.lastRunId ? ` (${job.lastRunId})` : ""}${policy}`;
   }
 
   private prModeStatus(job: CronPrJob, proposedMode?: PrIntakeMode): string {
@@ -514,7 +519,7 @@ export class CronJobs {
         return { text: `To prove this is a new control, reply directly to this status with ${next}.\n\n${summary}`,
           metadata: { [prStatusKey(source.id)]: this.prStatusReceipt(job, boundary) } };
       }
-      if (!details) return { text: `${this.status(job)}\n\nPrompt:\n${job.prompt}` };
+      if (!details) return { text: job.shell === true ? this.status(job) : `${this.status(job)}\n\nPrompt:\n${job.prompt}` };
     }
     if (this.store.getMeta("head:restart-fence")) return reject("Gateway and HEAD restart is held. No cron job was changed.");
     if (!this.originalMessage(input)) {
@@ -527,6 +532,7 @@ export class CronJobs {
       if (action === "edit" && !found) return reject("No cron job with that ID in this conversation.");
       const previous = action === "edit" ? found?.job : undefined;
       if (previous?.kind === "pr-intake") return reject("PR intake jobs cannot be edited as prompt jobs. To change the schedule, remove and re-enroll it here.");
+      if (previous?.shell === true || !previous && /^shell(?:\s|$)/u.test(tail)) return reject(shellDisabled);
       const body = previous ? details : tail;
       const pair = /^"([^"\r\n]+)"(?:\s+([\s\S]+))?$/.exec(body);
       const schedule = pair ? parseCronSchedule((pair[1] ?? "").trim(), now) : previous?.schedule;
@@ -575,6 +581,7 @@ export class CronJobs {
       return { text: `${remove ? "Removed" : "Paused"} cron job ${job.id}.${cancellation}${active}`,
         metadata: { ...jobMetadata(state, changed, remove && job.kind !== "pr-intake"), ...orderMetadata }, ...cancelPending };
     }
+    if (job.kind !== "pr-intake" && job.shell === true) return reject(shellDisabled);
     if (last?.state === "uncertain" || job.lastRunId && !last) {
       return reject(`The previous cron run ${job.lastRunId} is uncertain. Inspect it and use /resolve before running again.`);
     }
@@ -594,6 +601,11 @@ export class CronJobs {
       metadata: { ...jobMetadata(state, { ...job, lastRunId: run.id }), ...runMetadata(job, run) }, run };
   }
 
+  /** Both legacy marker formats were saved with the run and survive job removal. */
+  isDisabledShellRun(id: string): boolean {
+    return id.startsWith(CRON_RUN_PREFIX) && this.store.getMeta(`cron-shell:${id}`) !== null;
+  }
+
   poll(now: number): void {
     if (this.store.getMeta("head:restart-fence")) return;
     let state = this.state();
@@ -601,6 +613,7 @@ export class CronJobs {
     for (const job of state.jobs.filter(job => job.nextAt !== null && job.nextAt <= now)
       .sort((left, right) => (left.nextAt ?? 0) - (right.nextAt ?? 0))) {
       if (job.nextAt === null || job.paused || job.stopBoundary !== boundary || job.kind === "pr-intake" && job.removed) continue;
+      if (job.kind !== "pr-intake" && job.shell === true) continue;
       const source = this.source(job);
       if (!source) continue;
       const last = job.lastRunId ? this.store.input(job.lastRunId) : null;

@@ -82,7 +82,8 @@
 </picture>
 
 Gateway는 메신저 연결·수신 장부·헤드 수명을 관리하는 데몬입니다. 작업을 판단하고 레인을 지시하는 주체는 헤드입니다.
-헤드 런타임이 승인과 전송을 관리하되, 연결된 레인의 진행·답변은 전역 모델을 거치지 않습니다.
+헤드 런타임이 승인과 전송을 관리합니다. 연결된 주제의 일반 후속 요청은 해당 레인이 처리하며,
+전역 모델을 거치지 않고 답변을 전달합니다.
 
 [구조도 Mermaid 원본](assets/architecture.mmd)
 
@@ -103,7 +104,7 @@ OS 샌드박스가 아닙니다. 자세한 내용은 [설계(영문)](DESIGN.md)
 ## 배포 형태
 
 [npm 패키지](https://www.npmjs.com/package/omp-superagent)를 Bun 또는 npm으로 설치하거나
-[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.7)의 소스·npm tarball을 받으세요.
+[GitHub Release](https://github.com/dbc-hbin/omp-superagent/releases/tag/v0.1.8)의 소스·npm tarball을 받으세요.
 실행에는 Bun이 필요하며 독립 실행 바이너리는 아닙니다. 설치 시 관리형 의존성을 준비합니다.
 Host를 실행하려면 별도로 설치한 OMP가 필요하며, 이 프로젝트가 패치하거나 빌드하지 않습니다.
 
@@ -111,14 +112,13 @@ Host를 실행하려면 별도로 설치한 OMP가 필요하며, 이 프로젝�
 
 현재 소스는 Git, **Bun >= 1.4.4**, 로컬 Unix socket을 사용합니다. 패키지 설치에는 OMP가
 필요 없습니다. Host를 실행할 때는 별도로 설치한 OMP의 기능을 검사하며, 버전 범위로 제한하지
-않습니다. CI 기준판은 **OMP 19.0.0**이며, **18.20.3과 18.22.2**는 이전 릴리스에서 검증했습니다.
+않습니다. CI 기준판은 **OMP 19.1.1**이며, **18.20.3과 18.22.2**는 이전 릴리스에서 검증했습니다.
 Windows는 지원하지 않습니다.
 
 <details>
 <summary><strong>SDK 고정 버전과 CI 재현</strong></summary>
 
-SDK는 **19.0.0**으로 유지하며 upstream 커밋은
-[`57771ae562b9345e0579bceb2d68d585e3e6927e`](https://github.com/can1357/oh-my-pi/commit/57771ae562b9345e0579bceb2d68d585e3e6927e)입니다.
+SDK는 [upstream `v19.1.1` 커밋](https://github.com/can1357/oh-my-pi/commit/31ffee513f27a01bba7d4dfbe12bae239cdc646a)에 맞춰 고정합니다.
 `bun run test:ci`는 현재 설치된 OMP를 검사합니다. CI 기준판을 재현하려면 `bun run test:baseline`을
 사용하세요. OMP 18은 수동 검사만 제공합니다. `bash scripts/test-omp.sh v18.22.2` 또는 `v18.20.3`을
 지정하면 해당 공식 바이너리를 검증한 뒤 같은 회귀를 로컬에서 실행합니다.
@@ -140,7 +140,7 @@ OMP 19 데몬은 이전 브로커의 서비스를 인수하지 않습니다.
 OMP 자체를 설치하려면 [공식 설치 안내](https://github.com/can1357/oh-my-pi#install)를 참고하세요.
 
 ```sh
-bun add --global --trust omp-superagent@0.1.7
+bun add --global --trust omp-superagent@0.1.8
 omp-sa --help
 ```
 
@@ -153,7 +153,7 @@ omp-sa --help
 Bun이 `PATH`에 있다면 npm으로도 설치할 수 있습니다.
 
 ```sh
-npm install --global omp-superagent@0.1.7
+npm install --global omp-superagent@0.1.8
 ```
 
 postinstall이 필수 관리형 omp-superkit 통합을 준비하므로 설치 스크립트를 생략하지 마세요.
@@ -317,9 +317,13 @@ SSH가 끊겨도 Host 자체는 종료되지 않습니다. Host가 종료된 뒤
 
 ## 사용 방법
 
-- `디스코드 봇 온라인 상태 유지해 줘`, `owner/repo#35 CI가 통과하면 알려줘`, `이 작업이 멈추거나 끝나면 알려줘`처럼 요청하세요. 같은 대화에서 상태를 묻거나 감시만 중지할 수 있습니다. 감시가 PR 병합이나 작업 중지를 허가하지는 않습니다. Discord 온라인 표시를 꺼도 메시지는 계속 받습니다.
-- 이미 연결된 작업 스레드나 주제에서는 저장소 이름이나 명령 없이 후속 메시지를 보내면 그 작업을 이어갑니다.
-- 그 밖에서는 요청을 그대로 보내세요. 저장소 이름을 안다면 `client-ui에서 로그인 오류 봐줘`처럼 적어도 됩니다.
+- `discord.requireAddressing`을 켜면(기본값은 꺼짐), 허용된 서버의 부모 채널이나 이 봇이 만들지
+  않은 스레드에서는 이 봇을 멘션하거나 같은 대화에서 이 봇이 보낸 메시지에 답장해야 운영자의
+  일반 메시지가 접수됩니다. 이 봇이 만든 스레드에서는 멘션·답장이 필요 없고, 운영자 DM과 앱 명령은 그대로입니다.
+- 일반 후속 요청은 같은 대화에 보내세요. 연결된 작업 스레드에서는 해당 레인으로, 헤드가 처리하는
+  대화나 `/head 요청`은 HEAD로 갑니다. `/steer` 없이도 조건을 충족하면 다음 OMP steering 경계에서
+  실행 중인 작업에 반영하고, 유휴 상태라면 새 턴을 시작합니다. 일시정지·승인·불확실한 효과에 대한 보류는 유지합니다.
+- 새 요청은 그대로 보내세요. 저장소 이름을 안다면 `client-ui에서 로그인 오류 봐줘`처럼 적어도 됩니다.
   HEAD는 저장소가 필요 없는 질문에는 직접 답하고, 작업에는 요청과 해당 대화의 문맥을 바탕으로 실제
   작업 디렉터리를 찾아 확인한 뒤 배정합니다. 중요한 모호함이 남을 때만 구체적으로 묻습니다.
   기본 저장소나 마지막으로 활동한 채팅을 기준으로 삼지 않습니다. 아직 연결되지 않은 Discord
@@ -334,12 +338,27 @@ SSH가 끊겨도 Host 자체는 종료되지 않습니다. Host가 종료된 뒤
   해당 턴이 끝난 뒤 적용합니다. 전역 프리셋 저장은 명시적 `--global`이 필요합니다.
   Slack 일반 메시지 명령은 `!`를 씁니다.
 - `/usage`는 OMP가 조회한 기본·확장 제공자의 계정별 한도와 리셋 시각을 마스킹된 계정 이름과 함께 보여줍니다. 모델은 호출하지 않습니다.
-- `/usage reset`은 계정별로 지금 쓸 수 있는 리셋권 수를 보여줍니다. 계정을 고르고 Confirm을 누르면 한 개를 사용합니다. 계정 지정 리셋을 지원하는 순정 OMP가 필요합니다.
+- Discord 명령 목록과 채팅에서는 `/usage-reset`으로 계정별 보유 리셋권을 확인합니다.
+  Telegram은 `/usage reset`, Slack은 `!usage reset` 또는 `/superagent-usage reset`을 사용합니다.
+  계정을 고르고 **Confirm**을 누르면 지금 쓸 수
+  있는 리셋권 한 개를 사용합니다. 계정 지정 리셋을 지원하는 순정 OMP가 필요합니다.
+  이와 별개로, 도구 실행이나 부분 응답 없이 Codex 한도 초과가 확인된 경우 HEAD는 새 사용량 보고에서
+  회복을 확인한 뒤 후속 대기 요청을 처리합니다. 리셋권을 쓰거나 실패한 요청을 완료 처리·재실행하지 않습니다.
 - 결과 파일을 받으려면 운영자 요청 첫 줄에 `attach: 보고서/결과.pdf`처럼 작업 디렉터리 상대 경로를 적으세요.
 - 단체방·서버에서는 [제한 그룹 모드](docs/OPERATIONS.md#단체방서버-권한-분리)로 허용된 사용자에게 요청 접수, 도구 없는 채팅 또는 worktree 편집을 열 수 있습니다. 운영자 세션 권한은 주지 않습니다.
 - `/head 2시간마다 CI 상태를 요약해서 여기로 보내줘`라고 요청하거나
-  `/cron add "every 2h" CI 상태를 요약해줘`로 직접 등록하고,
-  `/cron list`로 확인합니다. [예약 작업 명령](docs/OPERATIONS.md#예약-작업-cron)으로 수정·중지·재개·즉시 실행·삭제할 수 있습니다.
+  `/cron add "every 2h" CI 상태를 요약해줘`로 직접 등록한 뒤, 같은 대화에서
+  [`/cron`](docs/OPERATIONS.md#예약-작업-cron)으로 관리합니다. 예약 프롬프트에는 HEAD의
+  일반 승인 규칙이 적용되며, 직접 셸 예약(`/cron add shell`)은 비활성화되어 있습니다.
+- `디스코드 봇 온라인 상태 유지해 줘`, `owner/repo#35 CI가 통과하면 알려줘`,
+  `이 작업이 멈추거나 끝나면 알려줘`처럼 요청하세요. 같은 대화에서 상태를 묻거나 감시를 중지할 수
+  있습니다. 감시는 알림만 보냅니다. PR을 변경하거나 작업을 중지하지 않으며, Discord 온라인 표시를
+  꺼도 메시지는 계속 받습니다.
+- [외부 PR 자동화](docs/OPERATIONS.md#새-외부-pr-검토-cron-pr-add)는 감시와 별개입니다.
+  허용된 Discord 서버의 부모 채널에서 `/cron pr-add`로 본인의 `gh` 인증 계정이 소유한
+  저장소를 명시적으로 등록합니다. 신규 등록은 기본적으로 무인 리뷰와 GitHub 코멘트만 남깁니다.
+  수정 커밋이나 병합을 자동화하려면 `/cron pr-mode`로 상위 모드를 선택해야 하며,
+  병합에는 독립 승인·필수 CI·브랜치 보호 규칙 충족이 필요합니다.
 - `/stop`은 연결 레인을 일시정지하고 `/resume`은 재개를 허가합니다. 승인·취소·도구 제외와
   불확실한 효과에 대한 보류는 유지합니다. 진척 보고·복구가 작업 완료의 검증이나 외부 효과의
   취소를 뜻하지 않으며, 저장된 goal은 crash replay나 로드되지 않은 상태의 실행을 보장하지 않습니다.
@@ -388,7 +407,7 @@ bun run test:ci
 오프라인 native/PTY 범위·필요 도구·로컬 패키징과 게시 경계는
 [개발자 검증·소스 릴리즈 절차](docs/OPERATIONS.md#6-개발자-검증)를 참고하세요.
 [현재 CI](https://github.com/dbc-hbin/omp-superagent/blob/main/.github/workflows/ci.yml)는
-순정 OMP 19.0.0을 검사 대상에 포함합니다.
+고정된 SDK와 같은 버전의 순정 CLI를 검사합니다.
 [과거 실행 기록](docs/releases/0.1.0.md#verification-records)은 기록된 버전과 시나리오에만 적용됩니다.
 오프라인 CI는 실계정 접속이나 운영 준비 완료를 보증하지 않습니다.
 
@@ -401,7 +420,7 @@ bun run test:ci
 | [실행과 조율(영문)](docs/design/execution.md) | 레인·native Host 수명·모델·workflow·관리형 통합·모니터링·게시판. |
 | [운영 가이드](docs/OPERATIONS.md) | 설치·설정·명령·복구 절차. |
 | [Discord 음성채팅](docs/discord-voice.md) | Codex 구독 음성 또는 별도 과금되는 API 음성 선택. |
-| 릴리즈 | [릴리즈 노트](docs/releases/0.1.7.md) 및 [과거 검증 기록](docs/releases/0.1.0.md#verification-records). |
+| 릴리즈 | [릴리즈 노트](docs/releases/0.1.8.md) 및 [과거 검증 기록](docs/releases/0.1.0.md#verification-records). |
 
 [oh-my-pi](https://github.com/can1357/oh-my-pi)를 기반으로 하며, workflow에는 [omp-superkit](https://github.com/dbc-hbin/omp-superkit)을 사용합니다.
 

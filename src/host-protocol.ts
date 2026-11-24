@@ -74,14 +74,6 @@ function serviceExitKey({ owner, id, generation, startedAt, restartCount, exited
   return JSON.stringify([owner, id, generation, String(startedAt), String(restartCount), String(exitedAt)]);
 }
 
-/** Positive native journal evidence for this exact terminal service generation. */
-export function serviceCompletionRecorded(daemon: Frame, entries: readonly unknown[]): boolean {
-  const key = serviceExitKey(daemon);
-  if (key === undefined || !hasValidGeneration(daemon) || !isTerminal(String(daemon.state))) return false;
-  return entries.some(entry => launchCompletions(entry)?.some(observed => isFrame(observed)
-    && observed.state === daemon.state && serviceExitKey(observed) === key));
-}
-
 /** Builds proof for the current observation only, from one native transcript. */
 export function indexServiceCompletions(entries: readonly unknown[]) {
   const byGeneration = new Set<string>();

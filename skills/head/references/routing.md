@@ -52,14 +52,20 @@ original attachments and quoted context; a narrower brief does not filter them.
 The event identity must also be compatible: a Discord interaction or Slack
 invocation cannot be reused across platforms.
 
-For a standalone handoff, progress and final reports use the original source
-conversation or its single `lane_start` delivery binding, not each execution
-topic. Reuse the source across open lanes only if that shared reporting is
-authorized. In a busy lane, `lane_message` can join the active run as steering
-and its combined report follows the active run's delivery route. If that route
-is unknown, not authorized for the new result, or a separate report is needed,
-don't dispatch into that active run; use an authorized independent placement or
-wait for the native result boundary, not a polling loop.
+For an explicit `lane_message` from the exact guild parent of an existing
+physical Discord work thread, the controller pins the lane's progress and
+final report to that thread. Keep the original source ID and review the
+receipts normally; do not repeat the work reports in the parent. A parent
+acknowledgement, if useful, should only point to the thread. An ordinary
+follow-up to an open lane is not a `/resume` of a paused native goal.
+
+Other standalone handoffs keep the original source conversation or its
+single `lane_start` delivery binding. Reuse a source across lanes only when
+every execution and reporting route is authorized. An eligible busy run can
+accept steering and report once on its existing route. A parent-origin
+`lane_message` does not steer a manager handoff from another origin, even
+when both report in the same thread. Do not force steering or wait in a
+polling loop when the work must queue separately.
 
 Deduplication is per source and lane for `lane_message`. If another new lane or
 separate data, reporting, or platform identity is needed, explain the limit,
@@ -203,17 +209,17 @@ entrusted objective, not permission to expand it or impersonate the user.
   approval, attempt and review/recovery rules. Don't ask for brand consent;
   real cost, scope, and approval decisions still belong to the owner.
 
-Use the command without `/` as `workflow.name`. Upstream skill identifiers are
-different from invocation names; do not derive a skill URL from `workflow.name`.
+Use the command without `/` as `workflow.name`. Read the canonical skill in the
+table, or the listed legacy skill if the installed revision has no canonical one.
 
-| Operator invocation | `workflow.name` | Installed skill | Choose for |
+| Operator invocation | `workflow.name` | Installed skill (legacy fallback) | Choose for |
 | --- | --- | --- | --- |
-| `/super` | `super` | `skill://ultrawork` | Explicit working policy; no specialty mode or implicit RPC goal. |
-| `/super-plan` | `super-plan` | `skill://ulw-plan` | A decision-complete plan and review as the deliverable; not implementation. |
-| `/super-run` | `super-run` | `skill://ulw-execute` | Authorized execution of a selected plan requiring durable resume and evidence. Native plan approval alone does not select it. |
-| `/super-loop` | `super-loop` | `skill://ulw-loop` | Multiple real goals with dependencies, verified checkpoints, and recovery; not waiting or a watchdog. |
-| `/super-research` | `super-research` | `skill://ulw-research` | Deep/contested inquiry needing independent evidence, counter-search, and cited synthesis; not ordinary lookup. |
-| `/super-graph` | `super-graph` | `skill://mass-ulw` | Consumed producer artifacts or dependency-ordered work with durable handoffs; not ordinary parallelism. |
+| `/super` | `super` | `skill://super` (`skill://ultrawork`) | Explicit working policy; no specialty mode or implicit RPC goal. |
+| `/super-plan` | `super-plan` | `skill://super-plan` (`skill://ulw-plan`) | A decision-complete plan and review as the deliverable; not implementation. |
+| `/super-run` | `super-run` | `skill://super-run` (`skill://ulw-execute`) | Authorized execution of a selected plan requiring durable resume and evidence. Native plan approval alone does not select it. |
+| `/super-loop` | `super-loop` | `skill://super-loop` (`skill://ulw-loop`) | Multiple real goals with dependencies, verified checkpoints, and recovery; not waiting or a watchdog. |
+| `/super-research` | `super-research` | `skill://super-research` (`skill://ulw-research`) | Deep/contested inquiry needing independent evidence, counter-search, and cited synthesis; not ordinary lookup. |
+| `/super-graph` | `super-graph` | `skill://super-graph` (`skill://mass-ulw`) | Consumed producer artifacts or dependency-ordered work with durable handoffs; not ordinary parallelism. |
 
 Reuse the existing objective and artifact owner. Runtime puts the actual native
 invocation outside fenced context and applies the installed bridge's default
