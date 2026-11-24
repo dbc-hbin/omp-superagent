@@ -203,17 +203,17 @@ entrusted objective, not permission to expand it or impersonate the user.
   approval, attempt and review/recovery rules. Don't ask for brand consent;
   real cost, scope, and approval decisions still belong to the owner.
 
-Use the command without `/` as `workflow.name`. Upstream skill identifiers are
-different from invocation names; do not derive a skill URL from `workflow.name`.
+Use the command without `/` as `workflow.name`. Read the canonical skill in the
+table, or the listed legacy skill if the installed revision has no canonical one.
 
-| Operator invocation | `workflow.name` | Installed skill | Choose for |
+| Operator invocation | `workflow.name` | Installed skill (legacy fallback) | Choose for |
 | --- | --- | --- | --- |
-| `/super` | `super` | `skill://ultrawork` | Explicit working policy; no specialty mode or implicit RPC goal. |
-| `/super-plan` | `super-plan` | `skill://ulw-plan` | A decision-complete plan and review as the deliverable; not implementation. |
-| `/super-run` | `super-run` | `skill://ulw-execute` | Authorized execution of a selected plan requiring durable resume and evidence. Native plan approval alone does not select it. |
-| `/super-loop` | `super-loop` | `skill://ulw-loop` | Multiple real goals with dependencies, verified checkpoints, and recovery; not waiting or a watchdog. |
-| `/super-research` | `super-research` | `skill://ulw-research` | Deep/contested inquiry needing independent evidence, counter-search, and cited synthesis; not ordinary lookup. |
-| `/super-graph` | `super-graph` | `skill://mass-ulw` | Consumed producer artifacts or dependency-ordered work with durable handoffs; not ordinary parallelism. |
+| `/super` | `super` | `skill://super` (`skill://ultrawork`) | Explicit working policy; no specialty mode or implicit RPC goal. |
+| `/super-plan` | `super-plan` | `skill://super-plan` (`skill://ulw-plan`) | A decision-complete plan and review as the deliverable; not implementation. |
+| `/super-run` | `super-run` | `skill://super-run` (`skill://ulw-execute`) | Authorized execution of a selected plan requiring durable resume and evidence. Native plan approval alone does not select it. |
+| `/super-loop` | `super-loop` | `skill://super-loop` (`skill://ulw-loop`) | Multiple real goals with dependencies, verified checkpoints, and recovery; not waiting or a watchdog. |
+| `/super-research` | `super-research` | `skill://super-research` (`skill://ulw-research`) | Deep/contested inquiry needing independent evidence, counter-search, and cited synthesis; not ordinary lookup. |
+| `/super-graph` | `super-graph` | `skill://super-graph` (`skill://mass-ulw`) | Consumed producer artifacts or dependency-ordered work with durable handoffs; not ordinary parallelism. |
 
 Reuse the existing objective and artifact owner. Runtime puts the actual native
 invocation outside fenced context and applies the installed bridge's default

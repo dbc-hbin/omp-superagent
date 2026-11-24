@@ -244,7 +244,9 @@ export PATH="$PWD/.upstream/toolchain/node_modules/.bin:$PATH"
 
 설치에는 공식 [dbc-hbin/omp-superkit](https://github.com/dbc-hbin/omp-superkit)이 항상 포함된다.
 루트 `bun install`의 postinstall이 관리형 패키지를 준비한다. 활성화 검사는 배포된 native SDK의
-실제 prompt composition을 사용한다. omp-superkit만 다시 준비할 때는 다음을 사용한다.
+실제 prompt composition을 사용한다. 최신 레이아웃에서는 `skill://super`와 `skill://super-*`의
+지침과 포인터를 검사하고, 기존 스킬 ID도 별칭으로 해석되는지 확인한다. 이전 레이아웃의 유효한
+설치는 그대로 사용할 수 있다. omp-superkit만 다시 준비할 때는 다음을 사용한다.
 
 ```sh
 bun run prepare:ulw

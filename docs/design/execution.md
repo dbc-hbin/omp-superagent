@@ -292,19 +292,21 @@ keyword interpretation; keep generated metadata fenced. Selection is
 serialized, not injected as steering. A conflict or missing advertised
 capability does not silently downgrade a selected SUPER request to ordinary work.
 
-SUPER's command, skill and native-keyword contracts are based on
+SUPER's commands and defaults are based on
 [omp-superkit `c11a6e4e185f9c31f484a05a13528ef724337bc1`](https://github.com/dbc-hbin/omp-superkit/tree/c11a6e4e185f9c31f484a05a13528ef724337bc1).
+[Revision `e8825367bed06985ccb1ee1e635dce850e22bbb9`](https://github.com/dbc-hbin/omp-superkit/tree/e8825367bed06985ccb1ee1e635dce850e22bbb9)
+moved the workflow instructions into canonical skills and retained the original IDs as aliases.
 Use a leading invocation; the `/` is optional in request text. These are OMP
 extension commands, not registered messenger controls.
 
-| OMP command | `workflow.name` | Discoverable OMP skill | Default native keyword |
-| --- | --- | --- | --- |
-| `/super` | `super` | `skill://ultrawork` | None |
-| `/super-plan` | `super-plan` | `skill://ulw-plan` | `ultrathink` |
-| `/super-run` | `super-run` | `skill://ulw-execute` | `orchestrate` |
-| `/super-loop` | `super-loop` | `skill://ulw-loop` | `orchestrate` |
-| `/super-research` | `super-research` | `skill://ulw-research` | `workflowz` |
-| `/super-graph` | `super-graph` | `skill://mass-ulw` | `workflowz` |
+| OMP command | `workflow.name` | Canonical OMP skill | Legacy skill | Default native keyword |
+| --- | --- | --- | --- | --- |
+| `/super` | `super` | `skill://super` | `skill://ultrawork` | None |
+| `/super-plan` | `super-plan` | `skill://super-plan` | `skill://ulw-plan` | `ultrathink` |
+| `/super-run` | `super-run` | `skill://super-run` | `skill://ulw-execute` | `orchestrate` |
+| `/super-loop` | `super-loop` | `skill://super-loop` | `skill://ulw-loop` | `orchestrate` |
+| `/super-research` | `super-research` | `skill://super-research` | `skill://ulw-research` | `workflowz` |
+| `/super-graph` | `super-graph` | `skill://super-graph` | `skill://mass-ulw` | `workflowz` |
 
 Plain SUPER arms the session without selecting a specialty workflow or implicitly
 creating a goal in RPC. SUPER Graph selects the graph workflow, not plain SUPER
@@ -333,7 +335,10 @@ detection recognize both `omp-superkit` and the legacy `omp-ulw` package ID.
 Stage the observed revision and its dependencies in a project-owned immutable
 package. Ignore arbitrary dependency lifecycle scripts; run defined
 materialization and an [offline native prompt-composition probe](../../src/managed-ulw-probe.ts)
-for ordinary and explicitly activated operation. Serialize preparation via
+for ordinary and explicitly activated operation. For the canonical layout the probe
+checks that the hook uses the canonical directive and pointer paths and that native
+discovery resolves both canonical skills and legacy aliases. An older revision
+uses the full legacy skills instead. Serialize preparation via
 the update lock and atomically publish `active.json` only after validation.
 Once installed, activate only fast-forward revisions from the same source;
 retain the last valid active revision and report failures. Do not delete older

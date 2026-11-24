@@ -6,6 +6,7 @@ import { parseSessionEntries, type FileEntry } from "@oh-my-pi/pi-coding-agent";
 import { hostPaths, type Config } from "../../src/config";
 import type { Inbound, InputRecord, Lane, Messenger, OutputRecord, Route } from "../../src/contracts";
 import { HostConnection } from "../../src/host";
+import { hasCanonicalSuperkitSkills } from "../../src/superkit-skills";
 import type { GatewayService } from "../oracles/bun-gateway/gateway";
 import { waitForFixtureProcessExit } from "./host-fixture-processes";
 import { nativeRequestEnvelope } from "./native-request-envelope";
@@ -36,7 +37,9 @@ export async function runNativeUlwProof(options: {
   const { root, config, db, gateway, messenger, connections, owned } = options;
   const entrypoint = process.env.OMP_TEST_ULW_EXTENSION;
   assert(entrypoint, "Native SUPER proof requires the real selected Superkit entrypoint");
-  const skillRoot = path.join(path.dirname(entrypoint), "skills");
+  const packagePath = path.dirname(entrypoint);
+  const skillRoot = path.join(packagePath, "skills");
+  const canonicalLayout = hasCanonicalSuperkitSkills(packagePath);
   const main = hostPaths(config, "main");
   const route: Route = { platform: "discord", accountId: "2", authorityId: "1", guildId: "3", channelId: "4", threadId: null };
   const thread = { ...route, threadId: "50" };
@@ -173,12 +176,13 @@ export async function runNativeUlwProof(options: {
     for (const record of records) {
       const notice = (selected as Record<string, string>)[record.requestId];
       assert.deepEqual(record.notices, notice ? [notice] : [], "Only this dispatch's actual native keyword event proves its mode");
-      const skill = notice === "ultrathink-notice" ? "ulw-plan" : notice === "orchestrate-notice" ? "ulw-execute" : undefined;
-      assert.equal(record.directives.length, skill ? 1 : 0, "Native jevify and ordinary replies/reports must not inherit an earlier SUPER directive");
-      if (skill) {
-        const command = skill === "ulw-plan" ? "super-plan" : "super-run";
+      const legacyId = notice === "ultrathink-notice" ? "ulw-plan" : notice === "orchestrate-notice" ? "ulw-execute" : undefined;
+      assert.equal(record.directives.length, legacyId ? 1 : 0, "Native jevify and ordinary replies/reports must not inherit an earlier SUPER directive");
+      if (legacyId) {
+        const command = legacyId === "ulw-plan" ? "super-plan" : "super-run";
+        const skill = canonicalLayout ? command : legacyId;
         const directive = record.directives[0];
-        assert(directive?.startsWith(`<omp-${skill}-pointer>`) && directive.includes(command)
+        assert(directive?.startsWith(`<omp-${legacyId}-pointer>`) && directive.includes(command)
           && directive.includes(path.join(skillRoot, skill, "SKILL.md")),
           `Actual ${record.role} directive must point from ${command} to its installed ${skill} skill`);
       }
