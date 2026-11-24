@@ -320,7 +320,7 @@ export interface StorePort {
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   ownerSource(id: string): InputRecord | null;
-  /** Manager handoff's verified reply route, pinned if a bound reply joined its run. */
+  /** Manager handoff's verified reply route, pinned for a parent-origin thread follow-up or a joined bound reply. */
   laneReplyRoute(input: InputRecord, source: InputRecord): Route;
   /** Exact original owner and authorized delivery route for a topic-owned lane input. */
   topicDelivery(id: string): { readonly source: InputRecord; readonly route: Route; readonly outputSourceId: string } | null;

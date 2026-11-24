@@ -2111,6 +2111,117 @@ describe("source-bound Discord topic management", () => {
     ]);
   });
 
+  test("a parent follow-up reports progress and completion only in the reopened Discord work thread", async () => {
+    const instance = fixture();
+    const { runtime, store, main, hosts, messenger } = instance;
+    const f = managedThread(instance);
+    const confirmAtParent = async (id: string, parent: Route) => {
+      const frame = { type: "extension_ui_request", id, method: "confirm", title: "Confirm", message: "Review this step?" };
+      main.state.pendingUiRequests = [frame];
+      main.emit(frame);
+      await messenger.whenApproval();
+      const card = [...messenger.shown.values()].find(approval => approval.requestId === id);
+      if (!card || !messenger.handlers) throw new Error("Expected the original HEAD approval card");
+      expect(card).toMatchObject({ route: parent, target: "main" });
+      await expect(messenger.handlers.answer(card.id, { confirmed: true }, f.lane.route)).rejects.toThrow("Stale or foreign approval");
+      await messenger.handlers.answer(card.id, { confirmed: true }, parent);
+    };
+    const initial = message("1750000000000000450", f.lane.route, "Implement the usage reset.");
+    await runtime.start();
+    await delegate(runtime, initial);
+    const worker = hosts.get(f.lane.socketPath);
+    if (!worker) throw new Error("Expected the original work-thread Host");
+    await f.whenTitle("⏳ Original");
+    worker.complete("Usage reset implemented.");
+    await main.whenPrompts(1);
+    main.complete("Usage reset implemented and verified.");
+    await f.whenTitle("✅ Original");
+
+    const followup = message("1750000000000000451", route(null), "Check the usage reset edge case.");
+    await admit(runtime, followup);
+    expect(store.input(followup.id)?.target).toBe("main");
+    await main.whenPrompts(2);
+    const { inputId } = await runtime.messageLane(f.lane.id, followup.text, followup.id);
+    await worker.whenPrompts(2);
+    await f.whenTitle("⏳ Original");
+    const nativePrompt = worker.prompts[1]?.command.message;
+    expect(nativePrompt).toContain(`Original authorized conversation: ${routeKey(followup.route)}`);
+    expect(nativePrompt).toContain("Delivery mode: manager handoff.");
+    expect(main.prompts[1]?.command.message).toContain(`sourceId: ${followup.id}`);
+    main.complete("");
+    await runtime.kick();
+    const commentary = { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Checking the latest result." }] };
+    worker.emit({ type: "message_end", message: commentary });
+    worker.emit({ type: "message_end", message: structuredClone(commentary) });
+    expect(store.inputs("main").some(input => input.id.startsWith(`progress:${inputId}:`))).toBe(true);
+    await main.whenPrompts(3);
+    await confirmAtParent("progress-review-card", followup.route);
+    main.complete("The follow-up checks are underway.");
+    await messenger.whenSent(2);
+
+    worker.complete("Follow-up verified.");
+    await main.whenPrompts(4);
+    await confirmAtParent("final-review-card", followup.route);
+    main.complete("Verified the follow-up result.");
+    await messenger.whenSent(3);
+    await f.whenTitle("✅ Original");
+    await admit(runtime, followup);
+    await runtime.messageLane(f.lane.id, followup.text, followup.id);
+
+    expect(worker.prompts).toHaveLength(2);
+    expect(store.input(followup.id)).toMatchObject({ target: "main", route: followup.route });
+    expect(messenger.attempted.slice(1).map(output => [output.route, output.replyTo, output.text])).toEqual([
+      [f.lane.route, undefined, "The follow-up checks are underway."],
+      [f.lane.route, undefined, "Verified the follow-up result."],
+    ]);
+    expect(store.input(`report:${inputId}`)?.state).toBe("done");
+    expect(main.responses).toEqual([
+      { id: "progress-review-card", response: { confirmed: true } },
+      { id: "final-review-card", response: { confirmed: true } },
+    ]);
+    expect(messenger.threads).toEqual([]);
+  });
+
+  test("a queued parent follow-up keeps its report in the existing thread after controller restart", async () => {
+    const { runtime, store, config, main, directory, launched, errors } = fixture(1);
+    const lane = savedLane(store, config, "queued-reopen", route("124"));
+    const followup = headMessage("1750000000000000452", route(null), "Check the existing work.");
+    await runtime.start();
+    await admit(runtime, followup);
+    await main.whenPrompts(1);
+    const { inputId, state } = await runtime.messageLane(lane.id, followup.text, followup.id);
+    expect(state).toBe("pending");
+    expect(launched).toEqual([]);
+    main.complete("");
+    await runtime.kick();
+    await runtime.stop();
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const transport = new MessengerTransport();
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
+    const worker = new HostTransport(lane.sessionFile, "session-queued-reopen");
+    const restarted = new Superagent({ ...config, maxHosts: 2 }, reopened, transport, join(directory, "extension.ts"),
+      error => errors.push(error), {
+        connect: async path => path === lane.socketPath ? worker : head,
+        startHost: async () => ({ pid: process.pid }),
+      });
+    fixtures.find(entry => entry.runtime === runtime)!.runtime = restarted;
+    await restarted.start();
+    await worker.whenPrompts(1);
+    await admit(restarted, followup);
+    await restarted.messageLane(lane.id, followup.text, followup.id);
+    worker.complete("Queued follow-up verified.");
+    await head.whenPrompts(1);
+    head.complete("Verified after controller restart.");
+    await transport.whenSent(1);
+
+    expect(worker.prompts).toHaveLength(1);
+    expect(transport.attempted).toMatchObject([{ sourceId: `report:${inputId}`, route: lane.route,
+      text: "Verified after controller restart." }]);
+    expect(transport.attempted[0]?.replyTo).toBeUndefined();
+    expect(errors).toEqual([]);
+  });
+
   for (const scenario of ["sent", "rate-limited", "recovered", "failed", "prior-uncertain", "older-admitted-last"] as const) {
     test(`startup reconciles stale titles from saved ${scenario} delivery without restarting work`, async () => {
       const instance = fixture();
@@ -8326,11 +8437,15 @@ describe("real Store runtime coordination", () => {
     expect(messenger.sent).toHaveLength(2);
   });
 
-  test("cross-channel lane handoff reports and head synthesis return to the requesting conversation", async () => {
+  test.each([
+    ["another allowed channel", route(null, { channelId: "5" }), route("75")],
+    ["another bot account", route(null), route("75", { accountId: "20" })],
+    ["a logical topic without a physical thread", route(null), route(null, { topicId: "work-75" })],
+  ] as const)("a handoff involving %s keeps reporting on the original route", async (_case, sourceRoute, laneRoute) => {
     const { runtime, store, config, hosts, main, messenger } = fixture();
     config.discord!.allowedChannelIds.push("5");
-    const lane = savedLane(store, config, "cross-channel", route("75"));
-    const original = headMessage("cross-channel-source", route(null, { channelId: "5" }), "Ask the existing lane for its result here");
+    const lane = savedLane(store, config, "original-route", laneRoute);
+    const original = headMessage("original-route-source", sourceRoute, "Ask the existing lane for its result here");
     await runtime.start();
     await admit(runtime, original);
     await runtime.messageLane(lane.id, "Report the requested result to head", original.id);
