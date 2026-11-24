@@ -19,7 +19,7 @@ pub(super) use spool::recover;
 const MAX_ATTACHMENT: u64 = 20 * 1024 * 1024;
 const MAX_REQUEST: u64 = 40 * 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 10;
-const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
