@@ -2616,6 +2616,129 @@ describe("same-HEAD evidence recovery", () => {
     } finally { clock.mockRestore(); }
   });
 
+  const refusalRun = { hostPid: process.pid, runOrdinal: 1, instanceKey: "fixture-refusal-instance" };
+  const refusalError = { provider: executionModel.provider, model: executionModel.id, retryable: false,
+    message: "Refusal (reasoning_extraction): blocked by provider policy" };
+  async function failHeadRun(instance: ReturnType<typeof fixture>, beforeRefusal: unknown[] = []) {
+    const { main } = instance;
+    const original = main.prompts.at(-1);
+    if (!original) throw new Error("Original HEAD request was not admitted");
+    const frame = { type: "prompt_result", id: original.id, status: "error", agentInvoked: true, sessionSettled: true,
+      error: refusalError };
+    const start = main.entries.findIndex(entry => (entry as { id?: string }).id === `start-${original.id}`);
+    main.entries[start] = nativeEntry(main, `start-${original.id}`, "rpc_agent_start", refusalRun);
+    main.entries.push(...beforeRefusal,
+      { id: "provider-refusal", type: "custom", customType: "provider_refusal",
+        data: { provider: refusalError.provider, model: refusalError.model, stopType: "refusal", category: "reasoning_extraction" } },
+      { type: "model_usage", id: "refusal-usage", provider: refusalError.provider, model: refusalError.model },
+      nativeEntry(main, "refusal-receipt", "rpc_prompt_result", { ...refusalRun, frame }),
+    );
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit(frame);
+    main.emit({ type: "session_settled" });
+    return original;
+  }
+
+  test("a settled tool-free provider refusal closes as failed and later HEAD work proceeds", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("refused", route("refused-route")));
+    const original = await failHeadRun(instance);
+    await messenger.whenSent(1);
+    expect(store.input("refused")?.state).toBe("cancelled");
+    expect(messenger.sent[0]).toMatchObject({ sourceId: "refused", route: route("refused-route") });
+    expect(messenger.sent[0]!.text).toContain("다음 요청은 계속 처리합니다");
+    expect(messenger.sent[0]!.text).not.toContain("/resolve");
+
+    await admit(runtime, headMessage("after-refusal", route("later-route")));
+    await main.whenPrompts(2);
+    const later = store.input("after-refusal");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id, later?.requestId ?? "missing"]);
+    main.complete("Later work answered");
+    await messenger.whenSent(2);
+    await runtime.kick();
+    expect(store.input("after-refusal")?.state).toBe("done");
+    expect(messenger.sent.at(-1)).toMatchObject({ sourceId: "after-refusal", text: "Later work answered" });
+  });
+
+  test("a provider failure after a started tool stays uncertain, names /resolve and notices the hold once", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("tool-then-refusal", route("refused-route")));
+    await failHeadRun(instance, [
+      { id: "tool-call", type: "message", message: { role: "assistant", stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "started-tool", name: "bash", arguments: {} }] } },
+      { id: "tool-start", type: "custom", customType: "tool_execution_start", data: { toolCallId: "started-tool", toolName: "bash" } },
+      { id: "tool-result", type: "message", message: { role: "toolResult", toolCallId: "started-tool" } },
+    ]);
+    await messenger.whenSent(1);
+    expect(store.input("tool-then-refusal")?.state).toBe("uncertain");
+    expect(messenger.sent[0]).toMatchObject({ sourceId: "tool-then-refusal" });
+    expect(messenger.sent[0]!.text).toContain("/resolve tool-then-refusal");
+
+    await admit(runtime, headMessage("held-first", route("later-route")));
+    await messenger.whenSent(2);
+    expect(messenger.sent[1]).toMatchObject({ id: "held-first:head-held:tool-then-refusal", sourceId: "held-first", route: route("later-route") });
+    expect(messenger.sent[1]!.text).toContain("/resolve tool-then-refusal");
+    await admit(runtime, headMessage("held-second", route("later-route")));
+    await runtime.kick();
+    // The queue pass records a notice synchronously; a later held message gets none.
+    expect(store.output("held-second:head-held:tool-then-refusal")).toBeNull();
+    expect(messenger.sent.filter(output => output.id.includes(":head-held"))).toHaveLength(1);
+    expect(store.input("held-first")?.state).toBe("pending");
+    expect(store.input("held-second")?.state).toBe("pending");
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  function heldRefusal(instance: ReturnType<typeof fixture>, afterReceipt: unknown[]) {
+    const { main, store } = instance;
+    const id = saved(instance, "held-refusal");
+    main.entries = [
+      nativeEntry(main, "refusal-start", "rpc_agent_start", refusalRun),
+      { id: "refusal-user", type: "message", message: { role: "user", content: "Original authorized work" } },
+      { id: "provider-refusal", type: "custom", customType: "provider_refusal", data: { stopType: "refusal" } },
+      nativeEntry(main, "refusal-receipt", "rpc_prompt_result", { ...refusalRun,
+        frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error: refusalError } }),
+      // A restart appends native lifecycle and extension state records after the settled receipt.
+      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal" } },
+      { id: "restart-context", type: "custom_message", customType: "extension-state-context", content: "state" },
+      ...afterReceipt,
+    ];
+    store.settle(id, "uncertain");
+    return id;
+  }
+
+  test("a restart closes an already held tool-free failure from the exact native journal", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    const id = heldRefusal(instance, []);
+    await runtime.start();
+    await admit(runtime, headMessage("after-restart"));
+    await main.whenPrompts(1);
+    expect(store.input(id)?.state).toBe("cancelled");
+    expect(messenger.sent.find(output => output.id === `${id}:tool-free-failure`)).toMatchObject({ sourceId: id });
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([store.input("after-restart")?.requestId ?? "missing"]);
+  });
+
+  test.each([
+    ["an unattributed assistant message", { id: "late-assistant", type: "message", message: { role: "assistant", stopReason: "aborted", content: [] } }],
+    ["a later tool start", { id: "late-tool", type: "custom", customType: "tool_execution_start", data: { toolCallId: "late" } }],
+  ] as const)("%s after the settled receipt keeps a restarted refusal on hold", async (_, late) => {
+    const instance = fixture();
+    const { runtime, main, store } = instance;
+    const id = heldRefusal(instance, [late]);
+    await runtime.start();
+    await admit(runtime, headMessage("after-unproven-restart"));
+    expect(store.input(id)?.state).toBe("uncertain");
+    expect(store.input("after-unproven-restart")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+  });
+
   test.each(["prior tool execution", "foreign native PID", "foreign native instance", "different native run"] as const)(
     "%s keeps a later Codex quota failure on manual hold", async scenario => {
     const now = Date.now();
@@ -2679,6 +2802,274 @@ describe("same-HEAD evidence recovery", () => {
       expect(store.input("after-foreign-receipt")?.state).toBe("pending");
       expect(main.prompts).toEqual([]);
     } finally { quotaReply.resolve(false); }
+  });
+
+  test("a normal session_exit suffix after a quota refusal keeps the quota hold without closing as tool-free", async () => {
+    const now = Date.now();
+    const instance = fixture(3, undefined, { readHeadQuota: async () => false });
+    const { runtime, main, store } = instance;
+    main.state.model = { provider: quotaError.provider, id: quotaError.model };
+    const id = saved(instance, "quota-restarted");
+    main.entries = [
+      nativeEntry(main, "quota-start", "rpc_agent_start", quotaRun),
+      { id: "quota-user", type: "message", message: { role: "user", content: "Original authorized work" } },
+      { id: "quota-error", type: "message", message: { role: "assistant", provider: quotaError.provider,
+        model: quotaError.model, stopReason: "error", content: [] } },
+      { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { ...quotaRun,
+        frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error: quotaError } }),
+      timestamp: new Date(now - 1).toISOString() },
+      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal" } },
+      { id: "restart-context", type: "custom_message", customType: "extension-state-context", content: "state" },
+    ];
+    store.settle(id, "uncertain");
+    await runtime.start();
+    await admit(runtime, headMessage("after-restarted-quota"));
+    expect(store.input(id)?.state).toBe("uncertain");
+    expect(store.output(`${id}:tool-free-failure`)).toBeNull();
+    expect(store.input("after-restarted-quota")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+  });
+
+  test.each(["unavailable quota adapter", "changed HEAD model"] as const)(
+    "%s keeps a Codex quota failure held instead of closing as tool-free", async scenario => {
+    const now = Date.now();
+    const instance = scenario === "unavailable quota adapter"
+      ? fixture()
+      : fixture(3, undefined, { readHeadQuota: async () => true });
+    const { runtime, main, store, messenger } = instance;
+    main.state.model = scenario === "changed HEAD model"
+      ? { ...executionModel }
+      : { provider: quotaError.provider, id: quotaError.model };
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("quota-unverified", route("failed-route")));
+    const original = main.prompts[0];
+    if (!original) throw new Error("Original HEAD request was not admitted");
+    const frame = { type: "prompt_result", id: original.id, status: "error", agentInvoked: true, sessionSettled: true, error: quotaError };
+    main.entries[0] = nativeEntry(main, "quota-start", "rpc_agent_start", quotaRun);
+    main.entries.push(
+      { id: "quota-error", type: "message", message: { role: "assistant", provider: quotaError.provider,
+        model: quotaError.model, stopReason: "error", content: [] } },
+      { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { ...quotaRun, frame }), timestamp: new Date(now - 1).toISOString() },
+    );
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit(frame);
+    await messenger.whenSent(1);
+    await admit(runtime, headMessage("after-unverified-quota", route("later-route")));
+    await runtime.kick();
+    expect(store.input("quota-unverified")?.state).toBe("uncertain");
+    expect(store.output("quota-unverified:tool-free-failure")).toBeNull();
+    expect(store.input("after-unverified-quota")?.state).toBe("pending");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id]);
+  });
+
+  test("a hold notice persisted before a crash reuses its snapshot after restart even if uncertain inputs change", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger, errors } = instance;
+    store.receive(headMessage("blocker-1", route("failed-route")), "main", { "user-source:blocker-1": "true" });
+    store.submit("blocker-1", "native-blocker-1", 0);
+    store.settle("blocker-1", "uncertain");
+
+    const waiting = headMessage("waiting-1", route("later-route"));
+    store.receive(waiting, "main", { "user-source:waiting-1": "true" });
+    store.queueOutput({ id: "waiting-1:head-held:blocker-1", sourceId: "waiting-1", route: route("later-route"),
+      text: "크래시 전 저장된 대기 안내 스냅샷" });
+    expect(store.getMeta("head:hold-notice:blocker-1")).toBeNull();
+
+    store.receive(headMessage("blocker-2", route("failed-route")), "main", { "user-source:blocker-2": "true" });
+    store.submit("blocker-2", "native-blocker-2", 0);
+    store.settle("blocker-2", "uncertain");
+
+    await runtime.start();
+    await messenger.whenSent(1);
+    await runtime.kick();
+
+    expect(errors).toEqual([]);
+    expect(messenger.sent.filter(output => output.id === "waiting-1:head-held:blocker-1")).toHaveLength(1);
+    expect(messenger.sent.find(output => output.id === "waiting-1:head-held:blocker-1")).toMatchObject({
+      sourceId: "waiting-1", route: route("later-route"), text: "크래시 전 저장된 대기 안내 스냅샷",
+    });
+    expect(store.getMeta("head:hold-notice:blocker-1")).toBe("waiting-1");
+    expect(store.input("waiting-1")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+
+    await admit(runtime, message("resolve-1", route("control-route"), "/resolve blocker-1"));
+    await admit(runtime, message("resolve-2", route("control-route"), "/resolve blocker-2"));
+    await main.whenPrompts(1);
+    expect(store.input("waiting-1")?.state).toBe("submitted");
+    expect(main.prompts[0]?.id).toBe(store.input("waiting-1")?.requestId ?? "missing");
+  });
+
+  test("one waiting input that meets a second blocker gets that blocker's own notice", () => {
+    // Exercise the real notice builder: its output identity must include the
+    // blocker, or the second blocker is marked notified without a notice.
+    const { runtime, store, messenger } = fixture();
+    const makeBlocker = (id: string) => {
+      store.receive(headMessage(id, route("failed-route")), "main", { [`user-source:${id}`]: "true" });
+      store.submit(id, `native-${id}`, 0);
+      store.settle(id, "uncertain");
+    };
+    makeBlocker("blocker-1");
+    store.receive(headMessage("waiting-1", route("later-route")), "main", { "user-source:waiting-1": "true" });
+    const waiting = store.input("waiting-1");
+    if (!waiting) throw new Error("waiting input was not recorded");
+    const notifier: { noticeHeadHold: (input: typeof waiting) => void } = runtime as unknown as typeof notifier;
+    const notice = () => notifier.noticeHeadHold(waiting);
+
+    notice();
+    expect(store.output("waiting-1:head-held:blocker-1")?.text).toContain("blocker-1");
+    expect(store.getMeta("head:hold-notice:blocker-1")).toBe("waiting-1");
+
+    store.settle("blocker-1", "done");
+    makeBlocker("blocker-2");
+    notice();
+    expect(store.getMeta("head:hold-notice:blocker-2")).toBe("waiting-1");
+    expect(store.output("waiting-1:head-held:blocker-2")?.text).toContain("blocker-2");
+    expect(store.outputs().map(output => output.id).filter(id => id.includes(":head-held"))).toHaveLength(2);
+  });
+
+  test.each(["already pending", "observed during the journal read"] as const)(
+    "a settled HEAD confirmation %s keeps its original route and queued work waits", async timing => {
+      const instance = fixture();
+      const { runtime, main, store, messenger } = instance;
+      const origin = route("confirm-route");
+      const frame = { type: "extension_ui_request", id: "confirm-outstanding", method: "confirm",
+        title: "Finish the original request?", message: "This remains on the original route." };
+      main.journalLeaf = true;
+      await runtime.start();
+      await admit(runtime, headMessage("confirmation-held", origin));
+      if (timing === "already pending") main.state.pendingUiRequests = [frame];
+      else main.afterEntries = () => {
+        main.afterEntries = undefined;
+        main.state.pendingUiRequests = [frame];
+      };
+
+      // No UI event is delivered: Host state knows the dialog before fanout.
+      const original = await failHeadRun(instance);
+      await messenger.whenApproval();
+      const card = [...messenger.shown.values()][0]!;
+      expect(card).toMatchObject({ requestId: frame.id, route: origin, state: "pending" });
+      expect(store.input("confirmation-held")?.state).toBe("submitted");
+      expect(store.output("confirmation-held:answer")).toBeNull();
+
+      await admit(runtime, headMessage("after-confirmation", route("later-route")));
+      expect(store.input("after-confirmation")?.state).toBe("pending");
+      expect(main.prompts).toHaveLength(1);
+
+      messenger.dismissApproval = async () => { throw new Error("Messenger card cleanup failed"); };
+      if (timing === "already pending") {
+        main.state.pendingUiRequests = [];
+        main.emit({ type: "extension_ui_request", method: "cancel", targetId: frame.id });
+      } else {
+        // Stock can acknowledge a response without another lifecycle event.
+        main.uiResponse = (id, response) => {
+          main.responses.push({ id, response });
+          main.state.pendingUiRequests = [];
+        };
+        await expect(messenger.handlers!.answer(card.id, { confirmed: true }, origin))
+          .rejects.toMatchObject({ certainty: "uncertain" });
+        expect(main.responses).toEqual([{ id: frame.id, response: { confirmed: true } }]);
+      }
+      await main.whenPrompts(2);
+      expect(store.input("confirmation-held")?.state).toBe("cancelled");
+      expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id, store.input("after-confirmation")?.requestId ?? "missing"]);
+    },
+  );
+
+  test("a failed final state read and failed card presentation do not strand HEAD", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    const failedRead = Promise.withResolvers<void>();
+    const origin = route("confirm-route");
+    const frame = { type: "extension_ui_request", id: "undeliverable-confirmation", method: "confirm",
+      title: "Original confirmation", message: "The messenger cannot present this card." };
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("presentation-failed", origin));
+    messenger.showApproval = async approval => {
+      expect(approval.route).toEqual(origin);
+      throw new DeliveryError("Card presentation rejected", "rejected");
+    };
+    main.uiResponse = (id, response) => {
+      main.responses.push({ id, response });
+      main.state.pendingUiRequests = [];
+    };
+    main.afterEntries = () => {
+      main.afterEntries = undefined;
+      main.state.pendingUiRequests = [frame];
+      main.beforeState = () => {
+        main.beforeState = undefined;
+        failedRead.resolve();
+        throw new Error("Transient native state read failure");
+      };
+    };
+
+    const original = await failHeadRun(instance);
+    await failedRead.promise;
+    await admit(runtime, headMessage("after-failed-presentation", route("later-route")));
+    // No UI fanout or cancellation event arrives. A normal wake can re-read
+    // the dialog, and the explicit native cancellation must be sent once.
+    await main.whenPrompts(2);
+    expect(main.responses).toEqual([{ id: frame.id, response: { cancelled: true } }]);
+    expect(store.input("presentation-failed")?.state).toBe("cancelled");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id,
+      store.input("after-failed-presentation")?.requestId ?? "missing"]);
+  });
+
+  test.each(["hasPendingAsyncWork", "hasOwnedRunningWork"] as const)(
+    "HEAD stays uncertain when %s appears during the failure journal read", async activity => {
+      const instance = fixture();
+      const { runtime, main, store, messenger } = instance;
+      main.journalLeaf = true;
+      await runtime.start();
+      await admit(runtime, headMessage("async-failure"));
+      main.afterEntries = () => {
+        main.afterEntries = undefined;
+        main.state[activity] = true;
+      };
+      await failHeadRun(instance);
+      await messenger.whenSent(1);
+      expect(store.input("async-failure")?.state).toBe("uncertain");
+      expect(messenger.sent[0]?.text).toContain("/resolve async-failure");
+
+      await admit(runtime, headMessage("after-async-failure", route("later-route")));
+      expect(store.input("after-async-failure")?.state).toBe("pending");
+      expect(main.prompts).toHaveLength(1);
+    },
+  );
+
+  test("a native continuation reported by the final state supersedes the old failure", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    const rechecked = Promise.withResolvers<void>();
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("continuing-failure"));
+    main.afterEntries = () => {
+      main.afterEntries = undefined;
+      // A continuation can be advertised before its agent_start fanout.
+      main.state.isSettled = false;
+      main.state.isStreaming = true;
+      main.beforeState = () => {
+        main.beforeState = undefined;
+        rechecked.resolve();
+      };
+    };
+    await failHeadRun(instance);
+    await rechecked.promise;
+    await admit(runtime, headMessage("after-continuation", route("later-route")));
+    expect(store.input("continuing-failure")?.state).toBe("submitted");
+    expect(store.input("after-continuation")?.state).toBe("pending");
+    expect(store.output("continuing-failure:answer")).toBeNull();
+
+    main.emit({ type: "agent_start" });
+    main.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop",
+      content: [{ type: "text", text: "The continuing run answered." }] } });
+    main.complete("The continuing run answered.");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]).toMatchObject({ sourceId: "continuing-failure", text: "The continuing run answered." });
+    expect(store.input("continuing-failure")?.state).toBe("done");
   });
 
   test("actual prompt acknowledgement loss uses durable receipts once, fences queued work, and notifies only the original route", async () => {

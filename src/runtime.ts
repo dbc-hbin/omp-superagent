@@ -1149,6 +1149,16 @@ export class Superagent {
         }
         return;
       }
+      if (authorizeRoute(this.config, input.route) && this.toolFreeHeadFailure(input.id, evidence)) {
+        // Reached after a restart or when the live settlement could not read
+        // the journal: the run started no tool, so close it without replay.
+        if (this.store.settle(input.id, "cancelled", { id: `${input.id}:tool-free-failure`,
+          text: "도구를 실행하기 전에 실패한 요청임을 네이티브 기록으로 확인해 보류를 자동으로 해제했습니다. 원래 요청을 다시 실행하거나 완료로 처리하지 않았습니다. 다음 요청을 계속 처리합니다." })) {
+          this.releaseHeadRecoveryAdmission(head, input.id);
+          this.background(this.kick());
+        }
+        return;
+      }
       if (!evidence || !evidence.outcome || !Number.isSafeInteger(state.hostPid) || state.hostPid! <= 0) continue;
       const effects = this.store.headRecoveryEffects(input.id);
       if (effects.some(effect => !["sent", "complete", "failed"].includes(effect.state))) continue;
@@ -1185,6 +1195,53 @@ export class Superagent {
       return;
     }
     if (!quotaHold) this.nextHeadQuotaCheck = undefined;
+  }
+
+  /**
+   * A settled HEAD failure whose exact native run started no tool has no
+   * effect to reconcile, so it must not hold later HEAD work. Quota and
+   * quota-like refusals keep their hold unless native recovery is confirmed;
+   * undelivered or ambiguous outputs keep the ordinary hold.
+   */
+  private toolFreeHeadFailure(inputId: string, evidence: ReturnType<typeof headRecoveryEvidence>): boolean {
+    return !!evidence?.toolFreeFailure
+      && !evidence.quotaFailure
+      && !this.store.headRecoveryEffects(inputId).some(effect => !["sent", "complete", "failed"].includes(effect.state));
+  }
+
+  /**
+   * Tell the owner once per held uncertainty why new HEAD messages wait. The
+   * notice is informational; it neither settles nor reorders the queue.
+   */
+  private noticeHeadHold(input: InputRecord): void {
+    if (this.store.getMeta(`user-source:${input.id}`) !== "true") return;
+    const held = this.store.inputs("main", "uncertain");
+    const blocker = held[0];
+    if (!blocker || this.store.getMeta(`head:hold-notice:${blocker.id}`)) return;
+    // The blocker is part of the notice identity: one waiting input can meet
+    // blocker A, then blocker B after A is resolved, and B needs its own notice.
+    if (this.store.recordHeadHoldNotice(blocker.id, { id: `${input.id}:head-held:${blocker.id}`, sourceId: input.id, route: input.route,
+      text: `앞선 HEAD 요청 ${blocker.id} 의 결과가 불확실해 이 메시지와 뒤 HEAD 요청이 대기 중입니다. 다시 실행하지 않았습니다. 원래 작업을 확인한 뒤 /resolve ${blocker.id} 로 닫으면 순서대로 처리합니다.${held.length > 1 ? ` 다른 불확실한 요청: ${held.slice(1).map(other => other.id).join(", ")}.` : ""}` })) {
+      this.wakeOutputs();
+    }
+  }
+
+  private async readSettledHeadFailure(head: Live, input: InputRecord, state: RuntimeState): Promise<ReturnType<typeof headRecoveryEvidence>> {
+    const ownerRecord = this.store.getMeta(`head-native-owner:${input.id}`);
+    if (!ownerRecord) return null;
+    try {
+      const owner = JSON.parse(ownerRecord) as
+        Pick<HeadRecoveryAttempt, "requestId" | "generation" | "sessionId" | "sessionFile" | "cursor">;
+      if (owner.requestId !== input.requestId || owner.generation !== input.generation
+        || owner.sessionId !== state.sessionId || owner.sessionFile !== state.sessionFile
+        || owner.cursor !== null && typeof owner.cursor !== "string") return null;
+      const entries = successful(await head.connection.request({ type: "get_entries" }), "read HEAD failure evidence").entries;
+      return Array.isArray(entries) ? headRecoveryEvidence(entries, owner) : null;
+    } catch (error) {
+      // An unreadable journal proves nothing; the failure stays on hold.
+      this.report(error);
+      return null;
+    }
   }
 
   private releaseHeadRecoveryAdmission(head: Live, inputId: string): void {
@@ -5481,7 +5538,7 @@ export class Superagent {
     }
     const uncertainInputs = inputs.filter(candidate => candidate.state === "uncertain");
     const uncertain = uncertainInputs.length
-      ? `\nUncertain HEAD inputs held (block later HEAD work): ${uncertainInputs.map(candidate => JSON.stringify(candidate.id)).join(", ")}. A proven tool-free Codex quota refusal can close after native quota recovery. Other eligible native evidence receives one isolated same-HEAD recovery decision; ambiguous results or effects remain held without replay. Inspect the original native session or use owner /resolve <input-id> to close uncertainty without claiming completion.`
+      ? `\nUncertain HEAD inputs held (block later HEAD work): ${uncertainInputs.map(candidate => JSON.stringify(candidate.id)).join(", ")}. A proven tool-free Codex quota refusal can close after native quota recovery; another proven tool-free settled failure closes on reconciliation. Other eligible native evidence receives one isolated same-HEAD recovery decision; ambiguous results or effects remain held without replay. Inspect the original native session or use owner /resolve <input-id> to close uncertainty without claiming completion.`
       : "";
     return `Native HEAD: ${state ? this.nativeStatus(state) : "unavailable or unverified"}.\nPreset initialization: ${this.initialization ? `${this.initialization.state}; ${this.initialization.detail}` : "not managed by this runtime"}.\nLogical topic: ${JSON.stringify(input.route.topicId ?? input.route.threadId ?? "main")}; shared HEAD session: ${state ? JSON.stringify(state.sessionId) : "unverified"}.\nHEAD inputs: ${counts(inputs)}; durable approvals: ${this.store.approvals("main").length}; stop pending: ${this.headStopping > 0}; managed compaction pending: ${!!this.headCompaction}.${uncertain}\nBound lane: ${laneStatus}.\nIdle/settled is not proof of task completion; uncertain effects are never automatically repeated.`;
   }
@@ -6678,6 +6735,12 @@ export class Superagent {
         for (const live of this.live.values()) {
           if (live.releasing) {
             await this.release(live);
+          } else if (live.id === "main" && live.input && !live.preparing && !live.finishing
+            && live.result?.status === "error" && this.store.input(live.input.id)?.state === "submitted"
+            && !this.store.approvals(live.id).length && this.recoveryControllerIdle()) {
+            // Retry an unavailable state read or silent native UI close on the
+            // existing wake. Never repeat a dialog response or hold the pump.
+            this.background(this.finish(live));
           } else if (live.id !== "main" && live.input && !live.preparing && !live.finishing
             && (live.result || this.store.input(live.input.id)?.state === "cancelled")) {
             // An explicit resolution may have raced a failed native read. Revisit
@@ -6880,7 +6943,10 @@ export class Superagent {
             if (steering) {
               if (!this.canSteer(live, input)) continue;
             } else {
-              if (heldTargets.has(input.target) || live.busy) continue;
+              if (heldTargets.has(input.target) || live.busy) {
+                if (live.id === "main" && heldTargets.has("main")) this.noticeHeadHold(input);
+                continue;
+              }
               const state = await this.state(live);
               if (!state.isSettled || state.pendingUiRequests?.length || this.store.approvals(live.id).length) {
                 live.busy = !state.isSettled;
@@ -7488,29 +7554,65 @@ export class Superagent {
       }
       this.recoverNativeOutcome(live, entries, state);
     }
+    const result = live.result;
+    const cancelled = input && this.store.input(input.id)?.state === "cancelled";
+    const settling = input && (result || cancelled) && admissions.every(admitted => admitted.result
+      || this.store.input(admitted.input.id)?.state === "cancelled");
+    // The originating command's result includes failures outside assistant
+    // generation (for example admission/cost limits). Only an authoritative
+    // later owned run can supersede it, including a successful native retry.
+    // Goal resume only acknowledges activation: even its first run needs an
+    // observed assistant outcome; a zero-run refusal is not completion.
+    const outcome = !settling ? undefined : cancelled ? "aborted" : result!.goalResume ? live.assistantOutcome?.status ?? "error"
+      : live.assistantOutcome && live.assistantOutcome.run > 1 ? live.assistantOutcome.status : result!.status;
+    let toolFree = false;
+    if (live.id === "main" && input && outcome === "error" && !result!.goalResume && admissions.length === 1) {
+      let confirmed: RuntimeState | null = state;
+      let evidence: ReturnType<typeof headRecoveryEvidence> = null;
+      if (this.recoveryIdle(state) && this.recoveryControllerIdle()) {
+        evidence = await this.readSettledHeadFailure(live, input, state);
+        confirmed = await this.state(live).catch(() => null);
+      }
+      // An awaited read can race a continuation, stop, or replaced Host.
+      if (!this.current(live) || live.preparing || live.input !== input
+        || admissions.length !== live.admitted.size || live.nativeVersion !== nativeVersion
+        || this.store.input(input.id)?.state !== "submitted") return;
+      // A settled failed admission kept for UI ownership is not steerable.
+      if (confirmed?.isSettled !== false) live.running = false;
+      const approvals = this.store.approvals(live.id);
+      if (confirmed?.pendingUiRequests?.length || approvals.length) {
+        // The Host state can expose a dialog before the observation fanout.
+        // Bind it while the original admission still owns the route. A native
+        // cancellation or acknowledged answer wakes settlement again.
+        for (const frame of confirmed?.pendingUiRequests ?? []) {
+          // Present a newly observed, supported dialog only. In particular a
+          // failed display leaves a durable cancellation, not a replay ticket.
+          if (frame.secret !== true && dialogs.has(String(frame.method)) && typeof frame.id === "string"
+            && !this.store.approval(`a-${key(`${live.id}:${live.generation}:${frame.id}`)}`)) this.background(this.frame(live, frame));
+        }
+        return;
+      }
+      if (!confirmed?.isSettled) return;
+      toolFree = confirmed.hostPid === state.hostPid && this.recoveryIdle(confirmed)
+        && this.recoveryControllerIdle() && this.toolFreeHeadFailure(input.id, evidence);
+    }
     const wasBusy = live.busy;
     live.busy = false;
     live.running = false;
     live.lastActivity = Date.now();
     if (live.id !== "main") this.store.updateLane(live.id, live.generation, { runtimeState: "idle", lastActivityAt: live.lastActivity });
-    const result = live.result;
-    const cancelled = input && this.store.input(input.id)?.state === "cancelled";
     let headFailed = false;
-    if (input && (result || cancelled) && admissions.every(admitted => admitted.result
-      || this.store.input(admitted.input.id)?.state === "cancelled")) {
-      // The originating command's result includes failures outside assistant
-      // generation (for example admission/cost limits). Only an authoritative
-      // later owned run can supersede it, including a successful native retry.
-      // Goal resume only acknowledges activation: even its first run needs an
-      // observed assistant outcome; a zero-run refusal is not completion.
-      const outcome = cancelled ? "aborted" : result!.goalResume ? live.assistantOutcome?.status ?? "error"
-        : live.assistantOutcome && live.assistantOutcome.run > 1 ? live.assistantOutcome.status : result!.status;
+    if (input && settling) {
       const completed = outcome === "completed";
-      const state = completed ? "done" : outcome === "aborted" ? "cancelled" : "uncertain";
+      const state = completed ? "done" : outcome === "aborted" || toolFree ? "cancelled" : "uncertain";
       headFailed = live.id === "main" && state === "uncertain";
       const text = completed ? (result!.agentInvoked || result!.goalResume && live.ownedRuns > 0 ? live.text : "") : outcome === "aborted"
         ? "실행이 중단되었습니다. 작업 완료로 처리하지 않았습니다."
-        : "실행이 실패했습니다. 작업 완료로 처리하지 않았습니다.";
+        : toolFree
+          ? "실행이 실패했습니다. 도구를 실행하기 전에 모델 또는 제공자가 응답을 거절하거나 오류를 냈습니다. 작업 완료로 처리하지 않았고 다시 실행하지 않았습니다. 다음 요청은 계속 처리합니다."
+          : headFailed
+            ? `실행이 실패했습니다. 작업 완료로 처리하지 않았고 다시 실행하지 않았습니다. 실패 전에 도구가 실행됐거나 효과를 확인할 수 없어 뒤 HEAD 요청이 막혀 있습니다. 원래 작업을 확인한 뒤 /resolve ${input.id} 로 이 요청을 닫으면 다음 요청을 처리합니다.`
+            : "실행이 실패했습니다. 작업 완료로 처리하지 않았습니다.";
       for (const admitted of admissions) {
         this.activity(admitted.input, false);
         if (admitted.input.id === input.id || this.store.input(admitted.input.id)?.state === "cancelled") continue;
@@ -7586,6 +7688,10 @@ export class Superagent {
     for (const frame of state.pendingUiRequests) await this.frame(live, frame);
   }
 
+  private wakeFailedHeadAfterUi(live: Live): void {
+    if (live.id === "main" && live.input && live.result?.status === "error") this.background(this.finish(live));
+  }
+
   private async frame(live: Live, frame: Record<string, unknown>): Promise<void> {
     if (!this.current(live)) return;
     // Recovery has no Messenger route and never answers/cancels native dialogs
@@ -7594,15 +7700,20 @@ export class Superagent {
     if (frame.method === "cancel") {
       const approval = this.store.approvals(live.id).find(approval => approval.generation === live.generation && approval.requestId === frame.targetId);
       if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
-      if (approval && this.store.resolveApproval(approval.id, live.generation, "cancelled")) {
-        if (!groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
-      }
+      const resolved = approval && this.store.resolveApproval(approval.id, live.generation, "cancelled");
+      this.wakeFailedHeadAfterUi(live);
+      if (approval && resolved && !groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
       return;
     }
     if (!dialogs.has(String(frame.method)) || typeof frame.id !== "string") return;
+    const requestId = frame.id;
+    const cancelDialog = () => {
+      live.connection.uiResponse(requestId, { cancelled: true });
+      this.wakeFailedHeadAfterUi(live);
+    };
     if (frame.method === "ask" && live.id === "main" && live.input?.id.startsWith(laneDecisionReview)) {
       // The internal reviewer can escalate only the lane's original question.
-      live.connection.uiResponse(frame.id, { cancelled: true });
+      cancelDialog();
       return;
     }
     const id = `a-${key(`${live.id}:${live.generation}:${frame.id}`)}`;
@@ -7611,7 +7722,7 @@ export class Superagent {
     // An answered marker is written before the native effect. If its receipt
     // was lost, neither replay the response nor silently cancel that request.
     if (persisted?.state === "answered") return;
-    if (persisted && persisted.state !== "pending") { live.connection.uiResponse(frame.id, { cancelled: true }); return; }
+    if (persisted && persisted.state !== "pending") { cancelDialog(); return; }
     if (!persisted && !live.input && live.id !== "main" && this.store.hasTopicAdmission(live.id, live.generation)) {
       // Native UI frames have no prompt receipt ID. After a detached reconnect,
       // the lane's route does not prove which original topic owns this request.
@@ -7626,7 +7737,7 @@ export class Superagent {
       : this.store.input(reportApprovalSource)?.route);
     if (route && groupRoom(this.config, route)) {
       if (persisted) this.store.resolveApproval(persisted.id, live.generation, "cancelled");
-      live.connection.uiResponse(frame.id, { cancelled: true });
+      cancelDialog();
       return;
     }
     if (!route && live.id === "main" && this.store.hasInput("main", "uncertain")) return;
@@ -7642,8 +7753,9 @@ export class Superagent {
     }
     const held = live.id !== "main" && this.requireLane(live.id).workState !== "open";
     if (!route || held || frame.secret === true) {
-      live.connection.uiResponse(frame.id, { cancelled: true });
-      if (persisted && this.store.resolveApproval(persisted.id, live.generation, "cancelled")) await this.messenger.dismissApproval(persisted);
+      const resolved = persisted && this.store.resolveApproval(persisted.id, live.generation, "cancelled");
+      cancelDialog();
+      if (persisted && resolved) await this.messenger.dismissApproval(persisted);
       return;
     }
     const decision = decisionRequestId(frame);
@@ -7696,7 +7808,7 @@ export class Superagent {
       if (updated.state !== "pending") await this.messenger.dismissApproval(updated);
     } catch {
       this.store.resolveApproval(id, live.generation, "cancelled");
-      live.connection.uiResponse(approval.requestId, { cancelled: true });
+      cancelDialog();
       if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
       this.report(new Error(`Approval ${id} could not be presented; native request cancelled`));
     } finally { this.cards.delete(id); }
@@ -7774,6 +7886,7 @@ export class Superagent {
         if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
         if (live.input && this.store.hasInput(live.id, "pending")) this.background(this.kick());
       }
+      this.wakeFailedHeadAfterUi(live);
       if (!headSelection) await this.messenger.dismissApproval(this.store.approval(id)!);
     } catch (error) {
       if (attempted) throw new DeliveryError("Native approval outcome unresolved", "uncertain", undefined, { cause: error });

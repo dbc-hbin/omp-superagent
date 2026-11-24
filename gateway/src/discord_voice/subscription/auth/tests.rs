@@ -325,3 +325,23 @@ fn rejects_relative_managed_home_before_creating_the_broker() {
     });
     assert!(result.unwrap_err().to_string().contains("must be absolute"));
 }
+
+#[tokio::test]
+async fn retries_transient_executable_file_busy_when_starting_broker() {
+    let fixture = Fixture::new();
+    let account = active_account();
+    let status = auth_status(&claims());
+    let command = fixture.command(&exchange(&account, &status, &account), EOF);
+    let writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(command.as_std().get_program())
+        .unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        drop(writer);
+    });
+    let login = run_broker(command).await.unwrap();
+    release.await.unwrap();
+    assert_eq!(login.account_id(), "fixture-account");
+    fixture.assert_requests(5);
+}

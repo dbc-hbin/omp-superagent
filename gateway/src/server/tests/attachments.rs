@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use super::{GatewayClient, SocketDir};
+use crate::server::attachments::ATTACHMENT_TIMEOUT;
 
 const DEADLINE: Duration = Duration::from_secs(3);
 const UPSTREAM_HEADERS: &[u8] =
@@ -209,7 +210,15 @@ async fn attachment_ipc_bounds_unknown_sizes_per_file_and_per_batch() -> Result<
         });
         let root = SocketDir::new()?;
         let fixture = GatewayClient::connect(&root, local_url).await?;
-        let response = fixture.call("/attachment", &batch(&vec![None; count])).await?;
+        // This one reply follows up to three sequential streamed downloads and fsyncs.
+        // Don't let the fixture's default IPC timeout preempt the Gateway's per-file deadline.
+        let response: Value = fixture
+            .request("/attachment", &batch(&vec![None; count]))
+            .timeout(ATTACHMENT_TIMEOUT * u32::try_from(count)? + DEADLINE)
+            .send()
+            .await?
+            .json()
+            .await?;
         assert_eq!(response["certainty"], "rejected");
         assert_eq!(response["error"], "Attachment stream exceeds the size limit");
         assert!(entries(&root.0.join("attachments"))?.is_empty());

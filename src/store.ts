@@ -1194,6 +1194,24 @@ export class Store implements StorePort {
     }).immediate();
   }
 
+  recordHeadHoldNotice(blockerId: string, output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean {
+    return this.db.transaction(() => {
+      const marker = `head:hold-notice:${blockerId}`;
+      if (this.getMeta(marker)) return false;
+      const existing = this.output(output.id);
+      if (existing) {
+        if (existing.sourceId !== output.sourceId || routeKey(existing.route) !== routeKey(output.route)) {
+          throw new Error(`Output identity conflict: ${output.id}`);
+        }
+        this.setMeta(marker, output.sourceId);
+        return existing.state === "pending";
+      }
+      const queued = this.queueOutput(output);
+      this.setMeta(marker, output.sourceId);
+      return queued;
+    }).immediate();
+  }
+
   outputs(physicalRoute?: string): OutputRecord[] {
     if (physicalRoute !== undefined) {
       return (this.db.query("SELECT * FROM outputs WHERE state = 'pending' AND physical_route = ? ORDER BY sequence")

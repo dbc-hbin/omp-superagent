@@ -10,6 +10,7 @@ use std::{
     env,
     ffi::OsString,
     fs::Permissions,
+    io::ErrorKind,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -17,7 +18,7 @@ use std::{
 };
 use tokio::{
     process::{Child, Command},
-    time::timeout,
+    time::{sleep, timeout},
 };
 use zeroize::Zeroizing;
 
@@ -35,6 +36,8 @@ use rpc::{Request, Rpc};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const REAP_TIMEOUT: Duration = Duration::from_millis(500);
+const SPAWN_BUSY_RETRIES: usize = 20;
+const SPAWN_BUSY_BACKOFF: Duration = Duration::from_millis(25);
 const AUTH_ENV: [&str; 7] = [
     "CODEX_HOME",
     "SYSTEMROOT",
@@ -171,6 +174,23 @@ impl Drop for BrokerChild {
     }
 }
 
+async fn spawn_broker(command: &mut Command, cwd: &Path) -> Result<Child> {
+    command.current_dir(cwd);
+    for attempt in 0..=SPAWN_BUSY_RETRIES {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == ErrorKind::ExecutableFileBusy
+                    && attempt < SPAWN_BUSY_RETRIES =>
+            {
+                sleep(SPAWN_BUSY_BACKOFF).await;
+            }
+            Err(_) => bail!("Could not start Codex managed-login broker"),
+        }
+    }
+    bail!("Could not start Codex managed-login broker")
+}
+
 async fn run_broker(mut command: Command) -> Result<Login> {
     // Do not use project cwd or inherit an arbitrary TMPDIR as the parent of our private cwd.
     let cwd = tempfile::Builder::new()
@@ -178,10 +198,7 @@ async fn run_broker(mut command: Command) -> Result<Login> {
         .permissions(Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
         .map_err(|_| anyhow!("Could not create private Codex managed-login directory"))?;
-    let child = command
-        .current_dir(cwd.path())
-        .spawn()
-        .map_err(|_| anyhow!("Could not start Codex managed-login broker"))?;
+    let child = spawn_broker(&mut command, cwd.path()).await?;
     let mut child = BrokerChild(child);
     let mut rpc = Rpc::new(&mut child.0)?;
     let result = timeout(HANDSHAKE_TIMEOUT, read_account(&mut rpc))

@@ -162,15 +162,14 @@ impl GatewayClient {
     }
 
     pub(crate) async fn call(&self, endpoint: &str, body: &Value) -> Result<Value> {
-        Ok(self
-            .client
+        Ok(self.request(endpoint, body).send().await?.json().await?)
+    }
+
+    fn request(&self, endpoint: &str, body: &Value) -> reqwest::RequestBuilder {
+        self.client
             .post(format!("http://localhost{endpoint}"))
             .headers(self.headers.clone())
             .json(body)
-            .send()
-            .await?
-            .json()
-            .await?)
     }
 
     pub(crate) async fn events(&self, root: &SocketDir) -> Result<Response> {

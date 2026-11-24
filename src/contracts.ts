@@ -380,6 +380,7 @@ export interface StorePort {
   prepareHeadRecovery(attempt: HeadRecoveryAttempt): boolean;
   commitHeadRecovery(expected: HeadRecoveryAttempt, decided: HeadRecoveryAttempt): boolean;
   queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean;
+  recordHeadHoldNotice(blockerId: string, output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean;
   output(id: string): OutputRecord | null;
   outputs(physicalRoute?: string): OutputRecord[];
   claimOutput(id: string, editInPlace?: boolean): boolean;

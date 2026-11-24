@@ -52,43 +52,69 @@ export function headRecoveryEvidence(entries: unknown[], owner: Pick<HeadRecover
   const error = object(frame.error);
   const failedAt = typeof receipt.timestamp === "string" ? Date.parse(receipt.timestamp) : NaN;
   const receiptIndex = slice.indexOf(receipt);
-  const sameQuotaRun = typeof receiptData.hostPid === "number" && Number.isSafeInteger(receiptData.hostPid)
+  const sameRun = typeof receiptData.hostPid === "number" && Number.isSafeInteger(receiptData.hostPid)
     && receiptData.hostPid > 0 && typeof receiptData.instanceKey === "string" && receiptData.instanceKey !== ""
     && typeof receiptData.runOrdinal === "number" && Number.isSafeInteger(receiptData.runOrdinal) && receiptData.runOrdinal > 0
     && receiptData.hostPid === startData.hostPid && receiptData.instanceKey === startData.instanceKey
     && receiptData.runOrdinal === startData.runOrdinal;
-  // The exact provider refused the entire turn. An earlier tool, partial
-  // answer, other request, or unknown journal effect makes this unsafe to close.
-  const quotaFailure: HeadQuotaFailure | null = frame.status === "error" && frame.sessionSettled === true
-    && frame.agentInvoked === true && error.provider === "openai-codex" && typeof error.model === "string" && error.model !== ""
-    && error.retryable === false && typeof error.message === "string"
-    // Stock OMP's RPC error lacks a structured quota code. Match either
-    // native Codex formatter, but require the exact code in its metadata.
-    && /^Codex (?:error event|response failed)(?:: [\s\S]+)? \(code=usage_limit_reached(?:, status=[a-z_]+)?\)$/.test(error.message)
-    && Number.isFinite(failedAt) && sameQuotaRun && latestRunStatus === "error"
-    && users.length === 1 && receiptIndex > latestStartIndex
+  // The exact settled run failed before any tool started: only its prompt,
+  // failed model replies without tool calls, native provider refusals and
+  // usage records exist. An earlier tool, another request, an unknown journal
+  // entry or anything after the receipt makes the effect history unproven.
+  const settledToolFreeError = frame.status === "error" && frame.sessionSettled === true && frame.agentInvoked === true
+    && sameRun && users.length === 1 && receiptIndex > latestStartIndex
     && slice.every((entry, index) => {
       if (entry.type === "model_usage" || entry === receipt) return true;
-      if (index >= receiptIndex) return false;
+      // The settled receipt ends this run. Later native lifecycle and
+      // extension state records (for example session_exit on a restart) are
+      // not its effects; a later run, tool or message is not attributable.
+      if (index > receiptIndex) return (entry.type === "custom" || entry.type === "custom_message")
+        && !["rpc_agent_start", "rpc_prompt_result", "tool_execution_start"].includes(String(entry.customType));
       if (matches(entry, "rpc_agent_start")) {
         const start = object(entry.data);
         return start.hostPid === receiptData.hostPid && start.instanceKey === receiptData.instanceKey
           && typeof start.runOrdinal === "number" && Number.isSafeInteger(start.runOrdinal)
           && start.runOrdinal > 0 && start.runOrdinal <= Number(receiptData.runOrdinal);
       }
+      if (entry.type === "custom") return entry.customType === "provider_refusal";
       if (entry.type !== "message") return false;
       const message = object(entry.message);
       return message.role === "user" || message.role === "assistant" && message.stopReason === "error"
-        && message.provider === error.provider && message.model === error.model
-        && Array.isArray(message.content) && message.content.length === 0;
+        && Array.isArray(message.content) && !message.content.some(part => object(part).type === "toolCall");
+    });
+  const quotaLikeText = (value: unknown): boolean => typeof value === "string"
+    && /(?:usage_limit_reached|insufficient_quota|quota_exceeded|usage_limit|usage limit|quota)/i.test(value);
+  const quotaLikeFailure = quotaLikeText(error.message) || quotaLikeText(error.code) || quotaLikeText(error.type)
+    || slice.some(entry => {
+      if (entry.type !== "message") return false;
+      const message = object(entry.message);
+      return message.role === "assistant" && (quotaLikeText(message.errorMessage) || quotaLikeText(message.error));
+    });
+  // The exact provider refused the entire turn for quota. A partial answer or
+  // another provider's reply makes it something other than a quota hold.
+  const quotaFailure: HeadQuotaFailure | null = settledToolFreeError
+    && error.provider === "openai-codex" && typeof error.model === "string" && error.model !== ""
+    && error.retryable === false && typeof error.message === "string"
+    // Stock OMP's RPC error lacks a structured quota code. Match either
+    // native Codex formatter, but require the exact code in its metadata.
+    && /^Codex (?:error event|response failed)(?:: [\s\S]+)? \(code=usage_limit_reached(?:, status=[a-z_]+)?\)$/.test(error.message)
+    && Number.isFinite(failedAt) && latestRunStatus === "error"
+    && slice.slice(receiptIndex + 1).every(entry => entry.type === "model_usage")
+    && slice.every(entry => {
+      if (entry.type === "custom") return entry.customType !== "provider_refusal";
+      const message = object(entry.message);
+      return entry.type !== "message" || message.role !== "assistant" || message.provider === error.provider
+        && message.model === error.model && Array.isArray(message.content) && message.content.length === 0;
     })
     ? { failedAt, model: { provider: error.provider, id: error.model } } : null;
+  // Quota-like refusals stay held unless native quota recovery proves safe release.
+  const toolFreeFailure = settledToolFreeError && !quotaFailure && !quotaLikeFailure;
   const selected = [receipt, ...starts, ...assistants];
   if (selected.some(entry => typeof entry.id !== "string")) return null;
   const entryIds = [...new Set(selected.map(entry => String(entry.id)))];
   const proof = { entryIds, receiptStatus: String(frame.status), latestRunStatus: latestRunStatus ?? null,
     outcome: outcome ?? null };
-  return { ...proof, quotaFailure, boundary: String(journal[end]!.id),
+  return { ...proof, toolFreeFailure, quotaFailure, boundary: String(journal[end]!.id),
     fingerprint: createHash("sha256").update(JSON.stringify(slice.map(entry => [
       entry.id, entry.type, entry.customType,
       matches(entry, "rpc_prompt_result") ? object(entry.data).frame : null,
