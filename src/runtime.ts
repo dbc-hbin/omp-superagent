@@ -1082,7 +1082,7 @@ export class Superagent {
         }
         return;
       }
-      if (authorizeRoute(this.config, input.route) && this.toolFreeHeadFailure(input.id, evidence, confirmed.model)) {
+      if (authorizeRoute(this.config, input.route) && this.toolFreeHeadFailure(input.id, evidence)) {
         // Reached after a restart or when the live settlement could not read
         // the journal: the run started no tool, so close it without replay.
         if (this.store.settle(input.id, "cancelled", { id: `${input.id}:tool-free-failure`,
@@ -1132,14 +1132,13 @@ export class Superagent {
 
   /**
    * A settled HEAD failure whose exact native run started no tool has no
-   * effect to reconcile, so it must not hold later HEAD work. A provable Codex
-   * quota refusal keeps its quota hold; undelivered or ambiguous outputs keep
-   * the ordinary hold.
+   * effect to reconcile, so it must not hold later HEAD work. Quota and
+   * quota-like refusals keep their hold unless native recovery is confirmed;
+   * undelivered or ambiguous outputs keep the ordinary hold.
    */
-  private toolFreeHeadFailure(inputId: string, evidence: ReturnType<typeof headRecoveryEvidence>,
-    model: LaneModel | null | undefined): boolean {
+  private toolFreeHeadFailure(inputId: string, evidence: ReturnType<typeof headRecoveryEvidence>): boolean {
     return !!evidence?.toolFreeFailure
-      && !(evidence.quotaFailure && this.adapters.readHeadQuota && sameLaneModel(evidence.quotaFailure.model, model))
+      && !evidence.quotaFailure
       && !this.store.headRecoveryEffects(inputId).some(effect => !["sent", "complete", "failed"].includes(effect.state));
   }
 
@@ -1152,10 +1151,10 @@ export class Superagent {
     const held = this.store.inputs("main", "uncertain");
     const blocker = held[0];
     if (!blocker || this.store.getMeta(`head:hold-notice:${blocker.id}`)) return;
-    this.store.queueOutput({ id: `${input.id}:head-held`, sourceId: input.id, route: input.route,
-      text: `앞선 HEAD 요청 ${blocker.id} 의 결과가 불확실해 이 메시지와 뒤 HEAD 요청이 대기 중입니다. 다시 실행하지 않았습니다. 원래 작업을 확인한 뒤 /resolve ${blocker.id} 로 닫으면 순서대로 처리합니다.${held.length > 1 ? ` 다른 불확실한 요청: ${held.slice(1).map(other => other.id).join(", ")}.` : ""}` });
-    this.store.setMeta(`head:hold-notice:${blocker.id}`, input.id);
-    this.wakeOutputs();
+    if (this.store.recordHeadHoldNotice(blocker.id, { id: `${input.id}:head-held`, sourceId: input.id, route: input.route,
+      text: `앞선 HEAD 요청 ${blocker.id} 의 결과가 불확실해 이 메시지와 뒤 HEAD 요청이 대기 중입니다. 다시 실행하지 않았습니다. 원래 작업을 확인한 뒤 /resolve ${blocker.id} 로 닫으면 순서대로 처리합니다.${held.length > 1 ? ` 다른 불확실한 요청: ${held.slice(1).map(other => other.id).join(", ")}.` : ""}` })) {
+      this.wakeOutputs();
+    }
   }
 
   private async settledToolFreeHeadFailure(head: Live, input: InputRecord, state: RuntimeState): Promise<boolean> {
@@ -1167,7 +1166,7 @@ export class Superagent {
       || owner.sessionId !== state.sessionId || owner.sessionFile !== state.sessionFile) return false;
     try {
       const entries = successful(await head.connection.request({ type: "get_entries" }), "read HEAD failure evidence").entries;
-      return Array.isArray(entries) && this.toolFreeHeadFailure(input.id, headRecoveryEvidence(entries, owner), state.model);
+      return Array.isArray(entries) && this.toolFreeHeadFailure(input.id, headRecoveryEvidence(entries, owner));
     } catch (error) {
       // An unreadable journal proves nothing; the failure stays on hold.
       this.report(error);

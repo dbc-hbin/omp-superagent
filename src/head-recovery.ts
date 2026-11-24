@@ -61,7 +61,7 @@ export function headRecoveryEvidence(entries: unknown[], owner: Pick<HeadRecover
   // failed model replies without tool calls, native provider refusals and
   // usage records exist. An earlier tool, another request, an unknown journal
   // entry or anything after the receipt makes the effect history unproven.
-  const toolFreeFailure = frame.status === "error" && frame.sessionSettled === true && frame.agentInvoked === true
+  const settledToolFreeError = frame.status === "error" && frame.sessionSettled === true && frame.agentInvoked === true
     && sameRun && users.length === 1 && receiptIndex > latestStartIndex
     && slice.every((entry, index) => {
       if (entry.type === "model_usage" || entry === receipt) return true;
@@ -82,9 +82,17 @@ export function headRecoveryEvidence(entries: unknown[], owner: Pick<HeadRecover
       return message.role === "user" || message.role === "assistant" && message.stopReason === "error"
         && Array.isArray(message.content) && !message.content.some(part => object(part).type === "toolCall");
     });
+  const quotaLikeText = (value: unknown): boolean => typeof value === "string"
+    && /(?:usage_limit_reached|insufficient_quota|quota_exceeded|usage_limit|usage limit|quota)/i.test(value);
+  const quotaLikeFailure = quotaLikeText(error.message) || quotaLikeText(error.code) || quotaLikeText(error.type)
+    || slice.some(entry => {
+      if (entry.type !== "message") return false;
+      const message = object(entry.message);
+      return message.role === "assistant" && (quotaLikeText(message.errorMessage) || quotaLikeText(message.error));
+    });
   // The exact provider refused the entire turn for quota. A partial answer or
   // another provider's reply makes it something other than a quota hold.
-  const quotaFailure: HeadQuotaFailure | null = toolFreeFailure
+  const quotaFailure: HeadQuotaFailure | null = settledToolFreeError
     && error.provider === "openai-codex" && typeof error.model === "string" && error.model !== ""
     && error.retryable === false && typeof error.message === "string"
     // Stock OMP's RPC error lacks a structured quota code. Match either
@@ -99,6 +107,8 @@ export function headRecoveryEvidence(entries: unknown[], owner: Pick<HeadRecover
         && message.model === error.model && Array.isArray(message.content) && message.content.length === 0;
     })
     ? { failedAt, model: { provider: error.provider, id: error.model } } : null;
+  // Quota-like refusals stay held unless native quota recovery proves safe release.
+  const toolFreeFailure = settledToolFreeError && !quotaFailure && !quotaLikeFailure;
   const selected = [receipt, ...starts, ...assistants];
   if (selected.some(entry => typeof entry.id !== "string")) return null;
   const entryIds = [...new Set(selected.map(entry => String(entry.id)))];

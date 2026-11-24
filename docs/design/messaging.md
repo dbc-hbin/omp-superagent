@@ -206,10 +206,12 @@ after the settled receipt only usage records and native or extension `custom`
 entries (for example `session_exit`) are tolerated, never a later message, run
 or tool start.
 A started tool, a steered follow-up, an unknown journal entry, an unreadable
-journal or a provable quota hold keeps the input uncertain. That failure notice
-names the exact `/resolve <input-id>`, and the first new owner message held
-behind it receives one notice naming the blocking input. Later held messages
-receive no further notice for the same blocker.
+journal, or a quota or quota-like refusal (even after a restart `session_exit`,
+model change, or without a quota reader) keeps the input uncertain. That failure
+notice names the exact `/resolve <input-id>`, and the first new owner message
+held behind it atomically persists one hold notice and its marker naming the
+blocking input. Later held messages receive no further notice for the same
+blocker.
 
 `/resolve [input-id]` (`!resolve` in Slack) manually closes an uncertain head
 input as cancelled. A stalled lane exposes its exact input ID and queue blocker

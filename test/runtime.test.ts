@@ -2623,6 +2623,103 @@ describe("same-HEAD evidence recovery", () => {
     } finally { quotaReply.resolve(false); }
   });
 
+  test("a normal session_exit suffix after a quota refusal keeps the quota hold without closing as tool-free", async () => {
+    const now = Date.now();
+    const instance = fixture(3, undefined, { readHeadQuota: async () => false });
+    const { runtime, main, store } = instance;
+    main.state.model = { provider: quotaError.provider, id: quotaError.model };
+    const id = saved(instance, "quota-restarted");
+    main.entries = [
+      nativeEntry(main, "quota-start", "rpc_agent_start", quotaRun),
+      { id: "quota-user", type: "message", message: { role: "user", content: "Original authorized work" } },
+      { id: "quota-error", type: "message", message: { role: "assistant", provider: quotaError.provider,
+        model: quotaError.model, stopReason: "error", content: [] } },
+      { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { ...quotaRun,
+        frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error: quotaError } }),
+      timestamp: new Date(now - 1).toISOString() },
+      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal" } },
+      { id: "restart-context", type: "custom_message", customType: "extension-state-context", content: "state" },
+    ];
+    store.settle(id, "uncertain");
+    await runtime.start();
+    await admit(runtime, headMessage("after-restarted-quota"));
+    expect(store.input(id)?.state).toBe("uncertain");
+    expect(store.output(`${id}:tool-free-failure`)).toBeNull();
+    expect(store.input("after-restarted-quota")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+  });
+
+  test.each(["unavailable quota adapter", "changed HEAD model"] as const)(
+    "%s keeps a Codex quota failure held instead of closing as tool-free", async scenario => {
+    const now = Date.now();
+    const instance = scenario === "unavailable quota adapter"
+      ? fixture()
+      : fixture(3, undefined, { readHeadQuota: async () => true });
+    const { runtime, main, store, messenger } = instance;
+    main.state.model = scenario === "changed HEAD model"
+      ? { ...executionModel }
+      : { provider: quotaError.provider, id: quotaError.model };
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("quota-unverified", route("failed-route")));
+    const original = main.prompts[0];
+    if (!original) throw new Error("Original HEAD request was not admitted");
+    const frame = { type: "prompt_result", id: original.id, status: "error", agentInvoked: true, sessionSettled: true, error: quotaError };
+    main.entries[0] = nativeEntry(main, "quota-start", "rpc_agent_start", quotaRun);
+    main.entries.push(
+      { id: "quota-error", type: "message", message: { role: "assistant", provider: quotaError.provider,
+        model: quotaError.model, stopReason: "error", content: [] } },
+      { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { ...quotaRun, frame }), timestamp: new Date(now - 1).toISOString() },
+    );
+    main.state.isStreaming = false;
+    main.state.isSettled = true;
+    main.emit(frame);
+    await messenger.whenSent(1);
+    await admit(runtime, headMessage("after-unverified-quota", route("later-route")));
+    await runtime.kick();
+    expect(store.input("quota-unverified")?.state).toBe("uncertain");
+    expect(store.output("quota-unverified:tool-free-failure")).toBeNull();
+    expect(store.input("after-unverified-quota")?.state).toBe("pending");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id]);
+  });
+
+  test("a hold notice persisted before a crash reuses its snapshot after restart even if uncertain inputs change", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger, errors } = instance;
+    store.receive(headMessage("blocker-1", route("failed-route")), "main", { "user-source:blocker-1": "true" });
+    store.submit("blocker-1", "native-blocker-1", 0);
+    store.settle("blocker-1", "uncertain");
+
+    const waiting = headMessage("waiting-1", route("later-route"));
+    store.receive(waiting, "main", { "user-source:waiting-1": "true" });
+    store.queueOutput({ id: "waiting-1:head-held", sourceId: "waiting-1", route: route("later-route"),
+      text: "크래시 전 저장된 대기 안내 스냅샷" });
+    expect(store.getMeta("head:hold-notice:blocker-1")).toBeNull();
+
+    store.receive(headMessage("blocker-2", route("failed-route")), "main", { "user-source:blocker-2": "true" });
+    store.submit("blocker-2", "native-blocker-2", 0);
+    store.settle("blocker-2", "uncertain");
+
+    await runtime.start();
+    await messenger.whenSent(1);
+    await runtime.kick();
+
+    expect(errors).toEqual([]);
+    expect(messenger.sent.filter(output => output.id === "waiting-1:head-held")).toHaveLength(1);
+    expect(messenger.sent.find(output => output.id === "waiting-1:head-held")).toMatchObject({
+      sourceId: "waiting-1", route: route("later-route"), text: "크래시 전 저장된 대기 안내 스냅샷",
+    });
+    expect(store.getMeta("head:hold-notice:blocker-1")).toBe("waiting-1");
+    expect(store.input("waiting-1")?.state).toBe("pending");
+    expect(main.prompts).toEqual([]);
+
+    await admit(runtime, message("resolve-1", route("control-route"), "/resolve blocker-1"));
+    await admit(runtime, message("resolve-2", route("control-route"), "/resolve blocker-2"));
+    await main.whenPrompts(1);
+    expect(store.input("waiting-1")?.state).toBe("submitted");
+    expect(main.prompts[0]?.id).toBe(store.input("waiting-1")?.requestId ?? "missing");
+  });
+
   test("actual prompt acknowledgement loss uses durable receipts once, fences queued work, and notifies only the original route", async () => {
     const instance = fixture();
     const { runtime, main, store, messenger } = instance;
