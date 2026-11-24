@@ -2907,24 +2907,147 @@ describe("same-HEAD evidence recovery", () => {
     expect(store.outputs().map(output => output.id).filter(id => id.includes(":head-held"))).toHaveLength(2);
   });
 
-  test("a settled turn with an outstanding confirmation is held instead of closed", async () => {
+  test.each(["already pending", "observed during the journal read"] as const)(
+    "a settled HEAD confirmation %s keeps its original route and queued work waits", async timing => {
+      const instance = fixture();
+      const { runtime, main, store, messenger } = instance;
+      const origin = route("confirm-route");
+      const frame = { type: "extension_ui_request", id: "confirm-outstanding", method: "confirm",
+        title: "Finish the original request?", message: "This remains on the original route." };
+      main.journalLeaf = true;
+      await runtime.start();
+      await admit(runtime, headMessage("confirmation-held", origin));
+      if (timing === "already pending") main.state.pendingUiRequests = [frame];
+      else main.afterEntries = () => {
+        main.afterEntries = undefined;
+        main.state.pendingUiRequests = [frame];
+      };
+
+      // No UI event is delivered: Host state knows the dialog before fanout.
+      const original = await failHeadRun(instance);
+      await messenger.whenApproval();
+      const card = [...messenger.shown.values()][0]!;
+      expect(card).toMatchObject({ requestId: frame.id, route: origin, state: "pending" });
+      expect(store.input("confirmation-held")?.state).toBe("submitted");
+      expect(store.output("confirmation-held:answer")).toBeNull();
+
+      await admit(runtime, headMessage("after-confirmation", route("later-route")));
+      expect(store.input("after-confirmation")?.state).toBe("pending");
+      expect(main.prompts).toHaveLength(1);
+
+      messenger.dismissApproval = async () => { throw new Error("Messenger card cleanup failed"); };
+      if (timing === "already pending") {
+        main.state.pendingUiRequests = [];
+        main.emit({ type: "extension_ui_request", method: "cancel", targetId: frame.id });
+      } else {
+        // Stock can acknowledge a response without another lifecycle event.
+        main.uiResponse = (id, response) => {
+          main.responses.push({ id, response });
+          main.state.pendingUiRequests = [];
+        };
+        await expect(messenger.handlers!.answer(card.id, { confirmed: true }, origin))
+          .rejects.toMatchObject({ certainty: "uncertain" });
+        expect(main.responses).toEqual([{ id: frame.id, response: { confirmed: true } }]);
+      }
+      await main.whenPrompts(2);
+      expect(store.input("confirmation-held")?.state).toBe("cancelled");
+      expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id, store.input("after-confirmation")?.requestId ?? "missing"]);
+    },
+  );
+
+  test("a failed final state read and failed card presentation do not strand HEAD", async () => {
     const instance = fixture();
-    const { runtime, main, store } = instance;
+    const { runtime, main, store, messenger } = instance;
+    const failedRead = Promise.withResolvers<void>();
+    const origin = route("confirm-route");
+    const frame = { type: "extension_ui_request", id: "undeliverable-confirmation", method: "confirm",
+      title: "Original confirmation", message: "The messenger cannot present this card." };
     main.journalLeaf = true;
     await runtime.start();
-    await admit(runtime, headMessage("confirmation-held", route("confirm-route")));
-    main.state.pendingUiRequests = [{ id: "confirm-outstanding", method: "confirm" }];
+    await admit(runtime, headMessage("presentation-failed", origin));
+    messenger.showApproval = async approval => {
+      expect(approval.route).toEqual(origin);
+      throw new DeliveryError("Card presentation rejected", "rejected");
+    };
+    main.uiResponse = (id, response) => {
+      main.responses.push({ id, response });
+      main.state.pendingUiRequests = [];
+    };
+    main.afterEntries = () => {
+      main.afterEntries = undefined;
+      main.state.pendingUiRequests = [frame];
+      main.beforeState = () => {
+        main.beforeState = undefined;
+        failedRead.resolve();
+        throw new Error("Transient native state read failure");
+      };
+    };
+
+    const original = await failHeadRun(instance);
+    await failedRead.promise;
+    await admit(runtime, headMessage("after-failed-presentation", route("later-route")));
+    // No UI fanout or cancellation event arrives. A normal wake can re-read
+    // the dialog, and the explicit native cancellation must be sent once.
+    await main.whenPrompts(2);
+    expect(main.responses).toEqual([{ id: frame.id, response: { cancelled: true } }]);
+    expect(store.input("presentation-failed")?.state).toBe("cancelled");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id,
+      store.input("after-failed-presentation")?.requestId ?? "missing"]);
+  });
+
+  test.each(["hasPendingAsyncWork", "hasOwnedRunningWork"] as const)(
+    "HEAD stays uncertain when %s appears during the failure journal read", async activity => {
+      const instance = fixture();
+      const { runtime, main, store, messenger } = instance;
+      main.journalLeaf = true;
+      await runtime.start();
+      await admit(runtime, headMessage("async-failure"));
+      main.afterEntries = () => {
+        main.afterEntries = undefined;
+        main.state[activity] = true;
+      };
+      await failHeadRun(instance);
+      await messenger.whenSent(1);
+      expect(store.input("async-failure")?.state).toBe("uncertain");
+      expect(messenger.sent[0]?.text).toContain("/resolve async-failure");
+
+      await admit(runtime, headMessage("after-async-failure", route("later-route")));
+      expect(store.input("after-async-failure")?.state).toBe("pending");
+      expect(main.prompts).toHaveLength(1);
+    },
+  );
+
+  test("a native continuation reported by the final state supersedes the old failure", async () => {
+    const instance = fixture();
+    const { runtime, main, store, messenger } = instance;
+    const rechecked = Promise.withResolvers<void>();
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("continuing-failure"));
+    main.afterEntries = () => {
+      main.afterEntries = undefined;
+      // A continuation can be advertised before its agent_start fanout.
+      main.state.isSettled = false;
+      main.state.isStreaming = true;
+      main.beforeState = () => {
+        main.beforeState = undefined;
+        rechecked.resolve();
+      };
+    };
     await failHeadRun(instance);
-    await runtime.kick();
+    await rechecked.promise;
+    await admit(runtime, headMessage("after-continuation", route("later-route")));
+    expect(store.input("continuing-failure")?.state).toBe("submitted");
+    expect(store.input("after-continuation")?.state).toBe("pending");
+    expect(store.output("continuing-failure:answer")).toBeNull();
 
-    // The confirmation can still be answered, so the owner must stay held.
-    expect(store.input("confirmation-held")?.state).toBe("uncertain");
-    expect(store.output("confirmation-held:tool-free-failure")).toBeNull();
-
-    await admit(runtime, headMessage("after-confirmation", route("later-route")));
-    await runtime.kick();
-    expect(store.input("after-confirmation")?.state).toBe("pending");
-    expect(main.prompts).toHaveLength(1);
+    main.emit({ type: "agent_start" });
+    main.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop",
+      content: [{ type: "text", text: "The continuing run answered." }] } });
+    main.complete("The continuing run answered.");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]).toMatchObject({ sourceId: "continuing-failure", text: "The continuing run answered." });
+    expect(store.input("continuing-failure")?.state).toBe("done");
   });
 
   test("actual prompt acknowledgement loss uses durable receipts once, fences queued work, and notifies only the original route", async () => {

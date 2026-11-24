@@ -1178,26 +1178,21 @@ export class Superagent {
     }
   }
 
-  private async settledToolFreeHeadFailure(head: Live, input: InputRecord, state: RuntimeState): Promise<boolean> {
+  private async readSettledHeadFailure(head: Live, input: InputRecord, state: RuntimeState): Promise<ReturnType<typeof headRecoveryEvidence>> {
     const ownerRecord = this.store.getMeta(`head-native-owner:${input.id}`);
-    if (!ownerRecord) return false;
-    const owner = JSON.parse(ownerRecord) as
-      Pick<HeadRecoveryAttempt, "requestId" | "generation" | "sessionId" | "sessionFile" | "cursor">;
-    if (owner.requestId !== input.requestId || owner.generation !== input.generation
-      || owner.sessionId !== state.sessionId || owner.sessionFile !== state.sessionFile) return false;
+    if (!ownerRecord) return null;
     try {
+      const owner = JSON.parse(ownerRecord) as
+        Pick<HeadRecoveryAttempt, "requestId" | "generation" | "sessionId" | "sessionFile" | "cursor">;
+      if (owner.requestId !== input.requestId || owner.generation !== input.generation
+        || owner.sessionId !== state.sessionId || owner.sessionFile !== state.sessionFile
+        || owner.cursor !== null && typeof owner.cursor !== "string") return null;
       const entries = successful(await head.connection.request({ type: "get_entries" }), "read HEAD failure evidence").entries;
-      // The journal read is asynchronous: a confirmation or approval card can
-      // appear while it runs, and the evidence then describes a stale owner.
-      const settled = await this.state(head).catch(() => null);
-      if (!this.current(head) || !settled?.isSettled || head.preparing || head.input !== input
-        || settled.pendingUiRequests?.length || this.store.approvals(head.id).length
-        || this.store.input(input.id)?.state !== "submitted") return false;
-      return Array.isArray(entries) && this.toolFreeHeadFailure(input.id, headRecoveryEvidence(entries, owner));
+      return Array.isArray(entries) ? headRecoveryEvidence(entries, owner) : null;
     } catch (error) {
       // An unreadable journal proves nothing; the failure stays on hold.
       this.report(error);
-      return false;
+      return null;
     }
   }
 
@@ -6590,6 +6585,12 @@ export class Superagent {
         for (const live of this.live.values()) {
           if (live.releasing) {
             await this.release(live);
+          } else if (live.id === "main" && live.input && !live.preparing && !live.finishing
+            && live.result?.status === "error" && this.store.input(live.input.id)?.state === "submitted"
+            && !this.store.approvals(live.id).length && this.recoveryControllerIdle()) {
+            // Retry an unavailable state read or silent native UI close on the
+            // existing wake. Never repeat a dialog response or hold the pump.
+            this.background(this.finish(live));
           } else if (live.id !== "main" && live.input && !live.preparing && !live.finishing
             && (live.result || this.store.input(live.input.id)?.state === "cancelled")) {
             // An explicit resolution may have raced a failed native read. Revisit
@@ -7414,18 +7415,37 @@ export class Superagent {
     // observed assistant outcome; a zero-run refusal is not completion.
     const outcome = !settling ? undefined : cancelled ? "aborted" : result!.goalResume ? live.assistantOutcome?.status ?? "error"
       : live.assistantOutcome && live.assistantOutcome.run > 1 ? live.assistantOutcome.status : result!.status;
-    // A HEAD failure closes only on its exact native journal, read while this
-    // settled state is current and before this drain changes anything.
-    const readsFailure = live.id === "main" && outcome === "error" && !result!.goalResume && admissions.length === 1;
-    // A settled turn can still owe a supported extension confirmation or a
-    // durable approval card. Auto-closing it would drop the request and route
-    // those must be resolved on, so that close waits until both are clear.
-    const toolFree = readsFailure && !state.pendingUiRequests?.length && !this.store.approvals(live.id).length
-      && await this.settledToolFreeHeadFailure(live, input!, state);
-    // Either answer is stale once the awaited read let native or queue state move.
-    if (readsFailure && (!this.current(live) || live.preparing || live.input !== input
-      || admissions.length !== live.admitted.size || live.nativeVersion !== nativeVersion
-      || this.store.input(input!.id)?.state !== "submitted")) return;
+    let toolFree = false;
+    if (live.id === "main" && input && outcome === "error" && !result!.goalResume && admissions.length === 1) {
+      let confirmed: RuntimeState | null = state;
+      let evidence: ReturnType<typeof headRecoveryEvidence> = null;
+      if (this.recoveryIdle(state) && this.recoveryControllerIdle()) {
+        evidence = await this.readSettledHeadFailure(live, input, state);
+        confirmed = await this.state(live).catch(() => null);
+      }
+      // An awaited read can race a continuation, stop, or replaced Host.
+      if (!this.current(live) || live.preparing || live.input !== input
+        || admissions.length !== live.admitted.size || live.nativeVersion !== nativeVersion
+        || this.store.input(input.id)?.state !== "submitted") return;
+      // A settled failed admission kept for UI ownership is not steerable.
+      if (confirmed?.isSettled !== false) live.running = false;
+      const approvals = this.store.approvals(live.id);
+      if (confirmed?.pendingUiRequests?.length || approvals.length) {
+        // The Host state can expose a dialog before the observation fanout.
+        // Bind it while the original admission still owns the route. A native
+        // cancellation or acknowledged answer wakes settlement again.
+        for (const frame of confirmed?.pendingUiRequests ?? []) {
+          // Present a newly observed, supported dialog only. In particular a
+          // failed display leaves a durable cancellation, not a replay ticket.
+          if (frame.secret !== true && dialogs.has(String(frame.method)) && typeof frame.id === "string"
+            && !this.store.approval(`a-${key(`${live.id}:${live.generation}:${frame.id}`)}`)) this.background(this.frame(live, frame));
+        }
+        return;
+      }
+      if (!confirmed?.isSettled) return;
+      toolFree = confirmed.hostPid === state.hostPid && this.recoveryIdle(confirmed)
+        && this.recoveryControllerIdle() && this.toolFreeHeadFailure(input.id, evidence);
+    }
     const wasBusy = live.busy;
     live.busy = false;
     live.running = false;
@@ -7518,6 +7538,10 @@ export class Superagent {
     for (const frame of state.pendingUiRequests) await this.frame(live, frame);
   }
 
+  private wakeFailedHeadAfterUi(live: Live): void {
+    if (live.id === "main" && live.input && live.result?.status === "error") this.background(this.finish(live));
+  }
+
   private async frame(live: Live, frame: Record<string, unknown>): Promise<void> {
     if (!this.current(live)) return;
     // Recovery has no Messenger route and never answers/cancels native dialogs
@@ -7526,15 +7550,20 @@ export class Superagent {
     if (frame.method === "cancel") {
       const approval = this.store.approvals(live.id).find(approval => approval.generation === live.generation && approval.requestId === frame.targetId);
       if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
-      if (approval && this.store.resolveApproval(approval.id, live.generation, "cancelled")) {
-        if (!groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
-      }
+      const resolved = approval && this.store.resolveApproval(approval.id, live.generation, "cancelled");
+      this.wakeFailedHeadAfterUi(live);
+      if (approval && resolved && !groupRoom(this.config, approval.route)) await this.messenger.dismissApproval(approval);
       return;
     }
     if (!dialogs.has(String(frame.method)) || typeof frame.id !== "string") return;
+    const requestId = frame.id;
+    const cancelDialog = () => {
+      live.connection.uiResponse(requestId, { cancelled: true });
+      this.wakeFailedHeadAfterUi(live);
+    };
     if (frame.method === "ask" && live.id === "main" && live.input?.id.startsWith(laneDecisionReview)) {
       // The internal reviewer can escalate only the lane's original question.
-      live.connection.uiResponse(frame.id, { cancelled: true });
+      cancelDialog();
       return;
     }
     const id = `a-${key(`${live.id}:${live.generation}:${frame.id}`)}`;
@@ -7543,7 +7572,7 @@ export class Superagent {
     // An answered marker is written before the native effect. If its receipt
     // was lost, neither replay the response nor silently cancel that request.
     if (persisted?.state === "answered") return;
-    if (persisted && persisted.state !== "pending") { live.connection.uiResponse(frame.id, { cancelled: true }); return; }
+    if (persisted && persisted.state !== "pending") { cancelDialog(); return; }
     if (!persisted && !live.input && live.id !== "main" && this.store.hasTopicAdmission(live.id, live.generation)) {
       // Native UI frames have no prompt receipt ID. After a detached reconnect,
       // the lane's route does not prove which original topic owns this request.
@@ -7558,7 +7587,7 @@ export class Superagent {
       : this.store.input(reportApprovalSource)?.route);
     if (route && groupRoom(this.config, route)) {
       if (persisted) this.store.resolveApproval(persisted.id, live.generation, "cancelled");
-      live.connection.uiResponse(frame.id, { cancelled: true });
+      cancelDialog();
       return;
     }
     if (!route && live.id === "main" && this.store.hasInput("main", "uncertain")) return;
@@ -7574,8 +7603,9 @@ export class Superagent {
     }
     const held = live.id !== "main" && this.requireLane(live.id).workState !== "open";
     if (!route || held || frame.secret === true) {
-      live.connection.uiResponse(frame.id, { cancelled: true });
-      if (persisted && this.store.resolveApproval(persisted.id, live.generation, "cancelled")) await this.messenger.dismissApproval(persisted);
+      const resolved = persisted && this.store.resolveApproval(persisted.id, live.generation, "cancelled");
+      cancelDialog();
+      if (persisted && resolved) await this.messenger.dismissApproval(persisted);
       return;
     }
     const decision = decisionRequestId(frame);
@@ -7628,7 +7658,7 @@ export class Superagent {
       if (updated.state !== "pending") await this.messenger.dismissApproval(updated);
     } catch {
       this.store.resolveApproval(id, live.generation, "cancelled");
-      live.connection.uiResponse(approval.requestId, { cancelled: true });
+      cancelDialog();
       if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
       this.report(new Error(`Approval ${id} could not be presented; native request cancelled`));
     } finally { this.cards.delete(id); }
@@ -7706,6 +7736,7 @@ export class Superagent {
         if (live.id !== "main" && !live.input) this.background(this.syncLaneThreadTitle(this.requireLane(live.id)));
         if (live.input && this.store.hasInput(live.id, "pending")) this.background(this.kick());
       }
+      this.wakeFailedHeadAfterUi(live);
       if (!headSelection) await this.messenger.dismissApproval(this.store.approval(id)!);
     } catch (error) {
       if (attempted) throw new DeliveryError("Native approval outcome unresolved", "uncertain", undefined, { cause: error });

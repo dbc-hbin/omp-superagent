@@ -200,7 +200,10 @@ native run journal contains only its single prompt, failed model replies without
 tool calls, native `provider_refusal` entries and usage records closes as
 cancelled at settlement, with a failure notice and without replay. The same
 receipt identity, run ordinal, session and file binding as the quota rule
-applies, and every output of the input must have a terminal delivery state. An
+applies. Automatic closure requires that the native session still be idle
+after reading its journal and that every output have a terminal delivery
+state. An outstanding native confirmation retains its original owner route
+and delays settlement until the native dialog is answered or cancelled. An
 input already held after a restart closes the same way during reconciliation;
 after the settled receipt only usage records and native or extension `custom`
 entries (for example `session_exit`) are tolerated, never a later message, run
