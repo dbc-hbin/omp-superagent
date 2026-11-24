@@ -1,6 +1,6 @@
 /** Real OMP/Superkit extensions and tools; only the model transport is local. */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -13,7 +13,9 @@ export default function nativeUlwProvider(pi: ExtensionAPI): void {
   const root = process.env.OMP_NATIVE_GATEWAY_ROOT;
   const entrypoint = process.env.OMP_TEST_ULW_EXTENSION;
   assert(root && entrypoint, "Native SUPER provider requires an explicitly opted-in private fixture");
-  const skill = readFileSync(join(dirname(entrypoint), "skills/ultrawork/SKILL.md"), "utf8");
+  // SUPER-era Superkit ships the directive in its canonical super skill.
+  const canonical = join(dirname(entrypoint), "skills/super/SKILL.md");
+  const skill = readFileSync(existsSync(canonical) ? canonical : join(dirname(entrypoint), "skills/ultrawork/SKILL.md"), "utf8");
   const directive = /<ultrawork-mode>([\s\S]*?)<\/ultrawork-mode>/.exec(skill)?.[1];
   assert(directive?.trim(), "Live proof requires Superkit's installed ultrawork directive");
   const expectedBlock = `<omp-ulw-policy>\n<ultrawork-mode>${directive}</ultrawork-mode>\n</omp-ulw-policy>`;

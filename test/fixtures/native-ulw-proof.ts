@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseSessionEntries, type FileEntry } from "@oh-my-pi/pi-coding-agent";
@@ -179,7 +180,8 @@ export async function runNativeUlwProof(options: {
         const command = skill === "ulw-plan" ? "super-plan" : "super-run";
         const directive = record.directives[0];
         assert(directive?.startsWith(`<omp-${skill}-pointer>`) && directive.includes(command)
-          && directive.includes(path.join(skillRoot, skill, "SKILL.md")),
+          // SUPER-era Superkit points at the canonical skill; the tag keeps the legacy name.
+          && directive.includes(path.join(skillRoot, existsSync(path.join(skillRoot, "super", "SKILL.md")) ? command : skill, "SKILL.md")),
           `Actual ${record.role} directive must point from ${command} to its installed ${skill} skill`);
       }
     }
