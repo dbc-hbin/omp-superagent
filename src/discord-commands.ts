@@ -2,15 +2,15 @@ import {
   ApplicationCommandOptionType, ApplicationCommandType, ApplicationIntegrationType, InteractionContextType,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
-import { MESSENGER_COMMANDS } from "./messenger-commands";
+import { MESSENGER_COMMAND_CATALOG } from "./messenger-commands";
 
 /** The complete supported slash-command picker, also used for registration. */
-export const DISCORD_COMMANDS: readonly RESTPostAPIChatInputApplicationCommandsJSONBody[] = MESSENGER_COMMANDS.map(
-  (command): RESTPostAPIChatInputApplicationCommandsJSONBody => ({
-  type: ApplicationCommandType.ChatInput, name: command.name, description: command.description,
+export const DISCORD_COMMANDS: readonly RESTPostAPIChatInputApplicationCommandsJSONBody[] = MESSENGER_COMMAND_CATALOG.map(command => ({
+  type: ApplicationCommandType.ChatInput, name: command.name, description: command.discord?.description ?? command.description,
   contexts: [InteractionContextType.Guild, InteractionContextType.BotDM],
   integration_types: [ApplicationIntegrationType.GuildInstall],
-  ...(command.text !== undefined ? { options: [{ type: ApplicationCommandOptionType.String, name: "text", description: command.text, required: false }] } : {}),
+  ...(command.discord?.text !== false && command.text !== undefined
+    ? { options: [{ type: ApplicationCommandOptionType.String, name: "text", description: command.text, required: false }] } : {}),
 }));
 
 /** Reject stale registrations/options instead of silently executing a different command. */

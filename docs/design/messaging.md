@@ -351,7 +351,12 @@ on the same route.
 The interaction pattern was compared with [Hermes Agent at 242315ce](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/gateway/slash_commands_model.py#L516-L567);
 the catalogue and mutation remain native OMP, and no upstream picker code is used.
 
-`/usage reset` chooses an exact linked account from the configured OMP profile.
+The reset picker chooses an exact linked account from the configured OMP profile.
+Discord accepts the argumentless `/usage-reset` command in its picker and in
+authorized messages. `/usage` only reads quotas. The Gateway rejects stale
+`/usage` interactions carrying options; HEAD refuses legacy `/usage reset`
+messages as invalid controls, not model or lane requests. Edits cannot open
+the reset picker. Telegram and Slack keep their existing reset syntax.
 The first click only changes the displayed card revision; Confirm on that
 revision is the only action that admits a reset request. Cancel closes the card
 without admitting any request. The head checks the original sent card and live

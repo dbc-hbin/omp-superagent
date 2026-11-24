@@ -377,7 +377,9 @@ worker. That is not a stop command for an already running lane.
   with `/head` to switch its own model after that turn. Global preset changes
   require explicit `--global`. Slack's message commands use `!`.
 - `/usage` shows masked account names, quotas, and reset times for built-in and extension-provided usage sources reported by stock OMP, without a model turn.
-- `/usage reset` shows saved reset tickets by account. Select an account and choose **Confirm**
+- `/usage-reset` shows saved reset tickets by account in Discord's slash picker or chat.
+  On Telegram use `/usage reset`; on Slack use `!usage reset` or `/superagent-usage reset`.
+  Select an account and choose **Confirm**
   to spend one available ticket; this requires stock OMP with account-targeted reset support.
   Separately, after a proven Codex quota rejection with no tool calls or partial answer,
   HEAD releases later queued requests when fresh usage evidence confirms recovery. It does

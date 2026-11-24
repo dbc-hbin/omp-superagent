@@ -8,6 +8,7 @@ import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequ
 import { physicalRoute, physicalRouteKey, routeKey } from "../src/contracts";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { type Config, hostPaths } from "../src/config";
+import { parseDiscordCommand } from "../src/discord-commands";
 import type { HostOptions } from "../src/host";
 import { DeliveryError } from "../src/delivery";
 import { createGatewayMessenger, type GatewayHeadMessenger } from "../src/gateway-client";
@@ -5651,6 +5652,40 @@ describe("messenger head session controls", () => {
 });
 
 describe("priority native head commands", () => {
+  test("Discord refuses spaced reset on a bound thread and does not execute reset edits", async () => {
+    const { runtime, config, store, messenger, directory, main, launched } = fixture();
+    const executable = join(directory, "unexpected-reset-cli");
+    writeFileSync(executable, "#!/bin/sh\ntouch reset-invoked\nexit 1\n", { mode: 0o700 });
+    config.command = [executable];
+    const destination = route("12");
+    const lane = savedLane(store, config, "usage-thread", destination);
+    await runtime.start();
+    const quotas = message("1750000000000000041", destination, "/usage");
+    await admit(runtime, quotas);
+    expect(store.input(quotas.id)).toMatchObject({ target: "main", state: "done" });
+    expect(messenger.sent.find(output => output.sourceId === quotas.id)?.text).toContain("OMP 사용량");
+
+    for (const legacy of [
+      message("1750000000000000042", destination, "/usage reset"),
+      applicationCommand("1750000000000000043", destination, "/usage reset"),
+    ]) {
+      await admit(runtime, legacy);
+      expect(store.input(legacy.id)).toMatchObject({ target: "main", state: "cancelled" });
+      expect(messenger.sent.find(output => output.sourceId === legacy.id)?.text).toContain("/usage-reset");
+    }
+
+    for (const [id, text] of [[quotas.messageId, "/usage reset"], ["1750000000000000044", "/usage-reset"]] as const) {
+      const edit = { ...message(id, destination, text), id: `discord:2:${id}:edit:1750000001:changed` };
+      await admit(runtime, edit);
+      expect(store.input(edit.id)).toMatchObject({ target: "main", state: "cancelled" });
+    }
+    expect(messenger.sent.every(output => !output.picker && routeKey(output.route) === routeKey(destination))).toBe(true);
+    expect(launched).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(store.laneForRoute(destination)?.id).toBe(lane.id);
+    expect(await Bun.file(join(directory, "reset-invoked")).exists()).toBe(false);
+  });
+
   test("restart cannot hand off while a confirmed OMP reset is spending", async () => {
     const { runtime, config, store, messenger, directory, requests, handoff } = restartFixture();
     const started = Promise.withResolvers<void>();
@@ -5692,7 +5727,7 @@ esac
 `, { mode: 0o700 });
     try {
       await runtime.start();
-      await admit(runtime, message("reset-before-restart", route(), "/usage reset"));
+      await admit(runtime, message("reset-before-restart", route(), "/usage-reset"));
       const card = messenger.sent.find(output => output.sourceId === "reset-before-restart");
       if (!card?.picker) throw new Error("Expected a sent reset picker");
       const click = pickerClick(card, 0, 0);
@@ -5762,14 +5797,21 @@ case "$*" in
   *) exit 2 ;;
 esac
 `, { mode: 0o700 });
+    const discordRoute = route("12");
+    const lane = outcome === "unconfirmed" ? null : savedLane(store, config, "usage-thread", discordRoute);
     await runtime.start();
     const slackRoute = route("1750000000.000001", { platform: "slack", accountId: "TTEAM:UBOT",
       authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" });
+    const discordReset = parseDiscordCommand("usage-reset", []);
+    if (discordReset === null) throw new Error("Discord must advertise an argumentless reset command");
     const open = outcome === "unconfirmed" ? message("1750000000.000010", slackRoute, "/usage reset")
-      : applicationCommand("1750000000000000041", route("12"), "/usage reset");
+      : applicationCommand("1750000000000000041", discordRoute, discordReset);
     await admit(runtime, open);
+    expect(store.input(open.id)).toMatchObject({ target: "main", state: "done" });
     const card = messenger.sent.find(output => output.sourceId === open.id);
     if (card?.picker?.kind !== "usage-reset") throw new Error("Expected a sent reset picker");
+    expect(card.route).toEqual(open.route);
+    if (lane) expect(store.laneForRoute(open.route)).toMatchObject({ id: lane.id, runtimeState: "unloaded", workState: "open" });
     expect(card.text).toContain("사용 가능 계정 2개 · 지금 사용 가능 3개");
     expect(card.text).toContain("계정 1개는 합계에서 제외");
     const banked = messenger.sent.find(output => output.id === `${open.id}:usage-reset-banked`);
@@ -5787,7 +5829,8 @@ esac
     await expect(runtime.receive(click)).rejects.toThrow();
     await expect(runtime.receive({ ...confirmed, route: { ...open.route, threadId: "13" } })).rejects.toThrow();
     await expect(runtime.receive({ ...confirmed, route: { ...open.route, authorityId: "8" } })).rejects.toThrow();
-    await admit(runtime, { ...message("usage-reset-text-target", open.route, "/usage reset anthropic/9"),
+    const typedTarget = outcome === "unconfirmed" ? "/usage reset anthropic/9" : "/usage-reset anthropic/9";
+    await admit(runtime, { ...message("usage-reset-text-target", open.route, typedTarget),
       ...(outcome === "unconfirmed" ? { messageId: "1750000000.000002" } : {}) });
     expect(await Bun.file(join(directory, "attempts")).exists()).toBe(false);
 
@@ -5840,7 +5883,7 @@ case "$*" in
 esac
 `, { mode: 0o700 });
     await runtime.start();
-    const open = message(`usage-reset-${state}`, route(), "/usage reset");
+    const open = message(`usage-reset-${state}`, route(), "/usage-reset");
     await admit(runtime, open);
     const output = messenger.sent.find(item => item.sourceId === open.id);
     expect(output?.picker).toBeUndefined();

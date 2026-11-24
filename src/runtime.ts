@@ -58,7 +58,7 @@ const presetSyncMaxRetries = 5;
 // auto-compaction fires, matching host-extension.ts, Gateway rotation.rs, and DESIGN.md.
 const HEAD_ROTATION_CONTEXT_PERCENT = 50;
 const headPickerLifetimeMs = 5 * 60_000;
-const headControlPattern = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/;
+const headControlPattern = /^\/(help|status|stop|restart|context|compact|usage|usage-reset|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/;
 const dialogs = new Set(["select", "confirm", "input", "editor", "ask"]);
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 40 * 1024 * 1024;
@@ -120,9 +120,14 @@ function messengerEdit(input: Inbound): boolean {
   return input.id.startsWith(`${platform}:${scope}:${input.messageId}:edit:`);
 }
 
-function codeHandledControl(text: string): boolean {
+function matchHeadControl(text: string, platform: Route["platform"]): RegExpExecArray | null {
+  const match = headControlPattern.exec(text.trim());
+  return match?.[1] === "usage-reset" && platform !== "discord" ? null : match;
+}
+
+function codeHandledControl(text: string, platform: Route["platform"]): boolean {
   const command = text.trim();
-  return command === "/resume" || headControlPattern.test(command) || prModeArgument(command) !== null;
+  return command === "/resume" || matchHeadControl(command, platform) !== null || prModeArgument(command) !== null;
 }
 
 export interface RuntimeState {
@@ -253,10 +258,20 @@ interface DmCommandBoundary {
 }
 const laneDecisionReview = "lane-decision-review:";
 interface HeadCommand {
-  name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "model" | "effort" | "resolve" | "cron";
+  name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "usage-reset" | "model" | "effort" | "resolve" | "cron";
   argument: string;
   readonly picker?: true;
 }
+
+function matchesUsageReset(command: HeadCommand, platform: Route["platform"]): boolean {
+  return platform === "discord" ? command.name === "usage-reset" && !command.argument
+    : command.name === "usage" && command.argument === "reset";
+}
+
+function usageResetHint(platform: Route["platform"]): string {
+  return platform === "discord" ? "/usage-reset" : platform === "slack" ? "!usage reset" : "/usage reset";
+}
+
 interface HeadRestart extends GatewayRestartRequest {
   ownerPid: number;
   sessionId: string;
@@ -2141,7 +2156,7 @@ export class Superagent {
     input: Inbound,
     queue: readonly Inbound[],
   ): { readonly priority: "immediate" | "retry"; readonly laneId?: string } | null {
-    const control = headControlPattern.exec(input.text.trim());
+    const control = matchHeadControl(input.text, input.route.platform);
     const name = control?.[1];
     if (!control || name !== "restart" && name !== "stop" || input.pickerSelection
       || messengerEdit(input) || !authorizeRoute(this.config, input.route)) return null;
@@ -2267,7 +2282,7 @@ export class Superagent {
         ? picker?.groups[selection.group]?.options[selection.option] : undefined;
       const reset = picker?.kind === "usage-reset";
       const matchesOpener = reset
-        ? opener?.name === "usage" && opener.argument === "reset" && !opener.picker
+        ? opener && matchesUsageReset(opener, input.route.platform) && !opener.picker
           && selection.confirmed === true && selection.group === 0
         : opener?.name === picker?.kind && opener?.argument === "" && selection.confirmed === undefined;
       if (!output || !picker || !matchesOpener || !argument
@@ -2277,7 +2292,9 @@ export class Superagent {
         || input.text !== "" || input.attachments.length) {
         throw new DeliveryError("Picker selection does not match its original owner command and card", "rejected");
       }
-      return { ...input, route: output.route, text: reset ? "/usage reset" : `/${picker.kind} ${argument}` };
+      const text = reset ? (output.route.platform === "discord" ? "/usage-reset" : "/usage reset")
+        : `/${picker.kind} ${argument}`;
+      return { ...input, route: output.route, text };
     }
     return input;
   }
@@ -2299,7 +2316,7 @@ export class Superagent {
     const replyRoute = slackRoot ? { ...physicalRoute(input.route), threadId: null } : input.route;
     const replyId = input.reply?.messageId ?? slackRoot;
     const discordEdit = input.route.platform === "discord" && editEvent;
-    const query = !selection && !discordEdit && !headAddressed && !codeHandledControl(input.text)
+    const query = !selection && !discordEdit && !headAddressed && !codeHandledControl(input.text, input.route.platform)
       && candidate && !this.store.input(input.id)
       && !(input.messageId && this.store.firstAdmittedMessage(input.route, input.messageId))
       && !(input.reply && this.store.repliedTopicWorkspace(input.route, input.reply.messageId))
@@ -2362,7 +2379,7 @@ export class Superagent {
       input = { ...input, route: priorRevision.route };
       if (this.store.getMeta(`topic-confirm:${priorRevision.id}`) !== null || editsTopicPlacement(placementText(priorRevision), placement)) {
         metadata = { [`dm:control-edit:${input.id}`]: "true" };
-      } else if (codeHandledControl(priorRevision.text) || codeHandledControl(input.text)) {
+      } else if (codeHandledControl(priorRevision.text, priorRevision.route.platform) || codeHandledControl(input.text, input.route.platform)) {
         metadata = { [`dm:control-edit:${input.id}`]: "command" };
       } else if (priorRevision.target === "main" && this.isDm(priorRevision.route) && !headAddressed) {
         const placed = this.store.headLanePlacement(priorRevision.id);
@@ -2417,7 +2434,7 @@ export class Superagent {
       }
       input = { ...input, route: topicId ? { ...physical, topicId } : physical };
     }
-    if (!priorRevision && editEvent && codeHandledControl(input.text)) {
+    if (!priorRevision && editEvent && codeHandledControl(input.text, input.route.platform)) {
       metadata = { ...metadata, [`dm:control-edit:${input.id}`]: "command" };
     }
     const workspace = request.cwd === null ? null : existingWorkspace(request.cwd);
@@ -2445,7 +2462,7 @@ export class Superagent {
     }
     const commandText = placement.trim();
     const ordinary = !headAddressed && !selection && !metadata[`dm:control-edit:${input.id}`]
-      && !codeHandledControl(commandText) && !["/main", "/new"].includes(commandText);
+      && !codeHandledControl(commandText, input.route.platform) && !["/main", "/new"].includes(commandText);
     if (ordinary && (priorRevision?.target !== "main" || priorOwner)) {
       const keepThread = discordWorkThread(input.route) && !newTopic && Boolean(bound || opening);
       const sibling = !keepThread && !this.isDm(input.route) && !!input.route.threadId
@@ -4657,7 +4674,7 @@ export class Superagent {
     const mode = prModeArgument(input.text);
     if (mode && this.store.getMeta(`user-source:${input.id}`) === "true" && !this.store.getMeta(`handoff-source:${input.id}`))
       return { name: "cron", argument: mode };
-    const match = headControlPattern.exec(input.text.trim());
+    const match = matchHeadControl(input.text, input.route.platform);
     if (!match || this.store.getMeta(`user-source:${input.id}`) !== "true"
       || this.store.getMeta(`handoff-source:${input.id}`)) return null;
     return { name: match[1] as HeadCommand["name"], argument: (match[2] ?? "").trim(),
@@ -5253,7 +5270,7 @@ export class Superagent {
     // /resolve mutates only the durable ledger, never native session state, so it
     // must stay available while the HEAD is busy or its native state is unknown.
     return command.name === "resolve" || ["help", "status", "context"].includes(command.name)
-      || command.name === "usage" && !command.picker
+      || (command.name === "usage" || command.name === "usage-reset") && !command.picker
       || command.name === "effort" && !command.argument
       || !!preset && (!!preset.error || !preset.name)
       || command.name === "model" && ["", "list"].includes(command.argument);
@@ -5311,7 +5328,7 @@ export class Superagent {
         "Supported owner commands (Slack uses ! instead of /, e.g. !status):",
         "/help; /status; /context — read current shared HEAD, even while busy; no model turn.",
         "/usage — view account quotas and reset times from the configured OMP profile; no model turn.",
-        "/usage reset — list usable saved reset tickets. Choose an account and use Confirm to spend one ticket on it. Slack: !usage reset or /superagent-usage reset.",
+        `${usageResetHint(input.route.platform)}${input.route.platform === "slack" ? " or /superagent-usage reset" : ""} — list usable saved reset tickets. Choose an account and use Confirm to spend one ticket on it.`,
         "/model and /effort open selection menus. Text commands: /model list; /model <exact provider/id>; /model preset; /model preset list; /model preset <exact-name>; /effort <advertised-level>. Changes require idle, unambiguous HEAD state.",
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
@@ -5717,11 +5734,11 @@ export class Superagent {
 
   private uncertainUsageReset(input: InputRecord): string {
     const prefix = input.route.platform === "slack" ? "!" : "/";
-    return `OMP가 리셋권 사용을 확인하지 못했습니다. 자동으로 재시도하지 않았습니다. \`${prefix}usage reset\`으로 남은 리셋권을 확인한 뒤 \`${prefix}resolve ${input.id}\`로 보류를 해제할 수 있습니다.`;
+    return `OMP가 리셋권 사용을 확인하지 못했습니다. 자동으로 재시도하지 않았습니다. \`${usageResetHint(input.route.platform)}\`으로 남은 리셋권을 확인한 뒤 \`${prefix}resolve ${input.id}\`로 보류를 해제할 수 있습니다.`;
   }
 
-  private async usageControl(input: InputRecord, argument: string): Promise<void> {
-    if (!argument) {
+  private async usageControl(input: InputRecord, command: HeadCommand): Promise<void> {
+    if (command.name === "usage" && !command.argument) {
       let text: string;
       try { text = await this.adapters.readOmpUsage(this.config); }
       catch {
@@ -5732,12 +5749,12 @@ export class Superagent {
       this.controlReply(input, text);
       return;
     }
-    if (argument !== "reset") {
-      this.controlReply(input, "Invalid syntax. Use /usage or /usage reset. A ticket can only be spent from the confirmation card.", "cancelled");
+    const resetCommand = usageResetHint(input.route.platform);
+    if (!matchesUsageReset(command, input.route.platform)) {
+      const resetInput = input.route.platform === "discord" ? resetCommand : "/usage reset";
+      this.controlReply(input, `Invalid syntax. Use /usage or ${resetInput}. A ticket can only be spent from the confirmation card.`, "cancelled");
       return;
     }
-    const prefix = input.route.platform === "slack" ? "!" : "/";
-    const resetCommand = `${prefix}usage reset`;
     const savedKey = this.store.getMeta("usage-reset:identity-key");
     const identityKey = savedKey ?? crypto.randomUUID();
     if (savedKey === null) this.store.setMeta("usage-reset:identity-key", identityKey);
@@ -5853,7 +5870,7 @@ export class Superagent {
       return;
     }
     if (command.name === "cron") { this.cronControl(input.id, command.argument); return; }
-    if (command.name === "usage") { await this.usageControl(input, command.argument); return; }
+    if (command.name === "usage" || command.name === "usage-reset") { await this.usageControl(input, command); return; }
     if (command.name === "restart") {
       if (this.restartActive === input.id || this.admitRestart(input, command)) await this.runHeadRestart(input);
       return;

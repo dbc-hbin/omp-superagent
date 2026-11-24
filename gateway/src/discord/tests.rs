@@ -367,6 +367,47 @@ async fn discord_review_table_posts_stacked_markdown_in_order_without_touching_c
 }
 
 #[tokio::test]
+async fn usage_interactions_and_text_reach_the_original_discord_thread_without_stale_options() {
+    let (_temporary, store, hub, ws, mut observed, _, server) =
+        discord_fixture(json!({"discord":{}})).await;
+    let mut socket = addressing_tests::start(&hub, &ws, false).await;
+    for (sequence, id, data, expected) in [
+        (3, "501", json!({"type":1,"name":"usage"}), Some("/usage")),
+        (4, "502", json!({"type":1,"name":"usage-reset"}), Some("/usage-reset")),
+        (5, "503", json!({"type":1,"name":"usage","options":[{"type":3,"name":"text","value":" reset "}]}), None),
+        (6, "504", json!({"type":1,"name":"usage-reset","options":[{"type":3,"name":"text","value":"anthropic/9"}]}), None),
+    ] {
+        let application = json!({"application_id":"72","guild_id":"77","member":{"user":{"id":"42"}},
+            "channel":{"id":"90"},"token":"offline-interaction","type":2,"id":id,"data":data});
+        dispatch(&mut socket, sequence, "INTERACTION_CREATE", application).await;
+        let ack = received(&mut observed, &format!("/interactions/{id}/offline-interaction/callback")).await;
+        assert_eq!(ack["data"]["flags"], 64);
+        if let Some(expected) = expected {
+            let admitted = event(&hub, &store).await;
+            let input = &admitted["input"];
+            assert_eq!(input["text"], expected);
+            assert_eq!(input["messageId"], Value::Null);
+            assert_eq!(input["interactionId"], id);
+            assert_eq!(input["route"]["channelId"], "88");
+            assert_eq!(input["route"]["threadId"], "90");
+            assert!(input.get("pickerSelection").is_none());
+        } else {
+            assert_eq!(store.pending().unwrap(), 0, "stale usage options must never reach HEAD");
+        }
+    }
+
+    for (sequence, id, text) in [(7, "205", "/usage-reset"), (8, "206", "/usage reset")] {
+        dispatch(&mut socket, sequence, "MESSAGE_CREATE", message(id, Some("77"), "90", "42", text)).await;
+        let admitted = event(&hub, &store).await;
+        assert_eq!(admitted["input"]["text"], text);
+        assert_eq!(admitted["input"]["route"]["threadId"], "90");
+        assert_eq!(admitted["input"]["messageId"], id);
+    }
+    hub.stop().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     let (_temporary, store, hub, ws, mut observed, last_card, server) =
         discord_fixture(json!({"discord":{}})).await;
@@ -607,11 +648,11 @@ async fn websocket_ingress_and_rest_cards_keep_original_discord_identity() {
     assert_eq!(store.pending().unwrap(), 0);
 
     dispatch(&mut socket, 1218, "INTERACTION_CREATE", interaction("515", 2, json!({
-        "type":1,"name":"usage","options":[{"type":3,"name":"text","value":" reset "}]
+        "type":1,"name":"usage-reset"
     }))).await;
     received(&mut observed, "/interactions/515/offline-interaction/callback").await;
     let reset = event(&hub, &store).await;
-    assert_eq!(reset["input"]["text"], "/usage reset");
+    assert_eq!(reset["input"]["text"], "/usage-reset");
     assert_eq!(reset["input"]["messageId"], Value::Null);
     let label = "Codex · 계정 #7 · 사용 가능 2개";
     hub.effect("send", &[json!({

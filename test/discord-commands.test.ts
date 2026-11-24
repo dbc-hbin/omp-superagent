@@ -6,6 +6,7 @@ describe("Discord command catalog", () => {
   test("registers only supported Superagent commands for guild installs and owner bot DMs", () => {
     expect(DISCORD_COMMANDS.map(command => command.name)).toEqual([
       "help", "head", "status", "restart", "context", "usage", "cron", "resume", "resolve", "main", "model", "effort", "compact", "stop", "new",
+      "usage-reset",
     ]);
     for (const command of DISCORD_COMMANDS) {
       expect(command.type).toBe(ApplicationCommandType.ChatInput);
@@ -14,7 +15,7 @@ describe("Discord command catalog", () => {
       expect(command.contexts).toEqual([InteractionContextType.Guild, InteractionContextType.BotDM]);
       expect(command.integration_types).toEqual([ApplicationIntegrationType.GuildInstall]);
       expect(parseDiscordCommand(command.name, [])).toBe(`/${command.name}`);
-      if (["head", "model", "effort", "compact", "stop", "new", "resolve", "cron", "usage"].includes(command.name)) {
+      if (["head", "model", "effort", "compact", "stop", "new", "resolve", "cron"].includes(command.name)) {
         expect(command.options).toEqual([{
           name: "text", type: ApplicationCommandOptionType.String, description: expect.any(String), required: false,
         }]);
@@ -27,14 +28,14 @@ describe("Discord command catalog", () => {
     expect(parseDiscordCommand(name, [{ name: "text", type: ApplicationCommandOptionType.String, value: "  first line\nsecond line  " }])).toBe(`/${name} first line\nsecond line`);
   });
 
-  test("the registered usage command accepts reset and preserves argumentless quota lookup", () => {
-    expect(parseDiscordCommand("usage", [{ name: "text", type: ApplicationCommandOptionType.String, value: "reset" }])).toBe("/usage reset");
-    expect(parseDiscordCommand("usage", [])).toBe("/usage");
+  test("Discord usage and usage-reset both reject stale options", () => {
+    expect(parseDiscordCommand("usage-reset", [{ name: "text", type: ApplicationCommandOptionType.String, value: "anthropic/9" }])).toBeNull();
+    expect(parseDiscordCommand("usage", [{ name: "text", type: ApplicationCommandOptionType.String, value: "reset" }])).toBeNull();
   });
 
   test("rejects unknown commands and every stale option shape instead of ignoring data", () => {
     const text = { name: "text", type: ApplicationCommandOptionType.String, value: "high" };
-    for (const name of ["hermes", "clear", "models", "STATUS", "/status", "status\n", ""]) {
+    for (const name of ["hermes", "clear", "models", "usage reset", "STATUS", "/status", "status\n", ""]) {
       expect(parseDiscordCommand(name, [])).toBeNull();
     }
     for (const name of ["help", "status", "restart", "context", "resume", "main"]) {

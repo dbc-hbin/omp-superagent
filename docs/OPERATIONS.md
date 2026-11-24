@@ -332,8 +332,10 @@ export DISCORD_BOT_TOKEN
 위 입력은 Bash에서 토큰이 화면과 명령 이력에 노출되지 않게 받는 예다.
 프로세스는 현재 사용자 권한과 환경을 사용한다. 레인과 worktree는 보안 샌드박스가 아니다.
 
-Discord 자동완성 목록은 명시적으로 등록한다. 먼저 새 interaction 처리 코드가 실행되는
-Gateway를 사용해야 한다. 작업 중인 헤드를 강제 종료해서 업데이트하지 않는다.
+Discord 자동완성 목록은 명시적으로 등록한다. 명령을 등록하기 전에 Gateway와 HEAD 모두
+새 버전으로 실행 중이어야 한다. Gateway만 교체하면 기존 HEAD에 재연결될 수 있다.
+Discord에서 `/help`를 보내 `/usage-reset`이 표시되는지 확인한다. 표시되지 않으면
+등록하지 말고 HEAD 업데이트를 먼저 마친다. 작업 중인 HEAD를 강제 종료하지 않는다.
 
 ```sh
 bun --no-env-file src/cli.ts discord-commands --config config.local.json
@@ -342,7 +344,7 @@ bun --no-env-file src/cli.ts discord-commands --config config.local.json --apply
 
 첫 명령은 읽기 전용 변경 확인이다. `--apply`는 **이 봇의 전역 명령 목록 전체를 교체**하므로
 전용 Superagent 앱에서만 사용한다. Hermes 전용 명령은 제거하고 `/head`를 포함한
-[공통 명령 목록](../src/messenger-command-catalog.json)만 등록한다.
+[공통 명령 목록과 Discord 전용 `/usage-reset`](../src/messenger-command-catalog.json)을 등록한다.
 별도 guild 명령이 전역 명령을 가리는 경우 몰래 삭제하지 않고 충돌을 알린다.
 등록은 모델·메신저 연결을 시작하지 않으며 setup·doctor·start의 부수 효과로 실행되지 않는다.
 인수가 있는 명령은 선택적인 `text` 필드를 사용한다. 예를 들어 `/model`의 `text`에
@@ -1189,7 +1191,7 @@ head SHA를 사용한다. GitHub가 원자적으로 비교하는 값은 head SHA
 | `/restart` | 바쁜 헤드를 체크포인트한 뒤 Gateway와 헤드 교체. 원래 대화 ACK·실제 안전한 종료 확인, 같은 세션/모델 복원, 안전한 goal 재개. 레인은 유지하며 불확실한 효과는 보류 |
 | `/context` | 헤드 native 컨텍스트 사용량·한도 조회. 추정치·미상은 그대로 표시 |
 | `/usage` | 설정한 프로필의 순정 `omp usage`에서 제공자별 계정 한도·사용량·리셋 시각 조회. 세션 토큰·비용 통계가 아님 |
-| `/usage reset` | 지금 쓸 수 있는 리셋권의 계정별·전체 개수 조회. 계정을 고른 뒤 Confirm을 눌러야 그 계정의 리셋권 1개 사용 |
+| `/usage-reset` (Discord), `/usage reset` (Telegram), `!usage reset` (Slack) | 지금 쓸 수 있는 리셋권의 계정별·전체 개수 조회. 계정을 고른 뒤 Confirm을 눌러야 그 계정의 리셋권 1개 사용 |
 | `/compact [보존할 내용]` | 유휴 헤드의 native 컨텍스트 압축. 여러 줄 보존 지시 전달 가능 |
 | `/stop` | 연결된 레인은 일시정지. 미배정 대화에서는 경로 질문이나 실행 중인 요청의 원문에 답장해 대상을 지정. 배정 대기와 HEAD 실행이 함께 있거나 수정본이 서로 다른 레인을 가리키면 임의로 중지하지 않고 같은 대화에서 안내 |
 | `/stop head` | 현재 주제와 무관하게 공유 헤드 작업 중단 |
@@ -1214,10 +1216,16 @@ Gateway는 헤드가 연속 **30분 이상 유휴**이고 native 컨텍스트 �
 CLI 조회 실패와 확인 가능한 한도가 없는 경우는 구분한다. Slack에서는 `!usage`
 또는 등록된 `/superagent-usage`를 사용한다.
 
-`/usage reset`은 설치된 OMP CLI가 계정 지정 리셋권 사용을 지원할 때 동작한다.
-등록된 Discord `/usage`의 `text` 옵션에 `reset`을 입력하거나 Discord·Telegram 메시지로
-`/usage reset`을 보낸다. Slack에서는 `!usage reset` 또는 `/superagent-usage reset`을 사용한다.
-등록된 명령의 옵션 갱신은 기존 명령 등록 절차를 따른다. `Codex · 계정 #7 · al…`처럼
+리셋권 메뉴는 설치된 OMP CLI가 계정 지정 리셋권 사용을 지원할 때 동작한다.
+Discord 명령 목록과 허용된 일반 채팅에서는 인수 없는 `/usage-reset`만 사용한다.
+`/usage`는 인수 없는 한도 조회 전용이다. 예전 채팅의 `/usage reset`과 오래된 등록의
+`/usage text:reset`은 거부되며, 리셋권 메뉴를 열거나 모델·레인 작업을 시작하지 않는다.
+Gateway와 HEAD 업데이트 후 Discord `/help`에 `/usage-reset`이 표시되는지 확인한다.
+그런 다음 `discord-commands` 읽기 전용 결과에서 `/usage-reset` 추가를 확인하고 위의 전역
+등록 절차를 따른다. `/help` 확인 후에는 등록 전이라도 Discord에서 **일반 채팅 메시지**로
+`/usage-reset`을 보낼 수 있다(`requireAddressing`이 필요한 채널에서는 봇 멘션 또는 답장).
+Telegram에서는 `/usage reset`, Slack에서는 `!usage reset` 또는 `/superagent-usage reset`을 사용한다.
+`Codex · 계정 #7 · al…`처럼
 로컬 `omp usage reset`의 계정 지정 번호와 가능한 경우 짧게 마스킹한 계정·조직 이름을 표시한다.
 전체 이메일·제공자 계정 ID는 채팅에 넣지 않는다. 메뉴 열기·계정 선택·Cancel은 비용이 없다.
 확인 카드는 5분 뒤 만료되며 원래 대화의 운영자만 Confirm으로 한 번 사용할 수 있다. 사용 결과가 불확실하면
