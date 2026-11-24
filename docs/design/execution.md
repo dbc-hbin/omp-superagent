@@ -254,10 +254,11 @@ promotion, does not authorize another model.
 
 Warm recovery and cold resume may both return the Host to the original model.
 Normal readback recognizes that model directly without relying on a reverse
-journal entry. A newly restored Host must confirm the configured model before
-a retry marker can be used, even across reconnects. A current owner/generation
-receipt and a notice, written together,
-prevent the same fallback row from re-authorizing drift after that recovery or
+journal entry. A newly restored Host must confirm the configured model and
+record its active journal cursor before using retry evidence. Only a flagged
+row after that cursor on the active branch can authorize a fallback, even
+across reconnects. A current owner/generation receipt and a notice, written
+together, prevent the same row from re-authorizing drift after recovery or
 owner replacement. The notice reports which model is selected, not which model
 generated an answer. Frozen preset lanes remain excluded. An authorized
 `lane_set_model` can change one eligible idle lane with durable intent and

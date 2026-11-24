@@ -7721,6 +7721,50 @@ describe("authoritative per-lane model selection", () => {
     expect(messenger.sent).toEqual([]);
   });
 
+  test("cold configured readback allows only a new flagged retry after the restored journal cursor", async () => {
+    const f = fixture(3, undefined, { startHost: async options => {
+      f.launched.push(options);
+      const host = new HostTransport(options.sessionFile, "session-cold-retry-cursor", executionModel);
+      recordedModelChanges(host, [
+        { model: "fixture/capable" },
+        { model: "fixture/efficient", role: "fallback", fallback: true },
+      ]);
+      f.hosts.set(options.socketPath, host);
+      return { pid: process.pid };
+    } });
+    const { runtime, store, config, messenger } = f;
+    const lane = savedLane(store, config, "cold-retry-cursor", route("27g"));
+    store.updateLane(lane.id, lane.generation, { sessionId: "session-cold-retry-cursor", workState: "paused" });
+    mkdirSync(dirname(lane.sessionFile), { recursive: true });
+    writeFileSync(lane.sessionFile, JSON.stringify({ type: "session", version: 3, id: "session-cold-retry-cursor", cwd: lane.cwd }) + "\n");
+    await runtime.start();
+    const source = message("resume-cold-retry-cursor", lane.route);
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    await runtime.resume(lane.id, source.id);
+    const host = f.hosts.get(lane.socketPath)!;
+    expect(f.launched).toHaveLength(1);
+    expect(await runtime.inspect(lane.id)).toMatchObject({ modelCheck: { actual: executionModel, error: null } });
+
+    // A later mismatch cannot borrow an unobserved retry row at or before the
+    // configured cold readback, even if an ordinary entry advances the leaf.
+    host.state.model = otherModel;
+    await expect(runtime.resume(lane.id)).rejects.toThrow("model drift");
+    host.entries.push({ type: "message", id: "post-restore-message", parentId: "change-1" });
+    await expect(runtime.resume(lane.id)).rejects.toThrow("model drift");
+    expect(messenger.sent).toEqual([]);
+    expect(host.prompts).toEqual([]);
+
+    host.entries.push({ type: "model_change", id: "post-restore-fallback", parentId: "post-restore-message",
+      model: "fixture/efficient", role: "fallback", resolvedModelIsFallback: true });
+    await runtime.resume(lane.id);
+    await delegate(runtime, message("new-cold-retry-cursor", lane.route));
+    await host.whenPrompts(1);
+    expect(store.lane(lane.id)).toMatchObject(selection);
+    await messenger.whenSent(1);
+    expect(messenger.sent.filter(output => output.id.startsWith(`model-fallback-selected:${lane.id}:`))).toHaveLength(1);
+  });
+
   test("warm cooldown uses the configured model again without trusting an unflagged switch", async () => {
     const { runtime, store, config, hosts, messenger } = fixture();
     const lane = savedLane(store, config, "warm-model-restore", route("27d"), process.pid);
@@ -7928,7 +7972,11 @@ describe("frozen native preset lane choices", () => {
     expect(launched).toHaveLength(1);
     expect(launched[0]).not.toHaveProperty("model");
     const host = hosts.get(lane.socketPath)!;
-    expect(host.commands.map(command => command.type)).toEqual(["set_model", "get_journal_cursor", "prompt"]);
+    // The restored model is read back with a journal boundary before the
+    // independent prompt admission cursor is acquired. No other mutation runs.
+    expect(host.commands.map(command => command.type)).toEqual([
+      "set_model", "get_journal_cursor", "get_entries", "get_journal_cursor", "prompt",
+    ]);
     expect(host.state.model).toEqual(otherModel);
     expect(store.getMeta(`lane-model:${lane.id}:apply`)).toBe("");
     expect(host.prompts).toHaveLength(1);

@@ -52,7 +52,9 @@ import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, 
 import type { RemotePlacement, WorkerProbe, WorkerRegistration, WorkerSelector } from "./worker-wire";
 
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
-const restoreModelKey = (id: string) => `lane-model:${id}:restoring-generation`;
+const restoreModelKey = (id: string) => `lane-model:${id}:restore-boundary`;
+/** A missing leaf awaits readback, null has no usable branch, and an empty string attests an empty journal. */
+type RestoreModelBoundary = { generation: number; leaf?: string | null };
 
 /** Prefer exact catalog IDs over optional native selector suffixes, never a prefix match. */
 function recordedModel(selector: string, catalog: unknown[]): LaneModel | undefined {
@@ -65,7 +67,7 @@ function recordedModel(selector: string, catalog: unknown[]): LaneModel | undefi
 }
 
 /** Read model changes on the exact RPC leaf, newest first. An invalid path is not evidence. */
-function activeModelChanges(entries: unknown, leafId: string): ModelChangeEntry[] | null {
+function activeModelChanges(entries: unknown, leafId: string, after?: string): ModelChangeEntry[] | null {
   if (!Array.isArray(entries)) return null;
   const byId = new Map<string, Record<string, unknown>>();
   for (const value of entries) {
@@ -75,11 +77,16 @@ function activeModelChanges(entries: unknown, leafId: string): ModelChangeEntry[
   }
   const changes: ModelChangeEntry[] = [];
   const seen = new Set<string>();
+  let crossed = after === undefined;
   let cursor: string | null = leafId;
   while (cursor !== null) {
     const entry = byId.get(cursor);
     if (!entry || seen.has(cursor) || (entry.parentId !== null && (typeof entry.parentId !== "string" || !entry.parentId))) return null;
     seen.add(cursor);
+    if (cursor === after) {
+      if (!changes.length) return null; // The newest model entry must be strictly after the boundary.
+      crossed = true;
+    }
     if (entry.type === "model_change") {
       if (typeof entry.model !== "string" || !entry.model || (entry.role !== undefined && typeof entry.role !== "string")
         || (entry.resolvedModelIsFallback !== undefined && typeof entry.resolvedModelIsFallback !== "boolean")) return null;
@@ -87,7 +94,7 @@ function activeModelChanges(entries: unknown, leafId: string): ModelChangeEntry[
     }
     cursor = entry.parentId;
   }
-  return changes;
+  return crossed ? changes : null;
 }
 
 const presetSyncFallbackIntervalMs = 120_000;
@@ -1579,7 +1586,7 @@ export class Superagent {
     }
   }
 
-  private async confirmRecordedFallback(live: Live, lane: Lane, state: RuntimeState, actual: LaneModel, catalog: unknown[]):
+  private async confirmRecordedFallback(live: Live, lane: Lane, state: RuntimeState, actual: LaneModel, catalog: unknown[], after?: string):
     Promise<RuntimeState | null> {
     if (!lane.model || lane.modelPreset !== null || this.modelChanges.has(lane.id)
       || typeof state.hostPid !== "number" || !Number.isSafeInteger(state.hostPid) || state.hostPid <= 0
@@ -1590,7 +1597,7 @@ export class Superagent {
     const evidence = successful(await live.connection.request({ type: "get_entries" }), "read native lane model evidence");
     const leaf = evidence.leafId;
     if (typeof leaf !== "string" || !leaf) return null;
-    const changes = activeModelChanges(evidence.entries, leaf);
+    const changes = activeModelChanges(evidence.entries, leaf, after);
     if (!changes) return null;
     // Consecutive flagged retry hops belong to the same configured selection.
     // An unflagged ephemeral change can also be context promotion, not retry.
@@ -1693,10 +1700,12 @@ export class Superagent {
         lane = this.requireLane(live.id);
       }
       const restoreKey = restoreModelKey(live.id);
-      const freshRestore = this.store.getMeta(restoreKey) === String(live.generation);
+      const savedRestore = this.store.getMeta(restoreKey);
+      const boundary = JSON.parse(savedRestore ?? "null") as RestoreModelBoundary | null;
+      const restored = boundary?.generation === live.generation ? boundary : null;
       if (!sameLaneModel(lane.model, actual)) {
-        const fallback = !freshRestore && available.some(candidate => sameLaneModel(candidate, actual))
-          ? await this.confirmRecordedFallback(live, lane, state, actual, catalog) : null;
+        const fallback = (!restored || typeof restored.leaf === "string") && available.some(candidate => sameLaneModel(candidate, actual))
+          ? await this.confirmRecordedFallback(live, lane, state, actual, catalog, restored?.leaf || undefined) : null;
         if (!fallback) {
           throw new Error(`Lane ${live.id} model drift: expected ${laneModelArgument(lane.model!)}, actual ${laneModelArgument(actual)}; reconcile the native session or start a new explicitly selected lane. No model was reset and no prompt was sent`);
         }
@@ -1704,8 +1713,27 @@ export class Superagent {
       } else {
         // A matching model is authoritative regardless of whether OMP reached
         // it by cooldown or a cold resume. The old retry marker is now retired.
+        if (restored && restored.leaf === undefined && lane.modelPreset === null) {
+          const version = live.nativeVersion;
+          let leaf = await this.readJournalCursor(live, "record restored lane model boundary");
+          if (leaf === null) {
+            // A null cursor can hide abandoned branches. Only an empty
+            // append log can safely admit a later retry without an ancestor.
+            const snapshot = successful(await live.connection.request({ type: "get_entries" }), "verify empty restored lane journal");
+            if (snapshot.leafId === null && Array.isArray(snapshot.entries) && !snapshot.entries.length) leaf = "";
+          }
+          const confirmed = await this.state(live);
+          if (version !== live.nativeVersion || this.restartFence() || confirmed.settingsScope !== "session"
+            || confirmed.hostPid !== state.hostPid || !sameLaneModel(confirmed.model, actual)
+            || !sameLaneModel(this.requireLane(live.id).model, actual) || this.modelChanges.has(live.id)
+            || this.modelIntent(live.id) || this.modelIntent(live.id, "apply")) {
+            throw new Error(`Lane ${live.id} model or owner changed while recording its restored journal boundary`);
+          }
+          if (this.store.getMeta(restoreKey) === savedRestore)
+            this.store.setMeta(restoreKey, JSON.stringify({ generation: live.generation, leaf }));
+          state = confirmed;
+        }
         if (this.store.getMeta(laneFallbackKey(lane.id))) this.store.setMeta(laneFallbackKey(lane.id), "");
-        if (freshRestore) this.store.setMeta(restoreKey, "");
       }
       if (lane.modelPreset !== null) {
         if (!lane.modelPresetSnapshot) throw new Error(`Lane ${live.id} has a preset label without its frozen native snapshot`);
@@ -4683,7 +4711,7 @@ export class Superagent {
       lane = this.store.nextGeneration(lane.id);
       // A new owner must first read back the configured model; a bare
       // historical marker from an earlier owner is not a launch override.
-      if (restoring) this.store.setMeta(restoreModelKey(lane.id), String(lane.generation));
+      if (restoring) this.store.setMeta(restoreModelKey(lane.id), JSON.stringify({ generation: lane.generation }));
       preflight = false;
       if (!remote) await mkdir(dirname(lane.sessionFile), { recursive: true, mode: 0o700 });
       const beforeLaunch = this.requireLane(lane.id);
