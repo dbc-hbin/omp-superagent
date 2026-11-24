@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
 import { Type, type Static } from "@sinclair/typebox/type";
-import { PrReadError } from "./pr-github-schema";
+import { PrReadError, sha40 as sha } from "./pr-github-schema";
 import type { openIntakeGitHubSession } from "./pr-intake-github";
 
 type Session = Awaited<ReturnType<typeof openIntakeGitHubSession>>;
-const sha = Type.String({ pattern: "^[0-9a-f]{40}$" });
 const entry = Type.Object({ mode: Type.String(), type: Type.String(), sha, path: Type.String() });
 const commit = Type.Object({ sha, tree: Type.Object({ sha }) });
 const tree = Type.Object({ sha, truncated: Type.Literal(false), tree: Type.Array(entry) });

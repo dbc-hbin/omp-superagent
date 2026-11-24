@@ -6,7 +6,7 @@ import { EventEmitter, once } from "node:events";
 import { PassThrough } from "node:stream";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { buildHostArgs, connect, HostConnection, HostStartError, startHost, type HostFrame, type HostOptions } from "../src/host";
-import { HostChannel, HostRequestTimeout, serviceCompletionRecorded } from "../src/host-protocol";
+import { HostChannel, HostRequestTimeout, indexServiceCompletions } from "../src/host-protocol";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
 import { writeStockHostExecutable } from "./fixtures/stock-host";
 import { hostOwnerExecutable } from "../src/host-owner-path";
@@ -51,13 +51,14 @@ test("terminal service disposal needs native completion for the exact generation
   const daemon = { owner: "native-session", id: "service-id", name: "builder", startedAt: 10, restartCount: 0,
     state: "exited", exitedAt: 20 };
   const entries = [{ type: "custom_message", customType: "launch-completion", details: { daemons: [{ ...daemon }] } }];
-  expect(serviceCompletionRecorded(daemon, entries)).toBe(true);
+  const proof = indexServiceCompletions(entries);
+  expect(proof.hasCompletion(daemon)).toBe(true);
   for (const changed of [{ owner: "foreign" }, { id: "replacement" }, { startedAt: 11 }, { restartCount: 1 },
     { state: "failed" }, { exitedAt: 21 }]) {
-    expect(serviceCompletionRecorded({ ...daemon, ...changed }, entries)).toBe(false);
+    expect(proof.hasCompletion({ ...daemon, ...changed })).toBe(false);
   }
-  expect(serviceCompletionRecorded(daemon, [])).toBe(false);
-  expect(serviceCompletionRecorded({ ...daemon, state: "running" }, entries)).toBe(false);
+  expect(indexServiceCompletions([]).hasCompletion(daemon)).toBe(false);
+  expect(proof.hasCompletion({ ...daemon, state: "running" })).toBe(false);
 });
 
 const cleanups: Array<() => Promise<void>> = [];

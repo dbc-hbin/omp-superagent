@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
-use super::model::{RemoteMessage, Route, hash, snowflake};
+use crate::adapter::approval_token;
+
+use super::model::{RemoteMessage, Route, snowflake};
 use super::outputs::{OUTPUT_SEND_BUDGET, nonce};
 use super::rest::{Lookup, Rest, broken, no_mentions};
 use super::{Effect, EffectError, State, cards, dialogs::Dialog};
@@ -44,13 +46,13 @@ pub(super) struct Approval {
 
 impl Approval {
     fn token(&self) -> String {
-        hash(&json!([
-            self.id,
+        approval_token(
+            &self.id,
             self.generation,
-            self.target,
-            self.request_id,
-            self.route.key()
-        ]))
+            &self.target,
+            &self.request_id,
+            &self.route.key(),
+        )
     }
 }
 

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Type, type Static } from "@sinclair/typebox/type";
-import { parseWire, PrReadError } from "./pr-github-schema";
+import { parseWire, PrReadError, sha40 as oid } from "./pr-github-schema";
 import { openIntakeGitHubSession, queryIntakeGitHub, type IntakeRepositoryIdentity } from "./pr-intake-github";
 import {
   intakeEvidenceDeadlineMs, IntakeMaterialError, readIntakeDiff, readIntakePullIdentity, serializeIntakeDiff,
@@ -10,7 +10,6 @@ import { openIntakeTree, readIntakeBlob } from "./pr-intake-tree";
 
 const maxSnippet = 8 * 1024;
 const maxSource = 96 * 1024;
-const oid = Type.String({ pattern: "^[0-9a-f]{40}$" });
 const id = Type.String({ minLength: 1, maxLength: 256, pattern: "^[A-Za-z0-9_+=/-]+$" });
 const fix = Type.Object({
   path: Type.String({ minLength: 1, maxLength: 256 }),

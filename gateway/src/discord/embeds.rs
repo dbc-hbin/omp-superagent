@@ -1,7 +1,8 @@
 //! ```card fences holding a json-render spec become Discord embeds.
 //!
-//! This is the same contract as `extractDiscordCards` in src/discord-markdown.ts;
-//! test/fixtures/discord-cards.json pins both implementations to identical output.
+//! The Bun reference renderer (`extractDiscordCards` in
+//! `test/oracles/bun-gateway/discord-markdown.ts`) and this renderer use the same
+//! fixture (`test/fixtures/discord-cards.json`).
 //! An invalid spec, or one that would exceed the message's embed limits, stays
 //! verbatim as its original code block.
 

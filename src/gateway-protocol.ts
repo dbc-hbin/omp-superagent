@@ -1,13 +1,16 @@
+import { createHash } from "node:crypto";
 import { request, type IncomingMessage } from "node:http";
 import { existsSync } from "node:fs";
-import { lstat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Config } from "./config";
+import type { InboundAttachmentBatch, InboundAttachmentReceipt } from "./contracts";
 import { DeliveryError } from "./delivery";
 import type { GatewayStatus } from "./gateway-wire";
 
 export const MAX_GATEWAY_FRAME = 16 * 1024 * 1024;
 export const MAX_GATEWAY_ATTACHMENT = 20 * 1024 * 1024;
+export const MAX_GATEWAY_ATTACHMENT_BATCH = 40 * 1024 * 1024;
 export interface GatewayResult { ok: boolean; value?: unknown; error?: string; certainty?: "rejected" | "uncertain"; retryAfterMs?: number }
 
 export function gatewayPaths(config: Pick<Config, "stateDir">) {
@@ -82,4 +85,35 @@ export async function gatewayCall<T>(socketPath: string, endpoint: string, body?
   const result = await readGatewayJson(response) as GatewayResult;
   if (!result.ok) throw new DeliveryError(result.error ?? "Gateway rejected operation", result.certainty ?? "uncertain", result.retryAfterMs);
   return result.value as T;
+}
+
+/** A spool reply carries only correctly indexed local references, never attachment bytes. */
+export async function parseInboundAttachmentReceipt(
+  socketPath: string, batch: InboundAttachmentBatch, value: unknown,
+): Promise<InboundAttachmentReceipt> {
+  const invalid = () => new DeliveryError("Invalid attachment spool receipt", "uncertain");
+  if (!value || typeof value !== "object" || !("receipt" in value) || !("files" in value)
+    || typeof value.receipt !== "string" || !/^[a-f0-9]{64}$/.test(value.receipt)
+    || !Array.isArray(value.files) || value.files.length !== batch.attachments.length) throw invalid();
+  const directory = join(await realpath(dirname(dirname(socketPath))), "attachments", value.receipt);
+  const digest = createHash("sha256").update(createHash("sha256").update(batch.inputId).digest());
+  let total = 0;
+  const files: InboundAttachmentReceipt["files"][number][] = [];
+  for (const [index, attachment] of batch.attachments.entries()) {
+    const file: unknown = value.files[index];
+    if (!file || typeof file !== "object" || !("path" in file) || !("size" in file) || !("mimeType" in file)
+      || file.path !== join(directory, String(index)) || typeof file.size !== "number"
+      || !Number.isSafeInteger(file.size) || file.size < 0 || file.size > MAX_GATEWAY_ATTACHMENT
+      || (attachment.size !== null && file.size !== attachment.size)
+      || !("sha256" in file) || typeof file.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(file.sha256)
+      || typeof file.mimeType !== "string"
+      || !["application/octet-stream", "image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.mimeType))
+      throw invalid();
+    total += file.size;
+    if (total > MAX_GATEWAY_ATTACHMENT_BATCH) throw invalid();
+    digest.update(Buffer.from(file.sha256, "hex"));
+    files.push({ path: file.path, size: file.size, mimeType: file.mimeType, sha256: file.sha256 });
+  }
+  if (digest.digest("hex") !== value.receipt) throw invalid();
+  return { receipt: value.receipt, files };
 }

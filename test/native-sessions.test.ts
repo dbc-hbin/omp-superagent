@@ -16,7 +16,6 @@ test("native session discovery reuses the existing journal, artifacts, picker, I
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
     ]);
     expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
-    expect(JSON.parse(stdout)).toEqual({ localDiscovery: true, globalDiscovery: true, nativeIdLookup: true,
-      originalArtifacts: true, nativeResumeAndRewrite: true, collisionPreserved: true });
+    expect(stdout.trim()).toBe("NATIVE_SESSION_DISCOVERY_PROOF");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 }, 30_000);

@@ -2,7 +2,8 @@ import { strict as assert } from "node:assert";
 import { appendFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
-import type { DialogResponse, Inbound, Messenger, Route } from "../../src/contracts";
+import type { DialogResponse, Inbound, Route } from "../../src/contracts";
+import type { DownloadMessenger as Messenger } from "../fixtures/inbound-attachments";
 
 type Event =
   | { readonly kind: "message"; readonly input: Inbound }

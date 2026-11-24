@@ -163,6 +163,13 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::SUCCESS;
         }
         Some("__detach") => lifecycle::exec_detached(args),
+        Some("operator") => match (args.next(), args.next()) {
+            (Some(op), None) => omp_gateway::operator::stdio(&op, None),
+            _ => Err(anyhow::anyhow!("Expected one operator action")),
+        },
+        Some("__stage-result-attachment") if args.next().is_none() => {
+            omp_gateway::result_attachment::run_stage()
+        }
         Some(cmd) => parse(cmd, args).and_then(execute),
     };
     if result.is_err() {

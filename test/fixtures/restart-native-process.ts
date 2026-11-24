@@ -185,7 +185,7 @@ if (runnerRequest) {
     async dismissApproval(approval: Approval): Promise<void> { record("dismiss-approval", { approval }); }
     async createThread(): Promise<Route> { throw new Error("This proof never creates an external thread"); }
     async fetchAfter(): Promise<Inbound[]> { return []; }
-    async openAttachment(): Promise<Response> { throw new Error("This proof never opens external attachments"); }
+    async openAttachment(): Promise<never> { throw new Error("This proof never opens external attachments"); }
     async stop(): Promise<void> {
       closed = true;
       watcher?.close();

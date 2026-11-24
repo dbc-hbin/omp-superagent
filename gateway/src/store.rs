@@ -1,7 +1,7 @@
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +28,7 @@ pub(crate) use rotation::{HEAD_ROTATION, HEAD_SESSION_FILE};
 
 pub struct Store {
     db: Mutex<Connection>,
+    state_dir: PathBuf,
     // Independent lifetime lock shared with the old Gateway and native runner.
     // This connection retains its exclusive transaction until it is dropped.
     _lock: Mutex<Connection>,
@@ -35,6 +36,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(state_dir: &Path) -> Result<Self> {
+        let state_dir = fs::canonicalize(state_dir)?;
         let path = state_dir.join("coordination.sqlite");
         let lock_path = state_dir.join("coordination.sqlite.gateway-lock");
         let lock = Connection::open(&lock_path)?;
@@ -89,8 +91,13 @@ impl Store {
         fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600))?;
         Ok(Self {
             db: Mutex::new(db),
+            state_dir,
             _lock: Mutex::new(lock),
         })
+    }
+
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -125,6 +132,30 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// A file effect can disclose only the receipt already claimed by the head.
+    /// The native/run linkage was checked by the outbox admission transaction.
+    pub(crate) fn claimed_result_output(&self, id: &str) -> Result<Option<(Value, Value)>> {
+        let row = self.db()?.query_row(
+            "SELECT outputs.route, outputs.reply_to, outputs.result_attachment FROM outputs
+             WHERE outputs.id = ? AND outputs.state = 'sending' AND outputs.text = ''
+               AND outputs.result_attachment IS NOT NULL AND outputs.picker IS NULL
+               AND outputs.edit_of IS NULL AND outputs.status = 0
+               AND outputs.id = 'result-attachment:' || json_extract(outputs.result_attachment, '$.sourceId')
+               AND EXISTS (SELECT 1 FROM inputs WHERE inputs.id = outputs.source_id)
+               AND EXISTS (SELECT 1 FROM inputs WHERE inputs.id = json_extract(outputs.result_attachment, '$.sourceId'))
+               AND EXISTS (SELECT 1 FROM inputs WHERE inputs.id = json_extract(outputs.result_attachment, '$.inputId'))",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?)),
+        ).optional()?;
+        let Some((route, reply, attachment)) = row else { return Ok(None) };
+        let mut output = json!({"id":id,"route":serde_json::from_str::<Value>(&route)?,"text":""});
+        if let Some(reply) = reply {
+            output["replyTo"] = serde_json::from_str(&reply)?;
+        }
+        let attachment: Value = serde_json::from_str(&attachment)?;
+        Ok(Some((output, attachment["payload"].clone())))
     }
 
     pub fn begin_effect(&self, id: &str, operation: &str, args: &[Value]) -> Result<EffectStart> {

@@ -8,10 +8,13 @@ import type { Approval, DialogResponse, GatewayRestartRecord, GatewayRestartRequ
 import { physicalRoute, physicalRouteKey, routeKey } from "../src/contracts";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { type Config, hostPaths } from "../src/config";
+import { parseDiscordCommand } from "./oracles/bun-gateway/discord-commands";
 import type { HostOptions } from "../src/host";
 import { DeliveryError } from "../src/delivery";
+import { isResultAttachmentSnapshot, stageResultAttachment } from "../src/result-attachment";
 import { createGatewayMessenger, type GatewayHeadMessenger } from "../src/gateway-client";
 import { gatewayPaths } from "../src/gateway-protocol";
+import { fixtureAttachmentSpool, type AttachmentDownload } from "./fixtures/inbound-attachments";
 import { GatewayServer } from "./oracles/bun-gateway/gateway-server";
 import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { compareMessageIds } from "../src/message-order";
@@ -412,7 +415,7 @@ function delegated(store: Store, sourceId: string) {
   return store.input(`handoff:${sourceId}:${lane.id}`);
 }
 
-function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], adapters: Partial<RuntimeAdapters> = {}) {
+function fixture(maxHosts = 3, downloadAttachment?: AttachmentDownload, adapters: Partial<RuntimeAdapters> = {}) {
   const directory = realpathSync(mkdtempSync("/tmp/sa-runtime-"));
   const config: Config = {
     path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
@@ -421,7 +424,9 @@ function fixture(maxHosts = 3, openAttachment?: Messenger["openAttachment"], ada
   };
   const store = new Store(join(directory, "coordination.sqlite"));
   const messenger = new MessengerTransport();
-  if (openAttachment) messenger.openAttachment = openAttachment;
+  if (downloadAttachment) {
+    messenger.openAttachment = (batch, signal) => fixtureAttachmentSpool(directory, batch, signal, downloadAttachment);
+  }
   const main = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
   const hosts = new Map<string, HostTransport>([[hostPaths(config, "main").socketPath, main]]);
   const launched: HostOptions[] = [];
@@ -932,8 +937,19 @@ describe("explicit outbound result attachments", () => {
       expect(attempted?.resultAttachment).toMatchObject({
         sessionId: intent.sessionId, sessionFile: intent.sessionFile, sourceId: original.id,
         requestId: main.prompts[0]?.id, toolCallId: intent.toolCallId,
-        payload: { name: path, data: bytes.toString("base64") },
+        payload: { name: path, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") },
       });
+      const receipt = attempted?.resultAttachment?.payload;
+      if (!isResultAttachmentSnapshot(receipt)) throw new Error("Expected a native snapshot receipt");
+      const staged = join(config.stateDir, "result-attachments", receipt.snapshotId);
+      expect(readFileSync(staged)).toEqual(bytes);
+      const db = new Database(join(config.stateDir, "coordination.sqlite"), { readonly: true });
+      try {
+        const raw = db.query<{ result_attachment: string }, [string]>("SELECT result_attachment FROM outputs WHERE id = ?").get(id);
+        expect(raw?.result_attachment).toContain(receipt.snapshotId);
+        expect(raw?.result_attachment).not.toContain('"data"');
+        expect(raw?.result_attachment).not.toContain(file);
+      } finally { db.close(); }
       expect(store.output(id)?.state).toBe("uncertain");
       expect(runtime.requestResultAttachment({ ...intent, toolCallId: "repeated-tool-call" })).toContain("no new attempt");
       expect(() => store.finishOutput(id, "pending")).toThrow("never retried");
@@ -1003,10 +1019,42 @@ describe("explicit outbound result attachments", () => {
       await runtime.kick();
       expect(messenger.sent.find(output => output.id === id)).toMatchObject({
         sourceId: `handoff:${original.id}:lane`, route: lane.route,
-        resultAttachment: { payload: { name: filename, data: bytes.toString("base64") } },
+        resultAttachment: { payload: { name: filename, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") } },
       });
       expect(lane.route.threadId).not.toBeNull();
       expect(store.output(id)).toMatchObject({ state: "sent", remoteId: `remote-${id}` });
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("startup removes unassociated staged blobs but retains an interrupted outbox snapshot", async () => {
+    const { runtime, config, directory, store } = fixture();
+    const workspace = `${directory}-workspace`;
+    mkdirSync(workspace);
+    try {
+      const name = "result.bin";
+      const path = join(workspace, name);
+      writeFileSync(path, "unassociated");
+      const stage = () => stageResultAttachment(name, { stateDir: config.stateDir, cwd: workspace, privatePaths: [config.stateDir] });
+      const orphan = stage();
+      writeFileSync(path, "interrupted");
+      const retained = stage();
+      const spool = join(config.stateDir, "result-attachments");
+      const partial = `${orphan.snapshotId}.part`;
+      writeFileSync(join(spool, partial), "crash before publication");
+      const db = new Database(join(config.stateDir, "coordination.sqlite"));
+      try {
+        db.query("INSERT INTO outputs (id, source_id, route, physical_route, text, result_attachment) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("interrupted-snapshot", "fixture", JSON.stringify(route()), "held-test-route", "", JSON.stringify({ payload: retained }));
+        // An uncertain effect can still be draining in the surviving native
+        // Gateway. Its snapshot must not be selected as an orphan.
+        db.query("UPDATE outputs SET state = 'sending' WHERE id = 'interrupted-snapshot'").run();
+      } finally { db.close(); }
+      await runtime.start();
+      expect(store.output("interrupted-snapshot")?.state).toBe("uncertain");
+      expect(readdirSync(spool)).toEqual([retained.snapshotId]);
+      expect(readFileSync(join(spool, retained.snapshotId), "utf8")).toBe("interrupted");
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }
@@ -2109,6 +2157,117 @@ describe("source-bound Discord topic management", () => {
       { title: "⏳ Original" }, { title: "✅ Original" },
       { title: "⏳ Original" }, { title: "✅ Original" },
     ]);
+  });
+
+  test("a parent follow-up reports progress and completion only in the reopened Discord work thread", async () => {
+    const instance = fixture();
+    const { runtime, store, main, hosts, messenger } = instance;
+    const f = managedThread(instance);
+    const confirmAtParent = async (id: string, parent: Route) => {
+      const frame = { type: "extension_ui_request", id, method: "confirm", title: "Confirm", message: "Review this step?" };
+      main.state.pendingUiRequests = [frame];
+      main.emit(frame);
+      await messenger.whenApproval();
+      const card = [...messenger.shown.values()].find(approval => approval.requestId === id);
+      if (!card || !messenger.handlers) throw new Error("Expected the original HEAD approval card");
+      expect(card).toMatchObject({ route: parent, target: "main" });
+      await expect(messenger.handlers.answer(card.id, { confirmed: true }, f.lane.route)).rejects.toThrow("Stale or foreign approval");
+      await messenger.handlers.answer(card.id, { confirmed: true }, parent);
+    };
+    const initial = message("1750000000000000450", f.lane.route, "Implement the usage reset.");
+    await runtime.start();
+    await delegate(runtime, initial);
+    const worker = hosts.get(f.lane.socketPath);
+    if (!worker) throw new Error("Expected the original work-thread Host");
+    await f.whenTitle("⏳ Original");
+    worker.complete("Usage reset implemented.");
+    await main.whenPrompts(1);
+    main.complete("Usage reset implemented and verified.");
+    await f.whenTitle("✅ Original");
+
+    const followup = message("1750000000000000451", route(null), "Check the usage reset edge case.");
+    await admit(runtime, followup);
+    expect(store.input(followup.id)?.target).toBe("main");
+    await main.whenPrompts(2);
+    const { inputId } = await runtime.messageLane(f.lane.id, followup.text, followup.id);
+    await worker.whenPrompts(2);
+    await f.whenTitle("⏳ Original");
+    const nativePrompt = worker.prompts[1]?.command.message;
+    expect(nativePrompt).toContain(`Original authorized conversation: ${routeKey(followup.route)}`);
+    expect(nativePrompt).toContain("Delivery mode: manager handoff.");
+    expect(main.prompts[1]?.command.message).toContain(`sourceId: ${followup.id}`);
+    main.complete("");
+    await runtime.kick();
+    const commentary = { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Checking the latest result." }] };
+    worker.emit({ type: "message_end", message: commentary });
+    worker.emit({ type: "message_end", message: structuredClone(commentary) });
+    expect(store.inputs("main").some(input => input.id.startsWith(`progress:${inputId}:`))).toBe(true);
+    await main.whenPrompts(3);
+    await confirmAtParent("progress-review-card", followup.route);
+    main.complete("The follow-up checks are underway.");
+    await messenger.whenSent(2);
+
+    worker.complete("Follow-up verified.");
+    await main.whenPrompts(4);
+    await confirmAtParent("final-review-card", followup.route);
+    main.complete("Verified the follow-up result.");
+    await messenger.whenSent(3);
+    await f.whenTitle("✅ Original");
+    await admit(runtime, followup);
+    await runtime.messageLane(f.lane.id, followup.text, followup.id);
+
+    expect(worker.prompts).toHaveLength(2);
+    expect(store.input(followup.id)).toMatchObject({ target: "main", route: followup.route });
+    expect(messenger.attempted.slice(1).map(output => [output.route, output.replyTo, output.text])).toEqual([
+      [f.lane.route, undefined, "The follow-up checks are underway."],
+      [f.lane.route, undefined, "Verified the follow-up result."],
+    ]);
+    expect(store.input(`report:${inputId}`)?.state).toBe("done");
+    expect(main.responses).toEqual([
+      { id: "progress-review-card", response: { confirmed: true } },
+      { id: "final-review-card", response: { confirmed: true } },
+    ]);
+    expect(messenger.threads).toEqual([]);
+  });
+
+  test("a queued parent follow-up keeps its report in the existing thread after controller restart", async () => {
+    const { runtime, store, config, main, directory, launched, errors } = fixture(1);
+    const lane = savedLane(store, config, "queued-reopen", route("124"));
+    const followup = headMessage("1750000000000000452", route(null), "Check the existing work.");
+    await runtime.start();
+    await admit(runtime, followup);
+    await main.whenPrompts(1);
+    const { inputId, state } = await runtime.messageLane(lane.id, followup.text, followup.id);
+    expect(state).toBe("pending");
+    expect(launched).toEqual([]);
+    main.complete("");
+    await runtime.kick();
+    await runtime.stop();
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const transport = new MessengerTransport();
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
+    const worker = new HostTransport(lane.sessionFile, "session-queued-reopen");
+    const restarted = new Superagent({ ...config, maxHosts: 2 }, reopened, transport, join(directory, "extension.ts"),
+      error => errors.push(error), {
+        connect: async path => path === lane.socketPath ? worker : head,
+        startHost: async () => ({ pid: process.pid }),
+      });
+    fixtures.find(entry => entry.runtime === runtime)!.runtime = restarted;
+    await restarted.start();
+    await worker.whenPrompts(1);
+    await admit(restarted, followup);
+    await restarted.messageLane(lane.id, followup.text, followup.id);
+    worker.complete("Queued follow-up verified.");
+    await head.whenPrompts(1);
+    head.complete("Verified after controller restart.");
+    await transport.whenSent(1);
+
+    expect(worker.prompts).toHaveLength(1);
+    expect(transport.attempted).toMatchObject([{ sourceId: `report:${inputId}`, route: lane.route,
+      text: "Verified after controller restart." }]);
+    expect(transport.attempted[0]?.replyTo).toBeUndefined();
+    expect(errors).toEqual([]);
   });
 
   for (const scenario of ["sent", "rate-limited", "recovered", "failed", "prior-uncertain", "older-admitted-last"] as const) {
@@ -5919,6 +6078,40 @@ describe("messenger head session controls", () => {
 });
 
 describe("priority native head commands", () => {
+  test("Discord refuses spaced reset on a bound thread and does not execute reset edits", async () => {
+    const { runtime, config, store, messenger, directory, main, launched } = fixture();
+    const executable = join(directory, "unexpected-reset-cli");
+    writeFileSync(executable, "#!/bin/sh\ntouch reset-invoked\nexit 1\n", { mode: 0o700 });
+    config.command = [executable];
+    const destination = route("12");
+    const lane = savedLane(store, config, "usage-thread", destination);
+    await runtime.start();
+    const quotas = message("1750000000000000041", destination, "/usage");
+    await admit(runtime, quotas);
+    expect(store.input(quotas.id)).toMatchObject({ target: "main", state: "done" });
+    expect(messenger.sent.find(output => output.sourceId === quotas.id)?.text).toContain("OMP 사용량");
+
+    for (const legacy of [
+      message("1750000000000000042", destination, "/usage reset"),
+      applicationCommand("1750000000000000043", destination, "/usage reset"),
+    ]) {
+      await admit(runtime, legacy);
+      expect(store.input(legacy.id)).toMatchObject({ target: "main", state: "cancelled" });
+      expect(messenger.sent.find(output => output.sourceId === legacy.id)?.text).toContain("/usage-reset");
+    }
+
+    for (const [id, text] of [[quotas.messageId, "/usage reset"], ["1750000000000000044", "/usage-reset"]] as const) {
+      const edit = { ...message(id, destination, text), id: `discord:2:${id}:edit:1750000001:changed` };
+      await admit(runtime, edit);
+      expect(store.input(edit.id)).toMatchObject({ target: "main", state: "cancelled" });
+    }
+    expect(messenger.sent.every(output => !output.picker && routeKey(output.route) === routeKey(destination))).toBe(true);
+    expect(launched).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(store.laneForRoute(destination)?.id).toBe(lane.id);
+    expect(await Bun.file(join(directory, "reset-invoked")).exists()).toBe(false);
+  });
+
   test("restart cannot hand off while a confirmed OMP reset is spending", async () => {
     const { runtime, config, store, messenger, directory, requests, handoff } = restartFixture();
     const started = Promise.withResolvers<void>();
@@ -5960,7 +6153,7 @@ esac
 `, { mode: 0o700 });
     try {
       await runtime.start();
-      await admit(runtime, message("reset-before-restart", route(), "/usage reset"));
+      await admit(runtime, message("reset-before-restart", route(), "/usage-reset"));
       const card = messenger.sent.find(output => output.sourceId === "reset-before-restart");
       if (!card?.picker) throw new Error("Expected a sent reset picker");
       const click = pickerClick(card, 0, 0);
@@ -6030,14 +6223,21 @@ case "$*" in
   *) exit 2 ;;
 esac
 `, { mode: 0o700 });
+    const discordRoute = route("12");
+    const lane = outcome === "unconfirmed" ? null : savedLane(store, config, "usage-thread", discordRoute);
     await runtime.start();
     const slackRoute = route("1750000000.000001", { platform: "slack", accountId: "TTEAM:UBOT",
       authorityId: "UOWNER", guildId: "TTEAM", channelId: "CCHANNEL" });
+    const discordReset = parseDiscordCommand("usage-reset", []);
+    if (discordReset === null) throw new Error("Discord must advertise an argumentless reset command");
     const open = outcome === "unconfirmed" ? message("1750000000.000010", slackRoute, "/usage reset")
-      : applicationCommand("1750000000000000041", route("12"), "/usage reset");
+      : applicationCommand("1750000000000000041", discordRoute, discordReset);
     await admit(runtime, open);
+    expect(store.input(open.id)).toMatchObject({ target: "main", state: "done" });
     const card = messenger.sent.find(output => output.sourceId === open.id);
     if (card?.picker?.kind !== "usage-reset") throw new Error("Expected a sent reset picker");
+    expect(card.route).toEqual(open.route);
+    if (lane) expect(store.laneForRoute(open.route)).toMatchObject({ id: lane.id, runtimeState: "unloaded", workState: "open" });
     expect(card.text).toContain("사용 가능 계정 2개 · 지금 사용 가능 3개");
     expect(card.text).toContain("계정 1개는 합계에서 제외");
     const banked = messenger.sent.find(output => output.id === `${open.id}:usage-reset-banked`);
@@ -6055,7 +6255,8 @@ esac
     await expect(runtime.receive(click)).rejects.toThrow();
     await expect(runtime.receive({ ...confirmed, route: { ...open.route, threadId: "13" } })).rejects.toThrow();
     await expect(runtime.receive({ ...confirmed, route: { ...open.route, authorityId: "8" } })).rejects.toThrow();
-    await admit(runtime, { ...message("usage-reset-text-target", open.route, "/usage reset anthropic/9"),
+    const typedTarget = outcome === "unconfirmed" ? "/usage reset anthropic/9" : "/usage-reset anthropic/9";
+    await admit(runtime, { ...message("usage-reset-text-target", open.route, typedTarget),
       ...(outcome === "unconfirmed" ? { messageId: "1750000000.000002" } : {}) });
     expect(await Bun.file(join(directory, "attempts")).exists()).toBe(false);
 
@@ -6108,7 +6309,7 @@ case "$*" in
 esac
 `, { mode: 0o700 });
     await runtime.start();
-    const open = message(`usage-reset-${state}`, route(), "/usage reset");
+    const open = message(`usage-reset-${state}`, route(), "/usage-reset");
     await admit(runtime, open);
     const output = messenger.sent.find(item => item.sourceId === open.id);
     expect(output?.picker).toBeUndefined();
@@ -8594,11 +8795,15 @@ describe("real Store runtime coordination", () => {
     expect(messenger.sent).toHaveLength(2);
   });
 
-  test("cross-channel lane handoff reports and head synthesis return to the requesting conversation", async () => {
+  test.each([
+    ["another allowed channel", route(null, { channelId: "5" }), route("75")],
+    ["another bot account", route(null), route("75", { accountId: "20" })],
+    ["a logical topic without a physical thread", route(null), route(null, { topicId: "work-75" })],
+  ] as const)("a handoff involving %s keeps reporting on the original route", async (_case, sourceRoute, laneRoute) => {
     const { runtime, store, config, hosts, main, messenger } = fixture();
     config.discord!.allowedChannelIds.push("5");
-    const lane = savedLane(store, config, "cross-channel", route("75"));
-    const original = headMessage("cross-channel-source", route(null, { channelId: "5" }), "Ask the existing lane for its result here");
+    const lane = savedLane(store, config, "original-route", laneRoute);
+    const original = headMessage("original-route-source", sourceRoute, "Ask the existing lane for its result here");
     await runtime.start();
     await admit(runtime, original);
     await runtime.messageLane(lane.id, "Report the requested result to head", original.id);
@@ -10805,7 +11010,7 @@ describe("real Store runtime coordination", () => {
   test("attachments stream to a private request path and actual image bytes reach native prompt without signed URLs", async () => {
     const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
     const requested: string[] = [];
-    const fetcher: Messenger["openAttachment"] = async (destination, attachment, signal) => {
+    const fetcher: AttachmentDownload = async (destination, attachment, signal) => {
       requested.push(attachment.url);
       expect(destination).toEqual(route(null, { guildId: null }));
       expect(signal).toBeInstanceOf(AbortSignal);
@@ -10823,6 +11028,25 @@ describe("real Store runtime coordination", () => {
     expect(prompt.message).not.toContain("secret=signed");
     expect(prompt.message).not.toContain("cdn.discordapp.com");
     expect(prompt.images).toEqual([{ type: "image", data: png.toString("base64"), mimeType: "image/png" }]);
+  });
+
+  test("a same-size change after image staging is never submitted to the native prompt", async () => {
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
+    const { runtime, main, messenger, store } = fixture(3, async () => new Response(png));
+    const stage = messenger.openAttachment.bind(messenger);
+    messenger.openAttachment = async (batch, signal) => {
+      const receipt = await stage(batch, signal);
+      const changed = Buffer.from(png);
+      changed[changed.length - 1] = 1;
+      writeFileSync(receipt.files[0]!.path, changed);
+      return receipt;
+    };
+    await runtime.start();
+    const input = { ...headMessage("changed-image", route(null, { guildId: null })),
+      attachments: [{ id: "77", name: "report.png", url: "fixture:report", size: png.length }] };
+    await admit(runtime, input);
+    expect(store.input(input.id)?.state).toBe("cancelled");
+    expect(main.prompts).toHaveLength(0);
   });
 
   for (const [platform, unknownSize] of [["telegram", false], ["telegram", true], ["slack", false]] as const) {
@@ -10845,7 +11069,11 @@ describe("real Store runtime coordination", () => {
       expect(opened).toEqual([{ route: dm, reference }]);
       expect(main.prompts[0]!.command.images).toEqual([{ type: "image", data: png.toString("base64"), mimeType: "image/png" }]);
       expect(main.prompts[0]!.command.message).not.toContain(reference);
-      const requestDirectory = join(directory, "attachments", createHash("sha256").update(input.id).digest("hex").slice(0, 24));
+      const root = join(directory, "attachments");
+      const [receipt] = readdirSync(root);
+      expect(receipt).toMatch(/^[0-9a-f]{64}$/);
+      if (!receipt) throw new Error("Expected a published spool receipt");
+      const requestDirectory = join(root, receipt);
       const files = readdirSync(requestDirectory);
       expect(files).toHaveLength(1);
       expect(files[0]).not.toContain(".download");
@@ -10894,8 +11122,9 @@ describe("real Store runtime coordination", () => {
     expect(store.input(input.id)?.state).toBe("cancelled");
     expect(main.prompts).toEqual([]);
     expect(opened).toBe(input.attachments.length);
-    const requestDirectory = join(directory, "attachments", createHash("sha256").update(input.id).digest("hex").slice(0, 24));
-    expect(readdirSync(requestDirectory).filter(name => name.endsWith(".download"))).toEqual([]);
+    const entries = readdirSync(join(directory, "attachments"));
+    expect(entries).toHaveLength(mode === "image" ? 1 : 0);
+    expect(entries.every(name => /^[0-9a-f]{64}$/.test(name))).toBe(true);
   });
 
   test("attachment count, individual size and aggregate bounds reject before adapter access", async () => {
@@ -10928,14 +11157,13 @@ describe("real Store runtime coordination", () => {
       await admit(runtime, input);
       expect(store.input(input.id)?.state).toBe("cancelled");
       expect(main.prompts).toEqual([]);
-      const requestDirectory = join(directory, "attachments", createHash("sha256").update(input.id).digest("hex").slice(0, 24));
-      expect(readdirSync(requestDirectory)).toEqual([]);
+      expect(readdirSync(join(directory, "attachments"))).toEqual([]);
     });
   }
 
   test("adapter attachment rejection and oversized streams prevent native admission", async () => {
     let fetches = 0;
-    const fetcher: Messenger["openAttachment"] = async (_route, attachment) => {
+    const fetcher: AttachmentDownload = async (_route, attachment) => {
       fetches++;
       if (attachment.id === "77") throw new Error("Owning adapter rejected the resource");
       return new Response(new Uint8Array([1, 2, 3]));
@@ -10959,7 +11187,7 @@ describe("real Store runtime coordination", () => {
   test("a blocked attachment download never blocks durable intake of another request", async () => {
     const requested = Promise.withResolvers<void>();
     const response = Promise.withResolvers<Response>();
-    const fetcher: Messenger["openAttachment"] = async () => { requested.resolve(); return response.promise; };
+    const fetcher: AttachmentDownload = async () => { requested.resolve(); return response.promise; };
     const { runtime, store } = fixture(3, fetcher);
     await runtime.start();
     await runtime.receive({ ...headMessage("205", route(null, { guildId: null })), attachments: [

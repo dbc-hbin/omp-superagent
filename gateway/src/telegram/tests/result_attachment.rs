@@ -16,9 +16,11 @@ pub(super) async fn document(body: Bytes) -> Response {
 #[tokio::test]
 async fn result_attachment_is_a_native_document_in_the_original_forum_thread() -> Result<()> {
     let fixture = Fixture::start().await?;
-    let output = json!({"id":"result-file","route":route(),"text":"",
-        "resultAttachment":{"name":"result.bin","data":"AEJDCg=="}});
-    let remote = fixture.hub.effect("send", &[output]).await.map_err(|error| {
+    let output = json!({"id":"result-file","route":route(),"text":""});
+    let file = crate::result_attachment::VerifiedResultAttachment {
+        name: "result.bin".to_owned(), bytes: b"\0BC\n".to_vec(),
+    };
+    let remote = fixture.hub.send_result_attachment(&output, file).await.map_err(|error| {
         anyhow::anyhow!("Telegram native output failed: {}", error.message)
     })?;
     assert_eq!(remote, "303");

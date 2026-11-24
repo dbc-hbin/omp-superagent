@@ -50,8 +50,12 @@ canonical `stateDir` are instance-owned, not arbitrary URLs or a general RPC pro
 Native children get neither the manager nor the board. Managed extensions are not
 installed globally into ordinary OMP.
 
-The operator CLI is still Bun, not a second resident Gateway. `start` invokes
-the packaged native launcher; the daemon constructs only the configured
+The operator CLI is still Bun, not a second resident Gateway. Command registration
+and confirmed avatar setup invoke a one-shot Rust REST client with credentials
+for that operation only. The CLI keeps its private input pipe open while the
+operation runs. Losing the parent stops further requests; a write already sent
+without a receipt remains uncertain and is not retried. Neither operation starts a daemon or connects a bot.
+`start` invokes the packaged native launcher; the daemon constructs only the configured
 transports. The short-lived config reader reuses the CLI parser without
 importing OMP or messenger SDKs. Session recovery and named preset validation
 use their public OMP interfaces on demand; no OMP source or core patch is

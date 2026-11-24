@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
 use crate::picker::Picker;
-use crate::result_attachment::ResultAttachment;
+use crate::result_attachment::VerifiedResultAttachment;
 
 use super::picker::components as picker_components;
 use super::rest::{FILE_LIMIT, Rest, broken, no_mentions};
@@ -34,7 +34,19 @@ pub(super) struct Output {
     #[serde(default)]
     status: bool,
     picker: Option<Picker>,
-    result_attachment: Option<ResultAttachment>,
+}
+
+impl Output {
+    fn validate_reply(&self) -> Effect<()> {
+        if let Some(reply) = &self.reply_to
+            && (!snowflake(&reply.message_id) || reply.route.physical() != self.route.physical())
+        {
+            return Err(EffectError::rejected(
+                "Discord reply requires a real message in the exact destination conversation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -197,65 +209,63 @@ impl State {
         Ok(payload)
     }
 
+    pub(super) async fn send_result_attachment(&self, output: &Output, file: VerifiedResultAttachment) -> Effect<String> {
+        let deadline = Instant::now() + OUTPUT_SEND_BUDGET;
+        if output.route.authority_id != self.config.owner_id || output.picker.is_some()
+            || output.status || output.edit_of.is_some() || !output.text.is_empty()
+        {
+            return Err(EffectError::rejected("Discord result attachments require owner authority and a standalone file"));
+        }
+        output.validate_reply()?;
+        let not_started = || EffectError::rejected("Discord output deadline expired before sending");
+        let channel = timeout_at(deadline, self.destination(&output.route))
+            .await
+            .map_err(|_| not_started())??;
+        #[derive(Deserialize)]
+        struct Receipt {
+            #[serde(flatten)]
+            message: RemoteMessage,
+            attachments: Vec<RemoteAttachment>,
+        }
+        let size = file.bytes.len();
+        let mut payload = Payload::attachment("", file.name.clone(), file.bytes);
+        payload.create(&nonce(&output.id, &output.route, 0));
+        if let Some(reply) = &output.reply_to {
+            payload.body["message_reference"] =
+                json!({"message_id": reply.message_id, "fail_if_not_exists": false});
+        }
+        let request = payload.apply(self.rest.request(
+            Method::POST, &format!("channels/{}/messages", channel.id),
+        ));
+        if Instant::now() >= deadline {
+            return Err(not_started());
+        }
+        let sent: Receipt = Rest::response_before(request, deadline).await?;
+        if !sent.message.belongs(&output.route) || !snowflake(&sent.message.id)
+            || !matches!(sent.attachments.as_slice(), [item] if snowflake(&item.id)
+                && item.filename == file.name && usize::try_from(item.size) == Ok(size)) {
+            return Err(broken("Discord result attachment receipt could not be verified"));
+        }
+        Ok(sent.message.id)
+    }
+
     pub(super) async fn send(&self, output: &Output) -> Effect<String> {
         let deadline = Instant::now() + OUTPUT_SEND_BUDGET;
         if let Some(target) = &output.edit_of {
             return self.edit_status(output, target, deadline).await;
         }
-        if output.status && (output.picker.is_some() || output.result_attachment.is_some()) {
+        if output.status && output.picker.is_some() {
             return Err(EffectError::rejected(
                 "Discord status requires a plain message",
             ));
         }
-        if let Some(reply) = &output.reply_to
-            && (!snowflake(&reply.message_id) || reply.route.physical() != output.route.physical())
-        {
-            return Err(EffectError::rejected(
-                "Discord reply requires a real message in the exact destination conversation",
-            ));
-        }
-        let attachment = if let Some(file) = &output.result_attachment {
-            if output.route.authority_id != self.config.owner_id || output.picker.is_some() || !output.text.is_empty() {
-                return Err(EffectError::rejected("Discord result attachments require owner authority and a standalone file"));
-            }
-            Some((file, file.bytes()?))
-        } else {
-            None
-        };
+        output.validate_reply()?;
         let not_started =
             || EffectError::rejected("Discord output deadline expired before sending");
         let channel = timeout_at(deadline, self.destination(&output.route))
             .await
             .map_err(|_| not_started())??;
         let first_nonce = nonce(&output.id, &output.route, 0);
-        if let Some((file, bytes)) = attachment {
-            #[derive(Deserialize)]
-            struct Receipt {
-                #[serde(flatten)]
-                message: RemoteMessage,
-                attachments: Vec<RemoteAttachment>,
-            }
-            let size = bytes.len();
-            let mut payload = Payload::attachment("", file.name.clone(), bytes);
-            payload.create(&first_nonce);
-            if let Some(reply) = &output.reply_to {
-                payload.body["message_reference"] =
-                    json!({"message_id": reply.message_id, "fail_if_not_exists": false});
-            }
-            let request = payload.apply(self.rest.request(
-                Method::POST, &format!("channels/{}/messages", channel.id),
-            ));
-            if Instant::now() >= deadline {
-                return Err(not_started());
-            }
-            let sent: Receipt = Rest::response_before(request, deadline).await?;
-            if !sent.message.belongs(&output.route) || !snowflake(&sent.message.id)
-                || !matches!(sent.attachments.as_slice(), [item] if snowflake(&item.id)
-                    && item.filename == file.name && usize::try_from(item.size) == Ok(size)) {
-                return Err(broken("Discord result attachment receipt could not be verified"));
-            }
-            return Ok(sent.message.id);
-        }
         let _delivery = match &output.picker {
             Some(_) => Some(self.ctx.pickers.delivery().await),
             None => None,
@@ -354,7 +364,6 @@ impl State {
         if !snowflake(&target.message_id)
             || target.route.physical() != output.route.physical()
             || output.picker.is_some()
-            || output.result_attachment.is_some()
         {
             return Err(EffectError::rejected(
                 "Discord status edit requires a plain message in the exact destination conversation",

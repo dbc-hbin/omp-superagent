@@ -52,14 +52,20 @@ original attachments and quoted context; a narrower brief does not filter them.
 The event identity must also be compatible: a Discord interaction or Slack
 invocation cannot be reused across platforms.
 
-For a standalone handoff, progress and final reports use the original source
-conversation or its single `lane_start` delivery binding, not each execution
-topic. Reuse the source across open lanes only if that shared reporting is
-authorized. In a busy lane, `lane_message` can join the active run as steering
-and its combined report follows the active run's delivery route. If that route
-is unknown, not authorized for the new result, or a separate report is needed,
-don't dispatch into that active run; use an authorized independent placement or
-wait for the native result boundary, not a polling loop.
+For an explicit `lane_message` from the exact guild parent of an existing
+physical Discord work thread, the controller pins the lane's progress and
+final report to that thread. Keep the original source ID and review the
+receipts normally; do not repeat the work reports in the parent. A parent
+acknowledgement, if useful, should only point to the thread. An ordinary
+follow-up to an open lane is not a `/resume` of a paused native goal.
+
+Other standalone handoffs keep the original source conversation or its
+single `lane_start` delivery binding. Reuse a source across lanes only when
+every execution and reporting route is authorized. An eligible busy run can
+accept steering and report once on its existing route. A parent-origin
+`lane_message` does not steer a manager handoff from another origin, even
+when both report in the same thread. Do not force steering or wait in a
+polling loop when the work must queue separately.
 
 Deduplication is per source and lane for `lane_message`. If another new lane or
 separate data, reporting, or platform identity is needed, explain the limit,

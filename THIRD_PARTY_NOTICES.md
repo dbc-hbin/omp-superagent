@@ -129,7 +129,7 @@ SOFTWARE.
   credits `Copyright (c) 2026 SmokeDev`; the [codex-voice MIT notice](https://github.com/dmmeteo/codex-voice/blob/956d6b299f13b02a7ad036a619568e1740a2ee67/LICENSE-MIT)
   credits `Copyright (c) 2026 codex-asr contributors`. Both use the MIT permission notice reproduced above.
   Neither project grants a subscription entitlement. Discord routing, source-bound confirmation and HEAD delivery remain this project's responsibilities.
-- The Bun Gateway oracle and the production one-shot setup path use
+- The test-only Bun Gateway oracle uses
   [discord.js](https://github.com/discordjs/discord.js), not a copied client.
   The declared range is `^14.25.1`; `bun.lock` records the resolved version.
   The inspected installed version, `14.28.1`, is **Apache-2.0, not MIT**.
@@ -256,16 +256,16 @@ was imported. This project continues to use stock OMP and native skill discovery
   source revision `055a5a440f04d0b9fd5fd75a6d14dac4c2b83553`.
   Installed metadata is in `node_modules/grammy/package.json`; dependency pins
   are in `bun.lock`.
-- The Bun Gateway oracle (`test/oracles/bun-gateway/telegram.ts`) and
-  `src/setup-profiles.ts` use `Api` and `InputFile`, not a
+- The Bun Gateway oracle (`test/oracles/bun-gateway/telegram.ts`) uses
+  grammY, not a
   copied Telegram bot or SUL implementation. Version `1.46.0`'s
   `Api.setMyProfilePhoto`, the [official method](https://core.telegram.org/bots/api#setmyprofilephoto),
   and [JPEG multipart contract](https://core.telegram.org/bots/api#inputprofilephotostatic)
-  were checked on 2026-11-15. No separate raw Bot API client or image-conversion
-  dependency was added.
+  were checked on 2026-11-15. Production setup now calls the official Bot API
+  from Rust; no image-conversion dependency is needed.
 - Documentation: [grammY API](https://grammy.dev/guide/api),
   [Telegram Bot API](https://core.telegram.org/bots/api).
-- SDK cancellation uses [`abort-controller` 3.0.0](https://github.com/mysticatea/abort-controller),
+- The test oracle uses [`abort-controller` 3.0.0](https://github.com/mysticatea/abort-controller),
   the signal implementation required by grammY's Node API. Its MIT license,
   Copyright (c) 2017 Toru Nagashima, is retained in
   `node_modules/abort-controller/LICENSE`; preserve it when redistributing the dependency.
@@ -304,8 +304,8 @@ SOFTWARE.
 | `@slack/socket-mode` | `3.2.0` | [`5e8d3f08c16144a2d700c38389bf94cbcc4d5f0f`](https://github.com/slackapi/node-slack-sdk/tree/5e8d3f08c16144a2d700c38389bf94cbcc4d5f0f) | MIT |
 
 - The Bun Gateway oracle (`test/oracles/bun-gateway/slack.ts`) uses the
-  official `WebClient` and `SocketModeClient`. Only `WebClient`, for one-shot
-  setup, remains a production Node Slack SDK dependency. Transport, routing and
+  official `WebClient` and `SocketModeClient`. Both are development dependencies;
+  production command registration uses the Web API from Rust. Transport, routing and
   approval coordination were not copied from another Slack bot or SUL-covered bot.
 - Documentation: [Web API SDK](https://docs.slack.dev/tools/node-slack-sdk/web-api/),
   [Socket Mode SDK](https://docs.slack.dev/tools/node-slack-sdk/socket-mode/),

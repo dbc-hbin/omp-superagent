@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseEnv } from "node:util";
 import { nativeTestCommand } from "./fixtures/native-command";
+import { operatorExample } from "./fixtures/operator";
 
 // Opt in because this exercises the installed real native CLI, Python, and Unix PTYs.
 const ptyTest = process.env.OMP_SUPERAGENT_SETUP_PTY_TEST === "1" ? test : test.skip;
@@ -237,10 +238,10 @@ async function fixture(native: Record<string, unknown> | null = { memory: { back
   await fs.mkdir(path.join(root, "home"));
   await fs.mkdir(path.join(root, "tmp"));
   // This preload observes the real CLI, not an alternate setup/doctor implementation.
-  // Profile SDK methods are intercepted locally; all actual network entrypoints
-  // still fail before opening a socket, including native --help.
+  // Only the one-shot avatar binary is redirected to its loopback build.
+  // Network use from the Bun CLI and OMP probes stays forbidden.
   await fs.writeFile(guard, `
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import net from "node:net";
 import tls from "node:tls";
@@ -265,53 +266,6 @@ for (const name of ["connect", "listen", "serve"]) Bun[name] = deny("Bun." + nam
 globalThis.fetch = deny("fetch");
 globalThis.WebSocket = class { constructor() { deny("WebSocket")(); } };
 record("launch");
-// Profile mocks belong to setup's Bun process. The installed compiled OMP
-// metadata subprocess inherits the network guard, not external SDK preloads.
-if (process.argv.includes("setup")) {
-const { REST, Routes } = await import(${JSON.stringify(import.meta.resolve("discord.js"))});
-const { Api } = await import(${JSON.stringify(import.meta.resolve("grammy"))});
-const hash = value => createHash("sha256").update(value).digest("hex");
-const tokens = new WeakMap();
-const setToken = REST.prototype.setToken;
-REST.prototype.setToken = function (token) { tokens.set(this, token); return setToken.call(this, token); };
-function profile(platform, method, token, image) {
-  const at = process.argv.indexOf("--config");
-  const configPath = process.argv[at + 1];
-  if (!process.argv.includes("setup") || !existsSync(configPath) || !existsSync(configPath + ".env"))
-    return deny("profile-before-save")();
-  appendFileSync(process.env.SETUP_PTY_AUDIT, JSON.stringify({
-    phase: "profile", argv: process.argv, hashes: {}, platform, method,
-    credentialHash: hash(token), imageHash: image ? hash(image) : undefined,
-  }) + "\\n");
-  if (process.env.SETUP_PTY_PROFILE_FAILURE === platform && method !== "getMe")
-    throw new Error(token + " private profile failure");
-}
-REST.prototype.get = async function (route) {
-  if (route !== Routes.user("@me")) return deny("unexpected-discord-profile-route")();
-  profile("discord", "getMe", tokens.get(this));
-  return { id: "900", bot: true, avatar: "mascot-avatar" };
-};
-REST.prototype.patch = async function (route, options) {
-  if (route !== Routes.user("@me")) return deny("unexpected-discord-profile-route")();
-  const image = Buffer.from(options.body.avatar.split(",")[1], "base64");
-  profile("discord", "setProfile", tokens.get(this), image);
-  return { id: "900", bot: true, avatar: "mascot-avatar" };
-};
-Api.prototype.getMe = async function () {
-  profile("telegram", "getMe", this.token);
-  return { id: 900, is_bot: true, first_name: "Local bot" };
-};
-Api.prototype.setMyProfilePhoto = async function (photo) {
-  if (photo.type !== "static") return deny("unexpected-telegram-photo-type")();
-  profile("telegram", "setProfile", this.token, Buffer.from(await photo.photo.toRaw()));
-  return true;
-};
-Api.prototype.getUserProfilePhotos = async function (id, options) {
-  if (id !== 900 || options.limit !== 1) return deny("unexpected-telegram-profile-target")();
-  profile("telegram", "getProfile", this.token);
-  return { total_count: 1, photos: [[{ file_id: "mascot-photo", file_unique_id: "mascot-unique", width: 1254, height: 1254 }]] };
-};
-}
 // Native settings imports eagerly load OMP's own dotenv, unlike setup itself.
 // Observe that real side effect rather than mocking the inspector or its wiring.
 process.on("exit", () => {
@@ -321,6 +275,13 @@ process.on("exit", () => {
 const originalSpawn = Bun.spawn;
 Bun.spawn = function (...args) {
   const command = Array.isArray(args[0]) ? args[0] : args[0]?.cmd;
+  if (command?.[0] === ${JSON.stringify(path.join(repo, "gateway", "bin", `omp-gateway-${process.platform}-${process.arch}`))}) {
+    if (!process.argv.includes("setup") || !Array.isArray(args[0]) || command.length !== 3 ||
+        command[1] !== "operator" || !["discord-avatar", "telegram-avatar"].includes(command[2]))
+      return deny("unexpected-native-gateway-command")();
+    args[0] = [${JSON.stringify(await operatorExample())},
+      process.env.SETUP_PTY_API_PORT, command[2]];
+  }
   const child = originalSpawn.apply(Bun, args);
   if (process.argv.includes("doctor") && command) {
     record("doctor");
@@ -385,6 +346,57 @@ Bun.spawn = function (...args) {
   const nativeModelsBytes = "providers: {}\n# native model metadata must stay untouched\n";
   await fs.writeFile(nativeModels, nativeModelsBytes, { mode: 0o600 });
   const sessions: Terminal[] = [];
+  const api = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (!await exists(config) || !await exists(`${config}.env`)) {
+        await fs.writeFile(violation, "profile-before-save");
+        return new Response(null, { status: 403 });
+      }
+      const telegram = /^\/bot([^/]+)\/(getMe|setMyProfilePhoto|getUserProfilePhotos)$/.exec(url.pathname);
+      const platform = telegram ? "telegram" : "discord";
+      const token = telegram ? decodeURIComponent(telegram[1]!) : request.headers.get("authorization")?.replace(/^Bot /, "");
+      const discord = url.pathname === "/api/v10/users/%40me";
+      const method = telegram && request.method === "POST" ? {
+        getMe: "getMe", setMyProfilePhoto: "setProfile", getUserProfilePhotos: "getProfile",
+      }[telegram[2]!] : discord && request.method === "GET" ? "getMe" : discord && request.method === "PATCH" ? "setProfile" : null;
+      if (!token || !method) {
+        await fs.writeFile(violation, "unexpected-profile-request");
+        return new Response(null, { status: 403 });
+      }
+      let imageHash: string | undefined;
+      if (method === "setProfile") {
+        if (telegram) {
+          const form = await request.formData();
+          const photo = JSON.parse(String(form.get("photo")));
+          const image = photo.type === "static" && form.get(String(photo.photo).replace(/^attach:\/\//, ""));
+          if (!(image instanceof Blob)) return new Response(null, { status: 400 });
+          imageHash = createHash("sha256").update(new Uint8Array(await image.arrayBuffer())).digest("hex");
+        } else {
+          const body = await request.json();
+          if (!body || typeof body !== "object" || !("avatar" in body) || typeof body.avatar !== "string")
+            return new Response(null, { status: 400 });
+          const { avatar } = body;
+          imageHash = createHash("sha256").update(Buffer.from(avatar.split(",")[1], "base64")).digest("hex");
+        }
+      }
+      await fs.appendFile(audit, JSON.stringify({ phase: "profile", hashes: {}, argv: [], platform, method,
+        credentialHash: hash(token), imageHash }) + "\n");
+      if (env.SETUP_PTY_PROFILE_FAILURE === platform && method !== "getMe")
+        return Response.json({ ok: false, description: `${token} private failure` }, { status: 500 });
+      if (!telegram) return Response.json({ id: "900", bot: true, avatar: "mascot-avatar" });
+      if (method === "getProfile") {
+        const body = await request.json();
+        if (!body || typeof body !== "object" || !("user_id" in body) || body.user_id !== 900 ||
+            !("limit" in body) || body.limit !== 1) return new Response(null, { status: 400 });
+      }
+      const result = method === "getMe" ? { id: 900, is_bot: true, first_name: "Local bot" }
+        : method === "setProfile" ? true : { total_count: 1, photos: [[{ file_id: "mascot-photo", file_unique_id: "mascot-unique" }]] };
+      return Response.json({ ok: true, result });
+    },
+  });
+  env.SETUP_PTY_API_PORT = String(api.port);
   const context: Fixture = {
     root, config, state, env, nativeCommand, ...nativePaths, nativeOriginal,
     terminal(command = ["bash", "-x", wrapper, "--config", config], tty = true) {
@@ -440,7 +452,7 @@ Bun.spawn = function (...args) {
     },
     async cleanup() {
       try { for (const session of sessions) await session.close(); }
-      finally { await fs.rm(root, { recursive: true, force: true }); }
+      finally { await api.stop(true); await fs.rm(root, { recursive: true, force: true }); }
     },
   };
   return context;

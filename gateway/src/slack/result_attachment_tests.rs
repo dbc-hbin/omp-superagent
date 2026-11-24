@@ -20,10 +20,12 @@ async fn result_attachment_is_published_in_the_original_slack_thread() {
         "platform":"slack","accountId":"TLOCAL:UBOT","authorityId":"UOWNER","guildId":"TLOCAL",
         "channelId":"CALLOWED","threadId":"1000.000001"
     });
-    let result = fixture.hub.effect("send", &[json!({
-        "id":"result-file","route":route,"text":"",
-        "resultAttachment":{"name":"result.bin","data":"AEJDCg=="}
-    })]).await.expect("native Slack upload and publication");
+    let file = crate::result_attachment::VerifiedResultAttachment {
+        name: "result.bin".to_owned(), bytes: b"\0BC\n".to_vec(),
+    };
+    let result = fixture.hub.send_result_attachment(&json!({
+        "id":"result-file","route":route,"text":""
+    }), file).await.expect("native Slack upload and publication");
     assert_eq!(result, "file:FRESULT");
     let ticket = fixture.called("files.getUploadURLExternal").await;
     assert_eq!(ticket["filename"], "result.bin");

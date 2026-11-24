@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { parseSessionEntries, SessionManager } from "@oh-my-pi/pi-coding-agent";
 import { startHost, HostConnection, type HostFrame, type HostOptions } from "../src/host";
 import { nativeDisabledProviders } from "./fixtures/native-extension";
-import { serviceCompletionRecorded } from "../src/host-protocol";
+import { indexServiceCompletions } from "../src/host-protocol";
 import { decisionId } from "../src/decisions";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
 import { nativeTestCommand } from "./fixtures/native-command";
@@ -432,8 +432,9 @@ nativeTest("actual OMP preserves approvals and structured owner decisions across
     expect(completion?.type).toBe("custom_message");
     const daemon = completion?.type === "custom_message"
       ? (completion.details as { daemons: Record<string, unknown>[] }).daemons[0]! : {};
-    expect(serviceCompletionRecorded(daemon, entries)).toBe(true);
-    expect(serviceCompletionRecorded({ ...daemon, generation: crypto.randomUUID() }, entries)).toBe(false);
+    const completionIndex = indexServiceCompletions(entries);
+    expect(completionIndex.hasCompletion(daemon)).toBe(true);
+    expect(completionIndex.hasCompletion({ ...daemon, generation: crypto.randomUUID() })).toBe(false);
     const serviceRecords = entries.flatMap(entry => entry.type === "custom"
       && entry.customType === "superagent_service_generation" ? [entry.data as HostFrame] : []);
     expect(serviceRecords.filter(record => record.toolCallId === "native-service-denied")).toEqual([

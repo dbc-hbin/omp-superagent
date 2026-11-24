@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::adapter::EffectError;
+use crate::adapter::{EffectError, approval_token};
 
 use super::{
     Core,
@@ -35,15 +35,12 @@ pub(super) struct Approval {
 
 impl Approval {
     pub fn token(&self) -> String {
-        hash(
-            &json!([
-                self.id,
-                self.generation,
-                self.target,
-                self.request_id,
-                self.route.key()
-            ])
-            .to_string(),
+        approval_token(
+            &self.id,
+            self.generation,
+            &self.target,
+            &self.request_id,
+            &self.route.key(),
         )
     }
 

@@ -2,11 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WebClient, type WebClientOptions } from "@slack/web-api";
 import type { Config } from "../src/config";
 import { MESSENGER_COMMANDS } from "../src/messenger-commands";
-import { parseSlackCommand, SLACK_COMMANDS } from "../src/slack-commands";
-import { registerSlackCommands, type SlackCommandClient } from "../src/slack-command-registration";
+import { registerSlackCommands } from "../src/slack-command-registration";
+import { loopbackOperator } from "./fixtures/operator";
 
 const teamId = "T123456";
 const appId = "A123456";
@@ -22,6 +21,12 @@ const privateUrl = "https://hooks.slack.com/commands/private/response?secret=nev
 const directories: string[] = [];
 const environment = new Map<string, string | undefined>();
 type Row = Record<string, unknown>;
+const expectedCommands = MESSENGER_COMMANDS.map(command => ({
+  command: `/superagent-${command.name}`,
+  description: command.description,
+  ...(command.text === undefined ? {} : { usage_hint: command.text }),
+  should_escape: false,
+}));
 
 function setEnv(name: string, value?: string) {
   if (!environment.has(name)) environment.set(name, process.env[name]);
@@ -71,65 +76,74 @@ function manifest() {
   };
 }
 
-interface Call { role: "bot" | "configuration"; method: string; args?: unknown }
+interface Call {
+  method: string;
+  token: string;
+  form: Record<string, string>;
+  args: Row;
+}
 interface RemoteOptions {
   auth?: Row;
   bot?: Row;
+  authHeaders?: Record<string, string>;
+  botHeaders?: Record<string, string>;
   validation?: Row;
   updateResponse?: Row;
-  onCall?: (call: Call) => void;
+  onCall?: (call: Call, request: Request) => Response | undefined;
   readback?: (value: Row) => unknown;
 }
 
-/** Stateful Slack API boundary: update changes the manifest subsequently exported. */
+/** Stateful Slack Web API wire fixture: update changes the manifest subsequently exported. */
 function remote(initial: Row = manifest(), options: RemoteOptions = {}) {
   let state = structuredClone(initial);
   let updates = 0;
   const calls: Call[] = [];
-  const clients: { token: string; options: WebClientOptions }[] = [];
-  async function call(role: Call["role"], method: string, args?: unknown): Promise<unknown> {
-    const entry = { role, method, ...(args === undefined ? {} : { args: structuredClone(args) }) };
+  const run = loopbackOperator(async request => {
+    const path = new URL(request.url).pathname;
+    expect(path.startsWith("/api/")).toBe(true);
+    const method = path.slice("/api/".length);
+    expect(request.method).toBe("POST");
+    expect(request.headers.get("content-type")).toContain("application/x-www-form-urlencoded");
+    const token = request.headers.get("authorization") ?? "";
+    const form = Object.fromEntries(new URLSearchParams(await request.text()));
+    const args: Row = { ...form };
+    const wireManifest = form["manifest"];
+    if (wireManifest !== undefined) args.manifest = JSON.parse(wireManifest);
+    const entry = { method, token, form, args };
     calls.push(entry);
-    options.onCall?.(entry);
+    expect(form).not.toHaveProperty("token");
+    const override = options.onCall?.(entry, request);
+    if (override) return override;
     if (method === "auth.test") {
-      expect(role).toBe("bot");
-      return { ok: true, team_id: teamId, user_id: botUserId, bot_id: botId, app_id: appId,
-        url: privateUrl, response_metadata: { scopes: ["users:read", "commands", "chat:write"] }, ...options.auth };
+      expect(token).toBe(`Bearer ${botToken}`);
+      expect(args).toEqual({ team_id: teamId });
+      return Response.json({ ok: true, team_id: teamId, user_id: botUserId, bot_id: botId, app_id: appId,
+        url: privateUrl, ...options.auth }, { headers: options.authHeaders ?? { "x-oauth-scopes": "users:read, commands, chat:write" } });
     }
     if (method === "bots.info") {
-      expect(role).toBe("bot");
+      expect(token).toBe(`Bearer ${botToken}`);
       expect(args).toEqual({ bot: botId, team_id: teamId });
-      return { ok: true, bot: { id: botId, user_id: botUserId, app_id: appId, deleted: false, icons: { image_36: privateUrl } }, ...options.bot };
+      return Response.json({ ok: true, bot: { id: botId, user_id: botUserId, app_id: appId, deleted: false, icons: { image_36: privateUrl } }, ...options.bot },
+        { headers: options.botHeaders });
     }
-    expect(role).toBe("configuration");
-    expect((args as Row).app_id).toBe(appId);
-    if (method === "apps.manifest.export") return { ok: true, manifest: updates && options.readback ? options.readback(structuredClone(state)) : structuredClone(state) };
-    if (method === "apps.manifest.validate") return { ok: true, errors: [], ...options.validation };
+    expect(token).toBe(`Bearer ${manifestToken}`);
+    expect(args.app_id).toBe(appId);
+    expect(args).not.toHaveProperty("team_id");
+    if (method === "apps.manifest.export") return Response.json({ ok: true, manifest: updates && options.readback ? options.readback(structuredClone(state)) : structuredClone(state) });
+    if (method === "apps.manifest.validate") return Response.json({ ok: true, errors: [], ...options.validation });
     if (method === "apps.manifest.update") {
-      state = structuredClone((args as Row).manifest as Row);
+      const submitted = args.manifest;
+      if (!submitted || typeof submitted !== "object" || Array.isArray(submitted)) throw new Error("Expected an object manifest");
+      state = structuredClone(submitted) as Row;
       updates++;
-      return { ok: true, app_id: appId, permissions_updated: false, ...options.updateResponse };
+      return Response.json({ ok: true, app_id: appId, permissions_updated: false, ...options.updateResponse });
     }
     throw new Error("Unexpected test API call");
-  }
+  });
   return {
-    calls, clients,
+    calls, run,
     get state() { return state; },
     get updates() { return updates; },
-    createWebClient(token: string, settings: WebClientOptions): SlackCommandClient {
-      clients.push({ token, options: settings });
-      const role = token === botToken ? "bot" : "configuration";
-      expect(token).toBe(role === "bot" ? botToken : manifestToken);
-      return {
-        auth: { test: () => call(role, "auth.test") },
-        bots: { info: args => call(role, "bots.info", args) },
-        apps: { manifest: {
-          export: args => call(role, "apps.manifest.export", args),
-          validate: args => call(role, "apps.manifest.validate", args),
-          update: args => call(role, "apps.manifest.update", args),
-        } },
-      } as SlackCommandClient;
-    },
   };
 }
 
@@ -152,34 +166,6 @@ afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-describe("Slack supported command surface", () => {
-  test("uses unique namespaced picker entries without an HTTP request URL", () => {
-    expect(new Set(SLACK_COMMANDS.map(command => command.command)).size).toBe(SLACK_COMMANDS.length);
-    for (const command of SLACK_COMMANDS) {
-      expect(command.command.length).toBeLessThanOrEqual(32);
-      expect(command.description).toContain("Superagent");
-      expect(command).not.toHaveProperty("url");
-    }
-  });
-
-  test("accepts only exact names and validates every no-argument command", () => {
-    for (const command of MESSENGER_COMMANDS) {
-      expect(parseSlackCommand(`/superagent-${command.name}`, " \n ")).toBe(`/${command.name}`);
-      expect(parseSlackCommand(`/superagent-${command.name}`, "input")).toBe("text" in command ? `/${command.name} input` : null);
-      expect(parseSlackCommand(`/${command.name}`, "")).toBeNull();
-      expect(parseSlackCommand(`!${command.name}`, "")).toBeNull();
-    }
-    for (const name of ["/hermes", "/superagent-models", "/superagent-help extra", "/SUPERAGENT-help", "superagent-help"]) {
-      expect(parseSlackCommand(name, "")).toBeNull();
-    }
-    expect(parseSlackCommand("/superagent-model", "  --global provider/model  ")).toBe("/model --global provider/model");
-    expect(parseSlackCommand("/superagent-usage", " reset ")).toBe("/usage reset");
-    expect(parseSlackCommand("/superagent-compact", "  first line\nsecond line  ")).toBe("/compact first line\nsecond line");
-    expect(parseSlackCommand("/superagent-new", "start\nwith context")).toBe("/new start\nwith context");
-    expect(parseSlackCommand("/superagent-stop", "actual-lane-id")).toBe("/stop actual-lane-id");
-  });
-});
-
 describe("explicit Slack command registration", () => {
   test("dry-run authenticates the bot, derives the app authoritatively, exports only, and redacts reports", async () => {
     const policy = config();
@@ -188,18 +174,16 @@ describe("explicit Slack command registration", () => {
     expect(result).toMatchObject({ status: "dry-run", teamId, appId, botId, botUserId,
       currentCommands: ["/hermes"], obsoleteCommands: ["/hermes"], changed: true, updated: false,
       manifestReadbackMatched: false, commandsGrant: "granted", requiresReinstall: false, permissionsUpdated: null });
-    expect(result.plannedCommands).toEqual(SLACK_COMMANDS);
+    expect(result.plannedCommands).toEqual(expectedCommands);
+    expect(new Set(result.plannedCommands.map(command => command.command)).size).toBe(result.plannedCommands.length);
+    for (const command of result.plannedCommands) {
+      expect(command.command.length).toBeLessThanOrEqual(32);
+      expect(command.description).toContain("Superagent");
+      expect(command).not.toHaveProperty("url");
+    }
     expect(api.calls.map(call => call.method)).toEqual(["auth.test", "bots.info", "apps.manifest.export"]);
     expect(api.updates).toBe(0);
     expect(api.state).toEqual(manifest());
-    expect(api.clients.map(client => client.token)).toEqual([botToken, manifestToken]);
-    for (const client of api.clients) {
-      expect(client.options.retryConfig).toEqual({ retries: 0 });
-      expect(client.options.rejectRateLimitedCalls).toBe(true);
-      expect(client.options.allowAbsoluteUrls).toBe(false);
-    }
-    expect(api.clients[0]?.options.teamId).toBe(teamId);
-    expect(api.clients[1]?.options.teamId).toBeUndefined();
     expect(result.note).toContain("API reads and local comparison only");
     expect(result.note).toContain("active Socket Mode command delivery is not verified");
     noSecrets(result);
@@ -215,7 +199,7 @@ describe("explicit Slack command registration", () => {
       "auth.test", "bots.info", "apps.manifest.export", "apps.manifest.validate", "apps.manifest.update", "apps.manifest.export",
     ]);
     const expected = structuredClone(original) as Row;
-    (expected.features as Row).slash_commands = SLACK_COMMANDS;
+    (expected.features as Row).slash_commands = expectedCommands;
     ((expected.oauth_config as Row).scopes as Row).bot = ["users:read", "chat:write", "commands"];
     expect(api.state).toEqual(expected);
     expect(api.calls.find(call => call.method === "apps.manifest.validate")?.args).toEqual({ app_id: appId, manifest: expected });
@@ -245,7 +229,7 @@ describe("explicit Slack command registration", () => {
   test("an already exact app needs no validation or update", async () => {
     const policy = config();
     const current = manifest() as Row;
-    (current.features as Row).slash_commands = SLACK_COMMANDS;
+    (current.features as Row).slash_commands = expectedCommands;
     ((current.oauth_config as Row).scopes as Row).bot = ["commands", "users:read", "chat:write"];
     const api = remote(current);
     const result = await registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api });
@@ -262,7 +246,11 @@ describe("explicit Slack command registration", () => {
     for (const name of ["", "--apply", "literal-token-with-hyphens"]) {
       await expect(registerSlackCommands(policy, { manifestTokenEnv: name, ...api })).rejects.toThrow("--manifest-token-env NAME");
     }
-    expect(api.clients).toHaveLength(0);
+    for (const name of [appEnv, botEnv]) {
+      await expect(registerSlackCommands(policy, { manifestTokenEnv: name, ...api })).rejects.toThrow("distinct explicit Slack app configuration credential");
+    }
+    setEnv(manifestEnv, botToken);
+    await expect(registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, ...api })).rejects.toThrow("distinct explicit Slack app configuration credential");
     expect(api.calls).toHaveLength(0);
   });
 
@@ -276,7 +264,7 @@ describe("explicit Slack command registration", () => {
     const api = remote();
     await registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, ...api });
     for (const name of [botEnv, manifestEnv, appEnv, otherEnv]) expect(process.env[name]).toBeUndefined();
-    expect(api.clients.map(client => client.token)).toEqual([botToken, manifestToken]);
+    expect([...new Set(api.calls.map(call => call.token))]).toEqual([`Bearer ${botToken}`, `Bearer ${manifestToken}`]);
   });
 
   test("nonempty explicit environment takes precedence over sibling credentials", async () => {
@@ -284,7 +272,7 @@ describe("explicit Slack command registration", () => {
     writeFileSync(`${policy.path}.env`, `${botEnv}=wrong-bot\n${manifestEnv}=wrong-configuration\n`, { mode: 0o600 });
     const api = remote();
     await registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, ...api });
-    expect(api.clients.map(client => client.token)).toEqual([botToken, manifestToken]);
+    expect([...new Set(api.calls.map(call => call.token))]).toEqual([`Bearer ${botToken}`, `Bearer ${manifestToken}`]);
   });
 
   test("wrong workspace, user/bot binding, deleted bot, or contradictory app identity cannot reach manifest APIs", async () => {
@@ -328,40 +316,50 @@ describe("explicit Slack command registration", () => {
 
   test("validation failure redacts raw errors and never attempts update", async () => {
     const policy = config();
-    const api = remote(manifest(), { validation: { ok: false, errors: [{ message: `${manifestToken} ${botToken} ${privateUrl}` }] } });
-    const error = await errorText(registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api }));
-    expect(error).toContain("No mutation was attempted");
-    expect(api.updates).toBe(0);
-    expect(api.calls.filter(call => call.method === "apps.manifest.validate")).toHaveLength(1);
-    noSecrets(error);
+    const message = `${manifestToken} ${botToken} ${privateUrl}`;
+    for (const validation of [
+      { ok: false, errors: [{ message }] },
+      { ok: true, errors: [{ message }] },
+      { ok: true, errors: null },
+    ]) {
+      const api = remote(manifest(), { validation });
+      const error = await errorText(registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api }));
+      expect(error).toContain("Slack manifest validation failed. No mutation was attempted");
+      expect(api.updates).toBe(0);
+      expect(api.calls.filter(call => call.method === "apps.manifest.validate")).toHaveLength(1);
+      expect(api.calls.at(-1)?.method).toBe("apps.manifest.validate");
+      noSecrets(error);
+    }
   });
 
-  test("inspection and SDK initialization errors suppress configuration tokens and response URLs", async () => {
+  test("inspection HTTP errors suppress configuration tokens and response URLs", async () => {
     const policy = config();
-    const secretError = new Error(`${manifestToken} ${botToken} ${privateUrl}`);
-    const api = remote(manifest(), { onCall(call) { if (call.method === "apps.manifest.export") throw secretError; } });
+    const api = remote(manifest(), { onCall(call) {
+      if (call.method === "apps.manifest.export") return new Response(`${manifestToken} ${botToken} ${privateUrl}`, { status: 502 });
+    } });
     const error = await errorText(registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api }));
     expect(error).toContain("No mutation was attempted");
     expect(api.calls.filter(call => call.method === "apps.manifest.export")).toHaveLength(1);
     noSecrets(error);
-    const initialization = await errorText(registerSlackCommands(policy, {
-      manifestTokenEnv: manifestEnv, createWebClient() { throw secretError; },
-    }));
-    expect(initialization).toContain("initialization failed");
-    noSecrets(initialization);
   });
 
-  test("update transport failure preserves uncertainty and never retries or continues to readback", async () => {
+  test("failed, rate-limited, and redirected update requests stay uncertain without retry, redirect, or readback", async () => {
     const policy = config();
-    const api = remote(manifest(), { onCall(call) {
-      if (call.method === "apps.manifest.update") throw { message: `${manifestToken} ${privateUrl}`, code: "slack_webapi_request_error" };
-    } });
-    const error = await errorText(registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api }));
-    expect(error).toContain("outcome is uncertain");
-    expect(error).toContain("no automatic retry");
-    expect(api.calls.filter(call => call.method === "apps.manifest.update")).toHaveLength(1);
-    expect(api.calls.at(-1)?.method).toBe("apps.manifest.update");
-    noSecrets(error);
+    for (const status of [502, 429, 307]) {
+      const api = remote(manifest(), { onCall(call, request) {
+        if (call.method !== "apps.manifest.update") return undefined;
+        const headers: Record<string, string> = status === 307
+          ? { location: new URL("/api/not-authorized", request.url).href }
+          : { "retry-after": "0" };
+        return new Response(`${manifestToken} ${privateUrl}`, { status, headers });
+      } });
+      const error = await errorText(registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api }));
+      expect(error).toContain("outcome is uncertain");
+      expect(error).toContain("no automatic retry");
+      expect(api.calls.filter(call => call.method === "apps.manifest.update")).toHaveLength(1);
+      expect(api.calls.at(-1)?.method).toBe("apps.manifest.update");
+      noSecrets(error);
+    }
   });
 
   test("unsuccessful, wrong-target, and incomplete update acknowledgments are uncertain without retries", async () => {
@@ -402,11 +400,12 @@ describe("explicit Slack command registration", () => {
     }
   });
 
-  test("readback transport failure cannot report the mutation as verified", async () => {
+  test("failed readback cannot report the mutation as verified", async () => {
     const policy = config();
     let exports = 0;
     const api = remote(manifest(), { onCall(call) {
-      if (call.method === "apps.manifest.export" && ++exports === 2) throw new Error(`${manifestToken} ${privateUrl}`);
+      if (call.method === "apps.manifest.export" && ++exports === 2)
+        return new Response(`${manifestToken} ${privateUrl}`, { status: 502 });
     } });
     const error = await errorText(registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api }));
     expect(error).toContain("update may have succeeded");
@@ -419,7 +418,11 @@ describe("explicit Slack command registration", () => {
     const policy = config();
     const current = manifest() as Row;
     ((current.oauth_config as Row).scopes as Row).bot = ["commands", "users:read"];
-    const api = remote(current, { auth: { response_metadata: { scopes: ["users:read"] } } });
+    const api = remote(current, {
+      auth: { response_metadata: { scopes: ["commands"] } },
+      authHeaders: { "x-oauth-scopes": "users:read, commands:write" },
+      botHeaders: { "x-oauth-scopes": "commands, users:read" },
+    });
     const result = await registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...api });
     expect(result).toMatchObject({ commandsGrant: "missing", requiresReinstall: true, manifestReadbackMatched: true });
     expect(result.note).toContain("Reinstall or reauthorize");
@@ -432,48 +435,68 @@ describe("explicit Slack command registration", () => {
     const policy = config();
     const permissions = remote(manifest(), { updateResponse: { permissions_updated: true } });
     expect((await registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, apply: true, ...permissions })).requiresReinstall).toBe(true);
-    const unknown = remote(manifest(), { auth: { response_metadata: undefined } });
+    const unknown = remote(manifest(), { authHeaders: { "x-accepted-oauth-scopes": "commands" } });
     const result = await registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, ...unknown });
     expect(result).toMatchObject({ commandsGrant: "unknown", requiresReinstall: null });
     expect(result.note).toContain("Installed commands scope could not be confirmed");
+    const secondary = remote(manifest(), { authHeaders: {}, botHeaders: { "x-oauth-scopes": "users:read, commands" } });
+    expect((await registerSlackCommands(policy, { manifestTokenEnv: manifestEnv, ...secondary })).commandsGrant).toBe("granted");
   });
 
-  test("installed official WebClient serializes the actual manifest APIs with distinct credentials", async () => {
+  test("native Web API form serialization sends only the intended app manifest and no token in the form", async () => {
     const policy = config();
-    let state: Row = manifest();
-    const requests: { method: string; token: string; body: Record<string, string> }[] = [];
-    const result = await registerSlackCommands(policy, {
-      apply: true, manifestTokenEnv: manifestEnv,
-      createWebClient(token, settings) {
-        return new WebClient(token, { ...settings, fetch: async (url, init) => {
-          const method = new URL(String(url)).pathname.split("/").at(-1)!;
-          const authorization = new Headers(init?.headers).get("authorization") ?? "";
-          const form = new URLSearchParams(String(init?.body));
-          const body = Object.fromEntries(form);
-          requests.push({ method, token: authorization, body });
-          let response: Row;
-          if (method === "auth.test") response = { ok: true, team_id: teamId, bot_id: botId, user_id: botUserId };
-          else if (method === "bots.info") response = { ok: true, bot: { id: botId, user_id: botUserId, app_id: appId } };
-          else if (method === "apps.manifest.export") response = { ok: true, manifest: state };
-          else if (method === "apps.manifest.validate") response = { ok: true, errors: [] };
-          else if (method === "apps.manifest.update") {
-            state = JSON.parse(body.manifest!) as Row;
-            response = { ok: true, app_id: appId, permissions_updated: false };
-          } else throw new Error("Unexpected official SDK method");
-          return new Response(JSON.stringify(response), { headers: { "content-type": "application/json", "x-oauth-scopes": "commands,users:read" } });
-        } });
-      },
+    const api = remote({
+      display_information: { name: "Keep socket app + café" },
+      settings: { socket_mode_enabled: true },
     });
-    expect(result).toMatchObject({ updated: true, manifestReadbackMatched: true, commandsGrant: "granted" });
-    expect(requests.map(request => request.method)).toEqual([
-      "auth.test", "bots.info", "apps.manifest.export", "apps.manifest.validate", "apps.manifest.update", "apps.manifest.export",
+    const result = await registerSlackCommands(policy, { apply: true, manifestTokenEnv: manifestEnv, ...api });
+    expect(result).toMatchObject({ updated: true, currentCommands: [], manifestReadbackMatched: true, commandsGrant: "granted" });
+    const serialized = api.calls.find(call => call.method === "apps.manifest.update")?.form["manifest"];
+    if (serialized === undefined) throw new Error("Missing serialized manifest");
+    expect(JSON.parse(serialized)).toEqual({
+      display_information: { name: "Keep socket app + café" },
+      settings: { socket_mode_enabled: true },
+      features: { slash_commands: expectedCommands },
+      oauth_config: { scopes: { bot: ["commands"] } },
+    });
+    expect(api.calls.map(call => Object.keys(call.form).sort())).toEqual([
+      ["team_id"], ["bot", "team_id"], ["app_id"], ["app_id", "manifest"], ["app_id", "manifest"], ["app_id"],
     ]);
-    for (const request of requests) {
-      expect(request.token).toBe(`Bearer ${request.method.startsWith("apps.manifest.") ? manifestToken : botToken}`);
-      if (request.method.startsWith("apps.manifest.")) expect(request.body.app_id).toBe(appId);
-      expect(request.body).not.toHaveProperty("token");
-    }
-    expect(JSON.parse(requests.find(request => request.method === "apps.manifest.update")!.body.manifest!).features.slash_commands).toEqual(SLACK_COMMANDS);
     noSecrets(result);
+  });
+
+  test("manifest publication preserves nested numeric literals and readback compares their numeric values", async () => {
+    const policy = config();
+    const exported = `{
+      "display_information": {"name":"Keep precision"},
+      "settings": {"socket_mode_enabled":true},
+      "features": {"future":[51.248178375505404,{"integer":18446744073709551617}]},
+      "oauth_config": {"scopes":{"future":{"precision":1.0000000000000001e+33}}},
+      "functions": {"keep":{"default":[1.00,-0]}}
+    }`;
+    for (const changed of [false, true]) {
+      let submitted: string | undefined;
+      const api = remote({}, { onCall(call) {
+        if (call.method === "apps.manifest.update") submitted = call.form["manifest"];
+        if (call.method !== "apps.manifest.export") return;
+        const manifest = submitted?.replace(
+          "51.248178375505404", changed ? "51.24817837550541" : "51248178375505404e-15",
+        ).replace("[1.00,-0]", "[1,0]") ?? exported;
+        return new Response(`{"ok":true,"manifest":${manifest}}`, { headers: { "content-type": "application/json" } });
+      } });
+      const action = registerSlackCommands(policy, { apply: true, manifestTokenEnv: manifestEnv, ...api });
+      if (changed) {
+        await expect(action).rejects.toThrow("authoritative readback failed or differed");
+      } else {
+        expect((await action).manifestReadbackMatched).toBe(true);
+      }
+      for (const method of ["apps.manifest.validate", "apps.manifest.update"]) {
+        const wire = api.calls.find(call => call.method === method)?.form["manifest"];
+        if (wire === undefined) throw new Error(`Missing submitted manifest for ${method}`);
+        for (const fragment of ["51.248178375505404", "18446744073709551617", "1.0000000000000001e+33", "[1.00,-0]"]) {
+          expect(wire).toContain(fragment);
+        }
+      }
+    }
   });
 });

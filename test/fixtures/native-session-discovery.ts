@@ -52,5 +52,4 @@ await fs.unlink(entry);
 await fs.writeFile(entry, "Unrelated operator file");
 await assert.rejects(() => publishNativeSession(original, cwd), /already belongs to another file/);
 assert.equal(await fs.readFile(entry, "utf8"), "Unrelated operator file");
-console.log(JSON.stringify({ localDiscovery: true, globalDiscovery: true, nativeIdLookup: true,
-  originalArtifacts: true, nativeResumeAndRewrite: true, collisionPreserved: true }));
+console.log("NATIVE_SESSION_DISCOVERY_PROOF");

@@ -313,10 +313,18 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   threads, not edits, quoted text or attachments. DM and other adapters retain
   their existing topic behavior.
 - `/head <request>` explicitly addresses the shared coordination model (Slack:
-  `!head` or `/superagent-head`). Its manager handoffs keep the original review
-  path. Bound-topic commentary and final answers instead pass through the
-  controller's source-bound outbox without a synthesis turn. Approval cards
-  also stay with their original native session and authorized route.
+  `!head` or `/superagent-head`). Manager handoffs keep HEAD's review path.
+  When HEAD explicitly uses `lane_message` to continue an existing physical
+  Discord work thread from its exact authorized guild parent, the controller
+  records that thread as the handoff's progress and final report route. It
+  does not change the original input or borrow its parent message as a thread
+  reply. Replays preserve the recorded destination and do not send a parent
+  copy. Native approvals during HEAD's review still use the original parent
+  route, not the report's destination. Other routes, logical topics and
+  `/resume` retain their existing rules. Bound-topic commentary and final
+  answers instead pass through the controller's source-bound outbox without a
+  synthesis turn. Approval cards stay with their original native session and
+  authorized route.
 - Thread-first work sends a short kickoff to the selected topic. The durable
   `sent` receipt gates new lane dispatch and steering for that input. A missing
   or uncertain delivery is not a successful kickoff.
@@ -334,10 +342,12 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   If a follow-up arrives before the native start event, that event rechecks
   pending inputs. An idle destination receives a new prompt.
   Match the full route including account, authority, thread and topic. A bound
-  reply can join the kickoff initiated elsewhere only if the existing verified
-  delivery route is this exact thread. A manager handoff keeps its HEAD review
-  mode, with the verified reply route fixed for the joined run, including logical
-  topics backed by native threads. Keep each source and native receipt distinct
+  reply can join a manager run initiated elsewhere only if its verified delivery
+  route is this exact thread. When steering another manager handoff into or from
+  a parent-origin thread follow-up, both source conversations and report routes
+  must match. A manager handoff keeps its HEAD review mode, with the verified
+  reply route fixed for the joined run, including logical topics backed by native
+  threads. Keep each source and native receipt distinct
   and deliver one result for a jointly handled cohort. History lookup verifies
   a joined reply's topic ownership and its own completed native receipt, not the
   manager's instructions or completion.
@@ -369,7 +379,12 @@ on the same route.
 The interaction pattern was compared with [Hermes Agent at 242315ce](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/gateway/slash_commands_model.py#L516-L567);
 the catalogue and mutation remain native OMP, and no upstream picker code is used.
 
-`/usage reset` chooses an exact linked account from the configured OMP profile.
+The reset picker chooses an exact linked account from the configured OMP profile.
+Discord accepts the argumentless `/usage-reset` command in its picker and in
+authorized messages. `/usage` only reads quotas. The Gateway rejects stale
+`/usage` interactions carrying options; HEAD refuses legacy `/usage reset`
+messages as invalid controls, not model or lane requests. Edits cannot open
+the reset picker. Telegram and Slack keep their existing reset syntax.
 The first click only changes the displayed card revision; Confirm on that
 revision is the only action that admits a reset request. Cancel closes the card
 without admitting any request. The head checks the original sent card and live
@@ -497,6 +512,9 @@ approval.
   API routes and metadata. Do not persist or surface credential URLs or
   follow redirects on private file downloads. Enforce byte limits end to end;
   an unknown size is not zero and a known size must match the bytes received.
+  Rust stages the authorized batch under the instance's private attachments
+  directory. The head receives file receipts, not a second copy of every
+  download over the Gateway socket; it still constructs the native image input.
   The adapters preserve audio metadata; they do not transcribe attachments.
 - An owner can authorize one specific result file with a standalone leading
   `attach: workspace/relative-file.ext` line. `result_attach` stages the exact
@@ -508,9 +526,11 @@ approval.
   hard links, dot paths and managed private state are excluded. Delivery uses
   the original authorized topic and stable outbox identity, with no destination
   override and no replay of uncertain sends. Restricted group rooms cannot
-  use this feature. The private controller outbox stores the bounded immutable
-  bytes; the Gateway attempt ledger stores their fingerprint and the receipt,
-  not a second copy of the file.
+  use this feature. New outbox rows refer to a private snapshot made before
+  admission. The Gateway verifies its recorded identity and contents rather
+  than reopening the workspace path. Older queued inline attachments retain
+  their original delivery identity; moving the bytes does not authorize a
+  second upload after an uncertain send.
 - Long outputs use a single bounded text attachment where supported. Discord
   first splits an over-limit reply at paragraph, line, then space boundaries
   into at most five ordered messages of up to 2,000 UTF-16 units, closing and
@@ -572,9 +592,9 @@ approval.
   An Image needs a valid HTTPS URL. A spec that is
   invalid, uses another component, reuses an element or exceeds Discord's embed
   limits stays verbatim as its code block, which is also what Telegram and Slack
-  show. The [Rust renderer](../../gateway/src/discord/embeds.rs) and
-  [`extractDiscordCards`](../../src/discord-markdown.ts) share one
-  [fixture](../../test/fixtures/discord-cards.json).
+  show. The [Rust renderer](../../gateway/src/discord/embeds.rs) and the
+  [test-only Bun renderer](../../test/oracles/bun-gateway/discord-markdown.ts)
+  share one [fixture](../../test/fixtures/discord-cards.json).
 
 ## Discord voice
 

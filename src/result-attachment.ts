@@ -1,5 +1,5 @@
-import { constants, fstatSync, lstatSync, openSync, closeSync, readSync, realpathSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import type { Inbound } from "./contracts";
@@ -7,10 +7,16 @@ import type { Inbound } from "./contracts";
 const MAX_RESULT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 export const RESULT_ATTACH_TOOL = "result_attach";
 
-export interface ResultAttachmentPayload {
+export interface ResultAttachmentSnapshot {
   readonly name: string;
-  readonly data: string;
+  readonly size: number;
+  readonly sha256: string;
+  readonly snapshotId: string;
+  readonly fileIdentity: string;
 }
+
+// Read-only compatibility with output rows persisted before the native spool.
+export type ResultAttachmentPayload = ResultAttachmentSnapshot | { readonly name: string; readonly data: string };
 
 interface NativeSession {
   readonly sessionId: string;
@@ -59,87 +65,62 @@ export function isOriginalAttachmentMessage({ id, messageId, route }: Inbound): 
     : `${route.platform}:${route.accountId}:${route.channelId}:${messageId}:original`);
 }
 
-function inside(root: string, file: string): boolean {
-  const delta = relative(root, file);
-  return delta === "" || delta !== ".." && !delta.startsWith(`..${sep}`) && !isAbsolute(delta);
-}
+const binary = fileURLToPath(new URL(`../gateway/bin/omp-gateway-${process.platform}-${process.arch}`, import.meta.url));
 
-/** Store the bytes, not a mutable file path to be opened later by the Gateway. */
-export function stageResultAttachment(path: string, scope: {
-  readonly cwd: string;
-  readonly privatePaths: readonly string[];
-}): ResultAttachmentPayload {
+type StageCommand =
+  | { readonly action: "stage"; readonly stateDir: string; readonly cwd: string; readonly path: string; readonly privatePaths: readonly string[] }
+  | { readonly action: "discard"; readonly stateDir: string; readonly snapshotId: string }
+  | { readonly action: "prune"; readonly stateDir: string };
+
+function runStage(command: StageCommand): unknown {
   try {
-    if (!validPath(path)) throw new ResultAttachmentError("Use a literal, non-hidden workspace-relative file path");
-    const root = resolve(scope.cwd);
-    if (realpathSync(root) !== root) throw new ResultAttachmentError("The canonical workspace root has changed");
-    const originalRoot = lstatSync(root, { bigint: true });
-    const file = resolve(root, path);
-    const name = basename(file);
-    if (Buffer.byteLength(name) > 180 || !/^[\p{L}\p{N}\p{M}_. -]+$/u.test(name))
-      throw new ResultAttachmentError("The result attachment has an unsupported filename");
-    const privateEntries = scope.privatePaths.map(privatePath => {
-      let canonical = resolve(privatePath);
-      try {
-        canonical = realpathSync(canonical);
-        return { canonical, stat: lstatSync(canonical, { bigint: true }) };
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-        return { canonical };
-      }
+    const child = Bun.spawnSync([binary, "__stage-result-attachment"], {
+      env: {}, stdin: Buffer.from(JSON.stringify(command)), stdout: "pipe", stderr: "ignore", timeout: 5_000,
     });
-    const checkPrivate = () => {
-      if (realpathSync(root) !== root) throw new ResultAttachmentError("The canonical workspace root has changed");
-      const rootStat = lstatSync(root, { bigint: true });
-      if (rootStat.dev !== originalRoot.dev || rootStat.ino !== originalRoot.ino)
-        throw new ResultAttachmentError("The canonical workspace root has changed");
-      if (privateEntries.some(entry => inside(entry.canonical, file)))
-        throw new ResultAttachmentError("Private state cannot be sent as a result attachment");
-      // Also compare filesystem identities (e.g. case-insensitive volumes).
-      let current = root;
-      for (const part of ["", ...path.split("/")]) {
-        current = resolve(current, part);
-        const stat = lstatSync(current, { bigint: true });
-        if (stat.isSymbolicLink()) throw new ResultAttachmentError("Result attachment paths cannot follow links");
-        if (privateEntries.some(entry => entry.stat?.dev === stat.dev && entry.stat.ino === stat.ino))
-          throw new ResultAttachmentError("Private state cannot be sent as a result attachment");
-      }
-    };
-    checkPrivate();
-    if (realpathSync(file) !== file) throw new ResultAttachmentError("Result attachment paths cannot follow links");
-    // lstat and the identity checks pin the observed directory entry to the
-    // descriptor. Nonblocking open cannot hang if it is replaced with a FIFO.
-    const initial = lstatSync(file, { bigint: true });
-    if (!initial.isFile() || initial.nlink !== 1n)
-      throw new ResultAttachmentError("A result attachment must be a regular file without hard links");
-    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    try {
-      const same = (stat: typeof initial) => stat.isFile() && stat.nlink === 1n
-        && stat.dev === initial.dev && stat.ino === initial.ino && stat.size === initial.size
-        && stat.mtimeNs === initial.mtimeNs && stat.ctimeNs === initial.ctimeNs;
-      if (!same(fstatSync(fd, { bigint: true }))) throw new ResultAttachmentError("The attachment changed before staging");
-      if (initial.size < 1n || initial.size > MAX_RESULT_ATTACHMENT_BYTES)
-        throw new ResultAttachmentError("Result attachments must be nonempty and at most 8 MiB");
-      const bytes = Buffer.allocUnsafe(Number(initial.size));
-      let offset = 0;
-      while (offset < bytes.length) {
-        const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
-        if (!count) break;
-        offset += count;
-      }
-      if (offset !== bytes.length || !same(fstatSync(fd, { bigint: true }))
-        || realpathSync(file) !== file || !same(lstatSync(file, { bigint: true }))) {
-        throw new ResultAttachmentError("The attachment changed during staging");
-      }
-      checkPrivate();
-      return { name, data: bytes.toString("base64") };
-    } finally {
-      closeSync(fd);
-    }
+    if (child.exitCode !== 0 || child.stdout.length > 4_096)
+      throw new ResultAttachmentError("The native result attachment helper did not complete");
+    const response = asRecord(JSON.parse(child.stdout.toString("utf8")));
+    if (response?.ok === true) return response.value;
+    if (response?.ok === false && typeof response.error === "string") throw new ResultAttachmentError(response.error);
+    throw new ResultAttachmentError("The native result attachment helper returned no receipt");
   } catch (error) {
     if (error instanceof ResultAttachmentError) throw error;
-    throw new ResultAttachmentError("The requested result attachment could not be read safely", { cause: error });
+    // Do not attach an exception that could include the command's private paths.
+    throw new ResultAttachmentError("The native result attachment helper is unavailable");
   }
+}
+
+export function isResultAttachmentSnapshot(value: unknown): value is ResultAttachmentSnapshot {
+  const snapshot = asRecord(value);
+  return snapshot !== null && Object.keys(snapshot).length === 5 &&
+    typeof snapshot.name === "string" && validPath(snapshot.name) && Buffer.byteLength(snapshot.name) <= 180 &&
+    /^[\p{L}\p{N}\p{M}_. -]+$/u.test(snapshot.name) &&
+    typeof snapshot.size === "number" && Number.isSafeInteger(snapshot.size) &&
+    snapshot.size > 0 && snapshot.size <= MAX_RESULT_ATTACHMENT_BYTES &&
+    typeof snapshot.sha256 === "string" && /^[a-f0-9]{64}$/.test(snapshot.sha256) &&
+    typeof snapshot.snapshotId === "string" && /^[a-f0-9]{32}$/.test(snapshot.snapshotId) &&
+    typeof snapshot.fileIdentity === "string" && /^\d+:\d+$/.test(snapshot.fileIdentity);
+}
+
+/** The helper publishes a private immutable snapshot before queue admission. */
+export function stageResultAttachment(path: string, scope: {
+  readonly stateDir: string;
+  readonly cwd: string;
+  readonly privatePaths: readonly string[];
+}): ResultAttachmentSnapshot {
+  if (!validPath(path)) throw new ResultAttachmentError("Use a literal, non-hidden workspace-relative file path");
+  const receipt = runStage({ action: "stage", ...scope, path });
+  if (!isResultAttachmentSnapshot(receipt) || receipt.name !== path.split("/").at(-1))
+    throw new ResultAttachmentError("The native result attachment receipt does not match the request");
+  return receipt;
+}
+
+export function discardResultAttachment(stateDir: string, snapshotId: string): void {
+  runStage({ action: "discard", stateDir, snapshotId });
+}
+
+export function pruneResultAttachments(stateDir: string): void {
+  runStage({ action: "prune", stateDir });
 }
 
 export function registerResultAttach(pi: ExtensionAPI, submit?: (intent: ResultAttachmentIntent) => string): void {

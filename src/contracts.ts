@@ -320,7 +320,7 @@ export interface StorePort {
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   ownerSource(id: string): InputRecord | null;
-  /** Manager handoff's verified reply route, pinned if a bound reply joined its run. */
+  /** Manager handoff's verified reply route, pinned for a parent-origin thread follow-up or a joined bound reply. */
   laneReplyRoute(input: InputRecord, source: InputRecord): Route;
   /** Exact original owner and authorized delivery route for a topic-owned lane input. */
   topicDelivery(id: string): { readonly source: InputRecord; readonly route: Route; readonly outputSourceId: string } | null;
@@ -452,6 +452,17 @@ export interface ThreadUpdate {
   readonly archived?: boolean;
 }
 
+export interface InboundAttachmentBatch {
+  readonly inputId: string;
+  readonly route: Route;
+  readonly attachments: readonly Attachment[];
+}
+
+export interface InboundAttachmentReceipt {
+  readonly receipt: string;
+  readonly files: readonly { readonly path: string; readonly size: number; readonly mimeType: string; readonly sha256: string }[];
+}
+
 export interface Messenger {
   start(handlers: {
     /** Authenticate first; do not consume inbound events until native approvals are reconciled. */
@@ -484,7 +495,7 @@ export interface Messenger {
   messengerPresence?(request: MessengerPresenceRequest): Promise<DiscordPresenceStatus>;
   /** null explicitly means no history API; intake recovery belongs to the adapter. */
   fetchAfter(route: Route, messageId: string): Promise<Inbound[] | null>;
-  /** Validate platform/auth destination before fetching. Never follow redirects with credentials. */
-  openAttachment(route: Route, attachment: Attachment, signal: AbortSignal): Promise<Response>;
+  /** Validate the source before fetching; receipt only a complete, private batch. */
+  openAttachment(batch: InboundAttachmentBatch, signal: AbortSignal): Promise<InboundAttachmentReceipt>;
   stop(): Promise<void>;
 }

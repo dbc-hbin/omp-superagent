@@ -4,7 +4,9 @@ mod owner;
 mod projection;
 mod transport;
 mod wire;
+mod worker_attach;
 mod worker_rpc;
+mod worker_serve;
 
 use std::{env, path::PathBuf, process::ExitCode};
 
@@ -15,6 +17,15 @@ async fn main() -> ExitCode {
         eprintln!("Usage: omp-host-owner <absolute owner.json>");
         return ExitCode::FAILURE;
     };
+    if path.as_os_str() == "--worker-serve" {
+        return match worker_serve::run(args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Worker transport: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if !path.is_absolute() || args.next().is_some() {
         eprintln!("Usage: omp-host-owner <absolute owner.json>");
         return ExitCode::FAILURE;

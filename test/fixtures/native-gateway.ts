@@ -47,7 +47,7 @@ class RecordingMessenger implements Messenger {
   async dismissApproval(_approval: Approval): Promise<void> { throw new Error("Unexpected native Gateway approval dismissal"); }
   async createThread(_route: Route, _title: string): Promise<Route> { throw new Error("The original independent topic already exists"); }
   async fetchAfter(): Promise<Inbound[]> { return []; }
-  async openAttachment(): Promise<Response> { throw new Error("No attachments are authorized by this proof"); }
+  async openAttachment(): Promise<never> { throw new Error("No attachments are authorized by this proof"); }
   async stop(): Promise<void> { this.handlers = undefined; }
 }
 

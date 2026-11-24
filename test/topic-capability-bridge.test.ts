@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../src/config";
-import type { Approval, Attachment, Inbound, Messenger, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
+import type { Approval, Attachment, Inbound, OutputRecord, Route, ThreadInfo, ThreadUpdate } from "../src/contracts";
+import type { DownloadMessenger as Messenger } from "./fixtures/inbound-attachments";
 import { DeliveryError } from "../src/delivery";
 import { createGatewayMessenger } from "../src/gateway-client";
 import { gatewayCall, gatewayPaths } from "../src/gateway-protocol";
@@ -51,6 +52,7 @@ async function fixture(messenger: Messenger) {
   cleanups.push(async () => store.close());
   const server = new GatewayServer({
     socketPath: gatewayPaths(config).socketPath, store, messenger,
+    downloadAttachment: messenger.openAttachment.bind(messenger),
     authorizeHead: async pid => {
       if (pid !== process.pid) throw new DeliveryError("Foreign native owner", "rejected");
     },
@@ -63,7 +65,7 @@ async function fixture(messenger: Messenger) {
   await server.listen();
   cleanups.push(() => server.close());
   const saved = process.env.OMP_SUPERAGENT_GATEWAY_TOKEN;
-  let client: Messenger;
+  let client: ReturnType<typeof createGatewayMessenger>;
   try {
     process.env.OMP_SUPERAGENT_GATEWAY_TOKEN = store.token();
     client = createGatewayMessenger(config);

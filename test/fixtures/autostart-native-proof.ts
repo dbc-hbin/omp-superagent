@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { hostPaths, loadConfig } from "../../src/config";
-import type { Messenger } from "../../src/contracts";
+import type { DownloadMessenger as Messenger } from "./inbound-attachments";
 import { loadCredentials } from "../../src/credentials";
 import type { GatewayService } from "../oracles/bun-gateway/gateway";
 import { offlineMnemopi } from "./native-memory";

@@ -1,5 +1,4 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, unlinkSync, type Stats } from "node:fs";
-import { createConnection, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { Value } from "@sinclair/typebox/value";
 import { HostConnection } from "./host";
@@ -10,7 +9,6 @@ import { remoteLanePaths, type WorkerPolicy, type WorkerProbe } from "./worker-w
 
 export const WORKER_ATTEMPT_ENV = "OMP_SUPERAGENT_WORKER_ATTEMPT";
 export const WORKER_SESSION_ENV = "OMP_SUPERAGENT_WORKER_EXPECTED_SESSION";
-const SOCKET_TIMEOUT_MS = 5_000;
 
 export function workerPaths(policy: WorkerPolicy, laneId: string) {
   const { socketPath, sessionFile } = remoteLanePaths(policy, laneId);
@@ -155,26 +153,4 @@ export async function inspectWorkerHost(ledger: WorkerLedger, paths: WorkerPaths
   }
   return { socket: !!files.socket, sessionFile: !!files.session, sessionId: null,
     pid, pidAlive: nativeAlive, ownerAlive, uncertain: true };
-}
-
-export async function rawWorkerSocket(path: string, identity: WorkerIdentity): Promise<Socket> {
-  if (!sameFile(identity, checkedSocket(path))) throw new WorkerRefusal("Worker socket changed before attach");
-  const socket = createConnection(path);
-  socket.pause();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => socket.destroy(new WorkerRefusal("Worker socket attach timed out")), SOCKET_TIMEOUT_MS);
-      socket.once("error", reject);
-      socket.once("connect", () => { clearTimeout(timer); resolve(); });
-      socket.once("close", () => {
-        clearTimeout(timer);
-        reject(new WorkerRefusal("Worker socket closed during attach"));
-      });
-    });
-    if (!sameFile(identity, checkedSocket(path))) throw new WorkerRefusal("Worker socket changed during attach");
-    return socket;
-  } catch (error) {
-    socket.destroy();
-    throw error;
-  }
 }

@@ -1,6 +1,6 @@
 import { AbortController as ApiAbortController, type AbortSignal as ApiAbortSignal } from "abort-controller";
 
-/** grammY's Node entrypoint requires its SDK signal; keep caller cancellation scoped to the API call. */
+/** The legacy oracle's grammY Node entrypoint requires its SDK signal. */
 export async function withTelegramSignal<T>(
   signal: AbortSignal | undefined, call: (signal: ApiAbortSignal | undefined) => Promise<T>,
 ): Promise<T> {

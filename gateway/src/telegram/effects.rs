@@ -43,6 +43,15 @@ pub(super) fn topic_payload(route: &Route) -> Value {
 }
 
 impl Core {
+    pub(super) async fn result_attachment(
+        &self,
+        output: &Value,
+        file: crate::result_attachment::VerifiedResultAttachment,
+    ) -> Result<Value, EffectError> {
+        let me = self.identity().await?;
+        self.send_result_attachment(&me, decode(output)?, file).await.map(Value::String)
+    }
+
     pub(super) async fn effect(
         &self,
         operation: &str,

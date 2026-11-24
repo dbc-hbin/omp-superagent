@@ -161,8 +161,8 @@ async fn group_effect_ipc_requires_durable_source_and_blocks_legacy_owner_routes
         let denied = fixture.call("/effect", &invalid).await?;
         assert_eq!(denied["certainty"], "rejected", "{invalid}");
     }
-    assert_eq!(fixture.call("/attachment", &json!({"route":work,
-        "attachment":{"id":"file","size":5,"name":"private.txt","url":"fixture"}})).await?["certainty"], "rejected");
+    assert_eq!(fixture.call("/attachment", &json!({"route":work,"inputId":source_id,
+        "attachments":[{"id":"file","size":5,"name":"private.txt","url":"fixture"}]})).await?["certainty"], "rejected");
     assert!(observed.try_recv().is_err());
 
     let valid = call(json!({"sourceId":source_id,"outcome":"finished"}));

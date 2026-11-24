@@ -763,10 +763,22 @@ impl Owner {
             },
             ready,
         );
-        if peer.send(json!({
+        let mut ready_frame = json!({
             "type": "ready", "protocolVersion": 1, "supportedProtocolVersions": [1, 2],
             "maxFrameBytes": wire::MAX_FRAME_BYTES, "maxReassembledFrameBytes": wire::MAX_REASSEMBLED_BYTES,
-        })).is_err() {
+        });
+        if let Some(identity) = self.identity.get()
+            && let Some(attempt) = &identity.worker_attempt
+        {
+            // This immutable launch identity has already passed native checkout,
+            // session and extension attestation before the socket starts accepting.
+            ready_frame["workerIdentity"] = json!({
+                "workerAttempt": attempt, "hostPid": self.native_pid,
+                "adapterOwnerPid": std::process::id(), "sessionId": identity.session_id,
+                "sessionFile": identity.session_file,
+            });
+        }
+        if peer.send(ready_frame).is_err() {
             peer.close();
         }
         let owner = Arc::clone(self);

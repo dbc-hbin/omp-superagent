@@ -57,7 +57,7 @@ export class RecordingMessenger implements Messenger {
     return structuredClone(this.thread);
   }
   async fetchAfter(_route: Route, _messageId: string): Promise<Inbound[]> { return []; }
-  async openAttachment(): Promise<Response> { throw new Error("Native fixture has no authorized attachments"); }
+  async openAttachment(): Promise<never> { throw new Error("Native fixture has no authorized attachments"); }
   async stop(): Promise<void> { this.handlers = undefined; }
 }
 
@@ -270,7 +270,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     requiresTag: true, appliedTags: ["101"], availableTags: [{ id: "101", name: "Work", moderated: false }] };
   const topic = headInput("102", threadRoute, "Handle this independent topic in its own workspace.");
   const followupTask = "Continue this independent topic in the same native session.";
-  const followup = headInput("103", threadRoute, followupTask);
+  const followup = headInput("103", modelSelection ? threadRoute : route, followupTask);
   const modelChangeSource = headInput("104", route, "Explicitly change the idle independent lane to the native low preset.");
   const changedFollowupTask = "Continue this independent topic after its explicit model change.";
   const changedFollowup = headInput("105", threadRoute, changedFollowupTask);
@@ -436,9 +436,9 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     }
 
     await messenger.deliver(followup);
-    await until(() => store.input(followup.id)?.state === "done", "bound follow-up reaches head before explicit delegation");
+    await until(() => store.input(followup.id)?.state === "done", "follow-up reaches head before explicit delegation");
     if (modelSelection) await runtime.resume(created.id, followup.id);
-    expect(store.input(followup.id)).toMatchObject({ target: "main", state: "done", route: threadRoute, generation: 0 });
+    expect(store.input(followup.id)).toMatchObject({ target: "main", state: "done", route: followup.route, generation: 0 });
     expect(requestIds(parseSessionEntries(await fs.readFile(firstLane.sessionFile, "utf8")))).toEqual([firstHandoff]);
     const followupHandoff = `handoff:${followup.id}:${created.id}`;
     await runtime.messageLane(created.id, followupTask, followup.id);
@@ -447,7 +447,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     expect(messenger.threadTitles).toEqual([
       "⏳ Independent topic", "✅ Independent topic", "⏳ Independent topic", "✅ Independent topic",
     ]);
-    expectedDelivered.push({ ...followup, id: report(followupHandoff) });
+    expectedDelivered.push({ ...followup, id: report(followupHandoff), route: threadRoute });
     const finalLane = store.lane(created.id)!;
     expect(finalLane).toMatchObject({ sessionId: firstLane.sessionId, sessionFile: firstLane.sessionFile,
       model: laneModel, modelReason, generation: firstLane.generation + (modelSelection ? 1 : 0) });

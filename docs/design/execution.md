@@ -51,7 +51,7 @@ references](../../skills/head/SKILL.md) for operating policy.
 | Tools | Authority and outcome |
 | --- | --- |
 | `lane_start` | Requires a durable user source, title, existing absolute cwd, exact model or native preset, model reason and kickoff. Accepts a bounded brief, acceptance criteria, and an authorized destination or workflow. At most one new lane per source. Returns the durable ID and admission state, not an execution or completion receipt. |
-| `lane_message` | Explicit follow-up with a real authorized `sourceId` and the target lane. Deduplicate by source and lane; check destination, attachment/quote scope and identity compatibility. The same source may reach existing lanes only where those routes and reporting are authorized. |
+| `lane_message` | Explicit follow-up with a real authorized `sourceId` and the target lane. Deduplicate by source and lane; check destination, attachment/quote scope and identity compatibility. For a physical Discord work thread and a source from its exact guild parent, pin the HEAD-reviewed report route to that thread per handoff. This does not rebind the source or resume a paused lane. The same source may reach existing lanes only where those routes and reporting are authorized. |
 | `lane_inspect` | Lists records without a live probe; inspecting a specific lane adds live status where observable, model readback, queue blockers and observed progress. Null actual state is unknown, not a match. |
 | `lane_pause` | Takes a managed lane ID. Persists pause intent and requests an interrupt without claiming owned services or earlier effects are gone. |
 | `lane_resume` | Takes a managed lane ID and an authorized original `sourceId`. May reopen a paused native goal after checking native state; never releases an uncertain submission or revives cancelled work. |
@@ -121,6 +121,9 @@ queue restoration uses the SDK's reassembled-frame byte limit: this is the value
 [`maxResponseBytes` in OMP 19.0](https://github.com/can1357/oh-my-pi/blob/v19.0.0/packages/coding-agent/src/modes/rpc/rpc-frame.ts#L341-L347)
 and [`maxIntactFrameBytes` in 19.1](https://github.com/can1357/oh-my-pi/blob/v19.1.0/packages/coding-agent/src/modes/rpc/rpc-frame.ts#L341-L347).
 An intact queue must not be reported as truncated. No second Bun runtime stays resident per Host.
+For SSH workers the enrolled forced command hands its stdio to the Rust relay.
+Admission and Host attestation can use a short-lived helper; no Bun process
+stays just to forward bytes. SSH EOF detaches only that connection.
 Gateway supervision reads the exact session, process and socket identity from a fresh handshake
 instead of fetching the same full state again on the new connection.
 

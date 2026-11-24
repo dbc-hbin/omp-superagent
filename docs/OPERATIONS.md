@@ -334,8 +334,10 @@ export DISCORD_BOT_TOKEN
 위 입력은 Bash에서 토큰이 화면과 명령 이력에 노출되지 않게 받는 예다.
 프로세스는 현재 사용자 권한과 환경을 사용한다. 레인과 worktree는 보안 샌드박스가 아니다.
 
-Discord 자동완성 목록은 명시적으로 등록한다. 먼저 새 interaction 처리 코드가 실행되는
-Gateway를 사용해야 한다. 작업 중인 헤드를 강제 종료해서 업데이트하지 않는다.
+Discord 자동완성 목록은 명시적으로 등록한다. 명령을 등록하기 전에 Gateway와 HEAD 모두
+새 버전으로 실행 중이어야 한다. Gateway만 교체하면 기존 HEAD에 재연결될 수 있다.
+Discord에서 `/help`를 보내 `/usage-reset`이 표시되는지 확인한다. 표시되지 않으면
+등록하지 말고 HEAD 업데이트를 먼저 마친다. 작업 중인 HEAD를 강제 종료하지 않는다.
 
 ```sh
 bun --no-env-file src/cli.ts discord-commands --config config.local.json
@@ -344,7 +346,7 @@ bun --no-env-file src/cli.ts discord-commands --config config.local.json --apply
 
 첫 명령은 읽기 전용 변경 확인이다. `--apply`는 **이 봇의 전역 명령 목록 전체를 교체**하므로
 전용 Superagent 앱에서만 사용한다. Hermes 전용 명령은 제거하고 `/head`를 포함한
-[공통 명령 목록](../src/messenger-command-catalog.json)만 등록한다.
+[공통 명령 목록과 Discord 전용 `/usage-reset`](../src/messenger-command-catalog.json)을 등록한다.
 별도 guild 명령이 전역 명령을 가리는 경우 몰래 삭제하지 않고 충돌을 알린다.
 등록은 모델·메신저 연결을 시작하지 않으며 setup·doctor·start의 부수 효과로 실행되지 않는다.
 인수가 있는 명령은 선택적인 `text` 필드를 사용한다. 예를 들어 `/model`의 `text`에
@@ -478,7 +480,8 @@ export SLACK_BOT_TOKEN SLACK_APP_TOKEN
 ```
 
 Rust Gateway가 [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/)와
-[Web API](https://docs.slack.dev/apis/web-api/)를 사용한다. 명령 등록 CLI는 Slack Web API SDK를 사용한다.
+[Web API](https://docs.slack.dev/apis/web-api/)를 사용한다. 명령 등록은 같은 배포 파일의 일회성 Rust
+REST 명령을 사용하며 Socket Mode나 Gateway 데몬을 시작하지 않는다.
 스레드 조회는 현재 공식 [conversations.replies](https://docs.slack.dev/reference/methods/conversations.replies/)
 문서의 bot history scopes를 따른다. bot token이면 채널 스레드를 무조건 조회할 수 없다는
 과거 제한을 전제로 하지 않는다. 실제 접근 권한·workspace 보존 정책·API rate limit은 여전히 적용된다.
@@ -1191,7 +1194,7 @@ head SHA를 사용한다. GitHub가 원자적으로 비교하는 값은 head SHA
 | `/restart` | 바쁜 헤드를 체크포인트한 뒤 Gateway와 헤드 교체. 원래 대화 ACK·실제 안전한 종료 확인, 같은 세션/모델 복원, 안전한 goal 재개. 레인은 유지하며 불확실한 효과는 보류 |
 | `/context` | 헤드 native 컨텍스트 사용량·한도 조회. 추정치·미상은 그대로 표시 |
 | `/usage` | 설정한 프로필의 순정 `omp usage`에서 제공자별 계정 한도·사용량·리셋 시각 조회. 세션 토큰·비용 통계가 아님 |
-| `/usage reset` | 지금 쓸 수 있는 리셋권의 계정별·전체 개수 조회. 계정을 고른 뒤 Confirm을 눌러야 그 계정의 리셋권 1개 사용 |
+| `/usage-reset` (Discord), `/usage reset` (Telegram), `!usage reset` (Slack) | 지금 쓸 수 있는 리셋권의 계정별·전체 개수 조회. 계정을 고른 뒤 Confirm을 눌러야 그 계정의 리셋권 1개 사용 |
 | `/compact [보존할 내용]` | 유휴 헤드의 native 컨텍스트 압축. 여러 줄 보존 지시 전달 가능 |
 | `/stop` | 연결된 레인은 일시정지. 미배정 대화에서는 경로 질문이나 실행 중인 요청의 원문에 답장해 대상을 지정. 배정 대기와 HEAD 실행이 함께 있거나 수정본이 서로 다른 레인을 가리키면 임의로 중지하지 않고 같은 대화에서 안내 |
 | `/stop head` | 현재 주제와 무관하게 공유 헤드 작업 중단 |
@@ -1216,10 +1219,16 @@ Gateway는 헤드가 연속 **30분 이상 유휴**이고 native 컨텍스트 �
 CLI 조회 실패와 확인 가능한 한도가 없는 경우는 구분한다. Slack에서는 `!usage`
 또는 등록된 `/superagent-usage`를 사용한다.
 
-`/usage reset`은 설치된 OMP CLI가 계정 지정 리셋권 사용을 지원할 때 동작한다.
-등록된 Discord `/usage`의 `text` 옵션에 `reset`을 입력하거나 Discord·Telegram 메시지로
-`/usage reset`을 보낸다. Slack에서는 `!usage reset` 또는 `/superagent-usage reset`을 사용한다.
-등록된 명령의 옵션 갱신은 기존 명령 등록 절차를 따른다. `Codex · 계정 #7 · al…`처럼
+리셋권 메뉴는 설치된 OMP CLI가 계정 지정 리셋권 사용을 지원할 때 동작한다.
+Discord 명령 목록과 허용된 일반 채팅에서는 인수 없는 `/usage-reset`만 사용한다.
+`/usage`는 인수 없는 한도 조회 전용이다. 예전 채팅의 `/usage reset`과 오래된 등록의
+`/usage text:reset`은 거부되며, 리셋권 메뉴를 열거나 모델·레인 작업을 시작하지 않는다.
+Gateway와 HEAD 업데이트 후 Discord `/help`에 `/usage-reset`이 표시되는지 확인한다.
+그런 다음 `discord-commands` 읽기 전용 결과에서 `/usage-reset` 추가를 확인하고 위의 전역
+등록 절차를 따른다. `/help` 확인 후에는 등록 전이라도 Discord에서 **일반 채팅 메시지**로
+`/usage-reset`을 보낼 수 있다(`requireAddressing`이 필요한 채널에서는 봇 멘션 또는 답장).
+Telegram에서는 `/usage reset`, Slack에서는 `!usage reset` 또는 `/superagent-usage reset`을 사용한다.
+`Codex · 계정 #7 · al…`처럼
 로컬 `omp usage reset`의 계정 지정 번호와 가능한 경우 짧게 마스킹한 계정·조직 이름을 표시한다.
 전체 이메일·제공자 계정 ID는 채팅에 넣지 않는다. 메뉴 열기·계정 선택·Cancel은 비용이 없다.
 확인 카드는 5분 뒤 만료되며 원래 대화의 운영자만 Confirm으로 한 번 사용할 수 있다. 사용 결과가 불확실하면
@@ -1472,10 +1481,13 @@ bun --no-env-file src/cli.ts uninstall --config config.local.json
 - 모든 플랫폼의 입력 첨부는 요청당 최대 10개, 개별 20 MiB, 합계 40 MiB다.
   선언 크기·실제 스트림 크기를 대조하며 redirect는 따르지 않는다.
   Telegram에서 `file_size`가 없으면 크기 미상(`null`)으로 저장한다. 알려진 0바이트와 구분하며,
-  미상 크기도 실제 다운로드 바이트의 파일·요청·이미지 한도와 Gateway 완료 프레임을 검사한다.
-  PNG/JPEG/GIF/WebP는 내용 시그니처를 확인해 모델 이미지 입력으로 전달하고,
+  미상 크기도 실제 다운로드 바이트의 파일·요청·이미지 한도를 적용한다. Gateway가 전용 디렉터리에
+  파일을 저장하고 요청 전체가 완료되면 파일별 경로·SHA-256을 반환한다. HEAD는 요청 ID와
+  파일 순서로 영수증을 검증한다. PNG/JPEG/GIF/WebP는 내용 시그니처를 확인하며,
+  모델에 넘길 바이트의 SHA-256이 영수증과 다르면 요청을 취소한다.
   RPC base64 입력의 디코딩 후 이미지 데이터 합계는 별도로 8 MiB로 제한한다.
   그 밖의 파일은 로컬 경로를 제공한다. 임의 URL 다운로드·문서 자동 변환은 제공하지 않는다.
+  Gateway 재시작 시에는 소유권과 형식이 확인된 미완료 다운로드만 정리한다. 완료된 첨부는 남는다.
   자격 증명·서명된 다운로드 URL은 모델 프롬프트에 넣지 않는다.
   안전한 다운로드에 실패하면 그 요청의 모델 실행을 시작하지 않는다.
 - Discord·Telegram 답장의 참조 ID·작성자·본문과 Telegram 선택 인용문을 head와 명시적 레인
@@ -1615,6 +1627,7 @@ GitHub 소스 아카이브는 커밋된 소스만 담으며 설치할 때 현재
 owner를 빌드한다. npm `.tgz`는 네 플랫폼용 실행 파일과 라이선스 고지를 함께 담아 설치
 머신에서 Rust 빌드를 요구하지 않는다. 실제 실행에는 두 배포 모두 Bun과 별도 설치한 OMP가
 필요하다. 관리형 omp-superkit은 설치 단계에서 준비하며 아카이브에 내장하지 않는다.
+CI·기준판 테스트·릴리즈 스크립트는 소스 checkout 전용이며 npm 패키지에는 포함하지 않는다.
 
 `package.json`의 버전과 `docs/releases/<version>.md`를 준비하고 의도한 변경을 커밋한다.
 [CI의 네이티브 빌드 매트릭스](../.github/workflows/ci.yml)는 각 대상(`darwin-arm64`, `darwin-x64`,

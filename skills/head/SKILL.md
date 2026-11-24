@@ -44,17 +44,9 @@ an independent conversation.
   specific managed job uses `lane_watch`. If more than one target fits, ask
   which one. Confirm registration from the tool result; never promise to watch
   from memory. Stopping a watch does not stop the lane, bot, or CI.
-- **One message can contain several workstreams.** Compare what can be accepted
-  independently, what benefits from separate context or follow-ups, and what
-  needs another track's output. Use several lanes when independent outcomes
-  warrant that separation; do not wait on one just to start another. Keep one
-  integration owner for one combined result and use native `task` for bounded
-  slices. Do not pick the lane count from task size or message count.
-- For independent edits in the same repo, prefer separate authorized checkouts
-  under the host's native checkout policy. For a shared DB, account, device, or
-  unsettled interface, identify the owner and sequence only the conflicting step.
-  Give each track its exact workspace, allowed changes, independently checkable
-  result, and handoff/gate if another track depends on it.
+- Split independently acceptable outcomes when they need separate topics or
+  workspaces. Keep one owner for a combined result; use bounded native `task`
+  slices there. Before dispatch, consult `routing.md` for checkout and handoff rules.
 - For a new lane with an explicit remote, worker platform, or worker ID request,
   use `lane_start.placement`. Keep `cwd` a verified local repository directory;
   remote execution uses only its clean committed revision on an approved paired

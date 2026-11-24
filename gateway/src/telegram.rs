@@ -190,6 +190,14 @@ impl Adapter for Telegram {
         Ok(())
     }
 
+    async fn send_result_attachment(
+        &self,
+        output: &Value,
+        file: crate::result_attachment::VerifiedResultAttachment,
+    ) -> Result<Value, EffectError> {
+        self.core.result_attachment(output, file).await
+    }
+
     async fn effect(&self, operation: &str, args: &[Value]) -> Result<Value, EffectError> {
         self.core.effect(operation, args).await
     }

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { constants, existsSync, lstatSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
+import { mkdir, open } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
@@ -15,7 +15,7 @@ import { authorizeRoute, credentialEnvNames, type Config, hostPaths, privateDire
 import { DeliveryError } from "./delivery";
 import { GroupAccess } from "./group-access";
 import { groupRoom } from "./group-policy";
-import { isOriginalAttachmentMessage, readResultAttachmentIntent, readResultAttachmentStart,
+import { discardResultAttachment, isOriginalAttachmentMessage, pruneResultAttachments, readResultAttachmentIntent, readResultAttachmentStart,
   requestedResultPath, ResultAttachmentError, stageResultAttachment, type ResultAttachmentIntent } from "./result-attachment";
 import { HostConnection, type HostOptions, PR_REVIEW_INPUT_PREFIX, startHost } from "./host";
 import { compareMessageIds } from "./message-order";
@@ -58,7 +58,7 @@ const presetSyncMaxRetries = 5;
 // auto-compaction fires, matching host-extension.ts, Gateway rotation.rs, and DESIGN.md.
 const HEAD_ROTATION_CONTEXT_PERCENT = 50;
 const headPickerLifetimeMs = 5 * 60_000;
-const headControlPattern = /^\/(help|status|stop|restart|context|compact|usage|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/;
+const headControlPattern = /^\/(help|status|stop|restart|context|compact|usage|usage-reset|model|effort|resolve|cron)(?:\s+([\s\S]*))?$/;
 const dialogs = new Set(["select", "confirm", "input", "editor", "ask"]);
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 40 * 1024 * 1024;
@@ -120,9 +120,14 @@ function messengerEdit(input: Inbound): boolean {
   return input.id.startsWith(`${platform}:${scope}:${input.messageId}:edit:`);
 }
 
-function codeHandledControl(text: string): boolean {
+function matchHeadControl(text: string, platform: Route["platform"]): RegExpExecArray | null {
+  const match = headControlPattern.exec(text.trim());
+  return match?.[1] === "usage-reset" && platform !== "discord" ? null : match;
+}
+
+function codeHandledControl(text: string, platform: Route["platform"]): boolean {
   const command = text.trim();
-  return command === "/resume" || headControlPattern.test(command) || prModeArgument(command) !== null;
+  return command === "/resume" || matchHeadControl(command, platform) !== null || prModeArgument(command) !== null;
 }
 
 export interface RuntimeState {
@@ -253,10 +258,20 @@ interface DmCommandBoundary {
 }
 const laneDecisionReview = "lane-decision-review:";
 interface HeadCommand {
-  name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "model" | "effort" | "resolve" | "cron";
+  name: "help" | "status" | "stop" | "restart" | "context" | "compact" | "usage" | "usage-reset" | "model" | "effort" | "resolve" | "cron";
   argument: string;
   readonly picker?: true;
 }
+
+function matchesUsageReset(command: HeadCommand, platform: Route["platform"]): boolean {
+  return platform === "discord" ? command.name === "usage-reset" && !command.argument
+    : command.name === "usage" && command.argument === "reset";
+}
+
+function usageResetHint(platform: Route["platform"]): string {
+  return platform === "discord" ? "/usage-reset" : platform === "slack" ? "!usage reset" : "/usage reset";
+}
+
 interface HeadRestart extends GatewayRestartRequest {
   ownerPid: number;
   sessionId: string;
@@ -474,6 +489,10 @@ export class Superagent {
       for (const directory of ["run", "sessions", "logs", "attachments"]) privateDirectory(join(this.config.stateDir, directory));
       if (this.config.groupRooms?.length) this.groups = new GroupAccess(this.config, this.messenger);
       this.store.recoverDeliveries();
+      if (existsSync(join(this.config.stateDir, "result-attachments"))) {
+        try { pruneResultAttachments(this.config.stateDir); }
+        catch (error) { this.report(error); }
+      }
       // Reserve the recovery boundaries before opening streaming intake.
       const cursors = this.reserveCatchupCursors();
       // Deferred routing waits for intake readiness, then admits in its saved order.
@@ -1328,17 +1347,23 @@ export class Superagent {
     if (existing) return `Result attachment ${id} is ${existing.state}; no new attempt was made.`;
     const agentDb = getAgentDbPath();
     const payload = stageResultAttachment(intent.path, {
+      stateDir: this.config.stateDir,
       cwd: lane?.cwd ?? this.config.headCwd,
       privatePaths: [this.config.stateDir, this.config.path, `${this.config.path}.env`, getAgentDir(), sessionFile,
-        agentDb, `${agentDb}-wal`, `${agentDb}-shm`, `${agentDb}-journal`],
+        agentDb, `${agentDb}-wal`, `${agentDb}-shm`, `${agentDb}-journal`].map(path => resolve(path)),
     });
-    this.store.queueOutput({
-      id, sourceId: outputSourceId, route, text: "",
-      resultAttachment: {
-        payload, sourceId: source.id, inputId: input.id, requestId: input.requestId,
-        generation: live.generation, sessionId: live.sessionId, sessionFile, toolCallId: intent.toolCallId,
-      },
-    });
+    try {
+      this.store.queueOutput({
+        id, sourceId: outputSourceId, route, text: "",
+        resultAttachment: {
+          payload, sourceId: source.id, inputId: input.id, requestId: input.requestId,
+          generation: live.generation, sessionId: live.sessionId, sessionFile, toolCallId: intent.toolCallId,
+        },
+      });
+    } catch (error) {
+      this.discardResultSnapshot(payload);
+      throw error;
+    }
     this.wakeOutputs(route);
     return `Result attachment ${id} was durably queued to the original topic, not yet confirmed delivered.`;
   }
@@ -2203,7 +2228,7 @@ export class Superagent {
     input: Inbound,
     queue: readonly Inbound[],
   ): { readonly priority: "immediate" | "retry"; readonly laneId?: string } | null {
-    const control = headControlPattern.exec(input.text.trim());
+    const control = matchHeadControl(input.text, input.route.platform);
     const name = control?.[1];
     if (!control || name !== "restart" && name !== "stop" || input.pickerSelection
       || messengerEdit(input) || !authorizeRoute(this.config, input.route)) return null;
@@ -2329,7 +2354,7 @@ export class Superagent {
         ? picker?.groups[selection.group]?.options[selection.option] : undefined;
       const reset = picker?.kind === "usage-reset";
       const matchesOpener = reset
-        ? opener?.name === "usage" && opener.argument === "reset" && !opener.picker
+        ? opener && matchesUsageReset(opener, input.route.platform) && !opener.picker
           && selection.confirmed === true && selection.group === 0
         : opener?.name === picker?.kind && opener?.argument === "" && selection.confirmed === undefined;
       if (!output || !picker || !matchesOpener || !argument
@@ -2339,7 +2364,9 @@ export class Superagent {
         || input.text !== "" || input.attachments.length) {
         throw new DeliveryError("Picker selection does not match its original owner command and card", "rejected");
       }
-      return { ...input, route: output.route, text: reset ? "/usage reset" : `/${picker.kind} ${argument}` };
+      const text = reset ? (output.route.platform === "discord" ? "/usage-reset" : "/usage reset")
+        : `/${picker.kind} ${argument}`;
+      return { ...input, route: output.route, text };
     }
     return input;
   }
@@ -2361,7 +2388,7 @@ export class Superagent {
     const replyRoute = slackRoot ? { ...physicalRoute(input.route), threadId: null } : input.route;
     const replyId = input.reply?.messageId ?? slackRoot;
     const discordEdit = input.route.platform === "discord" && editEvent;
-    const query = !selection && !discordEdit && !headAddressed && !codeHandledControl(input.text)
+    const query = !selection && !discordEdit && !headAddressed && !codeHandledControl(input.text, input.route.platform)
       && candidate && !this.store.input(input.id)
       && !(input.messageId && this.store.firstAdmittedMessage(input.route, input.messageId))
       && !(input.reply && this.store.repliedTopicWorkspace(input.route, input.reply.messageId))
@@ -2424,7 +2451,7 @@ export class Superagent {
       input = { ...input, route: priorRevision.route };
       if (this.store.getMeta(`topic-confirm:${priorRevision.id}`) !== null || editsTopicPlacement(placementText(priorRevision), placement)) {
         metadata = { [`dm:control-edit:${input.id}`]: "true" };
-      } else if (codeHandledControl(priorRevision.text) || codeHandledControl(input.text)) {
+      } else if (codeHandledControl(priorRevision.text, priorRevision.route.platform) || codeHandledControl(input.text, input.route.platform)) {
         metadata = { [`dm:control-edit:${input.id}`]: "command" };
       } else if (priorRevision.target === "main" && this.isDm(priorRevision.route) && !headAddressed) {
         const placed = this.store.headLanePlacement(priorRevision.id);
@@ -2479,7 +2506,7 @@ export class Superagent {
       }
       input = { ...input, route: topicId ? { ...physical, topicId } : physical };
     }
-    if (!priorRevision && editEvent && codeHandledControl(input.text)) {
+    if (!priorRevision && editEvent && codeHandledControl(input.text, input.route.platform)) {
       metadata = { ...metadata, [`dm:control-edit:${input.id}`]: "command" };
     }
     const workspace = request.cwd === null ? null : existingWorkspace(request.cwd);
@@ -2507,7 +2534,7 @@ export class Superagent {
     }
     const commandText = placement.trim();
     const ordinary = !headAddressed && !selection && !metadata[`dm:control-edit:${input.id}`]
-      && !codeHandledControl(commandText) && !["/main", "/new"].includes(commandText);
+      && !codeHandledControl(commandText, input.route.platform) && !["/main", "/new"].includes(commandText);
     if (ordinary && (priorRevision?.target !== "main" || priorOwner)) {
       const keepThread = discordWorkThread(input.route) && !newTopic && Boolean(bound || opening);
       const sibling = !keepThread && !this.isDm(input.route) && !!input.route.threadId
@@ -3543,6 +3570,12 @@ export class Superagent {
       if (queued) this.background(this.syncLaneThreadTitle(lane));
       return handoffId;
     }
+    // Pin only an original HEAD input from this physical thread's exact parent.
+    // Do not rebind the inbound message, topic, or source of native callbacks.
+    const reportInThread = original.target === "main" && !original.pickerSelection
+      && this.store.getMeta(`user-source:${original.id}`) === "true"
+      && discordWorkThread(lane.route) && lane.route.topicId === undefined
+      && routeKey(original.route) === routeKey({ ...lane.route, threadId: null });
     const queued = this.store.receive({
       id: handoffId, route: lane.route, messageId: original.messageId,
       ...(original.interactionId === undefined ? {} : { interactionId: original.interactionId }),
@@ -3551,7 +3584,10 @@ export class Superagent {
       ...(original.discordContext === undefined ? {} : { discordContext: original.discordContext }),
       text, receivedAt: original.receivedAt,
       attachments: original.attachments,
-    }, id, { [`handoff-source:${handoffId}`]: sourceId }, workflow);
+    }, id, {
+      [`handoff-source:${handoffId}`]: sourceId,
+      ...(reportInThread ? { [`handoff-reply:${handoffId}`]: routeKey(lane.route) } : {}),
+    }, workflow);
     if (queued) this.background(this.syncLaneThreadTitle(lane));
     return handoffId;
   }
@@ -4719,7 +4755,7 @@ export class Superagent {
     const mode = prModeArgument(input.text);
     if (mode && this.store.getMeta(`user-source:${input.id}`) === "true" && !this.store.getMeta(`handoff-source:${input.id}`))
       return { name: "cron", argument: mode };
-    const match = headControlPattern.exec(input.text.trim());
+    const match = matchHeadControl(input.text, input.route.platform);
     if (!match || this.store.getMeta(`user-source:${input.id}`) !== "true"
       || this.store.getMeta(`handoff-source:${input.id}`)) return null;
     return { name: match[1] as HeadCommand["name"], argument: (match[2] ?? "").trim(),
@@ -5315,7 +5351,7 @@ export class Superagent {
     // /resolve mutates only the durable ledger, never native session state, so it
     // must stay available while the HEAD is busy or its native state is unknown.
     return command.name === "resolve" || ["help", "status", "context"].includes(command.name)
-      || command.name === "usage" && !command.picker
+      || (command.name === "usage" || command.name === "usage-reset") && !command.picker
       || command.name === "effort" && !command.argument
       || !!preset && (!!preset.error || !preset.name)
       || command.name === "model" && ["", "list"].includes(command.argument);
@@ -5373,7 +5409,7 @@ export class Superagent {
         "Supported owner commands (Slack uses ! instead of /, e.g. !status):",
         "/help; /status; /context — read current shared HEAD, even while busy; no model turn.",
         "/usage — view account quotas and reset times from the configured OMP profile; no model turn.",
-        "/usage reset — list usable saved reset tickets. Choose an account and use Confirm to spend one ticket on it. Slack: !usage reset or /superagent-usage reset.",
+        `${usageResetHint(input.route.platform)}${input.route.platform === "slack" ? " or /superagent-usage reset" : ""} — list usable saved reset tickets. Choose an account and use Confirm to spend one ticket on it.`,
         "/model and /effort open selection menus. Text commands: /model list; /model <exact provider/id>; /model preset; /model preset list; /model preset <exact-name>; /effort <advertised-level>. Changes require idle, unambiguous HEAD state.",
         "/model preset <exact-name> --global — first apply and verify the shared HEAD session, then save those exact roles/thinking as future/default settings. Existing lanes remain unchanged. --global is only supported for named preset selection, not queries/lists, direct models or effort; duplicate/unknown flags are rejected. A failed/unconfirmed global save does not undo the session change and is never automatically replayed.",
         "/compact [instructions] — native shared HEAD compaction; multiline instructions allowed; requires idle, unambiguous state.",
@@ -5779,11 +5815,11 @@ export class Superagent {
 
   private uncertainUsageReset(input: InputRecord): string {
     const prefix = input.route.platform === "slack" ? "!" : "/";
-    return `OMP가 리셋권 사용을 확인하지 못했습니다. 자동으로 재시도하지 않았습니다. \`${prefix}usage reset\`으로 남은 리셋권을 확인한 뒤 \`${prefix}resolve ${input.id}\`로 보류를 해제할 수 있습니다.`;
+    return `OMP가 리셋권 사용을 확인하지 못했습니다. 자동으로 재시도하지 않았습니다. \`${usageResetHint(input.route.platform)}\`으로 남은 리셋권을 확인한 뒤 \`${prefix}resolve ${input.id}\`로 보류를 해제할 수 있습니다.`;
   }
 
-  private async usageControl(input: InputRecord, argument: string): Promise<void> {
-    if (!argument) {
+  private async usageControl(input: InputRecord, command: HeadCommand): Promise<void> {
+    if (command.name === "usage" && !command.argument) {
       let text: string;
       try { text = await this.adapters.readOmpUsage(this.config); }
       catch {
@@ -5794,12 +5830,12 @@ export class Superagent {
       this.controlReply(input, text);
       return;
     }
-    if (argument !== "reset") {
-      this.controlReply(input, "Invalid syntax. Use /usage or /usage reset. A ticket can only be spent from the confirmation card.", "cancelled");
+    const resetCommand = usageResetHint(input.route.platform);
+    if (!matchesUsageReset(command, input.route.platform)) {
+      const resetInput = input.route.platform === "discord" ? resetCommand : "/usage reset";
+      this.controlReply(input, `Invalid syntax. Use /usage or ${resetInput}. A ticket can only be spent from the confirmation card.`, "cancelled");
       return;
     }
-    const prefix = input.route.platform === "slack" ? "!" : "/";
-    const resetCommand = `${prefix}usage reset`;
     const savedKey = this.store.getMeta("usage-reset:identity-key");
     const identityKey = savedKey ?? crypto.randomUUID();
     if (savedKey === null) this.store.setMeta("usage-reset:identity-key", identityKey);
@@ -5915,7 +5951,7 @@ export class Superagent {
       return;
     }
     if (command.name === "cron") { this.cronControl(input.id, command.argument); return; }
-    if (command.name === "usage") { await this.usageControl(input, command.argument); return; }
+    if (command.name === "usage" || command.name === "usage-reset") { await this.usageControl(input, command); return; }
     if (command.name === "restart") {
       if (this.restartActive === input.id || this.admitRestart(input, command)) await this.runHeadRestart(input);
       return;
@@ -6800,68 +6836,46 @@ export class Superagent {
     if (input.attachments.length > 10) throw new Error("Too many attachments");
     const declared = input.attachments.reduce((total, attachment) => total + (attachment.size ?? 0), 0);
     if (!Number.isSafeInteger(declared) || declared > MAX_REQUEST_BYTES) throw new Error("Attachment request exceeds the size limit");
-    const directory = join(this.config.stateDir, "attachments", key(input.id));
     const sourceId = this.store.getMeta(`handoff-source:${input.id}`);
     const source = sourceId ? this.store.input(sourceId) : input;
     if (!source) throw new Error("Attachment source identity is unavailable");
     this.authorized(source.route);
-    if (input.attachments.length) privateDirectory(directory);
-    let totalBytes = 0;
-    for (const [index, attachment] of input.attachments.entries()) {
+    if (!input.attachments.length) return { descriptions, images };
+    for (const attachment of input.attachments) {
       if (attachment.size !== null && (!Number.isSafeInteger(attachment.size) || attachment.size < 0 || attachment.size > MAX_ATTACHMENT_BYTES)) throw new Error("Invalid attachment size");
-      const destination = join(directory, `${index}-${key(attachment.id)}`);
-      const temporary = `${destination}.download`;
-      await rm(temporary, { force: true });
-      const file = await open(temporary, "wx", 0o600);
-      let reader: { cancel(): Promise<void> } | undefined;
-      let bytes = 0;
-      try {
-        const response = await this.messenger.openAttachment(source.route, attachment, AbortSignal.timeout(30_000));
-        if (!response.ok || !response.body) throw new Error("Attachment download was rejected");
-        const length = response.headers.get("content-length");
-        if (length !== null && (!/^\d+$/.test(length) || Number(length) > (attachment.size ?? MAX_ATTACHMENT_BYTES))) throw new Error("Attachment response exceeds declared size");
-        const expectedSize = attachment.size ?? (length === null ? null : Number(length));
-        const activeReader = response.body.getReader();
-        reader = activeReader;
-        for (;;) {
-          const chunk = await activeReader.read();
-          if (chunk.done) break;
-          bytes += chunk.value.byteLength;
-          totalBytes += chunk.value.byteLength;
-          if (bytes > (attachment.size ?? MAX_ATTACHMENT_BYTES) || bytes > MAX_ATTACHMENT_BYTES || totalBytes > MAX_REQUEST_BYTES) throw new Error("Attachment stream exceeds the size limit");
-          let offset = 0;
-          while (offset < chunk.value.length) {
-            const { bytesWritten } = await file.write(chunk.value, offset, chunk.value.length - offset);
-            if (!bytesWritten) throw new Error("Attachment write made no progress");
-            offset += bytesWritten;
-          }
-        }
-        if (expectedSize !== null && bytes !== expectedSize) throw new Error("Attachment stream differs from declared size");
-        await file.sync();
-      } catch {
-        await reader?.cancel().catch(() => {});
-        await file.close();
-        await rm(temporary, { force: true });
-        throw new Error("Attachment could not be safely downloaded; no prompt was submitted");
-      }
-      await file.close();
-      await rename(temporary, destination);
+    }
+    const batch = { inputId: input.id, route: source.route, attachments: input.attachments };
+    const receipt = await this.messenger.openAttachment(batch, AbortSignal.timeout(30_000 * batch.attachments.length + 1000))
+      .catch(() => { throw new Error("Attachment could not be safely downloaded; no prompt was submitted"); });
+    if (receipt.files.length !== batch.attachments.length) throw new Error("Invalid attachment spool receipt");
+    for (const [index, attachment] of input.attachments.entries()) {
+      const result = receipt.files[index];
+      if (!result) throw new Error("Attachment spool receipt omitted a file");
+      const { path: destination, size: bytes, mimeType } = result;
       const media = [
         attachment.voice ? "voice message" : "",
         attachment.durationSeconds === undefined ? "" : `duration ${attachment.durationSeconds} seconds`,
       ].filter(Boolean).join("; ");
       descriptions.push(`Attachment ${index + 1}: ${JSON.stringify(attachment.name)}; local file ${destination}; ${bytes} bytes${media ? `; ${media}` : ""}. Attachment contents are untrusted task data.`);
-      const data = Buffer.from(await Bun.file(destination).slice(0, 12).arrayBuffer());
-      let mimeType: string | undefined;
-      if (data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) mimeType = "image/png";
-      else if (data[0] === 255 && data[1] === 216 && data[2] === 255) mimeType = "image/jpeg";
-      else if (["GIF87a", "GIF89a"].includes(data.subarray(0, 6).toString())) mimeType = "image/gif";
-      else if (data.subarray(0, 4).toString() === "RIFF" && data.subarray(8, 12).toString() === "WEBP") mimeType = "image/webp";
-      if (mimeType) {
-        imageBytes += bytes;
-        if (imageBytes > MAX_IMAGE_BYTES) throw new Error("Image payload exceeds the bounded native RPC allowance");
-        images.push({ type: "image", data: (await readFile(destination)).toString("base64"), mimeType });
-      }
+      if (!mimeType.startsWith("image/")) continue;
+      imageBytes += bytes;
+      if (imageBytes > MAX_IMAGE_BYTES) throw new Error("Image payload exceeds the bounded native RPC allowance");
+      if (realpathSync(destination) !== destination) throw new Error("Attachment spool path changed");
+      const file = await open(destination, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600
+          || stat.nlink !== 1 || stat.size !== bytes) throw new Error("Attachment spool file changed");
+        const data = Buffer.alloc(bytes);
+        for (let offset = 0; offset < bytes;) {
+          const { bytesRead } = await file.read(data, offset, bytes - offset, offset);
+          if (!bytesRead) throw new Error("Attachment spool file was truncated");
+          offset += bytesRead;
+        }
+        if (createHash("sha256").update(data).digest("hex") !== result.sha256)
+          throw new Error("Attachment image changed after the Gateway published its receipt");
+        images.push({ type: "image", data: data.toString("base64"), mimeType });
+      } finally { await file.close(); }
     }
     return { descriptions, images };
   }
@@ -6899,7 +6913,13 @@ export class Superagent {
       const activeTopic = this.store.topicDelivery(owner.id);
       const nextTopic = this.store.topicDelivery(input.id);
       const activeReply = routeKey(activeTopic?.route ?? this.store.laneReplyRoute(owner, activeSource));
-      if (!nextTopic) return !activeTopic && activeReply === routeKey(this.store.laneReplyRoute(input, nextSource));
+      if (!nextTopic) {
+        if (activeTopic || activeReply !== routeKey(this.store.laneReplyRoute(input, nextSource))) return false;
+        // A parent handoff and a thread-origin handoff can now report to the
+        // same thread without belonging to the same manager conversation.
+        return routeKey(activeSource.route) === routeKey(nextSource.route)
+          || this.store.getMeta(`handoff-reply:${owner.id}`) === null && this.store.getMeta(`handoff-reply:${input.id}`) === null;
+      }
       // A verified kickoff can originate in the parent conversation, but its
       // cohort must still answer on the exact thread of the ordinary followup.
       const nextReply = routeKey(nextTopic.route);
@@ -7531,7 +7551,11 @@ export class Superagent {
       return;
     }
     const topic = !persisted && live.input ? this.store.topicDelivery(live.input.id) : null;
-    const route = persisted?.route ?? topic?.route ?? live.input?.route ?? this.store.lane(live.id)?.route;
+    const reportApprovalSource = !persisted && live.id === "main" && live.input
+      ? this.store.getMeta(`report-approval-source:${live.input.id}`) : null;
+    const route = persisted?.route ?? (reportApprovalSource === null
+      ? topic?.route ?? live.input?.route ?? this.store.lane(live.id)?.route
+      : this.store.input(reportApprovalSource)?.route);
     if (route && groupRoom(this.config, route)) {
       if (persisted) this.store.resolveApproval(persisted.id, live.generation, "cancelled");
       live.connection.uiResponse(frame.id, { cancelled: true });
@@ -7836,16 +7860,24 @@ export class Superagent {
         catch (error) {
           const rejected = error instanceof DeliveryError && error.certainty === "rejected";
           this.store.finishOutput(output.id, rejected ? "failed" : "uncertain", undefined, rejected ? "Messenger rejected delivery" : "Messenger send outcome uncertain");
+          if (rejected) this.discardResultSnapshot(output.resultAttachment?.payload);
           if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
           this.report(new Error(`Delivery ${output.id} ${rejected ? "rejected" : "uncertain"}`));
           continue;
         }
         // Persist a successful remote send without reinterpreting a local failure.
         this.store.finishOutput(output.id, "sent", remoteId);
+        this.discardResultSnapshot(output.resultAttachment?.payload);
         if (resultInputId) this.syncLaneThreadAfterResult(resultInputId);
         delivered = true;
       }
     }
+  }
+
+  private discardResultSnapshot(payload: NonNullable<OutputRecord["resultAttachment"]>["payload"] | undefined): void {
+    if (!payload || !("snapshotId" in payload)) return;
+    try { discardResultAttachment(this.config.stateDir, payload.snapshotId); }
+    catch (error) { this.report(error); }
   }
 
   private async flushOutputs(targetRouteKey?: string): Promise<void> {

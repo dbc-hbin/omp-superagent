@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "../src/discord-markdown.ts";
+import { extractDiscordCards, renderDiscordMarkdown, type DiscordEmbed } from "./oracles/bun-gateway/discord-markdown.ts";
 
 describe("Discord markdown table rendering", () => {
   test("renders labeled rows with blank boundaries next to prose", () => {

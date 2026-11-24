@@ -4,7 +4,8 @@
   { "name": "status", "description": "Inspect Superagent HEAD and this conversation's lane, including while busy." },
   { "name": "restart", "description": "Interrupt HEAD work and restart Superagent Gateway and HEAD with the same session and memory." },
   { "name": "context", "description": "Inspect Superagent HEAD context without starting a model turn." },
-  { "name": "usage", "description": "Show Superagent's OMP quotas or open the saved reset picker.", "text": "Omit to view quotas, or enter reset to choose an account and confirm using one saved reset." },
+  { "name": "usage", "description": "Show Superagent's OMP quotas or open the saved reset picker.", "text": "Omit to view quotas, or enter reset to choose an account and confirm using one saved reset.",
+    "discord": { "description": "Show Superagent's OMP quotas.", "text": false } },
   { "name": "cron", "description": "Schedule and manage Superagent jobs in this conversation.", "text": "Use help, add, list, show, edit, pause, resume, run or remove." },
   { "name": "resume", "description": "Resume the Superagent lane bound to this conversation." },
   { "name": "resolve", "description": "Close an uncertain Superagent HEAD or bound lane input without replay.", "text": "Exact uncertain HEAD input ID, or --lane followed by the bound lane's exact input ID." },
@@ -13,5 +14,6 @@
   { "name": "effort", "description": "Choose the Superagent HEAD thinking effort.", "text": "Omit for the menu, or enter an exact advertised effort level." },
   { "name": "compact", "description": "Compact Superagent HEAD context when idle.", "text": "Optional compaction instructions, including multiple lines." },
   { "name": "stop", "description": "Stop Superagent work in this conversation, the shared HEAD, or a named lane.", "text": "Omit for this conversation, or specify head or an exact lane ID." },
-  { "name": "new", "description": "Start a Superagent work topic; use a sibling for a new request in an existing thread.", "text": "An optional first request for the new topic." }
+  { "name": "new", "description": "Start a Superagent work topic; use a sibling for a new request in an existing thread.", "text": "An optional first request for the new topic." },
+  { "name": "usage-reset", "description": "Choose an OMP account and review a saved usage reset in Superagent.", "discordOnly": true }
 ]
