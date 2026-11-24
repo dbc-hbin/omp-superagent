@@ -2502,13 +2502,13 @@ describe("same-HEAD evidence recovery", () => {
 
     await admit(runtime, headMessage("held-first", route("later-route")));
     await messenger.whenSent(2);
-    expect(messenger.sent[1]).toMatchObject({ id: "held-first:head-held", sourceId: "held-first", route: route("later-route") });
+    expect(messenger.sent[1]).toMatchObject({ id: "held-first:head-held:tool-then-refusal", sourceId: "held-first", route: route("later-route") });
     expect(messenger.sent[1]!.text).toContain("/resolve tool-then-refusal");
     await admit(runtime, headMessage("held-second", route("later-route")));
     await runtime.kick();
     // The queue pass records a notice synchronously; a later held message gets none.
-    expect(store.output("held-second:head-held")).toBeNull();
-    expect(messenger.sent.filter(output => output.id.endsWith(":head-held"))).toHaveLength(1);
+    expect(store.output("held-second:head-held:tool-then-refusal")).toBeNull();
+    expect(messenger.sent.filter(output => output.id.includes(":head-held"))).toHaveLength(1);
     expect(store.input("held-first")?.state).toBe("pending");
     expect(store.input("held-second")?.state).toBe("pending");
     expect(main.prompts).toHaveLength(1);
@@ -2692,7 +2692,7 @@ describe("same-HEAD evidence recovery", () => {
 
     const waiting = headMessage("waiting-1", route("later-route"));
     store.receive(waiting, "main", { "user-source:waiting-1": "true" });
-    store.queueOutput({ id: "waiting-1:head-held", sourceId: "waiting-1", route: route("later-route"),
+    store.queueOutput({ id: "waiting-1:head-held:blocker-1", sourceId: "waiting-1", route: route("later-route"),
       text: "크래시 전 저장된 대기 안내 스냅샷" });
     expect(store.getMeta("head:hold-notice:blocker-1")).toBeNull();
 
@@ -2705,8 +2705,8 @@ describe("same-HEAD evidence recovery", () => {
     await runtime.kick();
 
     expect(errors).toEqual([]);
-    expect(messenger.sent.filter(output => output.id === "waiting-1:head-held")).toHaveLength(1);
-    expect(messenger.sent.find(output => output.id === "waiting-1:head-held")).toMatchObject({
+    expect(messenger.sent.filter(output => output.id === "waiting-1:head-held:blocker-1")).toHaveLength(1);
+    expect(messenger.sent.find(output => output.id === "waiting-1:head-held:blocker-1")).toMatchObject({
       sourceId: "waiting-1", route: route("later-route"), text: "크래시 전 저장된 대기 안내 스냅샷",
     });
     expect(store.getMeta("head:hold-notice:blocker-1")).toBe("waiting-1");
@@ -2718,6 +2718,54 @@ describe("same-HEAD evidence recovery", () => {
     await main.whenPrompts(1);
     expect(store.input("waiting-1")?.state).toBe("submitted");
     expect(main.prompts[0]?.id).toBe(store.input("waiting-1")?.requestId ?? "missing");
+  });
+
+  test("one waiting input that meets a second blocker gets that blocker's own notice", () => {
+    // Exercise the real notice builder: its output identity must include the
+    // blocker, or the second blocker is marked notified without a notice.
+    const { runtime, store, messenger } = fixture();
+    const makeBlocker = (id: string) => {
+      store.receive(headMessage(id, route("failed-route")), "main", { [`user-source:${id}`]: "true" });
+      store.submit(id, `native-${id}`, 0);
+      store.settle(id, "uncertain");
+    };
+    makeBlocker("blocker-1");
+    store.receive(headMessage("waiting-1", route("later-route")), "main", { "user-source:waiting-1": "true" });
+    const waiting = store.input("waiting-1");
+    if (!waiting) throw new Error("waiting input was not recorded");
+    const notifier: { noticeHeadHold: (input: typeof waiting) => void } = runtime as unknown as typeof notifier;
+    const notice = () => notifier.noticeHeadHold(waiting);
+
+    notice();
+    expect(store.output("waiting-1:head-held:blocker-1")?.text).toContain("blocker-1");
+    expect(store.getMeta("head:hold-notice:blocker-1")).toBe("waiting-1");
+
+    store.settle("blocker-1", "done");
+    makeBlocker("blocker-2");
+    notice();
+    expect(store.getMeta("head:hold-notice:blocker-2")).toBe("waiting-1");
+    expect(store.output("waiting-1:head-held:blocker-2")?.text).toContain("blocker-2");
+    expect(store.outputs().map(output => output.id).filter(id => id.includes(":head-held"))).toHaveLength(2);
+  });
+
+  test("a settled turn with an outstanding confirmation is held instead of closed", async () => {
+    const instance = fixture();
+    const { runtime, main, store } = instance;
+    main.journalLeaf = true;
+    await runtime.start();
+    await admit(runtime, headMessage("confirmation-held", route("confirm-route")));
+    main.state.pendingUiRequests = [{ id: "confirm-outstanding", method: "confirm" }];
+    await failHeadRun(instance);
+    await runtime.kick();
+
+    // The confirmation can still be answered, so the owner must stay held.
+    expect(store.input("confirmation-held")?.state).toBe("uncertain");
+    expect(store.output("confirmation-held:tool-free-failure")).toBeNull();
+
+    await admit(runtime, headMessage("after-confirmation", route("later-route")));
+    await runtime.kick();
+    expect(store.input("after-confirmation")?.state).toBe("pending");
+    expect(main.prompts).toHaveLength(1);
   });
 
   test("actual prompt acknowledgement loss uses durable receipts once, fences queued work, and notifies only the original route", async () => {

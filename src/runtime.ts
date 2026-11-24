@@ -1151,7 +1151,9 @@ export class Superagent {
     const held = this.store.inputs("main", "uncertain");
     const blocker = held[0];
     if (!blocker || this.store.getMeta(`head:hold-notice:${blocker.id}`)) return;
-    if (this.store.recordHeadHoldNotice(blocker.id, { id: `${input.id}:head-held`, sourceId: input.id, route: input.route,
+    // The blocker is part of the notice identity: one waiting input can meet
+    // blocker A, then blocker B after A is resolved, and B needs its own notice.
+    if (this.store.recordHeadHoldNotice(blocker.id, { id: `${input.id}:head-held:${blocker.id}`, sourceId: input.id, route: input.route,
       text: `앞선 HEAD 요청 ${blocker.id} 의 결과가 불확실해 이 메시지와 뒤 HEAD 요청이 대기 중입니다. 다시 실행하지 않았습니다. 원래 작업을 확인한 뒤 /resolve ${blocker.id} 로 닫으면 순서대로 처리합니다.${held.length > 1 ? ` 다른 불확실한 요청: ${held.slice(1).map(other => other.id).join(", ")}.` : ""}` })) {
       this.wakeOutputs();
     }
@@ -1166,6 +1168,12 @@ export class Superagent {
       || owner.sessionId !== state.sessionId || owner.sessionFile !== state.sessionFile) return false;
     try {
       const entries = successful(await head.connection.request({ type: "get_entries" }), "read HEAD failure evidence").entries;
+      // The journal read is asynchronous: a confirmation or approval card can
+      // appear while it runs, and the evidence then describes a stale owner.
+      const settled = await this.state(head).catch(() => null);
+      if (!this.current(head) || !settled?.isSettled || head.preparing || head.input !== input
+        || settled.pendingUiRequests?.length || this.store.approvals(head.id).length
+        || this.store.input(input.id)?.state !== "submitted") return false;
       return Array.isArray(entries) && this.toolFreeHeadFailure(input.id, headRecoveryEvidence(entries, owner));
     } catch (error) {
       // An unreadable journal proves nothing; the failure stays on hold.
@@ -7389,7 +7397,11 @@ export class Superagent {
     // A HEAD failure closes only on its exact native journal, read while this
     // settled state is current and before this drain changes anything.
     const readsFailure = live.id === "main" && outcome === "error" && !result!.goalResume && admissions.length === 1;
-    const toolFree = readsFailure && await this.settledToolFreeHeadFailure(live, input!, state);
+    // A settled turn can still owe a supported extension confirmation or a
+    // durable approval card. Auto-closing it would drop the request and route
+    // those must be resolved on, so that close waits until both are clear.
+    const toolFree = readsFailure && !state.pendingUiRequests?.length && !this.store.approvals(live.id).length
+      && await this.settledToolFreeHeadFailure(live, input!, state);
     // Either answer is stale once the awaited read let native or queue state move.
     if (readsFailure && (!this.current(live) || live.preparing || live.input !== input
       || admissions.length !== live.admitted.size || live.nativeVersion !== nativeVersion
