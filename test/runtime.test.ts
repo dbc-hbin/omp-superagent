@@ -635,6 +635,28 @@ describe("remote lane ownership", () => {
     };
   }
 
+  test("worker lane fallback evidence comes from its owned native connection, not the controller filesystem", async () => {
+    const f = remoteFixture();
+    await f.runtime.start();
+    const source = headMessage("worker-fallback-evidence", route("30"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Remote work", cwd: f.directory,
+      kickoff: "Check the worker workspace.", placement: { target: "remote" } });
+    await f.runtime.kick();
+    const host = f.workerHost();
+    expect(existsSync(lane.sessionFile)).toBe(false);
+    host.state.model = otherModel;
+    recordedModelChanges(host, [
+      { model: "fixture/capable" },
+      { model: "fixture/efficient", role: "fallback", fallback: true },
+    ]);
+
+    expect(await f.runtime.inspect(lane.id)).toMatchObject({ modelCheck: { expected: executionModel, actual: otherModel, error: null } });
+    expect(f.store.lane(lane.id)?.model).toEqual(executionModel);
+    expect(host.commands.some(command => command.type === "get_entries" && !("sessionFile" in command))).toBe(true);
+    expect(existsSync(lane.sessionFile)).toBe(false);
+  });
+
   test("remote placement cannot drop native tool restrictions from the operator's launch command", async () => {
     const f = remoteFixture();
     f.config.command.push("--no-tools");
@@ -4144,29 +4166,16 @@ function legacyLane(store: Store, config: Config, id: string, destination: Route
   return store.lane(id)!;
 }
 
-/**
- * Write OMP's own `model_change` entries as a real append log: each entry
- * parents the one before it, so the last entry is the active branch leaf.
- * `offBranch` entries hang off an older parent and are never reachable from
- * that leaf, matching the abandoned branches the loader keeps in the file.
- */
-function recordedModelChanges(
-  lane: Lane,
+/** OMP's public get_entries returns the append log and an authoritative leaf. */
+function recordedModelChanges(host: HostTransport,
   changes: Array<{ model: string; role?: string; fallback?: boolean; parent?: number }>,
 ): void {
-  mkdirSync(dirname(lane.sessionFile), { recursive: true });
-  const ids = changes.map((_, index) => `change-${index}`);
-  writeFileSync(lane.sessionFile, [
-    { type: "session", version: 3, id: `session-${lane.id}`, timestamp: new Date(100).toISOString(), cwd: lane.cwd },
-    ...changes.map((change, index) => ({
-      type: "model_change", id: ids[index],
-      parentId: change.parent === undefined ? (index === 0 ? null : ids[index - 1]) : ids[change.parent] ?? null,
-      timestamp: new Date(101 + index).toISOString(),
-      model: change.model,
-      ...(change.role ? { role: change.role } : {}),
-      ...(change.fallback === undefined ? {} : { resolvedModelIsFallback: change.fallback }),
-    })),
-  ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+  host.journalLeaf = true;
+  host.entries = changes.map((change, index) => ({
+    type: "model_change", id: `change-${index}`,
+    parentId: (change.parent ?? index - 1) < 0 ? null : `change-${change.parent ?? index - 1}`,
+    model: change.model, role: change.role, resolvedModelIsFallback: change.fallback,
+  }));
 }
 
 function legacyTranscript(lane: Lane, model: LaneModel): void {
@@ -7616,105 +7625,176 @@ describe("authoritative per-lane model selection", () => {
     expect(delegated(store, "2140")?.state).toBe("pending");
   });
 
-  test("a restarted lane adopts the fallback its transcript still records", async () => {
+  test("an attached lane uses its flagged fallback without changing the configured model or claiming it answered", async () => {
     const { runtime, store, config, hosts, messenger } = fixture();
-    // The provider failed and OMP substituted its own model. The live event is
-    // gone after a restart, but the transcript keeps the substitute's role, so
-    // startup validation must read it back instead of fencing on drift.
     const lane = savedLane(store, config, "restart-fallback", route("27b"), process.pid);
-    recordedModelChanges(lane, [
+    const host = new HostTransport(lane.sessionFile, "session-restart-fallback", otherModel);
+    recordedModelChanges(host, [
       { model: "fixture/capable" },
       { model: "fixture/efficient", role: "fallback", fallback: true },
     ]);
-    const host = new HostTransport(lane.sessionFile, "session-restart-fallback");
-    host.state.model = otherModel;
     hosts.set(lane.socketPath, host);
     await runtime.start();
-    expect(store.lane(lane.id)).toMatchObject({ model: otherModel });
-    expect(store.lane(lane.id)?.modelReason).toContain("adopted from the lane transcript");
+    expect(await runtime.inspect(lane.id)).toMatchObject({ modelCheck: { expected: executionModel, actual: otherModel, error: null } });
+    expect(store.lane(lane.id)).toMatchObject(selection);
     expect(store.lane(lane.id)?.runtimeState).not.toBe("interrupted");
-    expect(messenger.sent.find(output => output.id.startsWith(`model-fallback-adopted:${lane.id}:`))?.text)
-      .toContain("실제 응답 모델: fixture/efficient");
+    expect(host.prompts).toEqual([]);
+    const notice = messenger.sent.find(output => output.id.startsWith(`model-fallback-selected:${lane.id}:`))!;
+    expect(notice.text).toContain("현재 모델: fixture/efficient");
+    expect(notice.text).not.toContain("생성한");
+    expect(notice.route).toEqual(lane.route);
   });
 
-  test("a restarted lane returns to its configured model when resume dropped the ephemeral fallback", async () => {
+  test("an owned cold resume accepts the configured model without a reverse journal entry", async () => {
+    const journal = [
+      { model: "fixture/capable" },
+      { model: "fixture/efficient", role: "fallback", fallback: true },
+    ];
+    const f = fixture(3, undefined, { startHost: async options => {
+      f.launched.push(options);
+      const host = new HostTransport(options.sessionFile, "session-restart-restored", executionModel);
+      recordedModelChanges(host, journal);
+      f.hosts.set(options.socketPath, host);
+      return { pid: process.pid };
+    } });
+    const { runtime, store, config, hosts, messenger } = f;
+    const exitedPid = 2147483647; // A Host that is gone once the fixture confirms shutdown.
+    const lane = savedLane(store, config, "restart-restored", route("27c"), exitedPid);
+    const host = new HostTransport(lane.sessionFile, "session-restart-restored", otherModel);
+    host.state.hostPid = exitedPid;
+    recordedModelChanges(host, journal);
+    hosts.set(lane.socketPath, host);
+    mkdirSync(dirname(lane.sessionFile), { recursive: true });
+    writeFileSync(lane.sessionFile, JSON.stringify({ type: "session", version: 3, id: host.state.sessionId, cwd: lane.cwd }) + "\n");
+
+    await runtime.start();
+    expect(await runtime.inspect(lane.id)).toMatchObject({ modelCheck: { actual: otherModel, error: null } });
+    expect(store.lane(lane.id)?.model).toEqual(executionModel);
+    host.shutdownDisconnect = true;
+    await runtime.closeLane(lane.id, "completed", "The native fixture is settled.");
+    expect(store.lane(lane.id)?.runtimeState).toBe("unloaded");
+    const source = message("resume-retry-default", lane.route);
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    await runtime.resume(lane.id, source.id);
+    const resumed = hosts.get(lane.socketPath)!;
+    expect(f.launched).toHaveLength(1);
+    expect(f.launched[0]).not.toHaveProperty("model");
+    expect(resumed).not.toBe(host);
+    expect(resumed.entries).toHaveLength(2);
+    expect(resumed.prompts).toEqual([]);
+    expect(store.lane(lane.id)).toMatchObject({ ...selection, generation: 1, workState: "open" });
+
+    // Restored journals retain the last fallback entry. It is already
+    // consumed, so later drift with no new transition cannot reuse it.
+    resumed.state.model = otherModel;
+    await expect(runtime.resume(lane.id)).rejects.toThrow("model drift");
+    expect(store.lane(lane.id)?.model).toEqual(executionModel);
+    expect(messenger.sent.filter(output => output.id.startsWith(`model-fallback-selected:${lane.id}:`))).toHaveLength(1);
+  });
+
+  test("a fresh restore cannot reuse an unobserved old fallback marker on repeated validation", async () => {
+    const f = fixture(3, undefined, { startHost: async options => {
+      f.launched.push(options);
+      const host = new HostTransport(options.sessionFile, "session-unobserved-fallback", otherModel);
+      recordedModelChanges(host, [
+        { model: "fixture/capable" },
+        { model: "fixture/efficient", role: "fallback", fallback: true },
+      ]);
+      f.hosts.set(options.socketPath, host);
+      return { pid: process.pid };
+    } });
+    const { runtime, store, config, messenger } = f;
+    const lane = savedLane(store, config, "unobserved-fallback", route("27f"));
+    store.updateLane(lane.id, lane.generation, { sessionId: "session-unobserved-fallback", workState: "paused" });
+    mkdirSync(dirname(lane.sessionFile), { recursive: true });
+    writeFileSync(lane.sessionFile, JSON.stringify({ type: "session", version: 3, id: "session-unobserved-fallback", cwd: lane.cwd }) + "\n");
+    await runtime.start();
+    const source = message("resume-unobserved-fallback", lane.route);
+    store.receive(source, "main");
+    store.settle(source.id, "done");
+    await expect(runtime.resume(lane.id, source.id)).rejects.toThrow("could not be restored");
+    await expect(runtime.resume(lane.id, source.id)).rejects.toThrow("model drift");
+    expect(f.launched).toHaveLength(1);
+    expect(f.hosts.get(lane.socketPath)?.prompts).toEqual([]);
+    expect(store.lane(lane.id)).toMatchObject({ ...selection, runtimeState: "interrupted" });
+    expect(messenger.sent).toEqual([]);
+  });
+
+  test("warm cooldown uses the configured model again without trusting an unflagged switch", async () => {
     const { runtime, store, config, hosts, messenger } = fixture();
-    // The durable record kept the substitute, but resume restores the configured
-    // model on purpose because the fallback role is ephemeral. Not drift.
-    const lane = savedLane(store, config, "restart-restored", route("27c"), process.pid);
-    store.changeLaneModel(lane.id, lane.generation, executionModel, otherModel,
-      "Native retry switched this lane after a provider failure.", null, null);
-    recordedModelChanges(lane, [
+    const lane = savedLane(store, config, "warm-model-restore", route("27d"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-warm-model-restore", otherModel);
+    const journal = [
       { model: "fixture/capable" },
       { model: "fixture/efficient", role: "fallback", fallback: true },
-      { model: "fixture/capable", role: "fallback", fallback: false },
-    ]);
-    const host = new HostTransport(lane.sessionFile, "session-restart-restored");
+    ];
+    recordedModelChanges(host, journal);
+    hosts.set(lane.socketPath, host);
+    await runtime.start();
+    expect(await runtime.inspect(lane.id)).toMatchObject({ modelCheck: { actual: otherModel, error: null } });
+
+    // Stock cooldown writes an unflagged ephemeral row. The configured model
+    // is normal readback, not a guessed interpretation of that row.
     host.state.model = executionModel;
-    hosts.set(lane.socketPath, host);
-    await runtime.start();
-    expect(store.lane(lane.id)).toMatchObject({ model: executionModel });
-    expect(store.lane(lane.id)?.modelReason).toContain("resumed on its configured model");
-    expect(store.lane(lane.id)?.runtimeState).not.toBe("interrupted");
-    // A lane back on its configured model must not be told a substitute answered.
-    const notice = messenger.sent.find(output => output.id.startsWith(`model-fallback-adopted:${lane.id}:`))?.text ?? "";
-    expect(notice).toContain("설정된 모델로 돌아왔습니다");
-    expect(notice).not.toContain("대체 모델이 생성한");
-  });
-
-  test("drift without an observed native fallback keeps fencing the lane", async () => {
-    const { runtime, store, config, hosts } = fixture();
-    const lane = savedLane(store, config, "unreported-drift", route("28a"), process.pid);
-    recordedModelChanges(lane, [
-      { model: "fixture/capable", role: "default" },
-    ]);
-    const host = new HostTransport(lane.sessionFile, "session-unreported-drift");
-    hosts.set(lane.socketPath, host);
-    await runtime.start();
-    // The same substitution, but nothing reported it: an operator or an
-    // unmanaged restart made this change, so it must stay held.
-    host.state.model = otherModel;
-    await expect(runtime.resume(lane.id)).rejects.toThrow("model drift");
-    expect(store.lane(lane.id)?.model).toEqual(executionModel);
-    expect(store.lane(lane.id)?.runtimeState).toBe("interrupted");
+    recordedModelChanges(host, [...journal, { model: "fixture/capable", role: "fallback", fallback: false }]);
+    await runtime.resume(lane.id);
+    expect(await runtime.inspect(lane.id)).toMatchObject({ modelCheck: { actual: executionModel, error: null } });
+    expect(store.lane(lane.id)).toMatchObject(selection);
     expect(host.prompts).toEqual([]);
+    expect(messenger.sent.filter(output => output.id.startsWith(`model-fallback-selected:${lane.id}:`))).toHaveLength(1);
+
+    // A new, flagged retry after cooldown is distinct evidence and may serve
+    // a later authorized request without changing the configured model.
+    host.state.model = otherModel;
+    recordedModelChanges(host, [...journal, { model: "fixture/capable", role: "fallback", fallback: false },
+      { model: "fixture/efficient", role: "fallback", fallback: true }]);
+    await delegate(runtime, message("new-flagged-fallback-after-cooldown", lane.route));
+    await host.whenPrompts(1);
+    expect(store.lane(lane.id)).toMatchObject(selection);
+    await messenger.whenSent(2);
+    expect(new Set(messenger.sent.filter(output => output.id.startsWith(`model-fallback-selected:${lane.id}:`)).map(output => output.id)).size).toBe(2);
   });
 
-  test("an ordinary model selection the transcript records is not automatic recovery", async () => {
-    const { runtime, store, config, hosts } = fixture();
-    // Someone ran `/model`, which OMP records as a role-less default entry. It
-    // names the live model but never carried the retry role, so no recovery
-    // happened and the lane must keep its fence instead of adopting the change.
-    const lane = savedLane(store, config, "ordinary-selection", route("28b"), process.pid);
-    recordedModelChanges(lane, [{ model: "fixture/efficient" }]);
-    const host = new HostTransport(lane.sessionFile, "session-ordinary-selection");
-    host.state.model = otherModel;
+  test("a model change while reading retry evidence cannot authorize the old readback", async () => {
+    const { runtime, store, config, hosts, messenger } = fixture();
+    const lane = savedLane(store, config, "retry-evidence-race", route("27e"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-retry-evidence-race");
     hosts.set(lane.socketPath, host);
     await runtime.start();
-    await expect(runtime.resume(lane.id)).rejects.toThrow("model drift");
-    expect(store.lane(lane.id)?.model).toEqual(executionModel);
-    expect(store.lane(lane.id)?.runtimeState).toBe("interrupted");
-    expect(host.prompts).toEqual([]);
-  });
-
-  test("an abandoned branch cannot authorise a later mismatch", async () => {
-    const { runtime, store, config, hosts } = fixture();
-    // The retry transition happened, but on a branch the session left: a later
-    // entry hangs off the pre-fallback model and becomes the active leaf. Its
-    // role is not the retry role, so the stale marker must not authorise drift.
-    const lane = savedLane(store, config, "abandoned-branch", route("28c"), process.pid);
-    recordedModelChanges(lane, [
+    host.state.model = otherModel;
+    recordedModelChanges(host, [
       { model: "fixture/capable" },
       { model: "fixture/efficient", role: "fallback", fallback: true },
-      { model: "fixture/capable", parent: 0 },
     ]);
-    const host = new HostTransport(lane.sessionFile, "session-abandoned-branch");
-    host.state.model = otherModel;
+    host.afterEntries = () => {
+      host.afterEntries = undefined;
+      host.state.model = executionModel;
+    };
+    await expect(runtime.resume(lane.id)).rejects.toThrow("model drift");
+    expect(store.lane(lane.id)).toMatchObject(selection);
+    expect(messenger.sent).toEqual([]);
+    expect(host.prompts).toEqual([]);
+  });
+
+  test.each([
+    ["no retry evidence", [{ model: "fixture/capable" }]],
+    ["ordinary model selection", [{ model: "fixture/capable" }, { model: "fixture/efficient" }]],
+    ["unflagged context promotion", [{ model: "fixture/capable" }, { model: "fixture/efficient", role: "fallback", fallback: false }]],
+    ["unrelated native source", [{ model: "fixture/unrelated" }, { model: "fixture/efficient", role: "fallback", fallback: true }]],
+    ["off-branch fallback", [{ model: "fixture/capable" }, { model: "fixture/efficient", role: "fallback", fallback: true },
+      { model: "fixture/capable", parent: 0 }]],
+    ["distinct literal suffix", [{ model: "fixture/capable" }, { model: "fixture/efficient:low", role: "fallback", fallback: true }]],
+  ] as const)("does not reconcile model drift on %s", async (_scenario, entries) => {
+    const { runtime, store, config, hosts, main } = fixture();
+    main.models.push({ provider: "fixture", id: "efficient:low" }, { provider: "fixture", id: "unrelated" });
+    const lane = savedLane(store, config, "drift-held", route("28a"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-drift-held", otherModel);
+    recordedModelChanges(host, [...entries]);
     hosts.set(lane.socketPath, host);
     await runtime.start();
     await expect(runtime.resume(lane.id)).rejects.toThrow("model drift");
-    expect(store.lane(lane.id)?.model).toEqual(executionModel);
-    expect(store.lane(lane.id)?.runtimeState).toBe("interrupted");
+    expect(store.lane(lane.id)).toMatchObject({ model: executionModel, runtimeState: "interrupted" });
     expect(host.prompts).toEqual([]);
   });
 });

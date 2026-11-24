@@ -24,9 +24,9 @@ import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
-  DEFERRED_ROUTING_META, HEAD_MODEL_CONTROL, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
+  DEFERRED_ROUTING_META, HEAD_MODEL_CONTROL, laneFallbackKey, physicalRoute, physicalRouteKey, routeKey, type Approval, type Inbound, type InputRecord, type Lane, type LaneModel, type ModelPreset, type LanePresetSnapshot,
   type ActiveInputState, type KickoffHold, type OutputRecord, type Route, type StorePort, type WorkflowActivation,
-  type HeadModelChange, type HeadRecoveryAttempt, type HeadRecoveryEffect,
+  type HeadModelChange, type HeadRecoveryAttempt, type HeadRecoveryEffect, type LaneFallbackReceipt,
 } from "./contracts.ts";
 import type { ApprovalResolution } from "./contracts";
 import { captureDecision, resolveDecision } from "./decisions";
@@ -1390,6 +1390,19 @@ export class Store implements StorePort {
       lane.modelPresetSnapshot = snapshot === null ? null : structuredClone(snapshot);
       this.db.query("UPDATE lanes SET data = ? WHERE id = ? AND generation = ?").run(laneData(lane), id, generation);
       for (const [key, value] of Object.entries(metadata)) this.setMeta(key, value);
+      return true;
+    }).immediate();
+  }
+
+  recordLaneFallback(id: string, configured: LaneModel, previous: string | null, receipt: LaneFallbackReceipt,
+    notice: Pick<OutputRecord, "id" | "sourceId" | "route" | "text">): boolean {
+    return this.db.transaction(() => {
+      const lane = this.lane(id);
+      const key = laneFallbackKey(id);
+      if (!lane || lane.generation !== receipt.generation || lane.sessionId !== receipt.sessionId || lane.pid !== receipt.hostPid
+        || lane.modelPreset !== null || !sameLaneModel(lane.model, configured) || this.getMeta(key) !== previous
+        || routeKey(lane.route) !== routeKey(notice.route) || !this.queueOutput(notice)) return false;
+      this.setMeta(key, JSON.stringify(receipt));
       return true;
     }).immediate();
   }

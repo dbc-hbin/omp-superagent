@@ -144,6 +144,13 @@ export interface LaneModel {
   provider: string;
   id: string;
 }
+export const laneFallbackKey = (id: string) => `lane-model:${id}:fallback`;
+export interface LaneFallbackReceipt {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly hostPid: number;
+  readonly entryId: string;
+}
 export const HEAD_MODEL_CONTROL = "head:model-control";
 export interface HeadModelChange {
   readonly sourceId: string;
@@ -388,6 +395,8 @@ export interface StorePort {
   adoptLaneModel(id: string, generation: number, model: LaneModel, reason: string): boolean;
   changeLaneModel(id: string, generation: number, expected: LaneModel | null, model: LaneModel, reason: string,
     preset: ModelPreset | null, snapshot: LanePresetSnapshot | null, metadata?: Readonly<Record<string, string>>): boolean;
+  recordLaneFallback(id: string, configured: LaneModel, previous: string | null, receipt: LaneFallbackReceipt,
+    notice: Pick<OutputRecord, "id" | "sourceId" | "route" | "text">): boolean;
   putApproval(approval: Approval, ownerInputId?: string): void;
   approval(id: string): Approval | null;
   approvals(target?: string): Approval[];

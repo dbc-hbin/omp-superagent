@@ -243,31 +243,26 @@ Each lane records a resolved model, selection reason, and the complete native
 role/thinking preset snapshot if a preset was selected. A later preset/global
 change does not change that snapshot. Resume and reconnect check native
 readback; unavailability or drift holds dispatch without silently selecting a
-different model. The one exception is a switch OMP itself made. OMP records a
-retry substitute as a `model_change` entry with `role: "fallback"`, and because
-that role is ephemeral, resume deliberately drops it and restores the configured
-model. So the durable lane record and the native session can legitimately differ
-in either direction, and OMP's own entry names both ends of that move. Recovery
-requires a transition whose source is the lane's saved model and whose
-destination is the live one; only then is it adopted and the durable record made
-to follow it. The owner is told which direction happened, and only a still-live
-substitute is reported as a different model answering.
+different model. A running lane may accept OMP's selected retry fallback
+without changing its durable configured model. The current model must match
+the newest flagged `model_change` on the active native journal branch, and the
+uninterrupted flagged chain must start at the configured model. The controller
+queries the attached native owner for the leaf and entries, including for
+remote workers; it does not open worker paths. Exact catalog IDs take precedence
+over native selector suffixes. An unflagged ephemeral switch, including context
+promotion, does not authorize another model.
 
-The evidence is the active transcript branch, not the whole append log, and it
-is the newest `model_change` on that branch. An abandoned branch or an entry a
-later one superseded cannot authorise a mismatch, and the fallback flag is not
-latched across transitions: the clear back to the configured model is written
-with the ephemeral role and no fallback flag, so an earlier substitute marker
-does not survive it. A destination match alone is not enough either. An ordinary
-selection also records a `model_change`, so a lane saved on one model whose live
-session sits on a configured other model would otherwise look like automatic
-recovery; a transition without that retry role, or one whose source is not the
-saved model, stays fenced as unreported operator or unmanaged drift. Frozen
-preset lanes are excluded, because their snapshot, not the transcript, describes
-the roles they must run. An authorized `lane_set_model`
-can change one eligible idle lane, with durable intent and readback.
-`config.model` is a head launch default, not the lane default or a reason to
-overwrite a saved head's model on restart.
+Warm recovery and cold resume may both return the Host to the original model.
+Normal readback recognizes that model directly without relying on a reverse
+journal entry. A newly restored Host must confirm the configured model before
+a retry marker can be used, even across reconnects. A current owner/generation
+receipt and a notice, written together,
+prevent the same fallback row from re-authorizing drift after that recovery or
+owner replacement. The notice reports which model is selected, not which model
+generated an answer. Frozen preset lanes remain excluded. An authorized
+`lane_set_model` can change one eligible idle lane with durable intent and
+readback. `config.model` is a head launch default, not the lane default or a
+reason to overwrite a saved head's model on restart.
 Managed Hosts use private settings overlays, with native session-scope
 readback. Legacy lanes without a recorded selection adopt their authoritative
 native model rather than assuming the current head default; only an unstarted
