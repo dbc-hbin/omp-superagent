@@ -4747,6 +4747,8 @@ export class Superagent {
         return { platform: "slack", supported: false, reason: "Socket Mode bots cannot set their online dot via the Slack Events API. Configure bot presence in the Slack app settings." };
       case "telegram":
         return { platform: "telegram", supported: false, reason: "The Telegram Bot API does not expose bot online presence." };
+      case "kakao":
+        return { platform: "kakao", supported: false, reason: "KakaoTalk has no bot presence; the bridge account's own status applies." };
       case "discord":
         if (!this.messenger.messengerPresence) throw new Error("This Gateway does not support Discord presence");
         return this.messenger.messengerPresence({ sourceId, action, route: source.route });

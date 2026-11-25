@@ -18,6 +18,7 @@ use tokio_util::task::TaskTracker;
 use crate::{
     discord::Discord,
     group::{Candidate, Request as GroupRequest, Room, Rooms},
+    kakao::Kakao,
     picker::{Pickers, Selection},
     slack::Slack,
     store::{
@@ -288,6 +289,7 @@ impl Hub {
                 "discord" => Box::new(Discord::new(section, ctx)?),
                 "telegram" => Box::new(Telegram::new(section, ctx)?),
                 "slack" => Box::new(Slack::new(section, ctx)?),
+                "kakao" => Box::new(Kakao::new(section, ctx)?),
                 _ => anyhow::bail!("Unknown messenger"),
             })
         })
@@ -306,6 +308,7 @@ impl Hub {
             ("telegram", "tokenEnv"),
             ("slack", "botTokenEnv"),
             ("slack", "appTokenEnv"),
+            ("kakao", "tokenEnv"),
         ]
         .into_iter()
         .filter_map(|(p, k)| config[p][k].as_str().map(str::to_owned))
@@ -330,7 +333,7 @@ impl Hub {
             rooms: rooms.clone(),
         };
         let mut adapters: Vec<(&'static str, Box<dyn Adapter>)> = Vec::new();
-        for name in ["discord", "telegram", "slack"] {
+        for name in ["discord", "telegram", "slack", "kakao"] {
             if let Some(section) = config.get(name) {
                 adapters.push((name, build(name, section, ctx(name))?));
             }

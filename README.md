@@ -60,6 +60,8 @@ omp-sa setup --config ./config.local.json
 
 Setup does not start bots or models. Keep `config.local.json.env` private: it stores tokens in plaintext with owner-only permissions. Review the final confirmation for avatar changes and any OMP memory setting change.
 
+KakaoTalk works only through a [bridge you run yourself](docs/kakao-bridge-protocol.md); it is unofficial automation and can put the Kakao account at risk. Add its block to the configuration manually.
+
 ### 3. Start
 
 ```sh

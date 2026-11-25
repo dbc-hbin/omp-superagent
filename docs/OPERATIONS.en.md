@@ -597,6 +597,41 @@ documentation. Do not assume the former restriction that a bot token can never r
 channel threads. Actual access permissions, workspace retention, and API rate limits
 still apply.
 
+### 2.4 KakaoTalk (local bridge, owner one-to-one only)
+
+> **Terms of service risk.** KakaoTalk has no official bot API. Automating a personal
+> Kakao account is not an official integration, can violate Kakao's terms of service,
+> and may lead to account restriction or suspension. The operator chooses and runs the
+> bridge and is responsible for it. Use a separate account where possible and do not
+> automate other people's chats.
+
+This adapter **never signs in to Kakao** or contacts Kakao servers. A **bridge** that
+the operator runs on the same machine owns the Kakao session. It records only the
+messages the owner sends in the owner's one-to-one chat; the Gateway reads that inbox
+and replies through a bridge endpoint that only delivers to the same chat. The
+repository ships only a [reference bridge](../scripts/kakao-reference-bridge.ts) that
+does not connect to Kakao. The request/response contract and security requirements
+for a real bridge are in the [KakaoTalk bridge protocol](kakao-bridge-protocol.md).
+
+- Example:
+  `"kakao": {"bridgeUrl":"http://127.0.0.1:PORT","tokenEnv":"KAKAO_SUPERAGENT_TOKEN","botUserId":"…","ownerId":"…","chatId":"…"}`.
+  `bridgeUrl` accepts only the literal addresses `127.0.0.1` or `[::1]`; host names such as
+  `localhost` are refused. `botUserId` is the bridge account, `ownerId` the owner, and
+  `chatId` their one-to-one chat.
+- The token named by `tokenEnv` is dedicated to this interface: at least 24 characters
+  from `[A-Za-z0-9_-]`. Do not reuse a token that opens other bridge features.
+- Supported: text input and replies (Markdown converted to plain text, split into
+  1500-character chunks) and DM controls such as `/new`. Unsupported: threads,
+  attachments, reactions and approval cards. When an approval is needed the adapter
+  sends a notice and **cancels** it; it never accepts on the owner's behalf.
+- Messages older than 30 minutes (`stale`) are reported once, not executed. First
+  contact never replays earlier history.
+- `groupRooms` cannot use kakao. `omp-sa setup` does not ask about kakao; add the block
+  to the configuration file manually.
+- Local check: `KAKAO_SUPERAGENT_TOKEN=… KAKAO_OWNER_CHAT_ID=777 KAKAO_OWNER_ID=42 bun scripts/kakao-reference-bridge.ts`
+  prints its base URL on the first line. `POST /demo/owner-message` injects an owner
+  message, and replies are printed in the terminal.
+
 ### Message Receipt and Processing Reactions
 
 For work that needs a new lane, confirm the scope and working directory, then first

@@ -281,7 +281,7 @@ impl Hub {
         let route = object(data.get("route").unwrap_or(&Value::Null))?;
         if !matches!(
             route.get("platform").and_then(Value::as_str),
-            Some("discord" | "telegram" | "slack")
+            Some("discord" | "telegram" | "slack" | "kakao")
         ) || ["accountId", "authorityId", "channelId"]
             .iter()
             .any(|field| !route.get(*field).is_some_and(Value::is_string))

@@ -25,5 +25,12 @@
     "ownerId": "REPLACE_WITH_SLACK_OWNER_ID",
     "teamId": "REPLACE_WITH_SLACK_TEAM_ID",
     "allowedChannelIds": ["REPLACE_WITH_SLACK_CHANNEL_ID"]
+  },
+  "kakao": {
+    "bridgeUrl": "http://127.0.0.1:REPLACE_WITH_BRIDGE_PORT",
+    "tokenEnv": "KAKAO_SUPERAGENT_TOKEN",
+    "botUserId": "REPLACE_WITH_BRIDGE_ACCOUNT_USER_ID",
+    "ownerId": "REPLACE_WITH_OWNER_KAKAO_USER_ID",
+    "chatId": "REPLACE_WITH_OWNER_ONE_TO_ONE_CHAT_ID"
   }
 }

@@ -125,7 +125,8 @@ async function newConfig(terminal: Terminal, path: string): Promise<{ config: Co
   if (!selected.length || selected.some(p => !["discord", "telegram", "slack"].includes(p)))
     throw new Error("Select at least one supported messenger");
   const raw: Record<string, unknown> = { ...template, command };
-  for (const platform of ["discord", "telegram", "slack"]) delete raw[platform];
+  // Kakao needs an operator-run bridge; add its block manually (docs/kakao-bridge-protocol.md).
+  for (const platform of ["discord", "telegram", "slack", "kakao"]) delete raw[platform];
   const list = async (label: string) => (await terminal.ask(`${label} (comma-separated; empty = deny groups / DM only): `))
     .split(",").map(s => s.trim()).filter(Boolean);
   for (const platform of selected) {

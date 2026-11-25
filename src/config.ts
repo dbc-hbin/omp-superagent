@@ -42,6 +42,18 @@ export interface TelegramConfig {
   allowedChatIds: string[];
 }
 
+/**
+ * KakaoTalk through an operator-run loopback bridge that owns the logged-in Kakao
+ * session (docs/kakao-bridge-protocol.md). Owner one-to-one chat only.
+ */
+export interface KakaoConfig {
+  bridgeUrl: string;
+  tokenEnv: string;
+  botUserId: string;
+  ownerId: string;
+  chatId: string;
+}
+
 export interface SlackConfig {
   botTokenEnv: string;
   appTokenEnv: string;
@@ -62,6 +74,7 @@ export interface Config {
   discord?: DiscordConfig;
   telegram?: TelegramConfig;
   slack?: SlackConfig;
+  kakao?: KakaoConfig;
   groupRooms?: readonly GroupRoom[];
 }
 
@@ -96,7 +109,7 @@ function tokenEnv(value: unknown, name: string): string {
 }
 
 export function configuredPlatforms(config: Config): Platform[] {
-  return (["discord", "telegram", "slack"] as const).filter(platform => config[platform] !== undefined);
+  return (["discord", "telegram", "slack", "kakao"] as const).filter(platform => config[platform] !== undefined);
 }
 
 export function voiceApiKeyEnv(config: Config): string | undefined {
@@ -117,6 +130,7 @@ export function credentialEnvNames(config: Config): string[] {
     ...(voiceKey === undefined ? [] : [voiceKey]),
     ...(config.telegram ? [config.telegram.tokenEnv] : []),
     ...(config.slack ? [config.slack.botTokenEnv, config.slack.appTokenEnv] : []),
+    ...(config.kakao ? [config.kakao.tokenEnv] : []),
   ])];
 }
 
@@ -164,6 +178,11 @@ export function isConfiguredRoute(config: Config, route: Route): boolean {
         (route.guildId === null ? /^D[A-Z0-9]+$/.test(route.channelId) :
           route.guildId === policy.teamId && policy.allowedChannelIds.includes(route.channelId));
     }
+    case "kakao": {
+      const policy = config.kakao;
+      return !!policy && route.authorityId === policy.ownerId && route.accountId === policy.botUserId
+        && route.guildId === null && route.threadId === null && route.channelId === policy.chatId;
+    }
   }
 }
 
@@ -200,7 +219,8 @@ export function parseConfig(value: unknown, path: string): Config {
   const discord = raw.discord === undefined ? undefined : record(raw.discord, "discord");
   const telegram = raw.telegram === undefined ? undefined : record(raw.telegram, "telegram");
   const slack = raw.slack === undefined ? undefined : record(raw.slack, "slack");
-  if (!discord && !telegram && !slack) throw new Error("Configure at least one messenger: discord, telegram, or slack");
+  const kakao = raw.kakao === undefined ? undefined : record(raw.kakao, "kakao");
+  if (!discord && !telegram && !slack && !kakao) throw new Error("Configure at least one messenger: discord, telegram, slack, or kakao");
   const base = dirname(absolute);
   const pathValue = (v: unknown, key: string) => resolve(base, text(v, key));
   if (!Array.isArray(raw.command) || !raw.command.length ||
@@ -241,7 +261,7 @@ export function parseConfig(value: unknown, path: string): Config {
       case "api":
       case undefined: {
         const apiKeyEnv = tokenEnv(voice.apiKeyEnv, "discord.voice.apiKeyEnv");
-        if ([discord?.tokenEnv, telegram?.tokenEnv, slack?.appTokenEnv, slack?.botTokenEnv].includes(apiKeyEnv))
+        if ([discord?.tokenEnv, telegram?.tokenEnv, slack?.appTokenEnv, slack?.botTokenEnv, kakao?.tokenEnv].includes(apiKeyEnv))
           throw new Error("discord.voice.apiKeyEnv must not name a messenger token");
         voiceConfig = {
           ...session, ...(auth === undefined ? {} : { auth }), apiKeyEnv,
@@ -284,8 +304,29 @@ export function parseConfig(value: unknown, path: string): Config {
       teamId: id(slack.teamId, "slack.teamId", /^T[A-Z0-9]+$/),
       allowedChannelIds: ids(slack.allowedChannelIds, "slack.allowedChannelIds", /^[CG][A-Z0-9]+$/),
     } } : {}),
+    ...(kakao ? { kakao: parseKakao(kakao) } : {}),
   };
   return raw.groupRooms === undefined ? config : { ...config, groupRooms: parseGroupRooms(raw.groupRooms, config, base) };
+}
+
+function parseKakao(kakao: Record<string, unknown>): KakaoConfig {
+  const kakaoId = /^[1-9]\d{0,19}$/;
+  const bridgeUrl = text(kakao.bridgeUrl, "kakao.bridgeUrl");
+  let url: URL;
+  try { url = new URL(bridgeUrl); } catch { throw new Error("kakao.bridgeUrl must be a URL"); }
+  // Literal loopback only: a host name could later resolve elsewhere.
+  if (url.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(url.hostname)
+    || url.username || url.password || url.search || url.hash)
+    throw new Error("kakao.bridgeUrl must be a plain http://127.0.0.1:PORT or http://[::1]:PORT URL");
+  const result: KakaoConfig = {
+    bridgeUrl,
+    tokenEnv: tokenEnv(kakao.tokenEnv, "kakao.tokenEnv"),
+    botUserId: id(kakao.botUserId, "kakao.botUserId", kakaoId),
+    ownerId: id(kakao.ownerId, "kakao.ownerId", kakaoId),
+    chatId: id(kakao.chatId, "kakao.chatId", kakaoId),
+  };
+  if (result.botUserId === result.ownerId) throw new Error("kakao.botUserId and kakao.ownerId must differ");
+  return result;
 }
 
 /** No caller can turn a shared/symlink directory into a trusted socket directory. */

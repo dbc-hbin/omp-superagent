@@ -58,6 +58,8 @@ Add a messenger to an existing installation:
     discord   tokenEnv, ownerId, allowedGuildIds[], allowedChannelIds[]
     telegram  tokenEnv, ownerId, allowedChatIds[]
     slack     botTokenEnv, appTokenEnv, ownerId, teamId, allowedChannelIds[]
+    kakao     bridgeUrl, tokenEnv, botUserId, ownerId, chatId (owner 1:1 through an operator-run loopback bridge;
+              see docs/kakao-bridge-protocol.md; unofficial automation may violate Kakao's terms)
   Copy the block shape from ${join(import.meta.dir, "../config.example.json")}.
   Use string IDs for the same trusted owner on each platform. Credential fields name variables, never tokens.
   Supply their values in the Gateway environment or private FILE.env (mode 0600). Run doctor before activation.

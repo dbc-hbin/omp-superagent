@@ -89,7 +89,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     parameters: Type.Object({
       action: Type.Union([Type.Literal("start"), Type.Literal("status"), Type.Literal("stop")]),
       sourceId: Type.String({ minLength: 1 }),
-      platform: Type.Optional(Type.Union([Type.Literal("discord"), Type.Literal("slack"), Type.Literal("telegram")])),
+      platform: Type.Optional(Type.Union([Type.Literal("discord"), Type.Literal("slack"), Type.Literal("telegram"), Type.Literal("kakao")])),
     }, { additionalProperties: false }),
     async execute(_id, params, _signal, _update, ctx) {
       return result(await requireRuntime(ctx).messengerPresence(params.sourceId, params.action, params.platform));
@@ -312,7 +312,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
       })),
       appliedTags: Type.Optional(threadTagsSchema),
       destination: Type.Optional(Type.Object({
-        platform: Type.Union([Type.Literal("discord"), Type.Literal("telegram"), Type.Literal("slack")]),
+        platform: Type.Union([Type.Literal("discord"), Type.Literal("telegram"), Type.Literal("slack"), Type.Literal("kakao")]),
         accountId: Type.String(), authorityId: Type.String(),
         guildId: Type.Union([Type.String(), Type.Null()]), channelId: Type.String(),
         threadId: Type.Union([Type.String(), Type.Null()]),

@@ -3,6 +3,7 @@ mod commands;
 pub mod daemon;
 mod discord;
 mod group;
+mod kakao;
 pub mod lifecycle;
 pub mod operator;
 mod picker;

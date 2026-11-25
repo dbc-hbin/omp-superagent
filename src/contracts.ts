@@ -8,7 +8,7 @@ import type { RemotePlacement } from "./worker-wire";
 import type { OmpResetAccount } from "./omp-usage";
 
 /** Coordination records only. OMP owns transcripts and execution state. */
-export type Platform = "discord" | "telegram" | "slack";
+export type Platform = "discord" | "telegram" | "slack" | "kakao";
 
 export interface Route {
   platform: Platform;

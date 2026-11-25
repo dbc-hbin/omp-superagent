@@ -39,6 +39,7 @@ struct Normalized {
     discord: Option<Discord>,
     telegram: Option<Token>,
     slack: Option<Slack>,
+    kakao: Option<Token>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +146,9 @@ impl LifecycleConfig {
         }
         if let Some(slack) = raw.slack {
             credentials.extend([slack.bot_token_env, slack.app_token_env]);
+        }
+        if let Some(kakao) = raw.kakao {
+            credentials.push(kakao.token_env);
         }
         ensure!(
             credentials

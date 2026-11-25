@@ -2,7 +2,8 @@ import type { Platform } from "./contracts";
 
 /** Platform message order only; event/edit IDs and local arrival times are not clocks. */
 export function compareMessageIds(platform: Platform, left: string, right: string): -1 | 0 | 1 | null {
-  if (platform === "discord" || platform === "telegram") {
+  // Kakao log IDs are numeric and increase within a chat.
+  if (platform === "discord" || platform === "telegram" || platform === "kakao") {
     if (!/^\d+$/.test(left) || !/^\d+$/.test(right)) return null;
     const a = BigInt(left);
     const b = BigInt(right);
