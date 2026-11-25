@@ -134,6 +134,8 @@ export interface Inbound {
   receivedAt: number;
   attachments: Attachment[];
   reply?: ReplyContext;
+  /** The adapter observed a reply or shared message without an in-route reply snapshot. */
+  readonly unresolvedReply?: true;
   discordContext?: DiscordContext;
 }
 

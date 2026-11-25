@@ -327,6 +327,45 @@ the original topic, not a model turn or native approval. The head validates
 the menu's session and generation before applying it, and an effort selection
 also requires the model for which the options were shown.
 
+## Owner-facing reply voice
+
+[SOUL](../../src/soul.ts) is an instance-wide presentation preference, not a
+role, workflow, or OMP profile. The default and the one saved override use
+bounded choices for presentational concept (plain, editorial, or mentoring),
+tone, register, detail, answer order, and emoji. The HEAD
+contract still defines its identity. The `soul_update` native tool checks the
+current root HEAD session and a fresh, explicit original owner request. The
+controller derives the supported combination from that exact message, not from
+model-supplied fields. A plain request already addressed to HEAD does not need
+a command or a SOUL keyword. Questions, one-off requests, quotes, edits,
+derived input, and restricted-group messages cannot authorize a change. The
+instance ledger owns the revision and readback. Choosing a concept does not
+change any other setting by implication or establish a new role.
+
+The controller supplies the current voice on new, eligible owner-facing
+HEAD turns (including synthesis from a normal lane report) and on direct
+topic-reply lane turns. It uses the admitted run's delivery scope, not message
+content or the current channel. A steer inherits the opening run's scope:
+joining an active manager handoff does not give the lane the reply voice.
+The private owned Host takes only the closed voice profile and renders a
+root-only, temporary system block. An opaque admission token is removed at
+the stock input boundary; neither token nor style enters the user history,
+lane brief, or global `PERSONALITY.md`. Native task children, internal control prompts,
+structured replies, and code-generated notices do not use it. Settings apply
+to the next eligible run on a capable resident Host, without reloading its
+session or changing SUPER activation. Hosts advertising reply voice v2 also
+receive the concept; v1 Hosts continue receiving the original style fields
+without the concept. Hosts with no capability continue unstyled.
+
+The prompt boundary was compared with [Cataly `d2cb7078`](https://github.com/vntrevx/Cataly/blob/d2cb7078033ccab27895515d4c566fe7ed4078de/extension/index.ts#L1274-L1295),
+[OpenClaw `6978b40e`](https://github.com/openclaw/openclaw/blob/6978b40e9d3812083064c97e24de00454d6bf868/docs/concepts/system-prompt.md#L166-L185),
+[Hermes `242315ce`](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/agent/system_prompt.py#L547-L553),
+and [Dori `3b5487df`](https://github.com/vntrevx/omp-dori/blob/3b5487df12540cdd428ebcf7455375d72921e2dc/skills/dori-mode/SKILL.md#L65-L74).
+These are design references, not prompt or code reuse. The stock OMP extension
+and RPC contract was inspected at [v19.1.1](https://github.com/can1357/oh-my-pi/commit/31ffee513f27a01bba7d4dfbe12bae239cdc646a);
+the installed Host advertises the optional bridge rather than inferring it
+from a CLI version.
+
 ## Workflow selection
 
 The root role extensions add only their own role instructions to native context.

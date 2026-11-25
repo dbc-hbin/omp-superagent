@@ -28,7 +28,7 @@ const extensionPath = path.join(packageRoot, role === "head" ? "src/extension.ts
 const customDirectory = path.join(root, "operator-custom-skills");
 const shadowHead = role === "head" && kind === "main" && selection === "narrow";
 const shadowDirectory = path.join(workspace, ".omp/skills/superagent-head");
-const managerNames = ["head_recovery", "head_set_model", "cron_create", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
+const managerNames = ["head_recovery", "head_set_model", "cron_create", "soul_update", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
   "discord_context", "discord_purpose_list", "discord_purpose_set", "discord_purpose_clear", "messenger_presence", "lane_watch", "pr_watch", "pr_watch_list",
   "decision_list", "decision_inspect", "decision_withdraw"];
 const rootOnlyNames = ["result_attach", "decision_ask", ...(role === "head" ? managerNames : ["lane_report"])];

@@ -37,6 +37,12 @@ The owner, guild and parent-channel checks still apply. Owner DMs, Discord
 application commands, approval components and restricted group rooms retain
 their existing policies.
 
+Standalone owner preferences, such as the shared reply voice, cannot be set
+through a reply, forward, or attachment. Adapters keep that provenance even
+when a Telegram external reply, Discord forward, or Slack shared attachment
+has no usable in-route snapshot. This marker does not change routing or message
+identity and does not import external reply content.
+
 The Gateway records pending owner-message candidates before advancing the
 Discord WebSocket sequence. Until it verifies the sender and route, it keeps
 only lookup coordinates and revision evidence, not message or attachment
@@ -328,6 +334,9 @@ See the [operations guide](../OPERATIONS.en.md#4-commands-and-daily-use) for com
   answers instead pass through the controller's source-bound outbox without a
   synthesis turn. Approval cards stay with their original native session and
   authorized route.
+- Send an explicit [SOUL reply voice change](execution.md#owner-facing-reply-voice)
+  through `/head` from a bound thread. Ordinary lane requests, reports and
+  quoted text do not become global settings changes.
 - Thread-first work sends a short kickoff to the selected topic. The durable
   `sent` receipt gates new lane dispatch and steering for that input. A missing
   or uncertain delivery is not a successful kickoff.

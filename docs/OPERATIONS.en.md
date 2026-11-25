@@ -1074,6 +1074,17 @@ directory, reply to the original question with the repository name or absolute p
 the **original request**. Lanes do not have messenger credentials. To compare multiple topics or
 explicitly address the shared HEAD, use `/head <request>` (Slack: `!head <request>`).
 
+**Change the shared reply voice (SOUL)** by telling HEAD in a fresh message:
+“From now on, answer like an editor, formally and briefly, with the answer first.”
+There is no required SOUL keyword. In a bound work thread only, address HEAD
+with the existing `/head` prefix (Slack: `!head`); ordinary messages there
+still go to the lane. “Reset your reply style” restores the default. Check the tool's saved
+revision in HEAD's confirmation. The setting survives restart and applies to
+new HEAD and direct lane replies, not messages already being written, internal
+reports, or code-generated status/approval messages. One-off requests are not stored.
+The supported concepts are editorial, mentoring, and plain. They do not change
+models, identity, tools, approvals, or workflows.
+
 If Mnemopi is active and searchable on the head, you can describe when the work happened and what
 it was in another operator channel or DM, for example: `Continue where we left off with the login
 bug last week`. You do not need a repository name, the original message link, or `/new`. The head

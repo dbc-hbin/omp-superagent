@@ -104,6 +104,7 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
     if (bootstrap) {
       if (role !== "head") throw new Error("Startup initialization must stay in the original head");
       if (!context.systemPrompt?.some(part => part.includes("lane_init_presets"))) throw new Error("Bootstrap lost the original head role instructions");
+      if (context.systemPrompt?.some(part => part.includes("<superagent-reply-voice>"))) throw new Error("Bootstrap inherited owner-facing reply voice");
       if (!called("lane_models")) return invoke("lane_models", {});
       if (process.env.OMP_NATIVE_GATEWAY_PRESETS === "failed") return { content: ["No presets created; initialization is not complete."] };
       if (!called("lane_init_presets")) {

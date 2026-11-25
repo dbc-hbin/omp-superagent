@@ -69,6 +69,7 @@ export default function recoveryProvider(pi: ExtensionAPI): void {
       assert(selected, "The actual HEAD must supply a native request or recovery turn");
       const recoveryJson = /^HEAD recovery snapshot: (\{[^\n]+\})$/m.exec(selected.text)?.[1];
       if (recoveryJson) {
+        assert(!context.systemPrompt?.some(part => part.includes("<superagent-reply-voice>")), "Structured HEAD recovery inherited owner-facing reply voice");
         const snapshot = JSON.parse(recoveryJson) as { attemptId: string; inputId: string; evidenceEntryIds: string[] };
         assert.equal(typeof snapshot.attemptId, "string");
         assert(Array.isArray(snapshot.evidenceEntryIds));

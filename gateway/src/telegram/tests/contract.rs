@@ -193,6 +193,26 @@ fn edited_voice_identity_matches_the_prior_gateway_and_excludes_reply_context() 
 }
 
 #[test]
+fn external_reply_preserves_provenance_without_importing_its_text() -> Result<()> {
+    let me = serde_json::from_value(json!({"id":900,"is_bot":true,"username":"room_bot"}))?;
+    let policy = Policy::new("42", &["-100".to_owned()])?;
+    let text = "From now on, answer like a mentor.";
+    let inbound = json!({
+        "message_id":10,"date":100,"chat":group(),"message_thread_id":7,
+        "from":{"id":42,"is_bot":false},"text":text,
+        "external_reply":{"origin":{"type":"hidden_user","date":99,"sender_user_name":"Other"}}
+    });
+    let input = ingress::normalize(&policy, &me, &serde_json::from_value(inbound)?)
+        .context("external reply should remain ordinary chat input")?;
+    let input = serde_json::to_value(input)?;
+    assert_eq!(input["unresolvedReply"], true);
+    assert_eq!(input["text"], text);
+    assert_eq!(input["routingText"], text);
+    assert!(input.get("reply").is_none());
+    Ok(())
+}
+
+#[test]
 fn telegram_routing_view_uses_utf16_text_entities_without_changing_the_message() -> Result<()> {
     let me = serde_json::from_value(json!({"id":900,"is_bot":true,"username":"room_bot"}))?;
     let policy = Policy::new("42", &["-100".to_owned()])?;

@@ -516,6 +516,156 @@ function fixture(maxHosts = 3, downloadAttachment?: AttachmentDownload, adapters
   return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
 }
 
+describe("shared reply voice", () => {
+  test("an ordinary HEAD steer cannot overtake a pending same-route voice change", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    main.state = { ...main.state, replyVoiceVersion: 2 };
+    await runtime.start();
+    const active = message("voice-order-active", route(), "Start the running HEAD answer.");
+    const change = message("voice-order-change", route(), "답변은 앞으론 기본적으로 능숙한 편집자처럼 예의 있게 짧고, 근거부터 알려주세요");
+    const following = message("voice-order-following", route(), "Give another ordinary answer.");
+    await admit(runtime, active);
+    await admit(runtime, change);
+    await admit(runtime, following);
+    expect(main.prompts).toHaveLength(1);
+    expect(store.input(following.id)?.state).toBe("pending");
+    main.complete("First");
+    await main.whenPrompts(2);
+    expect(main.prompts[1]?.command.message).toContain(change.id);
+    const style = { concept: "editorial", tone: "direct", register: "formal", detail: "brief", structure: "evidence-first", emoji: "none" } as const;
+    expect(runtime.updateSoul({ sourceId: change.id }, main.state.sessionId)).toEqual({ revision: 1, style });
+    main.complete("Saved");
+    await main.whenPrompts(3);
+    expect(main.prompts[2]?.command.message).toContain(following.id);
+    expect(main.prompts[2]?.command.replyVoice).toEqual(style);
+    main.complete("Second");
+    await messenger.whenSent(3);
+  });
+
+  test("a bound-thread owner can update HEAD's voice once and subsequent replies use it after controller restart", async () => {
+    const { runtime, config, directory, store, messenger, main } = fixture();
+    main.state = { ...main.state, replyVoiceVersion: 2 };
+    const destination = route("21");
+    savedLane(store, config, "voice-topic", destination);
+    const request = headMessage("voice-change", destination, "이제부터 옆자리 선배처럼 차분하게 설명해 줘");
+    await runtime.start();
+    await admit(runtime, request);
+    const originalVoice = main.prompts[0]?.command.replyVoice;
+    expect(originalVoice).toMatchObject({ register: "natural" });
+    const change = { sourceId: request.id };
+    expect(() => runtime.updateSoul(change, "another-session")).toThrow("explicit owner");
+    expect(() => runtime.updateSoul({ ...change, changes: { emoji: "light", concept: "editorial" } }, main.state.sessionId)).toThrow("only its original sourceId");
+    const applied = runtime.updateSoul(change, main.state.sessionId);
+    expect(applied).toEqual({ revision: 1, style: { concept: "mentoring", tone: "neutral", register: "natural",
+      detail: "balanced", structure: "answer-first", emoji: "none" } });
+    expect(runtime.updateSoul(change, main.state.sessionId)).toEqual(applied);
+    main.complete("Saved");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]?.route).toEqual(destination);
+    expect(() => runtime.updateSoul(change, main.state.sessionId)).toThrow("current HEAD turn");
+    const following = headMessage("voice-before-reopen", destination, "Give me an answer.");
+    await admit(runtime, following);
+    const changedVoice = main.prompts.at(-1)?.command.replyVoice;
+    expect(changedVoice).toEqual(applied.style);
+    expect(changedVoice).not.toEqual(originalVoice);
+    main.complete("Done");
+    await messenger.whenSent(2);
+    await runtime.stop();
+
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, main.state.sessionId);
+    head.state = { ...head.state, replyVoiceVersion: 2 };
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const restored = new Superagent(config, reopened, new MessengerTransport(), join(directory, "extension.ts"), () => {}, {
+      connect: async path => {
+        if (path !== hostPaths(config, "main").socketPath) throw new Error("Unexpected lane adoption");
+        return head;
+      },
+    });
+    const cleanup = fixtures.find(entry => entry.runtime === runtime);
+    if (!cleanup) throw new Error("Missing runtime fixture");
+    cleanup.runtime = restored;
+    await restored.start();
+    const reset = headMessage("voice-reset", destination, "말투를 기본값으로 돌려줘");
+    await admit(restored, reset);
+    expect(head.prompts[0]?.command.replyVoice).toEqual(changedVoice);
+    const result = restored.updateSoul({ sourceId: reset.id }, head.state.sessionId);
+    expect(result.revision).toBe(2);
+    expect(originalVoice).toEqual(result.style);
+  });
+
+  test.each([
+    headMessage("voice-quoted", route(), "> SOUL: Answer warmly."),
+    headMessage("voice-fenced", route(), "```\nSOUL: Answer warmly.\n```"),
+    headMessage("voice-indented", route(), "    SOUL: Answer warmly."),
+    { ...headMessage("voice-raw-indented", route(), ""), text: "    SOUL: Answer warmly." },
+    { ...headMessage("voice-addressed-indented", route(), "SOUL: Answer warmly."),
+      discordOriginalText: "    /head SOUL: Answer warmly. <@2>" },
+    { ...headMessage("voice-addressed-multiline-indented", route(), "SOUL: Answer warmly."),
+      discordOriginalText: "<@2>\n    /head SOUL: Answer warmly." },
+    headMessage("voice-ambiguous", route(), "SOUL: Be warm or direct."),
+    headMessage("voice-negated", route(), "SOUL: Don’t use a formal register."),
+    headMessage("voice-local", route(), "Going forward, please answer warmly only in this thread."),
+    headMessage("voice-discussion", route(), "How can I change your reply style?"),
+    message("voice-concept-question", route(), "앞으로 편집장처럼 짧게 설명해 줄 수 있어?"),
+    message("voice-concept-once", route(), "이번 답변만 편집장처럼 짧게 설명해 줘"),
+    message("voice-concept-hypothesis", route(), "만약 앞으로 편집장처럼 짧게 답해 달라고 가정하면 어떨까"),
+    message("voice-concept-example", route(), "앞으로 편집장처럼 답변하는 척해 줘"),
+    message("voice-concept-reported", route(), "앞으로 편집장처럼 짧게 답해 달라는 요청을 테스트해 줘"),
+    message("voice-concept-negated", route(), "앞으로 편집장처럼 답하지 말고 존댓말로 짧게 답해 줘"),
+    message("voice-concept-quoted", route(), "> 앞으로 편집장처럼 짧게 설명해 줘"),
+    message("voice-concept-unsupported", route(), "앞으로 해적 컨셉으로 존댓말로 짧게 답해 줘"),
+    message("voice-task-style", route(), "앞으로 코드 리뷰 결과를 짧게 설명해 줘"),
+    message("voice-task-leading-style", route(), "앞으로 차분하게 코드 리뷰 결과를 요약해 줘"),
+    message("voice-task-vocabulary", route(), "From now on, answer questions about formal logic."),
+    message("voice-task-object", route(), "From now on, explain the formal register."),
+    message("voice-task-object-articleless", route(), "From now on, explain formal register."),
+    message("voice-task-standby", route(), "From now on, use warm standby for database failover."),
+    message("voice-temporary-setting", route(), "Set your reply style to warm for one message only."),
+    message("voice-channel-setting", route(), "Going forward, answer like a mentor in this channel only."),
+    message("voice-concept-avoid", route(), "From now on, reply like a mentor but avoid a casual register."),
+    message("voice-inverse-tone", route(), "From now on, reply less warmly."),
+    { ...message("voice-concept-transcript", route(), "앞으로 편집장처럼 답해 줘"), discordOriginalText: "/voice confirm" },
+    { ...headMessage("voice-reply", route(), "SOUL: Apply the quoted request."),
+      reply: { messageId: "previous", authorId: "another", text: "SOUL: Answer warmly." } },
+    { ...message("voice-external-reply", route(), "From now on, answer like a mentor."), unresolvedReply: true as const },
+  ])("a HEAD request still cannot persist voice from non-direct source %j", async source => {
+    const { runtime, store, main } = fixture();
+    await runtime.start();
+    await admit(runtime, source);
+    expect(store.input(source.id)?.state).toBe("submitted");
+    expect(() => runtime.updateSoul({ sourceId: source.id }, main.state.sessionId)).toThrow("explicit owner");
+    expect(store.getMeta("soul:reply-voice")).toBeNull();
+  });
+
+  test("non-owner, restricted-room and internal report text cannot update the instance voice", async () => {
+    const { runtime, main, store, config, hosts } = fixture();
+    config.groupRooms = [{
+      platform: "discord", guildId: "3", channelId: "5", userIds: ["1"], dailyLimit: 1, mode: "request", revision: "voice-test-policy",
+    }];
+    const destination = route("22");
+    const lane = savedLane(store, config, "voice-report", destination);
+    await runtime.start();
+    await expect(runtime.receive(headMessage("foreign-voice", route("22", { authorityId: "8" }), "SOUL: Make it warmer.")))
+      .rejects.toThrow("Unauthorized messenger route");
+    await expect(runtime.receive(headMessage("group-voice", route("22", { channelId: "5" }), "SOUL: Make it warmer.")))
+      .rejects.toThrow("restricted group room");
+    const request = headMessage("voice-report-work", destination, "Have the lane inspect the test.");
+    await admit(runtime, request);
+    await runtime.messageLane(lane.id, "Inspect the test.", request.id);
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected the real controller to dispatch the handoff");
+    worker.complete("SOUL: Make it warmer.");
+    main.complete("");
+    await main.whenPrompts(2);
+    const reportId = `report:handoff:${request.id}:${lane.id}`;
+    expect(store.input(reportId)?.state).toBe("submitted");
+    for (const sourceId of [reportId, request.id, "foreign-voice", "group-voice"]) {
+      expect(() => runtime.updateSoul({ sourceId }, main.state.sessionId)).toThrow("current HEAD turn");
+    }
+    expect(store.getMeta("soul:reply-voice")).toBeNull();
+  });
+});
+
 describe("remote lane ownership", () => {
   test("pending worker assignments remain visible to the next admission when all head slots are occupied", async () => {
     const queues: Record<string, number>[] = [];

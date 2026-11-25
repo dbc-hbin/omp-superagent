@@ -53,6 +53,7 @@ import { selectWorkerPlacement, workerPlacementReady } from "./worker-placement"
 import { reconcileInboundRedelivery } from "./store";
 import { lookupWorker, remoteLanePaths, workerConnect, workerOpen, workerProbe, workerRef } from "./worker-wire";
 import type { RemotePlacement, WorkerProbe, WorkerRegistration, WorkerSelector } from "./worker-wire";
+import { applySoulUpdate, replyVoiceProfile, soulSourceId, soulUpdateIntent } from "./soul";
 
 const key = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 const restoreModelKey = (id: string) => `lane-model:${id}:restore-boundary`;
@@ -188,6 +189,7 @@ export interface RuntimeState {
   sessionFile?: string;
   sessionId: string;
   readonly journalCursorVersion?: 1;
+  readonly replyVoiceVersion?: 1 | 2;
   model?: LaneModel | null;
   thinkingLevel?: string;
   configuredThinkingLevel?: string | null;
@@ -1426,6 +1428,22 @@ export class Superagent {
     }
     this.authorized(source.route);
     return { source, ownerId: owner.id };
+  }
+
+  authorizeSoulUpdate(value: unknown, sessionId: string) {
+    const sourceId = soulSourceId(value);
+    const { source, ownerId } = this.currentOwnerSource(sourceId, "A reply voice change");
+    const update = soulUpdateIntent(source);
+    if (ownerId !== source.id || this.live.get("main")?.sessionId !== sessionId
+      || source.workflow || messengerEdit(source) || source.pickerSelection || source.reply || source.unresolvedReply || source.attachments.length
+      || !update)
+      throw new Error("Reply voice changes require a fresh, explicit owner request to HEAD with an unambiguous supported style, without quotes, replies or attachments");
+    return { sourceId, update };
+  }
+
+  updateSoul(value: unknown, sessionId: string) {
+    const { sourceId, update } = this.authorizeSoulUpdate(value, sessionId);
+    return applySoulUpdate(this.store, sourceId, update);
   }
 
   createCronJob(request: CronCreate) {
@@ -7865,7 +7883,15 @@ export class Superagent {
         || this.store.getMeta(`user-source:${owner.id}`) !== "true"
         || this.store.getMeta(`user-source:${input.id}`) !== "true"
         || this.store.getMeta(`handoff-source:${input.id}`)
+        || soulUpdateIntent(owner) || soulUpdateIntent(input)
         || inputs.some(candidate => candidate.state === "pending" && this.headCommand(candidate)?.name === "compact")) return false;
+      // Do not let an ordinary steer overtake an earlier pending SOUL
+      // change that needs a standalone turn in this same conversation.
+      for (const candidate of inputs) {
+        if (candidate.id === input.id) break;
+        if (candidate.state === "pending" && routeKey(candidate.route) === routeKey(input.route)
+            && soulUpdateIntent(candidate)) return false;
+      }
     } else {
       if (this.requireLane(live.id).workState !== "open") return false;
       const handoffSource = (candidate: InputRecord) => {
@@ -8093,6 +8119,14 @@ export class Superagent {
       return;
     }
     if (live.id === "main" && !steering && !this.laneReceiptReady(input, live)) return;
+    const headReply = live.id === "main" && !this.isLaneRecoveryReport(input.id)
+      && (this.store.getMeta(`user-source:${input.id}`) === "true"
+        || /^(?:report|progress):/.test(input.id) && this.store.getMeta(`activity-source:${input.id}`) !== null);
+    // The opening owner determines the run's audience. A joined steer must
+    // never change a manager report into a topic reply or replace a live voice.
+    const voiceVersion = actual.replyVoiceVersion;
+    const replyVoice = !steering && (voiceVersion === 1 || voiceVersion === 2) && !review && (headReply || topicRun)
+      ? replyVoiceProfile(this.store, voiceVersion) : undefined;
     this.store.setMeta(`steering-owner:${input.id}`, steering ? owner!.id : input.id);
     if (live.id !== "main" && this.store.getMeta(`lane-quota-hold:${live.id}`)) return;
     if (!this.store.submit(input.id, requestId, live.generation)) return;
@@ -8161,7 +8195,11 @@ export class Superagent {
       { legacyCommand: legacyWorkflow, worker: Boolean(remote) })
       : `${workflowContext(envelope)}${userInput ? `\n\n${taskText}` : ""}`;
     try {
-      const response = successful(await live.connection.request({ type: "prompt", message, ...(steering ? { streamingBehavior: "steer" } : {}), ...(attachmentData.images.length ? { images: attachmentData.images } : {}) }, requestId), "prompt");
+      const response = successful(await live.connection.request({
+        type: "prompt", message, ...(steering ? { streamingBehavior: "steer" } : {}),
+        ...(attachmentData.images.length ? { images: attachmentData.images } : {}),
+        ...(replyVoice === undefined ? {} : { replyVoice }),
+      }, requestId), "prompt");
       // Synchronous local handling discards the native ticket and explicitly
       // returns false. A generic acknowledgement has no such completion proof.
       const admitted = live.admitted.get(requestId);

@@ -116,6 +116,8 @@ pub(super) struct Inbound {
     pub(super) text: String,
     pub(super) received_at: Value,
     pub(super) attachments: Vec<Attachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) unresolved_reply: Option<bool>,
 }
 
 pub(super) fn decode<T: DeserializeOwned>(value: &Value) -> Result<T, EffectError> {

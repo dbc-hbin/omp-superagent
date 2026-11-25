@@ -144,13 +144,14 @@ const inboundData = (input: Inbound): Inbound => ({
   ...(input.invocationId === undefined ? {} : { invocationId: input.invocationId }),
   ...(input.pickerSelection === undefined ? {} : { pickerSelection: input.pickerSelection }),
   ...(input.reply === undefined ? {} : { reply: input.reply }),
+  ...(input.unresolvedReply === undefined ? {} : { unresolvedReply: input.unresolvedReply }),
   ...(input.discordContext === undefined ? {} : { discordContext: input.discordContext }),
   receivedAt: input.receivedAt, attachments: input.attachments,
 });
 function inboundIdentity(input: Inbound) {
   // Derived routing text and independently edited references do not change the
   // event identity. Keep the first snapshot, including on pre-upgrade replay.
-  const { reply: _reply, discordContext: _context, routingText: _routingText, ...data } = inboundData(input);
+  const { reply: _reply, unresolvedReply: _unresolvedReply, discordContext: _context, routingText: _routingText, ...data } = inboundData(input);
   return {
     ...data,
     // Slack supplies no command timestamp. A transport redelivery has a fresh

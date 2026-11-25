@@ -44,6 +44,7 @@ pub(super) struct Message {
     pub text: Option<String>,
     pub caption: Option<String>,
     pub reply_to_message: Option<Box<Message>>,
+    external_reply: Option<Value>,
     pub reply_markup: Option<Markup>,
     quote: Option<Quote>,
     sender_chat: Option<Value>,
@@ -107,6 +108,8 @@ pub(super) struct Inbound {
     attachments: Vec<Attachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply: Option<Reply>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unresolved_reply: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -213,6 +216,9 @@ pub(super) fn normalize(policy: &Policy, me: &Identity, message: &Message) -> Op
             quote: message.quote.as_ref().map(|quote| quote.text.clone()),
         })
     });
+    let unresolved_reply = (message.external_reply.is_some() || message.forward_date.is_some()
+        || reply.is_none() && (message.reply_to_message.is_some() || message.quote.is_some()))
+        .then_some(true);
     Some(Inbound {
         id,
         route,
@@ -222,6 +228,7 @@ pub(super) fn normalize(policy: &Policy, me: &Identity, message: &Message) -> Op
         received_at,
         attachments,
         reply,
+        unresolved_reply,
     })
 }
 

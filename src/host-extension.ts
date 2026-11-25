@@ -24,6 +24,7 @@ import { verifyHostSuperkit } from "./host-superkit";
 import { isPrReviewInferenceModel, prReviewModelChoices } from "./pr-review-models";
 import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent,
   type RotationNative, type RotationProbeEvent } from "./head-rotation";
+import { installReplyVoice } from "./host-reply-voice";
 
 const terminalService = (state: ServiceUnit["state"]) => state === "exited" || state === "failed";
 const serviceGeneration = ({ owner, id, generation, startedAt, restartCount }: ServiceUnit) =>
@@ -82,6 +83,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
   const selectedSuperkit = process.env[MANAGED_ULW_ENV];
   const workerAttempt = process.env.OMP_SUPERAGENT_WORKER_ATTEMPT;
   const reviewCwd = process.env.OMP_SUPERAGENT_PR_REVIEW_CWD;
+  let replyVoice: ReturnType<typeof installReplyVoice>;
   if (reviewCwd && PR_REVIEW_GITHUB_ENV.some(name => process.env[name]))
     throw new Error("Static PR review cannot load GitHub credentials from the native profile");
   let loadedSuperkitPath: string | undefined;
@@ -488,6 +490,14 @@ export default function hostExtension(pi: ExtensionAPI): void {
         modelSettings: { modelRoles: roles, ...(defaultThinkingLevel !== undefined ? { defaultThinkingLevel } : {}) } } };
   };
   const handle = async (command: Frame): Promise<unknown> => {
+    if (command.type === "stage_reply_voice" || command.type === "clear_reply_voice") {
+      exact();
+      if (!replyVoice || typeof command.token !== "string" || !command.token)
+        throw new Error("Native reply voice control is unavailable");
+      if (command.type === "stage_reply_voice") return { staged: replyVoice.stage(command) };
+      replyVoice.clear(command.token);
+      return {};
+    }
     if (command.type === "get_head_rotation") {
       const state = rotationState();
       if (!state) return null;
@@ -531,6 +541,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
     }
     if (command.type === "interrupt_maintenance") {
       const { session } = exact();
+      replyVoice?.clear();
       const restored = command.restoreQueue === true ? session.clearQueue({ forInterrupt: true }) : undefined;
       // abort() raises its barrier and withdraws marked internal context before
       // its first await. Do not await its compaction cleanup until the owner has
@@ -583,6 +594,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
       // Only an owner that implements the cursor command can advertise it to peers.
       return { ...ownerIdentity(ownership.identity), loadedSuperkitPath, prReviewPolicy, settingsScope: "session", modelSettings: snapshot(),
         journalCursorControlVersion: 1,
+        ...(replyVoice?.available() ? { replyVoiceControlVersion: 2 } : {}),
         hasOwnedRunningWork: ownership.unknown ? undefined : ownership.busy, mutationHeld, observationHeld,
         admitted: ownership.identity.session.hasAdmittedSubmission,
         postPromptWork: ownership.identity.session.hasPostPromptWork,
@@ -816,7 +828,12 @@ export default function hostExtension(pi: ExtensionAPI): void {
         process.stderr.write(`${error instanceof ReviewIsolationError ? error.message : "Static PR review native guard setup failed"}\n`);
         throw error;
       }
-    }
+    } else replyVoice = installReplyVoice(pi, identity.session, async token => {
+      const response = await ownerChannel?.request({ type: "claim_reply_voice", token });
+      return response?.success === true && isDeepStrictEqual(response.data, { claimed: true });
+    }, token => {
+      ownerChannel?.send({ type: "retire_reply_voice", token });
+    });
     await ctx.sessionManager.ensureOnDisk();
     if (exact().ref !== identity.ref) throw new Error("Native session changed during materialization");
     identity.session.sessionManager.flushSync();
@@ -835,7 +852,11 @@ export default function hostExtension(pi: ExtensionAPI): void {
       if (ownerChannel) { socket.destroy(); return; }
       const channel = new HostChannel(socket, socket, true);
       ownerChannel = channel;
-      void channel.exited.then(() => { if (ownerChannel === channel) ownerChannel = undefined; });
+      void channel.exited.then(() => {
+        if (ownerChannel !== channel) return;
+        ownerChannel = undefined;
+        replyVoice?.clear();
+      });
       channel.encoder.setProtocolVersion(2);
       channel.on("frame", (command: Frame) => {
         if (command.type === "response" || typeof command.id !== "string") return;

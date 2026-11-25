@@ -13,6 +13,8 @@ import { startGateway, type GatewayService } from "../oracles/bun-gateway/gatewa
 import { HostConnection } from "../../src/host";
 import { nativeDisabledProviders } from "./native-extension";
 import { runNativeUlwProof } from "./native-ulw-proof";
+import { runNativeSoulProof } from "./native-soul-proof";
+import { soulSteerRelease } from "./native-soul-cases";
 import { runNativeRecoveryProof } from "./native-recovery-proof";
 import { nativeRequestEnvelope } from "./native-request-envelope";
 import { nativeTestCommand } from "./native-command";
@@ -100,10 +102,12 @@ function requestIds(entries: readonly FileEntry[]): string[] {
 const root = process.env.OMP_NATIVE_GATEWAY_ROOT;
 assert(root && path.isAbsolute(root), "Native Gateway proof needs a private absolute root");
 const presetScenario = process.env.OMP_NATIVE_GATEWAY_PRESETS ?? "create";
-assert(["create", "valid", "failed", "skipped", "interrupted", "recovery"].includes(presetScenario));
+assert(["create", "valid", "failed", "skipped", "interrupted", "recovery", "soul"].includes(presetScenario));
+const soulScenario = presetScenario === "soul";
 assert.equal(process.env.HOME, path.join(root, "home"));
 const nativeCommand = await nativeTestCommand();
 const ulwEntrypoint = process.env.OMP_TEST_ULW_EXTENSION ? await fs.realpath(process.env.OMP_TEST_ULW_EXTENSION) : undefined;
+assert(!soulScenario || ulwEntrypoint, "Native SOUL proof requires the real Superkit extension");
 const managedUlwPath = ulwEntrypoint
   ? (await fs.stat(ulwEntrypoint)).isDirectory() ? ulwEntrypoint : path.dirname(ulwEntrypoint)
   : path.resolve(import.meta.dir, "managed-ulw");
@@ -122,8 +126,9 @@ for (const directory of [agent, headCwd, laneCwd]) privateDirectory(directory);
 const model = "gateway-native/local";
 const settings = {
   ...offlineMnemopi,
-  disabledProviders: nativeDisabledProviders, modelRoles: { default: model, judge: model },
+  disabledProviders: nativeDisabledProviders, modelRoles: { default: model, judge: model, ...(soulScenario ? { task: model } : {}) },
   eval: { js: true, py: false },
+  ...(soulScenario ? { async: { enabled: true }, task: { batch: false, structured: false } } : {}),
   // Keep the actual tool result attached to its call when steering arrives
   // during manager dispatch. A background job's admission is not settlement.
   bash: { autoBackground: { enabled: false } },
@@ -142,7 +147,8 @@ const config: Config = {
   path: path.join(root, "superagent.json"), stateDir: root, headCwd,
   command: [...nativeCommand, "-e", path.resolve(import.meta.dir, "native-extension.ts"), "-e",
     presetScenario === "recovery" ? recoveryProvider
-      : path.resolve(import.meta.dir, ulwEntrypoint ? "native-ulw-provider-extension.ts" : "gateway-provider-extension.ts")],
+      : path.resolve(import.meta.dir, soulScenario ? "native-soul-provider.ts"
+        : ulwEntrypoint ? "native-ulw-provider-extension.ts" : "gateway-provider-extension.ts")],
   maxHosts: 2, maxSubagents: 2, idleMs: 3_600_000, model,
   discord: { tokenEnv: "ISOLATED_GATEWAY_DISCORD_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4"] },
 };
@@ -200,6 +206,7 @@ function cleanup(): Promise<void> {
     await fs.writeFile(path.join(root!, "release-observation"), "cleanup", { mode: 0o600 });
     await fs.writeFile(path.join(root!, "release-observation-final"), "cleanup", { mode: 0o600 });
     await fs.writeFile(path.join(root!, "release-recovery"), "cleanup", { mode: 0o600 });
+    if (soulScenario) await fs.writeFile(path.join(root!, soulSteerRelease), "", { mode: 0o600 });
     if (starting) {
       try { gateway = await within(starting, 40_000, "Native Gateway startup exceeded signal cleanup deadline"); }
       catch (error) { console.error(String(error)); }
@@ -329,7 +336,20 @@ try {
     for (const [name, bytes] of settingsBytes) assert.deepEqual(await fs.readFile(path.join(agent, name)), bytes);
     assert.deepEqual(errors, []);
   } else if (ulwEntrypoint) {
-    await runNativeUlwProof({ root, config, db, gateway, messenger, connections, owned, until });
+    if (soulScenario) {
+      await runNativeSoulProof({ root, config, db, gateway, messenger, connections, owned, until,
+        reopen: async stopped => {
+          assert.equal(gateway, stopped);
+          await stopped.stop();
+          starting = startGateway(config, { messenger, managedUlwPath, onError: error => errors.push(error) });
+          const replacement = await starting;
+          gateway = replacement;
+          starting = undefined;
+          await until(() => replacement.status().head.ready, "reopened controller and the same durable HEAD session");
+          return replacement;
+        },
+      });
+    } else await runNativeUlwProof({ root, config, db, gateway, messenger, connections, owned, until });
     gateway = undefined;
     for (const [name, bytes] of settingsBytes) assert.deepEqual(await fs.readFile(path.join(agent, name)), bytes);
     assert.deepEqual(errors, []);
