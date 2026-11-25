@@ -48,6 +48,7 @@ const reviewSettingValues = {
   "dev.autoqa": false,
 } as const;
 class ReviewIsolationError extends Error {}
+class DescendantOwnershipChanged extends Error {}
 
 /** Match the running CLI's own RPC settlement predicate (old and new SDK surface). */
 function pendingNativeWake(session: { readonly wakeSources?: unknown; readonly hasPendingAsyncWork?: () => boolean }): boolean {
@@ -280,8 +281,13 @@ export default function hostExtension(pi: ExtensionAPI): void {
       return entry.id;
     } catch (error) { observationHeld = true; throw error; }
   };
-  const owned = async (drain = false) => {
-    const identity = exact();
+  const assertSameRoot = (identity: ReturnType<typeof exact>) => {
+    const current = exact();
+    if (current.ref !== identity.ref || current.session !== identity.session
+      || current.id !== identity.id || current.file !== identity.file)
+      throw new Error("Native root changed during ownership observation");
+  };
+  const observeOwned = async (identity: ReturnType<typeof exact>, drain: boolean) => {
     const registry = pi.pi.AgentRegistry.global();
     const refs = registry.list();
     const refEpoch = refs.map(ref => [ref.id, ref.generation, ref.parentId, ref.session?.instanceKey, ref.sessionFile]);
@@ -365,10 +371,10 @@ export default function hostExtension(pi: ExtensionAPI): void {
     }
     const scopedServices = async () => (await observeServices()).filter(unit => unit.owner && owners.has(unit.owner));
     const services = await scopedServices();
+    assertSameRoot(identity);
     const currentRefs = registry.list();
-    if (exact().ref !== identity.ref || currentRefs.length !== refs.length
-      || refs.some((ref, index) => currentRefs[index] !== ref))
-      throw new Error("Native ownership tree changed during service observation");
+    if (currentRefs.length !== refs.length || refs.some((ref, index) => currentRefs[index] !== ref))
+      throw new DescendantOwnershipChanged("Native ownership tree changed during service observation");
     const deliveriesPending = (session: NativeSession) => {
       const delivery = session.getAsyncJobSnapshot({ recentLimit: 0 })?.delivery;
       return !!delivery && (delivery.delivering || delivery.queued > 0 || delivery.pendingJobIds.length > 0);
@@ -456,12 +462,25 @@ export default function hostExtension(pi: ExtensionAPI): void {
       if (!isDeepStrictEqual(services, refreshed))
         throw new Error("Native services changed while their durable completion evidence was drained");
     }
+    assertSameRoot(identity);
     if (!isDeepStrictEqual(refEpoch, registry.list().map(ref =>
       [ref.id, ref.generation, ref.parentId, ref.session?.instanceKey, ref.sessionFile])))
-      throw new Error("Native descendant identity changed during completion readback");
+      throw new DescendantOwnershipChanged("Native descendant identity changed during completion readback");
     const tree = identity.session.getAsyncJobTree({ recentLimit: 0 });
     return { identity, tree, unknown: servicesUnknown || serviceDeliveryUnknown || descendantsUnknown(),
       busy: liveGenerations.size > 0 || descendantsBusy() || deliveriesPending(identity.session) || !!tree?.running.length };
+  };
+  const owned = async (drain = false) => {
+    const identity = exact();
+    try {
+      return await observeOwned(identity, drain);
+    } catch (error) {
+      if (drain || !(error instanceof DescendantOwnershipChanged)) throw error;
+      // A read may overlap native child registration or attachment. Rebuild
+      // lineage, inventory and completions together, without retrying a drain.
+      assertSameRoot(identity);
+      return observeOwned(identity, false);
+    }
   };
   const localIdle = () => {
     const { session } = exact();

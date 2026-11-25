@@ -3,8 +3,13 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { EventEmitter, once } from "node:events";
-import { PassThrough } from "node:stream";
+import { duplexPair, PassThrough, type Duplex } from "node:stream";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import hostExtension from "../src/host-extension";
+import { MANAGED_ULW_ENV } from "../src/managed-ulw";
 import { buildHostArgs, connect, HostConnection, HostStartError, startHost, type HostFrame, type HostOptions } from "../src/host";
 import { HostChannel, HostRequestTimeout, indexServiceCompletions } from "../src/host-protocol";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
@@ -86,6 +91,135 @@ async function directory(launchesHost = false): Promise<string> {
   }
   return result;
 }
+
+test("native ownership snapshots resample child startup once without trusting a mixed epoch", async () => {
+  const root = await directory();
+  const socketPath = path.join(root, "native.sock");
+  const managed = path.resolve(import.meta.dir, "fixtures/managed-ulw");
+  const registry = new AgentRegistry();
+  class Session {
+    readonly settings = Settings.isolated();
+    readonly extensionRunner = {
+      getLoadedExtensions: () => [{ path: "fixture", resolvedPath: path.join(managed, "index.ts") }],
+      isExtensionActive: () => true,
+    };
+    readonly agent = {};
+    readonly instanceKey: string;
+    readonly sessionManager;
+    readonly goalRuntime = { pauseGoal() {} };
+    readonly yieldQueue = { has: () => false };
+    hasAdmittedSubmission = false;
+    hasPostPromptWork = false;
+    isBusyForSnapshot = false;
+    isStreaming = false;
+    isCompacting = false;
+    isDisposed = false;
+    queuedMessageCount = 0;
+    runStartedAt?: number;
+    wakeSources = undefined;
+    constructor(id: string) {
+      this.instanceKey = id;
+      const journal: unknown[] = [];
+      this.sessionManager = {
+        getSessionId: () => id, getSessionFile: () => path.join(root, id + ".jsonl"), getLeafId: () => null,
+        getEntries: () => journal, appendCustomEntry: (customType: string, data: unknown) => {
+          journal.push({ type: "custom", customType, data });
+        },
+        ensureOnDisk: async () => {}, flushSync() {},
+      };
+    }
+    getAsyncJobTree() { return null; }
+    getAsyncJobSnapshot() { return null; }
+    getGoalModeState() { return null; }
+    waitForIdle() {}
+    abortCompaction() {}
+    beginDispose() { throw new Error("An unstable drain must not reach disposal"); }
+  }
+  type SessionHandle = Parameters<AgentRegistry["attachSession"]>[1];
+  const head = new Session("head");
+  const child = new Session("child");
+  const base = { id: MAIN_AGENT_ID, kind: "main" as const, displayName: "head",
+    session: head as unknown as SessionHandle, sessionFile: head.sessionManager.getSessionFile() };
+  registry.register(base);
+  const callbacks = new Map<string, (event: unknown, context: ExtensionContext) => Promise<void>>();
+  const pi = {
+    pi: { AgentRegistry: { global: () => registry }, MAIN_AGENT_ID, AgentSession: Session },
+    on: (name: string, callback: (event: unknown, context: ExtensionContext) => Promise<void>) => callbacks.set(name, callback),
+  } as unknown as ExtensionAPI;
+  const settings = { OMP_SUPERAGENT_NATIVE_SOCKET: socketPath, OMP_SUPERAGENT_HOST_CONFIG: path.join(root, "config"),
+    [MANAGED_ULW_ENV]: managed };
+  const previous = Object.fromEntries(Object.keys(settings).map(name => [name, process.env[name]]));
+  try {
+    Object.assign(process.env, settings);
+    hostExtension(pi);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  const ctx = { agent: { kind: "main" }, sessionManager: head.sessionManager } as unknown as ExtensionContext;
+  // Run the real private RPC handler and codec without a native process or OS socket.
+  const [host, owner] = duplexPair();
+  const channel = new HostChannel(owner, owner);
+  cleanups.push(async () => { channel.destroy(); await channel.exited; });
+  await fs.writeFile(socketPath, "");
+  const server = spyOn(net, "createServer").mockImplementation(((accept: (input: Duplex) => void) => {
+    return Object.assign(new EventEmitter(), {
+      listen(_path: string, ready: () => void) { accept(host); ready(); },
+      close() { host.destroy(); },
+    });
+  }) as typeof net.createServer);
+  try { await callbacks.get("session_start")!(null, ctx); }
+  finally { server.mockRestore(); }
+  cleanups.push(async () => { await callbacks.get("session_shutdown")!(null, ctx); });
+
+  const childFile = child.sessionManager.getSessionFile();
+  await fs.writeFile(childFile, JSON.stringify({ type: "session", id: "child" }) + "\n");
+  let childRef: AgentRef | undefined;
+  const registerChild = () => {
+    childRef = registry.registerIfAvailable({ id: "child", kind: "sub", parentId: MAIN_AGENT_ID, displayName: "child",
+      session: null, sessionFile: childFile }, null);
+    expect(childRef).toBeDefined();
+  };
+  const inventory = () => {};
+  let observe = inventory, calls = 0, available = true;
+  channel.on("frame", (frame: HostFrame) => {
+    if (frame.type !== "list_service_units") return;
+    calls++;
+    observe();
+    channel.send({ type: "response", id: frame.id, command: frame.type, success: available, data: { units: [] } });
+  });
+  const read = async (change: () => void = inventory, command = "snapshot") => {
+    observe = change;
+    calls = 0;
+    const response = await channel.request({ type: command }, undefined, 2_000);
+    return { calls, response };
+  };
+  expect(await read(() => { if (calls === 1) registerChild(); })).toMatchObject({
+    calls: 2, response: { success: true, data: { hasOwnedRunningWork: false } },
+  });
+  expect(await read(() => {
+    if (calls !== 1) return;
+    child.runStartedAt = 1;
+    expect(registry.attachSession("child", child as unknown as SessionHandle, childFile, childRef)).toBe(true);
+  })).toMatchObject({ calls: 2, response: { success: true, data: { hasOwnedRunningWork: true } } });
+  expect(await read()).toMatchObject({ calls: 1, response: { success: true, data: { hasOwnedRunningWork: true } } });
+
+  const removeChild = () => { expect(registry.unregister("child", childRef)).toBe(true); };
+  expect(await read(() => { if (calls === 1) removeChild(); else registerChild(); })).toMatchObject({
+    calls: 2, response: { success: false, error: "Native ownership tree changed during service observation" },
+  });
+  expect(await read(removeChild, "shutdown_host")).toMatchObject({
+    calls: 1, response: { success: false, error: "Native ownership tree changed during service observation" },
+  });
+  available = false;
+  expect(await read()).toMatchObject({ calls: 1, response: { success: false, error: "Native service ownership is unavailable" } });
+  available = true;
+  expect(await read(() => { registry.register(base); })).toMatchObject({
+    calls: 1, response: { success: false, error: "Native root changed during ownership observation" },
+  });
+});
 
 function startFixtureHost(launch: HostOptions): ReturnType<typeof startHost> {
   const starting = startHost(launch);

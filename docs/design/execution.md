@@ -176,6 +176,10 @@ journal persistence. An enabled native goal, including a paused one, can prevent
 shutdown. Do not infer eligibility from `agent_end`, an RPC disconnect, a saved
 file, or a lease alone. Release ownership and the slot only after actual native
 exit; a shutdown ACK is not exit. Reload the same native session when authorized.
+A read-only ownership snapshot invalidated by a child identity change may
+resample the full evidence once for the same root. A second change, a root
+mismatch, or another observation failure still leaves ownership unverified.
+Maintenance drains do not retry invalidated observations.
 
 The resident Rust owner speaks the stock JSONL/v2 protocol. Bun and the published SDK still
 prepare and publish the native session under its exact profile. One short-lived
