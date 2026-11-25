@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:p
 import { isDeepStrictEqual } from "node:util";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { resolveRoutedModelSelector } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { CREDENTIAL_PATTERNS } from "@oh-my-pi/pi-coding-agent/secrets/patterns";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type ModelChangeEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { readSessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { getAgentDir, untilAborted } from "@oh-my-pi/pi-utils";
@@ -3796,10 +3797,16 @@ export class Superagent {
 
   private scopeOwnerEligible(owner: InputRecord, laneId: string): boolean {
     const text = owner.text.trim();
-    // A lossy projection might remove a restriction as easily as a quote.
-    // Never authorize the remaining fragment as if it were the whole request.
-    return !!text && !text.startsWith("/") && ownerRoutingProse(transportRoutingProse(owner)) === text
+    // The line-based projection can miss a quotation spanning two lines.
+    // Use the joined text only to detect exclusions, never as authority.
+    const joined = text.replace(/[\r\n\u2028\u2029]+/gu, " ");
+    return !!text && !text.startsWith("/") && (joined === text || ownerRoutingProse(joined) === joined)
+      && ownerRoutingProse(transportRoutingProse(owner)) === text
       && (owner.discordOriginalText === undefined || owner.discordOriginalText.trim() === text)
+      // Scan the text that will cross sessions, never redact it into authority.
+      // An explicit auth header is sensitive even with a short opaque token.
+      && !/\bauthorization[ \t]*:[ \t]*(?:bearer|basic)[ \t]+\S/iu.test(text)
+      && !CREDENTIAL_PATTERNS.some(({ source, flags }) => new RegExp(source, flags).test(text))
       && authorizeRoute(this.config, owner.route)
       && this.boundLane(owner.route)?.id === laneId && !isPrReviewLane(this.store, laneId);
   }
@@ -8237,10 +8244,11 @@ export class Superagent {
     const headReply = live.id === "main" && !this.isLaneRecoveryReport(input.id)
       && (this.store.getMeta(`user-source:${input.id}`) === "true"
         || /^(?:report|progress):/.test(input.id) && this.store.getMeta(`activity-source:${input.id}`) !== null);
+    const correctiveReply = live.id === scopeReview?.lane.id;
     // The opening owner determines the run's audience. A joined steer must
     // never change a manager report into a topic reply or replace a live voice.
     const voiceVersion = actual.replyVoiceVersion;
-    const replyVoice = !steering && (voiceVersion === 1 || voiceVersion === 2) && !review && (headReply || topicRun)
+    const replyVoice = !steering && (voiceVersion === 1 || voiceVersion === 2) && !review && (headReply || topicRun || correctiveReply)
       ? replyVoiceProfile(this.store, voiceVersion) : undefined;
     this.store.setMeta(`steering-owner:${input.id}`, steering ? owner!.id : input.id);
     if (live.id !== "main" && this.store.getMeta(`lane-quota-hold:${live.id}`)) return;

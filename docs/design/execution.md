@@ -104,10 +104,12 @@ its current topic binding independently. Both the review and corrective
 prompt require a fresh Gateway check of the original messenger account; a
 stored allowlist alone is insufficient after reconnect. A newer owner
 message in the same topic takes precedence even if catch-up admitted the
-older physical message last. HEAD compares the sanitized durable
-owner text against the existing assignment; it receives no lane prose as
-part of the review and cannot authorize work from a quote, attachment or
-lane report.
+older physical message last. Review requires exact trimmed owner text with
+no detected credentials or excluded material, including quotes spanning
+lines. Ineligible text stays in the bound lane; its
+redacted or projected remainder cannot authorize a review. HEAD compares
+the eligible text against the existing assignment and receives no lane
+prose, quote, or attachment as part of the review.
 
 If the original text explicitly supersedes the conflicting scope, the only
 allowed dispatch is a direct `lane_message` to that same lane with its review

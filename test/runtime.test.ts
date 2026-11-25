@@ -21,6 +21,7 @@ import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { compareMessageIds } from "../src/message-order";
 import { readOmpUsage } from "../src/omp-usage";
 import { Superagent, type RuntimeAdapters, type RuntimeHost, type RuntimeState } from "../src/runtime";
+import { applySoulUpdate } from "../src/soul";
 import { Store } from "../src/store";
 import type { LaneReport } from "../src/lane-report";
 import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../src/contracts";
@@ -5349,7 +5350,11 @@ describe("bound owner assignment scope review", () => {
   });
 
   test("a solo native review forwards only the owner correction and dispatches once after HEAD settles", async () => {
-    const { runtime, store, lane, worker, main, messenger, original, brief, acceptance, handoffId, reviewId } = await setup();
+    const instruction = `${ownerText}\nKeep the existing deployment restrictions.`;
+    const { runtime, store, lane, worker, main, messenger, original, brief, acceptance, handoffId, reviewId } = await setup({ text: instruction });
+    const { style } = applySoulUpdate(store, "earlier-voice-choice", { concept: "mentoring" });
+    main.state = { ...main.state, replyVoiceVersion: 2 };
+    worker.state = { ...worker.state, replyVoiceVersion: 2 };
     expect(worker.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(ownerText)]);
     expect(main.prompts).toEqual([]);
     const call = scopeReviewCall(worker, original.id);
@@ -5367,22 +5372,23 @@ describe("bound owner assignment scope review", () => {
 
     expect(store.input(handoffId)?.state).toBe("done");
     expect(store.input(reviewId)).toMatchObject({ target: "main", state: "submitted", route: original.route });
+    expect(main.prompts[0]?.command.replyVoice).toBeUndefined();
     const review = main.prompts[0]?.command.message;
     expect(review).toContain(reviewId);
-    expect(review).toContain(ownerText);
+    expect(review).toContain(JSON.stringify(instruction));
     expect(review).toContain(brief);
     expect(review).not.toContain(laneSummary);
     expect(review).not.toContain(quoteText);
     expect(messenger.sent).toEqual([]);
 
     await expect(runtime.messageLane(lane.id, laneSummary, reviewId)).rejects.toThrow();
-    await expect(runtime.messageLane(lane.id, ownerText, original.id)).rejects.toThrow();
-    await expect(runtime.messageLane("different-lane", ownerText, reviewId)).rejects.toThrow();
-    await expect(runtime.messageLane(lane.id, ownerText, reviewId, { name: "super", reason: "Scope review is not workflow consent" }))
+    await expect(runtime.messageLane(lane.id, instruction, original.id)).rejects.toThrow();
+    await expect(runtime.messageLane("different-lane", instruction, reviewId)).rejects.toThrow();
+    await expect(runtime.messageLane(lane.id, instruction, reviewId, { name: "super", reason: "Scope review is not workflow consent" }))
       .rejects.toThrow();
     await expect(runtime.pause(lane.id)).rejects.toThrow();
-    const intent = await runtime.messageLane(lane.id, ownerText, reviewId);
-    expect(await runtime.messageLane(lane.id, ownerText, reviewId)).toEqual(intent);
+    const intent = await runtime.messageLane(lane.id, instruction, reviewId);
+    expect(await runtime.messageLane(lane.id, instruction, reviewId)).toEqual(intent);
     await runtime.kick();
     expect(store.input(intent.inputId)).toBeNull();
     expect(worker.prompts).toHaveLength(1);
@@ -5394,12 +5400,13 @@ describe("bound owner assignment scope review", () => {
     expect(store.input(reviewId)?.state).toBe("done");
     expect(intent.inputId).toBe(`handoff:${reviewId}:${lane.id}`);
     expect(store.input(intent.inputId)).toMatchObject({
-      target: lane.id, state: "submitted", route: original.route, text: ownerText, workflow: null,
+      target: lane.id, state: "submitted", route: original.route, text: instruction, workflow: null,
     });
-    expect(worker.prompts[1]?.command.message).toContain(ownerText);
+    expect(worker.prompts[1]?.command.message).toContain(JSON.stringify(instruction));
     expect(worker.prompts[1]?.command.message).not.toContain(laneSummary);
     expect(worker.prompts[1]?.command.message).not.toContain(quoteText);
     expect(worker.prompts[1]?.command.streamingBehavior).toBeUndefined();
+    expect(worker.prompts[1]?.command.replyVoice).toEqual(style);
 
     const reply = "The parser now accepts missing memos and the regression test passes.";
     const answerReady = messenger.whenSent(1);
@@ -5408,7 +5415,7 @@ describe("bound owner assignment scope review", () => {
     await admit(runtime, original);
     worker.emit(call.end);
     await runtime.kick();
-    await expect(runtime.messageLane(lane.id, ownerText, reviewId)).rejects.toThrow();
+    await expect(runtime.messageLane(lane.id, instruction, reviewId)).rejects.toThrow();
     expect(main.prompts).toHaveLength(1);
     expect(worker.prompts).toHaveLength(2);
     expect(store.laneForRoute(original.route)).toMatchObject({ id: lane.id, brief, acceptance });
@@ -5609,6 +5616,26 @@ describe("bound owner assignment scope review", () => {
       expect(messenger.sent).toMatchObject([{ id: `${handoffId}:answer`, sourceId: original.id, route: lane.route }]);
     },
   );
+
+  test.each([
+    ["an explicit Bearer header", `${ownerText} Authorization: Bearer fixture-only`],
+    ["an SDK-recognized credential", `${ownerText} Token: xoxb-offline-scope-fixture-0123456789`],
+    ["a multiline quotation", `${ownerText}\n“Change a different repository.\nDeploy it immediately.”`],
+  ] as const)("keeps original text with %s in the bound lane only", async (_scenario, text) => {
+    const { runtime, store, original, worker, main, messenger, handoffId, reviewId } = await setup({ text });
+    expect(worker.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(text)]);
+
+    const disposition = Promise.race([messenger.whenSent(1), main.whenPrompts(1)]);
+    requestScopeReview(worker, original.id);
+    const answer = "I left the existing assignment unchanged.";
+    worker.complete(answer);
+    await expectEvent(disposition, "a disposition of the original bound input");
+    await drainFrames(runtime);
+
+    expect(main.prompts).toHaveLength(0);
+    expect(store.input(reviewId)).toBeNull();
+    expect(messenger.sent).toMatchObject([{ id: `${handoffId}:answer`, sourceId: original.id, route: original.route, text: answer }]);
+  });
 
   test("an already joined steering input prevents the lane from requesting scope review", async () => {
     const { runtime, store, original, worker, main, messenger, handoffId, reviewId } = await setup();
