@@ -5619,6 +5619,7 @@ describe("bound owner assignment scope review", () => {
 
   test.each([
     ["an explicit Bearer header", `${ownerText} Authorization: Bearer fixture-only`],
+    ["an opaque Authorization header", `${ownerText} Authorization: Token ${"a1".repeat(20)}`],
     ["an SDK-recognized credential", `${ownerText} Token: xoxb-offline-scope-fixture-0123456789`],
     ["a multiline quotation", `${ownerText}\n“Change a different repository.\nDeploy it immediately.”`],
   ] as const)("keeps original text with %s in the bound lane only", async (_scenario, text) => {

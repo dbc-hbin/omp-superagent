@@ -3804,8 +3804,8 @@ export class Superagent {
       && ownerRoutingProse(transportRoutingProse(owner)) === text
       && (owner.discordOriginalText === undefined || owner.discordOriginalText.trim() === text)
       // Scan the text that will cross sessions, never redact it into authority.
-      // An explicit auth header is sensitive even with a short opaque token.
-      && !/\bauthorization[ \t]*:[ \t]*(?:bearer|basic)[ \t]+\S/iu.test(text)
+      // Header values are sensitive regardless of scheme or token length.
+      && !/\bauthorization[ \t]*:\s*\S/iu.test(text)
       && !CREDENTIAL_PATTERNS.some(({ source, flags }) => new RegExp(source, flags).test(text))
       && authorizeRoute(this.config, owner.route)
       && this.boundLane(owner.route)?.id === laneId && !isPrReviewLane(this.store, laneId);
