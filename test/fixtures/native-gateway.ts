@@ -694,6 +694,26 @@ try {
       ["HEAD:209"], "The normal lane result must not be preceded by a separate native choice notice");
     const afterUsage = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
     assert(!requestIds(afterUsage).includes(usage.id), "Usage must not enter the native conversation");
+
+    const original: Inbound = { id: "discord:2:241:original", messageId: "241", route: thread,
+      text: "Implement the parser change now instead of only inspecting it.", receivedAt: Date.now(), attachments: [] };
+    const review = `scope-review:handoff:${original.id}:${firstLane.id}`;
+    const correction = `handoff:${review}:${firstLane.id}`;
+    await messenger.deliver(original);
+    const answerId = `${correction}:answer`;
+    const receipt = () => db.query("SELECT state, remote_id FROM outputs WHERE id = ? AND source_id = ?")
+      .get(answerId, original.id) as { state: string; remote_id: string } | null;
+    await until(() => receipt()?.state === "sent", "production HEAD grants the correction and Gateway confirms the original-thread reply");
+    assert.equal(receipt()?.remote_id, `gateway-native-receipt:${answerId}`);
+    assert.deepEqual(messenger.sent.filter(output => output.sourceId === original.id).map(output => [output.id, output.text, output.route, output.replyTo?.messageId]), [
+      [answerId, "Reviewed correction received on the original lane.", thread, original.messageId],
+    ]);
+    const journal = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
+    const grants = nativeJournalDispatches(journal).filter(call => call.name === "lane_message" && call.args?.sourceId === review);
+    assert.deepEqual(grants.map(call => [call.presentation, call.ok, call.args]),
+      [["direct", true, { sourceId: review, id: firstLane.id, text: original.text }]]);
+    assert.equal(input(review)?.state, "done");
+    assert.equal(input(correction)?.target, firstLane.id);
   }
   for (const [name, bytes] of settingsBytes) assert.deepEqual(await fs.readFile(path.join(agent, name)), bytes);
   assert.deepEqual(errors, []);

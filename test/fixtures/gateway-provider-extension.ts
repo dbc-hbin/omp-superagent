@@ -127,6 +127,15 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
     }
     if (!requestId) throw new Error("Ordinary native input requires its durable request identity");
     if (role === "head") {
+      if (requestId.startsWith("scope-review:")) {
+        const lane = /Assignment scope review for lane ("[^"]+")/.exec(text)?.[1];
+        const original = /Authenticated original owner message \(only source of a scope change\): ([^\n]+)/.exec(text)?.[1];
+        if (!lane || !original || !text.includes("Read-only parser inspection.")) throw new Error("Missing original scope review evidence");
+        if (!called("lane_message")) return invoke("lane_message", {
+          id: JSON.parse(lane), sourceId: requestId, text: JSON.parse(original),
+        });
+        return { content: ["Correction requested."] };
+      }
       if (requestId === "240") {
         if (!called("cron_create")) return invoke("cron_create", {
           sourceId: requestId, schedule: "in 1s", prompt: "Return the native scheduled check result in this conversation.",
@@ -157,6 +166,7 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
         });
         if (!called("lane_start")) return invoke("lane_start", {
           sourceId: requestId, title: "Native Gateway independent topic", kickoff: "I will inspect the requested workspace, perform the authorized work, and verify the result in this topic.", cwd: join(root, "topic"),
+          ...(process.env.OMP_NATIVE_GATEWAY_PRESETS === "create" ? { brief: "Read-only parser inspection." } : {}),
           model: { provider, id: model }, modelReason: "Use the isolated deterministic available text model for actual Gateway native integration.",
           acceptance: ["Return findings to the head; never send directly to Messenger"],
         });
@@ -200,6 +210,14 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
     }
 
     if (role !== "lane") throw new Error(`Unexpected Gateway native role: ${role}`);
+    if (requestId.startsWith("handoff:scope-review:")) return { content: ["Reviewed correction received on the original lane."] };
+    if (requestId.startsWith("handoff:discord:2:241:original:")) {
+      if (!called("lane_report")) {
+        const signal = invoke("lane_report", { status: "scope_review", sourceId: "discord:2:241:original" });
+        return { content: ["Holding the edit for scope review.", ...signal.content ?? []] };
+      }
+      return { content: ["The disputed work has not started."] };
+    }
     if (requestId === `handoff:209:${process.env.OMP_SUPERAGENT_LANE}`) {
       if (!called("decision_ask")) return invoke("decision_ask", {
         questions: [{ question: "Which reversible local cache layout?", options: [{ label: "Flat" }, { label: "Nested" }] }],

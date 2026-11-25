@@ -94,6 +94,15 @@ completion clears only the matching wait, and job/dependency resolution uses a
 matching report. Finish the eval reporting cell before a long wait. A printed
 receipt doesn't verify acceptance, authorize continuation, or send a message.
 
+Assignment scope review is separate from progress and waits. Use the direct
+native `lane_report` form from the Lane operating contract only for the current
+standalone original owner message; if isolated ownership is uncertain or the
+tool is unavailable, keep the disputed action held and do not substitute an
+indirect call. If the controller later delivers a corrective assignment, apply
+the explicit correction only to that assignment. Preserve other constraints,
+actual tool permissions and approvals; do not replay denied or uncertain
+effects, undo completed effects, or make operator or global changes.
+
 If a board observation helps, use `board_post` for concise evidence or collisions,
 `board_read` for needed bodies, and `board_subscribe` for this session's channels.
 Runtime verifies actual connected/registered identity per instance and assigns

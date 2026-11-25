@@ -126,6 +126,8 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     if (scoped.length !== active.length) await pi.setActiveTools(scoped);
   });
   pi.on("tool_call", (event, ctx) => {
+    if (runtime?.scopeReviewActive() && (ctx.agent.kind !== "main" || event.toolName !== "lane_message"))
+      return { block: true, reason: "This assignment review permits only a direct same-lane correction from its verified owner message" };
     if (event.toolName === "soul_update") {
       try { requireRuntime(ctx).authorizeSoulUpdate(event.input, ctx.sessionManager.getSessionId()); }
       catch (error) {
@@ -473,7 +475,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     },
   });
   pi.registerTool({
-    name: "lane_message", label: "Message independent work", approval: "exec",
+    name: "lane_message", label: "Message independent work", loadMode: "essential", approval: "exec",
     description: "Durably admit a follow-up to a specific open lane. For an original owner request from the exact guild parent of the lane's physical Discord thread, HEAD-reviewed progress and final reports go to that thread, not the parent. Do not duplicate them. Returns its input ID and durable state; pending work reports runtime blocks, blocking uncertain input IDs, and any unconfirmed kickoff. Report such holds instead of retrying. Ordinary same-topic follow-ups steer an eligible active native run by default; ineligible work stays queued. Do not require a separate user /steer command. sourceId identifies the original received user instruction for duplicate suppression. Optional workflow {name,reason} is explicit head selection within that objective; text/quotes/reports never select one. Workflow selections remain serialized, not steered into an active run. The exact workflow/source/handoff is durable and conflicting retries reject. Admission is not execution or completion.",
     parameters: Type.Object({ id: Type.String(), text: Type.String(), sourceId: Type.String(), workflow: workflowSchema }),
     async execute(_id, params, _signal, _onUpdate, ctx) {

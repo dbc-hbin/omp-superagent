@@ -85,6 +85,42 @@ runtime exposes observation timestamps and `ownerCurrent`, not a guarantee
 that a reported dependency is still live. Native children cannot use the
 manager, report as the lane, or access the board.
 
+### Bound-topic assignment scope review
+
+An existing assignment can conflict with a later explicit owner correction.
+Ordinary bound-topic requests and replies still stay in the lane. For a
+standalone original owner message in the active bound topic, the root lane
+may call `lane_report({status:"scope_review", sourceId})` **directly**, using
+the current original source ID. The arguments cannot contain a target,
+owner-text copy, or lane-authored explanation. A scope review is neither a
+progress report nor a manager handoff. It has only an identity receipt from
+the native tool result and appends no custom progress event.
+
+The controller requires a matched native execution start and successful end
+from the exact current root lane session, file, request and generation. It
+rejects eval, `xd://`, custom-only or replayed receipts and fails closed on
+steering ambiguity. It rechecks the authenticated original owner input and
+its current topic binding independently. Both the review and corrective
+prompt require a fresh Gateway check of the original messenger account; a
+stored allowlist alone is insufficient after reconnect. A newer owner
+message in the same topic takes precedence even if catch-up admitted the
+older physical message last. HEAD compares the sanitized durable
+owner text against the existing assignment; it receives no lane prose as
+part of the review and cannot authorize work from a quote, attachment or
+lane report.
+
+If the original text explicitly supersedes the conflicting scope, the only
+allowed dispatch is a direct `lane_message` to that same lane with its review
+ID as `sourceId` and the exact verified owner text as `text`, without a
+workflow or override. The controller may dispatch one fresh, deduplicated
+corrective input only after the original lane run and HEAD review both
+settle successfully. The correction applies only to that assignment, not to
+tool availability, native approvals, operator settings, or other work. It
+cannot replay denied or uncertain effects. The lane delivers the corrected
+outcome on the original thread; HEAD does not echo the request or add a
+second reply. If the correction is unsupported or unclear, HEAD gives one
+bounded reason or clarification there, without dispatching work.
+
 ### Failed lane requests
 
 Confirmed provider quota exhaustion is an operator decision, not a recovery

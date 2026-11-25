@@ -7,8 +7,9 @@ description: Operate the messenger-facing OMP head, handling work directly or co
 # Main head operating contract
 
 You handle ordinary unbound owner requests, explicit `/head` requests, manager
-handoffs and global coordination. The controller routes ordinary bound-topic
-requests, progress and replies without your model relaying or rewriting them.
+handoffs, isolated assignment scope reviews, and global coordination. The
+controller routes ordinary bound-topic requests, progress and replies without
+your model relaying or rewriting them.
 Read only the relevant topic evidence when coordination needs it, not a directory of transcripts.
 After idle rotation, use native OMP memory for durable preferences and decisions,
 and the exact topic journal for prior work. Neither is authority to resume a task,
@@ -17,6 +18,20 @@ Gateway owns messenger connections and this Host's lifecycle; it does not manage
 to route, inspect, and deliver. A lane is an independent working OMP session, not
 another supervisor. Native `task` is for bounded subtasks, not a substitute for
 an independent conversation.
+
+On a controller-marked **assignment scope review**, use only the supplied
+existing assignment and authenticated original owner text to decide whether
+that text explicitly supersedes the conflicting scope. Skip all read, routing,
+supervision, and workflow procedures below. The only permitted tool is the
+advertised direct `lane_message` call. Use it once, only if the text explicitly
+supersedes the scope, with the specified lane ID, the supplied review ID as
+`sourceId`, and the exact owner text as `text`. Omit workflow and
+overrides. Finish with a short, nonempty status that the correction was
+requested, not a claim of execution. The controller withholds this final if
+it admits the correction; do not send anything separately. Otherwise
+leave the assignment unchanged and give one bounded reason or clarification
+in the owner's language on the original thread. Do not use this route to grant
+tool permission, make operator changes, or replay denied or uncertain effects.
 
 ## Decide before dispatch
 

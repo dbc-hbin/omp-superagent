@@ -42,6 +42,8 @@ export function physicalRouteKey(route: Route): string {
 
 /** Store meta key: owner inputs acknowledged to Gateway whose topic routing is still pending, in delivery order. */
 export const DEFERRED_ROUTING_META = "intake:deferred-routing";
+/** Internal HEAD review ID prefix; authority lives in the current store binding. */
+export const SCOPE_REVIEW_PREFIX = "scope-review:";
 
 /** Exact successor generation reserved when a submitted card is authorized to restore its original lane session. */
 export const laneModelPickerRestoreKey = (sourceId: string) => `lane-model:picker-restore:${sourceId}`;
@@ -298,7 +300,21 @@ export interface OutputRecord {
 export type SettlementOutput = Pick<OutputRecord, "id" | "text" | "picker"> & {
   /** Controller-only lane failure routing, never derived from output text. */
   readonly laneFailure?: "quota" | "recover";
+  /** Controller-verified clean native settlement of a solo scope-review admission. */
+  readonly scopeReviewEligible?: boolean;
 };
+
+export interface ScopeReview {
+  readonly lane: Lane;
+  readonly original: InputRecord;
+  readonly handoff: InputRecord;
+}
+
+/** Controller-proven successful native report, with its exact own approval if one was required. */
+export interface ScopeReviewNativeProof {
+  readonly toolCallId: string;
+  readonly approvalId?: string;
+}
 
 export interface LaneRecoveryScope {
   readonly lane: Lane;
@@ -370,6 +386,12 @@ export interface StorePort {
   ownerSource(id: string): InputRecord | null;
   /** Revalidate a report's exact failed admission, actionable owner and operator selection. */
   laneRecoveryScope(reportId: string): LaneRecoveryScope | null;
+  /** Stage a verified direct native scope-review signal; does not enqueue a HEAD input. */
+  recordScopeReview(inputId: string, generation: number, sessionId: string, sourceId: string, proof: ScopeReviewNativeProof): boolean;
+  /** Verify the current owner request, solo admission, and lane binding for review or granted dispatch. */
+  scopeReview(reviewId: string): ScopeReview | null;
+  /** Record one HEAD intent; only eligible native settlement can admit corrective work. */
+  requestScopeCorrection(reviewId: string): string;
   /** Original parent route for a redirected report or a handoff derived from that report. */
   reportApprovalSource(id: string): InputRecord | null;
   /** Manager handoff's verified reply route, pinned for a parent-origin thread follow-up or a joined bound reply. */
@@ -388,6 +410,8 @@ export interface StorePort {
   latestLaneRun(target: string): InputRecord | null;
   /** A successful lane run still has an unresolved final report or delivery. */
   hasPendingLaneResult(target: string): boolean;
+  /** A current scope review or granted correction still needs this lane generation. */
+  hasPendingScopeReview(target: string): boolean;
   hasPendingLanePlacement(target: string): boolean;
   /** An uncertain HEAD input with a nonempty original native-owner record. */
   hasHeadRecoveryInput(): boolean;
