@@ -38,6 +38,35 @@ const laneChat = { ...parent, threadId: "52" };
 type Receipt = { readonly output: OutputRecord; readonly remoteId: string };
 type Tool = { readonly name: string; readonly action?: string };
 
+// Read the journal only after a confirmed output fails the settlement assertion.
+async function nativeReceipt(requestId: string) {
+  try {
+    const entries = parseSessionEntries(await readFile(fixture.sessionFile, "utf8"));
+    for (const entry of entries.toReversed()) {
+      if (entry.type !== "custom" || entry.customType !== "rpc_prompt_result") continue;
+      const data: unknown = entry.data;
+      if (!data || typeof data !== "object" || !("frame" in data)) continue;
+      const frame = data.frame;
+      if (!frame || typeof frame !== "object" || !("id" in frame) || frame.id !== requestId
+        || !("status" in frame)) continue;
+      const status = frame.status;
+      const error = "error" in frame && frame.error && typeof frame.error === "object" ? frame.error : null;
+      // Only emit native protocol enums and primitive flags; provider errors can contain raw text and paths.
+      return {
+        status: status === "completed" || status === "aborted" || status === "error" ? status : "unknown",
+        agentInvoked: "agentInvoked" in frame && typeof frame.agentInvoked === "boolean" ? frame.agentInvoked : null,
+        ...(error && "code" in error && error.code === "cost_cap" ? { errorCode: error.code } : {}),
+        ...(error && "httpStatus" in error && typeof error.httpStatus === "number"
+          && Number.isInteger(error.httpStatus) && error.httpStatus >= 400 && error.httpStatus <= 599 ? { httpStatus: error.httpStatus } : {}),
+        ...(error && "retryable" in error && typeof error.retryable === "boolean" ? { retryable: error.retryable } : {}),
+      };
+    }
+    return { status: "receipt-missing" };
+  } catch {
+    return { status: "journal-unavailable" };
+  }
+}
+
 try {
   console.log((await fixture.sdk("prepare")).stdout.trim());
   const config = await loadConfig(fixture.config);
@@ -57,7 +86,9 @@ try {
   const instance = await fixture.start();
   using db = new Database(join(root, "coordination.sqlite"), { readonly: true, strict: true });
   const deliveredPath = join(root, "adapter-output.jsonl");
-  const inputState = db.query<{ state: string }, [string]>("SELECT state FROM inputs WHERE id=?");
+  const inputRow = db.query<{ state: string; request_id: string | null }, [string]>(
+    "SELECT state,request_id FROM inputs WHERE id=?",
+  );
   const receipts = async (): Promise<Receipt[]> => existsSync(deliveredPath)
     ? (await readFile(deliveredPath, "utf8")).split("\n").slice(0, -1).map(line => JSON.parse(line)) : [];
   const delivery = async (label: string, matches: (output: OutputRecord) => boolean) => until(async () => {
@@ -70,7 +101,14 @@ try {
     ).get(output.id);
     if (persisted?.state !== "sent") return;
     assert.equal(persisted.remote_id, remoteId);
-    assert.equal(inputState.get(output.sourceId)?.state, "done");
+    const source = inputRow.get(output.sourceId);
+    if (source?.state !== "done") {
+      const requestId = source?.request_id ?? null;
+      const native = requestId ? await nativeReceipt(requestId) : null;
+      assert.equal(source?.state, "done", `Sent observation output did not settle its source: ${JSON.stringify({
+        stage: label, outputId: output.id, sourceId: output.sourceId, sourceState: source?.state ?? null, requestId, native,
+      })}`);
+    }
     return output;
   }, label);
 
@@ -82,7 +120,8 @@ try {
     assert(!input.text.startsWith("/"), "Observation smoke must use ordinary owner chat");
     expectedCalls.set(input.id, message.tool);
     await fixture.deliver(input);
-    const output = await delivery(input.text, row => row.id === `${id}:answer`);
+    const stage = [message.tool.name, message.tool.action].filter(Boolean).join("/");
+    const output = await delivery(stage, row => row.id === `${id}:answer`);
     assert.equal(output.sourceId, id);
     assert.deepEqual(output.route, input.route);
     assert.deepEqual(output.replyTo, { route: input.route, messageId: id });
