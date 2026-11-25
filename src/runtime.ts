@@ -7678,11 +7678,13 @@ export class Superagent {
           if (live.releasing) {
             await this.release(live);
           } else if (live.id === "main" && live.input && !live.preparing && !live.finishing
-            && live.result?.status === "error" && this.store.input(live.input.id)?.state === "submitted"
-            && !this.store.approvals(live.id).length && this.recoveryControllerIdle()) {
-            // Retry an unavailable state read or silent native UI close on the
-            // existing wake. Never repeat a dialog response or hold the pump.
-            this.background(this.finish(live));
+            && this.store.input(live.input.id)?.state === "submitted") {
+            const completionReadPending = live.settlementReadPending && live.result?.status === "completed"
+              && [...live.admitted.values()].every(({ input, result }) => result || this.store.input(input.id)?.state === "cancelled");
+            // Retry a lost settlement read or confirm a silent native UI close.
+            // Never resubmit a prompt or a dialog response, or hold the pump.
+            if (completionReadPending || live.result?.status === "error"
+              && !this.store.approvals(live.id).length && this.recoveryControllerIdle()) this.background(this.finish(live));
           } else if (live.id !== "main" && live.input && !live.preparing && !live.finishing
             && (live.result || this.store.input(live.input.id)?.state === "cancelled")) {
             // Retry an interrupted settlement read or explicit resolution on

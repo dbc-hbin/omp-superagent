@@ -472,14 +472,16 @@ export default function hostExtension(pi: ExtensionAPI): void {
   };
   const owned = async (drain = false) => {
     const identity = exact();
-    try {
-      return await observeOwned(identity, drain);
-    } catch (error) {
-      if (drain || !(error instanceof DescendantOwnershipChanged)) throw error;
-      // A read may overlap native child registration or attachment. Rebuild
-      // lineage, inventory and completions together, without retrying a drain.
-      assertSameRoot(identity);
-      return observeOwned(identity, false);
+    // Stock OMP registers a child before attaching its session. Each
+    // transition can invalidate a different read. Rebuild all evidence
+    // together, and never retry a maintenance drain.
+    for (let remaining = drain ? 0 : 2; ; remaining--) {
+      try {
+        return await observeOwned(identity, drain);
+      } catch (error) {
+        if (remaining === 0 || !(error instanceof DescendantOwnershipChanged)) throw error;
+        assertSameRoot(identity);
+      }
     }
   };
   const localIdle = () => {

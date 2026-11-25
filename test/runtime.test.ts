@@ -3253,6 +3253,38 @@ describe("same-HEAD evidence recovery", () => {
     },
   );
 
+  test("a transient final state read failure does not strand a completed HEAD prompt", async () => {
+    const { runtime, main, store, messenger, errors } = fixture();
+    const original = headMessage("completed-readback", route("original-route"));
+    await runtime.start();
+    await admit(runtime, original);
+    await main.whenPrompts(1);
+    const requestId = store.input(original.id)?.requestId;
+    if (!requestId) throw new Error("Missing original native admission");
+
+    let reads = 0;
+    const failed = new Error("Transient native state read failure");
+    main.beforeState = () => { if (++reads === 1) throw failed; };
+    main.complete("Native work is complete.");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(errors).toContain(failed);
+    expect(reads).toBe(1);
+    expect(store.input(original.id)?.state).toBe("submitted");
+    expect(store.output(`${original.id}:answer`)).toBeNull();
+
+    // There is no further native frame. The ordinary pump wake rechecks only
+    // verified settlement and publishes a single answer on the original route.
+    await runtime.kick();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(reads).toBe(2);
+    expect(store.input(original.id)?.state).toBe("done");
+    expect(store.output(`${original.id}:answer`)?.state).toBe("sent");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([requestId]);
+    expect(messenger.attempted).toHaveLength(1);
+    expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route, text: "Native work is complete.",
+      replyTo: { route: original.route, messageId: original.messageId } }]);
+  });
+
   test("a failed final state read and failed card presentation do not strand HEAD", async () => {
     const instance = fixture();
     const { runtime, main, store, messenger } = instance;

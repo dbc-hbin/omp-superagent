@@ -92,7 +92,7 @@ async function directory(launchesHost = false): Promise<string> {
   return result;
 }
 
-test("native ownership snapshots resample child startup once without trusting a mixed epoch", async () => {
+test("native ownership snapshots resample registration and attachment without trusting a mixed epoch", async () => {
   const root = await directory();
   const socketPath = path.join(root, "native.sock");
   const managed = path.resolve(import.meta.dir, "fixtures/managed-ulw");
@@ -196,21 +196,20 @@ test("native ownership snapshots resample child startup once without trusting a 
     const response = await channel.request({ type: command }, undefined, 2_000);
     return { calls, response };
   };
-  expect(await read(() => { if (calls === 1) registerChild(); })).toMatchObject({
-    calls: 2, response: { success: true, data: { hasOwnedRunningWork: false } },
-  });
   expect(await read(() => {
-    if (calls !== 1) return;
-    child.runStartedAt = 1;
-    expect(registry.attachSession("child", child as unknown as SessionHandle, childFile, childRef)).toBe(true);
-  })).toMatchObject({ calls: 2, response: { success: true, data: { hasOwnedRunningWork: true } } });
+    if (calls === 1) registerChild();
+    if (calls === 2) {
+      child.runStartedAt = 1;
+      expect(registry.attachSession("child", child as unknown as SessionHandle, childFile, childRef)).toBe(true);
+    }
+  })).toMatchObject({ calls: 3, response: { success: true, data: { hasOwnedRunningWork: true } } });
   expect(await read()).toMatchObject({ calls: 1, response: { success: true, data: { hasOwnedRunningWork: true } } });
 
   const removeChild = () => { expect(registry.unregister("child", childRef)).toBe(true); };
-  expect(await read(() => { if (calls === 1) removeChild(); else registerChild(); })).toMatchObject({
-    calls: 2, response: { success: false, error: "Native ownership tree changed during service observation" },
+  expect(await read(() => { if (calls % 2) removeChild(); else registerChild(); })).toMatchObject({
+    calls: 3, response: { success: false, error: "Native ownership tree changed during service observation" },
   });
-  expect(await read(removeChild, "shutdown_host")).toMatchObject({
+  expect(await read(registerChild, "shutdown_host")).toMatchObject({
     calls: 1, response: { success: false, error: "Native ownership tree changed during service observation" },
   });
   available = false;
