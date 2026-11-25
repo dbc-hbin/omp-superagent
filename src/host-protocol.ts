@@ -25,6 +25,7 @@ export type HostState = RpcSessionState & {
   readonly loadedSuperkitPath?: string;
   readonly prReviewPolicy?: { readonly version: 1; readonly cwd: string; readonly modelApi: string };
   readonly journalCursorVersion?: 1;
+  readonly replyVoiceVersion?: 1 | 2;
   settingsScope: "session";
   modelSettings: LanePresetSnapshot;
   hasOwnedRunningWork: boolean;

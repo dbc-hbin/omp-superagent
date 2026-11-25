@@ -280,6 +280,7 @@ impl Inner {
             text,
             received_at: json!(now_ms()),
             attachments: Vec::new(),
+            unresolved_reply: None,
         };
         self.admit(json!({ "kind": "message", "input": input }))
             .await?;
@@ -408,6 +409,10 @@ impl Inner {
             text: control_text(text),
             received_at: json!(age),
             attachments,
+            unresolved_reply: source["attachments"]
+                .as_array()
+                .is_some_and(|attachments| !attachments.is_empty())
+                .then_some(true),
         }))
     }
 }

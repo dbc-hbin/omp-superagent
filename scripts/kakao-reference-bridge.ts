@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Reference KakaoTalk bridge for docs/kakao-bridge-protocol.md (version 1).
+ * Reference KakaoTalk bridge for docs/kakao-bridge-protocol.md.
  *
  * It never connects to Kakao. Messages enter through `inject()` (or the local
  * `POST /demo/owner-message` endpoint in demo mode) and replies are only recorded.
@@ -11,6 +11,8 @@
 import { timingSafeEqual } from "node:crypto";
 
 export const TOKEN_HEADER = "X-Superagent-Token";
+export const DESTINATION_PATH = "/superagent/v2/destination";
+export const SEND_PATH = "/superagent/v2/send";
 const REFUSED_HEADERS = ["forwarded", "x-forwarded-for", "x-real-ip", "cf-connecting-ip", "origin", "referer", "sec-fetch-site"];
 const PUSH_ID = /^sa-[A-Za-z0-9._:-]{1,120}$/;
 const KAKAO_ID = /^[1-9]\d{0,19}$/;
@@ -23,13 +25,14 @@ export interface InboxRow {
   id: number; logId: string; chatId: string; senderId: string; text: string;
   receivedAtMs: number; recordedAtMs: number;
 }
-export interface Delivery { pushId: string; outputId: string | null; message: string }
+export interface Delivery { pushId: string; outputId: string | null; message: string; messageId: string }
 
 export interface BridgeOptions {
   token: string;
   /** The owner's one-to-one chat with the bridge account; the only destination. */
   ownerChatId: string;
   ownerId: string;
+  botUserId: string;
   port?: number;
   hostname?: "127.0.0.1" | "::1";
   /** Enables POST /demo/owner-message for local demos. Never expose this. */
@@ -61,11 +64,13 @@ const json = (status: number, body: unknown) =>
 
 export function startReferenceBridge(options: BridgeOptions): ReferenceBridge {
   if (!/^[A-Za-z0-9_-]{24,}$/.test(options.token)) throw new Error("Bridge token needs at least 24 characters from [A-Za-z0-9_-]");
-  if (!KAKAO_ID.test(options.ownerChatId) || !KAKAO_ID.test(options.ownerId)) throw new Error("Owner chat and user IDs must be numeric");
+  if (![options.ownerChatId, options.ownerId, options.botUserId].every(id => KAKAO_ID.test(id))
+    || options.ownerId === options.botUserId) throw new Error("Expected numeric Kakao chat and distinct user IDs");
+  const destination = { botUserId: options.botUserId, ownerId: options.ownerId, chatId: options.ownerChatId };
   const now = options.now ?? Date.now;
   const rows: InboxRow[] = [];
   const deliveries: Delivery[] = [];
-  const delivered = new Set<string>();
+  const delivered = new Map<string, Delivery>();
   let nextId = 1;
   const state = { generation: crypto.randomUUID().replaceAll("-", ""), quiet: false };
 
@@ -118,17 +123,26 @@ export function startReferenceBridge(options: BridgeOptions): ReferenceBridge {
     if (raw.length > MAX_REQUEST_BYTES) return json(400, { error: "bad request" });
     let body: Record<string, unknown>;
     try { body = JSON.parse(raw); } catch { return json(400, { error: "bad request" }); }
-    const { pushId, message, outputId } = body ?? {};
+    const { pushId, message, outputId, expectedDestination } = body ?? {};
+    const expected = expectedDestination as Partial<typeof destination> | null | undefined;
+    // A mismatch is checked before duplicate lookup, queueing or any delivery.
+    if (!expected || expected.botUserId !== destination.botUserId || expected.ownerId !== destination.ownerId
+      || expected.chatId !== destination.chatId) return json(403, { error: "destination mismatch" });
     if (typeof pushId !== "string" || !PUSH_ID.test(pushId) || typeof message !== "string"
       || !message.trim() || [...message].length > MAX_PUSH)
       return json(400, { error: "bad request" });
-    if (delivered.has(pushId)) return json(200, { ok: true, state: "delivered" });
+    const sourceId = typeof outputId === "string" ? outputId : null;
+    const previous = delivered.get(pushId);
+    const receipt = (item: Delivery) => json(200, { ok: true, state: "delivered", pushId, destination, messageId: item.messageId });
+    if (previous) return previous.message === message && previous.outputId === sourceId
+      ? receipt(previous) : json(422, { error: "push ID conflicts with an earlier delivery" });
     if (state.quiet) return json(409, { ok: false });
-    delivered.add(pushId);
-    // A real bridge sends `message` to options.ownerChatId only. Any destination
-    // field in the request body is ignored by construction.
-    deliveries.push({ pushId, outputId: typeof outputId === "string" ? outputId : null, message });
-    return json(200, { ok: true, state: "queued" });
+    // This demo's only effect is recording a delivery. Its numeric IDs are
+    // simulated; a real bridge returns the actual Kakao log ID.
+    const item = { pushId, outputId: sourceId, message, messageId: String(deliveries.length + 1) };
+    deliveries.push(item);
+    delivered.set(pushId, item);
+    return receipt(item);
   }
 
   const server = Bun.serve({
@@ -142,10 +156,12 @@ export function startReferenceBridge(options: BridgeOptions): ReferenceBridge {
         const { logId, text } = await request.json() as { logId: string; text: string };
         return json(200, { id: inject({ logId, text }) });
       }
-      if (url.pathname !== "/superagent/inbox" && url.pathname !== "/superagent/send") return json(404, { error: "not found" });
+      if (url.pathname !== "/superagent/inbox" && url.pathname !== DESTINATION_PATH && url.pathname !== SEND_PATH)
+        return json(404, { error: "not found" });
       if (!authorized(request, peer)) return json(403, { error: "forbidden" });
       if (url.pathname === "/superagent/inbox" && request.method === "GET") return inbox(url);
-      if (url.pathname === "/superagent/send" && request.method === "POST") return send(request);
+      if (url.pathname === DESTINATION_PATH && request.method === "GET") return json(200, destination);
+      if (url.pathname === SEND_PATH && request.method === "POST") return send(request);
       return json(405, { error: "method not allowed" });
     },
   });
@@ -167,11 +183,12 @@ if (import.meta.main) {
   const token = process.env.KAKAO_SUPERAGENT_TOKEN;
   const ownerChatId = process.env.KAKAO_OWNER_CHAT_ID;
   const ownerId = process.env.KAKAO_OWNER_ID;
-  if (!token || !ownerChatId || !ownerId) {
-    console.error("Set KAKAO_SUPERAGENT_TOKEN, KAKAO_OWNER_CHAT_ID and KAKAO_OWNER_ID. Optional: KAKAO_BRIDGE_PORT.");
+  const botUserId = process.env.KAKAO_BOT_USER_ID;
+  if (!token || !ownerChatId || !ownerId || !botUserId) {
+    console.error("Set KAKAO_SUPERAGENT_TOKEN, KAKAO_OWNER_CHAT_ID, KAKAO_OWNER_ID and KAKAO_BOT_USER_ID. Optional: KAKAO_BRIDGE_PORT.");
     process.exit(2);
   }
-  const bridge = startReferenceBridge({ token, ownerChatId, ownerId, port: Number(process.env.KAKAO_BRIDGE_PORT ?? 0), demo: true });
+  const bridge = startReferenceBridge({ token, ownerChatId, ownerId, botUserId, port: Number(process.env.KAKAO_BRIDGE_PORT ?? 0), demo: true });
   // First stdout line is the machine-readable base URL.
   console.log(bridge.url);
   console.error("Reference Kakao bridge (no Kakao connection). Replies are printed below.");

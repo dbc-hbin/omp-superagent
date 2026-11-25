@@ -104,11 +104,13 @@ pub(crate) struct State {
     peers: HashMap<String, Channel>,
     pub(crate) ui: Vec<Arc<Value>>,
     pub(crate) requests: HashMap<String, String>,
+    pub(crate) reply_voice: Option<ReplyVoice>,
     prompt_receipts: HashMap<String, u64>,
     pub(crate) goal_resumes: Vec<GoalResume>,
     pub(crate) generation: u64,
     pub(crate) active_commands: usize,
     stock_thinking_levels: bool,
+    pub(crate) reply_voice_control: Option<u64>,
     pub(crate) serial: Option<Barrier>,
     pub(crate) dispatch: Option<Barrier>,
     pub(crate) interrupts: Option<Barrier>,
@@ -151,6 +153,11 @@ pub(crate) struct GoalResume {
     pub(crate) token: String,
     pub(crate) id: String,
     pub(crate) generation: u64,
+}
+
+pub(crate) struct ReplyVoice {
+    pub(crate) id: String,
+    pub(crate) claimable: bool,
 }
 
 struct Observation {
@@ -279,6 +286,27 @@ impl Owner {
 
     pub(crate) fn pr_review_only(&self) -> bool {
         self.identity.get().is_some_and(|identity| identity.pr_review_only)
+    }
+
+    pub(crate) fn supports_reply_voice(&self) -> bool {
+        !self.pr_review_only()
+            && self.control.get().is_some_and(|control| !control.is_closed())
+    }
+
+    pub(crate) fn clear_reply_voice(&self, state: &mut State, id: Option<&str>) -> Result<()> {
+        if let Some(voice) = state
+            .reply_voice
+            .take_if(|voice| id.is_none_or(|id| voice.id == id))
+        {
+            let control = self.control()?;
+            if let Err(error) = control.send(json!({
+                "type": "clear_reply_voice", "id": new_id(), "token": voice.id,
+            })) {
+                control.close();
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn observations_known(&self, state: &State) -> bool {
@@ -483,13 +511,19 @@ impl Owner {
         let mut terminal_id = None;
         // The single stdout reader owns terminal retirement. Resolve the
         // public ID before measuring bytes; retire it only with the enqueue.
-        if let Some(id) = frame["id"].as_str()
-            && let Some(original) = self.state()?.requests.get(id).cloned()
-        {
-            if terminal_prompt {
-                terminal_id = Some(id.to_owned());
+        if let Some(id) = frame["id"].as_str() {
+            let mut state = self.state()?;
+            if terminal_prompt
+                && (frame["sessionSettled"] == true || frame["agentInvoked"] == false)
+            {
+                self.clear_reply_voice(&mut state, Some(id))?;
             }
-            frame["id"] = Value::String(original);
+            if let Some(original) = state.requests.get(id).cloned() {
+                if terminal_prompt {
+                    terminal_id = Some(id.to_owned());
+                }
+                frame["id"] = Value::String(original);
+            }
         }
         let packet = Packet::new(frame)?;
         let slot = self.reserve_observation(&packet).await?;
@@ -647,11 +681,21 @@ impl Owner {
             owned.remove("configuredThinkingLevel");
             native.entry("configuredThinkingLevel").or_insert(Value::Null);
         }
+        let owned_voice = owned
+            .remove("replyVoiceControlVersion")
+            .and_then(|value| value.as_u64());
         native.remove("prReviewPolicy");
         native.extend(owned);
         // Only publish the capability attested by this owner's private launch control.
         native.remove("journalCursorControlVersion");
         native.remove("journalCursorVersion");
+        native.remove("replyVoiceVersion");
+        native.remove("replyVoiceControlVersion");
+        if let Some(version) = owned_voice
+            && self.state()?.reply_voice_control == Some(version) && self.supports_reply_voice()
+        {
+            native.insert("replyVoiceVersion".to_owned(), json!(version));
+        }
         if identity.worker_attempt.is_none() {
             native.remove("workerAttempt");
         }
@@ -668,6 +712,36 @@ impl Owner {
             .collect();
         native.insert("pendingUiRequests".to_owned(), Value::Array(pending_ui));
         Ok(Value::Object(native))
+    }
+
+    fn control_request(self: &Arc<Self>, frame: Value, control: &Channel) -> Result<()> {
+        if let (Some("retire_reply_voice"), Some(token)) =
+            (frame["type"].as_str(), frame["token"].as_str())
+        {
+            self.state()?
+                .reply_voice
+                .take_if(|voice| voice.id == token && !voice.claimable);
+            return Ok(());
+        }
+        if let (Some("claim_reply_voice"), Some(id), Some(token)) =
+            (frame["type"].as_str(), frame["id"].as_str(), frame["token"].as_str())
+        {
+            let mut state = self.state()?;
+            let claimed = !state.fenced()
+                && state.requests.contains_key(token)
+                && state.reply_voice.as_mut().is_some_and(|voice| {
+                    if voice.id != token || !voice.claimable {
+                        return false;
+                    }
+                    voice.claimable = false;
+                    true
+                });
+            return control.send(json!({
+                "type": "response", "command": "claim_reply_voice", "id": id, "success": true,
+                "data": {"claimed": claimed},
+            }));
+        }
+        self.inventory_request(frame, control)
     }
 
     fn inventory_request(self: &Arc<Self>, frame: Value, control: &Channel) -> Result<()> {
@@ -1007,7 +1081,7 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
         input,
         output,
         move |frame, control| {
-            if for_control.inventory_request(frame, control).is_err() {
+            if for_control.control_request(frame, control).is_err() {
                 control.close();
             }
             ready(())
@@ -1071,6 +1145,9 @@ async fn initialize(owner: &Arc<Owner>, manifest: &Manifest) -> anyhow::Result<(
             journal_cursor: identity["journalCursorControlVersion"].as_u64() == Some(1),
         })
         .map_err(|_| anyhow::anyhow!("Duplicate native launch identity"))?;
+    owner.state()?.reply_voice_control = identity["replyVoiceControlVersion"]
+        .as_u64()
+        .filter(|version| !manifest.options.pr_review_only && matches!(version, 1 | 2));
     let explicit = manifest.options.model_preset.as_ref();
     let preset = explicit
         .map(|value| &value.preset)

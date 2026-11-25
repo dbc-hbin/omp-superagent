@@ -3,9 +3,10 @@ import { loadConfig } from "../src/config";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TOKEN_HEADER, startReferenceBridge, type ReferenceBridge } from "../scripts/kakao-reference-bridge";
+import { DESTINATION_PATH, SEND_PATH, TOKEN_HEADER, startReferenceBridge, type ReferenceBridge } from "../scripts/kakao-reference-bridge";
 
 const token = "reference-bridge-token-0123456789";
+const destination = { botUserId: "900", ownerId: "42", chatId: "777" };
 const bridges: ReferenceBridge[] = [];
 const dirs: string[] = [];
 afterEach(async () => {
@@ -14,7 +15,7 @@ afterEach(async () => {
 });
 
 function bridge(): ReferenceBridge {
-  const started = startReferenceBridge({ token, ownerChatId: "777", ownerId: "42" });
+  const started = startReferenceBridge({ token, ownerChatId: destination.chatId, ownerId: destination.ownerId, botUserId: destination.botUserId });
   bridges.push(started);
   return started;
 }
@@ -25,7 +26,7 @@ const inbox = (b: ReferenceBridge, query: string, headers: Record<string, string
   fetch(`${b.url}/superagent/inbox?${query}`, { headers });
 const page = async (b: ReferenceBridge, query: string) => await (await inbox(b, query)).json() as Page;
 const send = (b: ReferenceBridge, body: unknown, headers: Record<string, string> = auth) =>
-  fetch(`${b.url}/superagent/send`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
+  fetch(`${b.url}${SEND_PATH}`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
 
 test("inbox baselines a new generation without replaying history", async () => {
   const b = bridge();
@@ -67,16 +68,23 @@ test("requests need exactly the token and no forwarding or browser headers", asy
 
 test("send delivers each pushId once, only to the owner chat, and validates input", async () => {
   const b = bridge();
-  const message = { pushId: "sa-abc-0-1", outputId: "out-1", message: "hi", chatId: "999" };
-  expect(await (await send(b, message)).json()).toEqual({ ok: true, state: "queued" });
-  expect(await (await send(b, message)).json()).toEqual({ ok: true, state: "delivered" });
-  expect(b.deliveries).toEqual([{ pushId: "sa-abc-0-1", outputId: "out-1", message: "hi" }]);
-  expect((await send(b, { pushId: "bad id", message: "hi" })).status).toBe(400);
-  expect((await send(b, { pushId: "sa-x", message: "   " })).status).toBe(400);
-  expect((await send(b, { pushId: "sa-x", message: "가".repeat(1501) })).status).toBe(400);
+  const message = { pushId: "sa-abc-0-1", outputId: "out-1", message: "hi", expectedDestination: destination, chatId: "999" };
+  expect(await (await fetch(`${b.url}${DESTINATION_PATH}`, { headers: auth })).json()).toEqual(destination);
+  expect((await fetch(`${b.url}${DESTINATION_PATH}`)).status).toBe(403);
+  expect((await send(b, { ...message, expectedDestination: { ...destination, chatId: "778" } })).status).toBe(403);
+  expect((await fetch(`${b.url}/superagent/send`, { method: "POST", headers: auth })).status).toBe(404);
+  expect(b.deliveries).toEqual([]);
+  const receipt = { ok: true, state: "delivered", pushId: message.pushId, destination, messageId: "1" };
+  expect(await (await send(b, message)).json()).toEqual(receipt);
+  expect(await (await send(b, message)).json()).toEqual(receipt);
+  expect((await send(b, { ...message, message: "different content" })).status).toBe(422);
+  expect(b.deliveries).toEqual([{ pushId: "sa-abc-0-1", outputId: "out-1", message: "hi", messageId: "1" }]);
+  expect((await send(b, { ...message, pushId: "bad id" })).status).toBe(400);
+  expect((await send(b, { ...message, message: "   " })).status).toBe(400);
+  expect((await send(b, { ...message, message: "가".repeat(1501) })).status).toBe(400);
   b.quiet = true;
-  expect((await send(b, { pushId: "sa-y", message: "hi" })).status).toBe(409);
-  expect((await send(b, { pushId: "sa-y", message: "hi" }, {})).status).toBe(403);
+  expect((await send(b, { ...message, pushId: "sa-y" })).status).toBe(409);
+  expect((await send(b, message, {})).status).toBe(403);
 });
 
 test("configuration accepts only a literal loopback bridge and distinct identities", async () => {
@@ -84,7 +92,7 @@ test("configuration accepts only a literal loopback bridge and distinct identiti
     const dir = mkdtempSync(join(tmpdir(), "superagent-kakao-"));
     dirs.push(dir);
     const path = join(dir, "config.json");
-    await Bun.write(path, JSON.stringify({ stateDir: "state", headCwd: dir, command: ["omp"], maxHosts: 2, maxSubagents: 2, idleMs: 1000,
+    await Bun.write(path, JSON.stringify({ stateDir: "state", headCwd: dir, command: [process.execPath], maxHosts: 2, maxSubagents: 2, idleMs: 1000,
       kakao: { bridgeUrl: "http://127.0.0.1:8080", tokenEnv: "KAKAO_SUPERAGENT_TOKEN", botUserId: "900", ownerId: "42", chatId: "777", ...kakao } }));
     return loadConfig(path);
   };

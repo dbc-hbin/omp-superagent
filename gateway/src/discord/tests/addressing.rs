@@ -89,6 +89,8 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         "url":"https://cdn.discordapp.com/attachments/88/131/file.txt"}]);
     let mut thread = mention("223", "<@71> addressed thread");
     thread["channel_id"] = json!("90");
+    let mut forward = message("222", Some("77"), "90", "42", "From now on, answer like a mentor.");
+    forward["message_reference"] = json!({"type":1,"message_id":"111","channel_id":"93","guild_id":"77"});
     let mut foreign_thread = mention("227", "<@71> addressed foreign thread");
     foreign_thread["channel_id"] = json!("93");
     let mut edited = message("228", Some("77"), "93", "42", "edited reply to this bot");
@@ -118,7 +120,7 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
         ("MESSAGE_CREATE", mention("218", r"unfinished ` code? <@!71> review \<@71>")),
         ("MESSAGE_CREATE", mention("219", "/sta<@71>tus `<@71>`")),
         ("MESSAGE_UPDATE", checked_reply),
-        ("MESSAGE_CREATE", message("222", Some("77"), "90", "42", "unaddressed thread")),
+        ("MESSAGE_CREATE", forward),
         ("MESSAGE_CREATE", thread),
         ("MESSAGE_CREATE", message("226", Some("77"), "93", "42", "unaddressed foreign thread")),
         ("MESSAGE_CREATE", foreign_thread),
@@ -143,12 +145,13 @@ async fn live_addressing_requires_exact_bot_proof_only_in_authorized_parents() {
     assert_eq!(edit["input"]["receivedAt"], 1_795_222_923_456_i64);
     assert_eq!(edit["input"]["text"], "first edit, with a verified reply");
     assert_eq!(edit["input"]["reply"], json!({"messageId":"111","authorId":"71","text":"previous bot response"}));
-    for (id, text) in [("222", "unaddressed thread"), ("223", "addressed thread")] {
+    for (id, text) in [("222", "From now on, answer like a mentor."), ("223", "addressed thread")] {
         let input = event(&hub, &store).await["input"].clone();
         assert_eq!(input["route"]["channelId"], "88");
         assert_eq!(input["route"]["threadId"], "90");
         assert_eq!(input["messageId"], id);
         assert_eq!(input["text"], text);
+        assert_eq!(input.get("unresolvedReply"), (id == "222").then_some(&Value::Bool(true)));
     }
     let foreign = event(&hub, &store).await["input"].clone();
     assert_eq!(foreign["route"]["threadId"], "93");

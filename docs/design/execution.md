@@ -85,6 +85,44 @@ runtime exposes observation timestamps and `ownerCurrent`, not a guarantee
 that a reported dependency is still live. Native children cannot use the
 manager, report as the lane, or access the board.
 
+### Bound-topic assignment scope review
+
+An existing assignment can conflict with a later explicit owner correction.
+Ordinary bound-topic requests and replies still stay in the lane. For a
+standalone original owner message in the active bound topic, the root lane
+may call `lane_report({status:"scope_review", sourceId})` **directly**, using
+the current original source ID. The arguments cannot contain a target,
+owner-text copy, or lane-authored explanation. A scope review is neither a
+progress report nor a manager handoff. It has only an identity receipt from
+the native tool result and appends no custom progress event.
+
+The controller requires a matched native execution start and successful end
+from the exact current root lane session, file, request and generation. It
+rejects eval, `xd://`, custom-only or replayed receipts and fails closed on
+steering ambiguity. It rechecks the authenticated original owner input and
+its current topic binding independently. Both the review and corrective
+prompt require a fresh Gateway check of the original messenger account; a
+stored allowlist alone is insufficient after reconnect. A newer owner
+message in the same topic takes precedence even if catch-up admitted the
+older physical message last. Review requires exact trimmed owner text with
+no detected credentials or excluded material, including quotes spanning
+lines. Ineligible text stays in the bound lane; its
+redacted or projected remainder cannot authorize a review. HEAD compares
+the eligible text against the existing assignment and receives no lane
+prose, quote, or attachment as part of the review.
+
+If the original text explicitly supersedes the conflicting scope, the only
+allowed dispatch is a direct `lane_message` to that same lane with its review
+ID as `sourceId` and the exact verified owner text as `text`, without a
+workflow or override. The controller may dispatch one fresh, deduplicated
+corrective input only after the original lane run and HEAD review both
+settle successfully. The correction applies only to that assignment, not to
+tool availability, native approvals, operator settings, or other work. It
+cannot replay denied or uncertain effects. The lane delivers the corrected
+outcome on the original thread; HEAD does not echo the request or add a
+second reply. If the correction is unsupported or unclear, HEAD gives one
+bounded reason or clarification there, without dispatching work.
+
 ### Failed lane requests
 
 Confirmed provider quota exhaustion is an operator decision, not a recovery
@@ -326,6 +364,45 @@ effort capabilities to construct menus. A selection is a new owner control on
 the original topic, not a model turn or native approval. The head validates
 the menu's session and generation before applying it, and an effort selection
 also requires the model for which the options were shown.
+
+## Owner-facing reply voice
+
+[SOUL](../../src/soul.ts) is an instance-wide presentation preference, not a
+role, workflow, or OMP profile. The default and the one saved override use
+bounded choices for presentational concept (plain, editorial, or mentoring),
+tone, register, detail, answer order, and emoji. The HEAD
+contract still defines its identity. The `soul_update` native tool checks the
+current root HEAD session and a fresh, explicit original owner request. The
+controller derives the supported combination from that exact message, not from
+model-supplied fields. A plain request already addressed to HEAD does not need
+a command or a SOUL keyword. Questions, one-off requests, quotes, edits,
+derived input, and restricted-group messages cannot authorize a change. The
+instance ledger owns the revision and readback. Choosing a concept does not
+change any other setting by implication or establish a new role.
+
+The controller supplies the current voice on new, eligible owner-facing
+HEAD turns (including synthesis from a normal lane report) and on direct
+topic-reply lane turns. It uses the admitted run's delivery scope, not message
+content or the current channel. A steer inherits the opening run's scope:
+joining an active manager handoff does not give the lane the reply voice.
+The private owned Host takes only the closed voice profile and renders a
+root-only, temporary system block. An opaque admission token is removed at
+the stock input boundary; neither token nor style enters the user history,
+lane brief, or global `PERSONALITY.md`. Native task children, internal control prompts,
+structured replies, and code-generated notices do not use it. Settings apply
+to the next eligible run on a capable resident Host, without reloading its
+session or changing SUPER activation. Hosts advertising reply voice v2 also
+receive the concept; v1 Hosts continue receiving the original style fields
+without the concept. Hosts with no capability continue unstyled.
+
+The prompt boundary was compared with [Cataly `d2cb7078`](https://github.com/vntrevx/Cataly/blob/d2cb7078033ccab27895515d4c566fe7ed4078de/extension/index.ts#L1274-L1295),
+[OpenClaw `6978b40e`](https://github.com/openclaw/openclaw/blob/6978b40e9d3812083064c97e24de00454d6bf868/docs/concepts/system-prompt.md#L166-L185),
+[Hermes `242315ce`](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/agent/system_prompt.py#L547-L553),
+and [Dori `3b5487df`](https://github.com/vntrevx/omp-dori/blob/3b5487df12540cdd428ebcf7455375d72921e2dc/skills/dori-mode/SKILL.md#L65-L74).
+These are design references, not prompt or code reuse. The stock OMP extension
+and RPC contract was inspected at [v19.1.1](https://github.com/can1357/oh-my-pi/commit/31ffee513f27a01bba7d4dfbe12bae239cdc646a);
+the installed Host advertises the optional bridge rather than inferring it
+from a CLI version.
 
 ## Workflow selection
 

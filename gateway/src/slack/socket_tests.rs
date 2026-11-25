@@ -376,6 +376,19 @@ async fn real_socket_waits_for_ready_and_sqlite_then_acks_exact_delivery() {
     send(&mut peer, command).await;
     assert_eq!(ack(&mut peer).await, json!({"envelope_id":"slash-retry"}));
     assert_eq!(fixture.store.pending().expect("deduped slash command"), 2);
+
+    let mut share = message("share", "CALLOWED", "From now on, answer like a mentor.");
+    share["payload"]["event"]["attachments"] = json!([{"is_msg_unfurl":true,"text":"copied content"}]);
+    send(&mut peer, share).await;
+    assert_eq!(ack(&mut peer).await, json!({"envelope_id":"share"}));
+    let shared = fixture
+        .store
+        .next(Some(slash.sequence + 1))
+        .expect("read share admission")
+        .expect("durable share");
+    assert_eq!(shared.event["input"]["text"], "From now on, answer like a mentor.");
+    assert_eq!(shared.event["input"]["unresolvedReply"], true);
+    assert!(!shared.event.to_string().contains("copied content"));
     fixture.hub.stop().await.expect("stop Slack adapter");
 }
 

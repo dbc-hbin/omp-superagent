@@ -426,7 +426,7 @@ fn identity(mut event: Value) -> Result<Value> {
         .context("Invalid Gateway input")?;
     // An adapter upgrade can add the routing view when redelivering an old
     // event. Its originally admitted data stays immutable.
-    for key in ["receivedAt", "reply", "discordContext", "routingText"] {
+    for key in ["receivedAt", "reply", "unresolvedReply", "discordContext", "routingText"] {
         input.remove(key);
     }
     let discord = input

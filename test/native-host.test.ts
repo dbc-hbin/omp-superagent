@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { watch } from "node:fs";
+import { existsSync, watch } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseSessionEntries, SessionManager } from "@oh-my-pi/pi-coding-agent";
@@ -10,6 +10,8 @@ import { decisionId } from "../src/decisions";
 import { assertResidentFixtureOwner, stopHostFixtures, waitForFixtureProcessExit } from "./fixtures/host-fixture-processes";
 import { nativeTestCommand } from "./fixtures/native-command";
 import { offlineMnemopi } from "./fixtures/native-memory";
+import { renderReplyVoice, replyVoiceProfile } from "../src/soul";
+import { Store } from "../src/store";
 
 const nativeTest = process.env.OMP_SUPERAGENT_NATIVE_TEST === "1" ? test : test.skip;
 const RECORD_TYPE = "omp-superagent-native-test";
@@ -279,6 +281,115 @@ for (const role of ["lane", "head"] as const) {
     }
   }, 90_000);
 }
+
+nativeTest("stock OpenAI transport sends ephemeral reply voice exactly once and never carries it into a later neutral prompt", async () => {
+  const { root, options } = await nativeHostOptions(["primary"]);
+  const wire: { prompt: string; system: string; user: string }[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/chat/completions")
+      return new Response("Unexpected route", { status: 404 });
+    const body: unknown = await request.json();
+    if (!body || typeof body !== "object" || !("messages" in body) || !Array.isArray(body.messages))
+      return new Response("Invalid chat message payload", { status: 400 });
+    const system = body.messages.filter(message => message?.role === "system" || message?.role === "developer");
+    const user = body.messages.filter(message => message?.role === "user");
+    wire.push({ prompt: JSON.stringify(user.at(-1)?.content ?? null), system: JSON.stringify(system), user: JSON.stringify(user) });
+    const row = { id: "native-wire", model: "local", object: "chat.completion.chunk", created: 1 };
+    const chunks = [
+      { index: 0, delta: { role: "assistant", content: "Loopback answer" }, finish_reason: null },
+      { index: 0, delta: {}, finish_reason: "stop" },
+    ];
+    return new Response(chunks.map(choice => `data: ${JSON.stringify({ ...row, choices: [choice] })}\n\n`).join("") + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } });
+  } });
+  let connection: HostConnection | undefined;
+  let passed = false;
+  try {
+    const origin = server.url.origin;
+    await fs.writeFile(path.join(root, "agent", "models.yml"), JSON.stringify({ providers: {
+      "voice-wire-fixture": { api: "openai-completions", apiKey: "local-only", baseUrl: `${origin}/v1`,
+        models: [{ id: "local", name: "Voice wire fixture", contextWindow: 32768, maxTokens: 4096 }] },
+    } }), { mode: 0o600 });
+    const child = await startHost({ ...options, model: "voice-wire-fixture/local",
+      env: { ...options.env, OMP_SUPERAGENT_ROLE: "head", OMP_TEST_NATIVE_LOOPBACK_ORIGIN: origin } });
+    const host = await HostConnection.connect(options.socketPath);
+    connection = host;
+    const initial = await host.client.getState();
+    expect(initial.replyVoiceVersion).toBe(2);
+    const ledger = new Store(path.join(root, "voice-fixture.sqlite"));
+    const base = (() => { try { return replyVoiceProfile(ledger); } finally { ledger.close(); } })();
+    const voice = { ...base, concept: "editorial", register: "formal", detail: "brief" };
+    const serializedVoice = JSON.stringify(renderReplyVoice(voice)).slice(1, -1);
+    expect(await host.request({ type: "prompt", message: "Unsupported sidecar", replyVoice: "arbitrary instructions" }))
+      .toMatchObject({ success: false });
+    expect(await host.request({ type: "prompt", message: "Unsupported sidecar", replyVoice: { ...voice, register: "arbitrary instructions" } }))
+      .toMatchObject({ success: false });
+    expect(await host.request({ type: "prompt", message: "Unsupported sidecar", replyVoice: { ...voice, concept: "arbitrary instructions" } }))
+      .toMatchObject({ success: false });
+    const entered = Promise.withResolvers<void>();
+    const entry = path.join(root, "voice-input-entered");
+    const checkEntry = () => { if (existsSync(entry)) entered.resolve(); };
+    const watcher = watch(root, checkEntry);
+    const timer = setTimeout(() => entered.reject(new Error("The stock input handler was not entered")), 5000);
+    const pending = host.request({ type: "prompt", message: "Input held by the extension", replyVoice: voice }, "held-input");
+    try {
+      checkEntry();
+      await Promise.race([entered.promise, pending.then(() => { throw new Error("Held stock input returned before its gate"); })]);
+      const deadline = Promise.withResolvers<never>();
+      const readTimer = setTimeout(() => deadline.reject(new Error("A journal/catalog read blocked behind an unadmitted stock input")), 5000);
+      try {
+        expect(await Promise.race([host.request({ type: "get_available_commands" }), deadline.promise])).toMatchObject({ success: true });
+      } finally { clearTimeout(readTimer); }
+    } finally {
+      watcher.close();
+      clearTimeout(timer);
+      await fs.writeFile(path.join(root, "release-voice-input"), "");
+    }
+    expect(await pending).toMatchObject({ success: true, id: "held-input", data: { agentInvoked: false } });
+    const heldEntries = parseSessionEntries(await fs.readFile(options.sessionFile, "utf8"));
+    expect(heldEntries).toContainEqual(expect.objectContaining({
+      type: "custom", customType: "rpc_prompt_result",
+      data: expect.objectContaining({ frame: { type: "prompt_result", id: "held-input", status: "completed", agentInvoked: false } }),
+    }));
+    for (const [id, message, eligible] of [
+      ["silent", "/fixture-state local-command", true],
+      ["neutral-after-local", "First neutral request", false],
+      ["styled", "Styled request", true],
+      ["neutral-after-style", "Last neutral request", false],
+    ] as const) {
+      const result = observe(host, frame => frame.type === "prompt_result" && frame.id === id);
+      try {
+        expect(await host.request({ type: "prompt", message, ...(eligible ? { replyVoice: voice } : {}) }, id))
+          .toMatchObject({ success: true, id });
+        expect(await result.promise).toMatchObject({ status: "completed", agentInvoked: id !== "silent" });
+      } finally { result.cancel(); }
+    }
+    const promptNames = ["First neutral request", "Styled request", "Last neutral request"];
+    const ownerRequests = wire.filter(row => promptNames.some(name => row.prompt.includes(name)));
+    expect(ownerRequests).toHaveLength(3);
+    for (const [index, row] of ownerRequests.entries()) expect(row.prompt).toContain(promptNames[index]!);
+    const tag = "<superagent-reply-voice>";
+    for (const row of wire) {
+      expect(row.prompt).not.toContain("local-command");
+      expect(row.prompt).not.toContain("Unsupported sidecar");
+      expect(row.prompt).not.toContain("Input held by the extension");
+      expect(row.system.split(tag).length - 1).toBe(row === ownerRequests[1] ? 1 : 0);
+      expect(row.system.includes(serializedVoice)).toBe(row === ownerRequests[1]);
+      expect(row.user).not.toContain(tag);
+      expect(row.user).not.toContain("omp-superagent-reply-voice:");
+    }
+    expect(await host.request({ type: "shutdown_host" })).toMatchObject({ success: true });
+    await host.exited;
+    await waitForFixtureProcessExit([child.pid, initial.adapterOwnerPid]);
+    passed = true;
+  } finally {
+    await server.stop(true);
+    await connection?.close();
+    await stopHostFixtures(root);
+    if (passed) await fs.rm(root, { recursive: true, force: true });
+    else console.error(`Retained native voice wire fixture at ${root}`);
+  }
+}, 90_000);
 
 nativeTest("actual OMP preserves approvals and structured owner decisions across one persistent host", async () => {
   const { root, options } = await nativeHostOptions(managedEntries);

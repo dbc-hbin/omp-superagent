@@ -48,8 +48,12 @@ struct Bridge {
     redirected: Arc<Mutex<bool>>,
     generation: Arc<Mutex<String>>,
     inbox: Arc<Mutex<Vec<Value>>>,
+    destination: Arc<Mutex<Value>>,
     pushes: Arc<Mutex<Vec<Value>>>,
     seen_push_ids: Arc<Mutex<Vec<String>>>,
+    push_attempts: Arc<Mutex<usize>>,
+    queued: Arc<Mutex<bool>>,
+    refuse_after: Arc<Mutex<Option<usize>>>,
     quiet: Arc<Mutex<bool>>,
     /// Refuse every push with 400 (a final rejection).
     refuse: Arc<Mutex<bool>>,
@@ -98,9 +102,25 @@ async fn inbox(
     Json(json!({"generation":generation,"latest":latest,"messages": rows})).into_response()
 }
 
+fn fixed_destination() -> Value {
+    json!({"botUserId":"900","ownerId":"42","chatId":"777"})
+}
+
+async fn destination(State(bridge): State<Bridge>, headers: HeaderMap) -> Response {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(bridge.destination.lock().expect("destination").clone()).into_response()
+}
+
 async fn push(State(bridge): State<Bridge>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
     if !authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    *bridge.push_attempts.lock().expect("attempts") += 1;
+    let destination = bridge.destination.lock().expect("destination").clone();
+    if body["expectedDestination"] != destination {
+        return StatusCode::FORBIDDEN.into_response();
     }
     if *bridge.refuse.lock().expect("refuse") {
         return StatusCode::BAD_REQUEST.into_response();
@@ -108,14 +128,30 @@ async fn push(State(bridge): State<Bridge>, headers: HeaderMap, Json(body): Json
     if *bridge.quiet.lock().expect("quiet") {
         return (StatusCode::CONFLICT, Json(json!({"ok":false,"suppressed":true}))).into_response();
     }
+    if bridge.refuse_after.lock().expect("refuse after").is_some_and(|count|
+        bridge.pushes.lock().expect("pushes").len() >= count)
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if *bridge.queued.lock().expect("queued") {
+        // Even a queue acknowledgement with otherwise complete correlation
+        // fields must not be taken as a confirmed delivery.
+        return Json(json!({
+            "ok":true,"state":"queued","pushId":body["pushId"],"destination":destination,"messageId":"1"
+        })).into_response();
+    }
     let id = body["pushId"].as_str().unwrap_or_default().to_owned();
     let mut seen = bridge.seen_push_ids.lock().expect("seen");
-    let duplicate = seen.contains(&id);
-    if !duplicate {
-        seen.push(id);
+    let message_id = if let Some(index) = seen.iter().position(|previous| previous == &id) {
+        index + 1
+    } else {
+        seen.push(id.clone());
         bridge.pushes.lock().expect("pushes").push(body);
-    }
-    Json(json!({"ok":true,"state": if duplicate {"delivered"} else {"queued"}})).into_response()
+        seen.len()
+    };
+    Json(json!({
+        "ok":true,"state":"delivered","pushId":id,"destination":destination,"messageId":message_id.to_string()
+    })).into_response()
 }
 
 async fn elsewhere(State(bridge): State<Bridge>) -> Response {
@@ -137,13 +173,15 @@ impl Fixture {
         let store = Arc::new(Store::open(&scratch.0)?);
         let bridge = Bridge::default();
         *bridge.generation.lock().expect("generation") = "gen-1".into();
+        *bridge.destination.lock().expect("destination") = fixed_destination();
         // A row that predates the adapter must never be replayed as new work.
         bridge.inbox.lock().expect("inbox").push(owner_row(1, "10", "old command"));
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let base = format!("http://{}", listener.local_addr()?);
         let service = Router::new()
             .route("/superagent/inbox", get(inbox))
-            .route("/superagent/send", post(push))
+            .route("/superagent/v2/destination", get(destination))
+            .route("/superagent/v2/send", post(push))
             .route("/elsewhere", get(elsewhere))
             .with_state(bridge.clone());
         let mut server = JoinSet::new();
@@ -228,11 +266,52 @@ async fn send_is_chunked_prefixed_and_idempotent() -> Result<()> {
     let output = json!({"id":"out-1","route":route(),"text":long});
     let first = fixture.hub.effect("send", &[output.clone()]).await.map_err(|e| anyhow::anyhow!(e.message))?;
     let again = fixture.hub.effect("send", &[output]).await.map_err(|e| anyhow::anyhow!(e.message))?;
+    assert_eq!(first, json!("1"), "return the external message ID, not the push ID");
     assert_eq!(first, again);
     let pushes = fixture.bridge.pushes.lock().expect("pushes").clone();
     assert_eq!(pushes.len(), 2, "retry must not deliver twice");
     assert!(pushes[0]["message"].as_str().is_some_and(|m| m.starts_with("가")), "no marker");
-    assert!(pushes[0].get("room").is_none(), "the bridge, not the adapter, fixes the room");
+    assert_eq!(pushes[0]["expectedDestination"], fixed_destination());
+    assert!(pushes[0].get("room").is_none(), "the expected tuple cannot select a different room");
+    fixture.hub.stop().await
+}
+
+#[tokio::test]
+async fn queued_restart_ack_is_not_reported_as_sent() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    *fixture.bridge.queued.lock().expect("queued") = true;
+    let error = fixture.hub.effect("send", &[json!({
+        "id":"request:restart-ack","route":route(),"text":"Preparing to restart"
+    })]).await.expect_err("queue acceptance is not Kakao delivery");
+    assert_eq!(error.certainty, "uncertain");
+    assert_eq!(*fixture.bridge.push_attempts.lock().expect("attempts"), 1);
+    assert!(fixture.bridge.pushes.lock().expect("pushes").is_empty());
+    fixture.hub.stop().await
+}
+
+#[tokio::test]
+async fn authenticated_wrong_destination_receives_no_send_request() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    fixture.bridge.destination.lock().expect("destination")["chatId"] = json!("778");
+    let error = fixture.hub.effect("send", &[json!({
+        "id":"mismatch","route":route(),"text":"private reply"
+    })]).await.expect_err("fixed destination does not match");
+    assert_eq!(error.certainty, "rejected");
+    assert_eq!(*fixture.bridge.push_attempts.lock().expect("attempts"), 0);
+    fixture.hub.stop().await
+}
+
+#[tokio::test]
+async fn later_refusal_does_not_erase_a_confirmed_first_chunk() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    *fixture.bridge.refuse_after.lock().expect("refuse after") = Some(1);
+    let error = fixture.hub.effect("send", &[json!({
+        "id":"partial","route":route(),"text":"가".repeat(CHUNK_CHARS * 2 + 1)
+    })]).await.expect_err("only one chunk delivered");
+    assert_eq!(error.certainty, "uncertain");
+    assert_eq!(error.retry_after_ms, None);
+    assert_eq!(*fixture.bridge.push_attempts.lock().expect("attempts"), 2);
+    assert_eq!(fixture.bridge.pushes.lock().expect("pushes").len(), 1);
     fixture.hub.stop().await
 }
 
@@ -360,6 +439,35 @@ async fn refused_stale_notice_does_not_stall_intake() -> Result<()> {
     fixture.add(owner_row(3, "32", "fresh"));
     let event = fixture.next_event().await?;
     assert_eq!(event["input"]["id"], "kakao:900:777:32");
+    fixture.hub.stop().await
+}
+
+#[tokio::test]
+async fn queued_stale_notice_does_not_replay_or_stall_intake() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    fixture.baseline().await?;
+    *fixture.bridge.queued.lock().expect("queued") = true;
+    let mut row = owner_row(2, "33", "old");
+    row["stale"] = json!(true);
+    {
+        let mut inbox = fixture.bridge.inbox.lock().expect("inbox");
+        inbox.extend([row.clone(), owner_row(3, "34", "fresh")]);
+    }
+    let event = fixture.next_event().await?;
+    assert_eq!(event["input"]["id"], "kakao:900:777:34");
+    assert_eq!(*fixture.bridge.push_attempts.lock().expect("attempts"), 1);
+    {
+        let mut generation = fixture.bridge.generation.lock().expect("generation");
+        let mut inbox = fixture.bridge.inbox.lock().expect("inbox");
+        *generation = "gen-2".to_owned();
+        row["id"] = json!(1);
+        row["stale"] = json!(false); // Rebuilding cannot reopen a retired Kakao log.
+        *inbox = vec![row, owner_row(2, "35", "new generation")];
+    }
+    let event = fixture.next_event().await?;
+    assert_eq!(event["input"]["id"], "kakao:900:777:35");
+    assert_eq!(*fixture.bridge.push_attempts.lock().expect("attempts"), 1, "same stale log is not posted again");
+    assert!(fixture.store.next(None)?.is_none());
     fixture.hub.stop().await
 }
 
@@ -493,6 +601,26 @@ async fn page_above_the_requested_limit_is_refused() -> Result<()> {
 }
 
 #[tokio::test]
+async fn unordered_page_is_refused_before_admission_or_cursor_advance() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    fixture.baseline().await?;
+    let before = fixture.store.get_meta(CURSOR)?;
+    fixture.bridge.inbox.lock().expect("inbox").extend([
+        owner_row(3, "71", "later"),
+        owner_row(2, "70", "earlier"),
+    ]);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fixture.store.get_meta(CURSOR)?, before);
+    assert!(fixture.store.next(None)?.is_none());
+    fixture.bridge.inbox.lock().expect("inbox").swap(1, 2);
+    for id in ["70", "71"] {
+        let event = fixture.next_event().await?;
+        assert_eq!(event["input"]["id"], format!("kakao:900:777:{id}"));
+    }
+    fixture.hub.stop().await
+}
+
+#[tokio::test]
 async fn bridge_redirects_are_not_followed() -> Result<()> {
     let fixture = Fixture::start().await?;
     fixture.baseline().await?;
@@ -517,6 +645,7 @@ async fn reference_bridge_round_trip() -> Result<()> {
         .env("KAKAO_SUPERAGENT_TOKEN", "reference-demo-token-0123456789")
         .env("KAKAO_OWNER_CHAT_ID", "777")
         .env("KAKAO_OWNER_ID", "42")
+        .env("KAKAO_BOT_USER_ID", "900")
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;

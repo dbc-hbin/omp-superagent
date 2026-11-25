@@ -405,6 +405,10 @@ impl State {
             input["reply"] = reply;
         } else if proof {
             return Ok(None);
+        } else if message.kind == 19
+            || message.message_reference.as_ref().is_some_and(|reference| reference.kind == 1)
+        {
+            input["unresolvedReply"] = json!(true);
         }
         input["discordContext"] = self.context_snapshot(route, Some(channel)).await;
         Ok(Some(input))

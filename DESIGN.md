@@ -161,6 +161,9 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
   keeps intake held; a configured default is not evidence of active effort.
   Reconnect to resident lanes within the Host budget only when ownership and
   generation match. Leave out-of-budget Hosts untouched and unloaded lanes unloaded.
+  A detached local lane's recorded residency is retired only after its exact owner
+  PID no longer exists and its socket path is confirmed absent. That releases its
+  slot without changing paused work, queue order or unresolved approvals.
   Restore native admission and outcomes from matching journal evidence, not receipts
   from another run. Held submissions are not replayed. Only a goal active before the
   restart with a verified original source can resume through native goal resume;

@@ -624,11 +624,13 @@ for a real bridge are in the [KakaoTalk bridge protocol](kakao-bridge-protocol.m
   1500-character chunks) and DM controls such as `/new`. Unsupported: threads,
   attachments, reactions and approval cards. When an approval is needed the adapter
   sends a notice and **cancels** it; it never accepts on the owner's behalf.
-- Messages older than 30 minutes (`stale`) are reported once, not executed. First
-  contact never replays earlier history.
+- Delivery requires a verified bridge destination and a Kakao message receipt
+  for every chunk. A queue acknowledgement or partial send is not confirmation.
+- The adapter never executes messages flagged `stale` and attempts one notice.
+  First contact never replays earlier history.
 - `groupRooms` cannot use kakao. `omp-sa setup` does not ask about kakao; add the block
   to the configuration file manually.
-- Local check: `KAKAO_SUPERAGENT_TOKEN=… KAKAO_OWNER_CHAT_ID=777 KAKAO_OWNER_ID=42 bun scripts/kakao-reference-bridge.ts`
+- Local check: `KAKAO_SUPERAGENT_TOKEN=… KAKAO_BOT_USER_ID=900 KAKAO_OWNER_CHAT_ID=777 KAKAO_OWNER_ID=42 bun scripts/kakao-reference-bridge.ts`
   prints its base URL on the first line. `POST /demo/owner-message` injects an owner
   message, and replies are printed in the terminal.
 
@@ -1108,6 +1110,17 @@ not import the previous conversation. If the assignment flow needs to confirm th
 directory, reply to the original question with the repository name or absolute path to continue
 the **original request**. Lanes do not have messenger credentials. To compare multiple topics or
 explicitly address the shared HEAD, use `/head <request>` (Slack: `!head <request>`).
+
+**Change the shared reply voice (SOUL)** by telling HEAD in a fresh message:
+“From now on, answer like an editor, formally and briefly, with the answer first.”
+There is no required SOUL keyword. In a bound work thread only, address HEAD
+with the existing `/head` prefix (Slack: `!head`); ordinary messages there
+still go to the lane. “Reset your reply style” restores the default. Check the tool's saved
+revision in HEAD's confirmation. The setting survives restart and applies to
+new HEAD and direct lane replies, not messages already being written, internal
+reports, or code-generated status/approval messages. One-off requests are not stored.
+The supported concepts are editorial, mentoring, and plain. They do not change
+models, identity, tools, approvals, or workflows.
 
 If Mnemopi is active and searchable on the head, you can describe when the work happened and what
 it was in another operator channel or DM, for example: `Continue where we left off with the login

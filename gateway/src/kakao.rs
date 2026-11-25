@@ -95,10 +95,12 @@ pub(crate) struct Route {
     pub topic_id: Option<String>,
 }
 
+#[derive(Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Policy {
-    bot: String,
-    owner: String,
-    chat: String,
+    bot_user_id: String,
+    owner_id: String,
+    chat_id: String,
 }
 
 impl Policy {
@@ -109,19 +111,19 @@ impl Policy {
         );
         ensure!(bot != owner, "Kakao botUserId and ownerId must differ");
         Ok(Self {
-            bot: bot.to_owned(),
-            owner: owner.to_owned(),
-            chat: chat.to_owned(),
+            bot_user_id: bot.to_owned(),
+            owner_id: owner.to_owned(),
+            chat_id: chat.to_owned(),
         })
     }
 
     pub fn route(&self) -> Route {
         Route {
             platform: PLATFORM.into(),
-            account_id: self.bot.clone(),
-            authority_id: self.owner.clone(),
+            account_id: self.bot_user_id.clone(),
+            authority_id: self.owner_id.clone(),
             guild_id: None,
-            channel_id: self.chat.clone(),
+            channel_id: self.chat_id.clone(),
             thread_id: None,
             topic_id: None,
         }
@@ -129,10 +131,10 @@ impl Policy {
 
     pub fn authorize(&self, route: &Route) -> Result<(), EffectError> {
         if route.platform != PLATFORM
-            || route.account_id != self.bot
-            || route.authority_id != self.owner
+            || route.account_id != self.bot_user_id
+            || route.authority_id != self.owner_id
             || route.guild_id.is_some()
-            || route.channel_id != self.chat
+            || route.channel_id != self.chat_id
             || route.thread_id.is_some()
             || route
                 .topic_id
@@ -191,8 +193,8 @@ impl Policy {
     /// Untrusted bridge rows become owner input only when every identity matches.
     pub fn inbound(&self, item: &InboxItem) -> Option<Value> {
         let text = item.text.trim();
-        if item.chat_id != self.chat
-            || item.sender_id != self.owner
+        if item.chat_id != self.chat_id
+            || item.sender_id != self.owner_id
             || !kakao_id(&item.log_id)
             || text.is_empty()
             || text.chars().count() > MAX_INPUT_CHARS
@@ -202,7 +204,7 @@ impl Policy {
             return None;
         }
         let input = Inbound {
-            id: format!("kakao:{}:{}:{}", self.bot, self.chat, item.log_id),
+            id: format!("kakao:{}:{}:{}", self.bot_user_id, self.chat_id, item.log_id),
             route: self.route(),
             message_id: &item.log_id,
             text,
@@ -395,6 +397,16 @@ fn push_id(output: &str, index: usize, count: usize) -> String {
     format!("sa-{digest}-{index}-{count}")
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryReceipt {
+    ok: bool,
+    state: String,
+    push_id: String,
+    destination: Policy,
+    message_id: String,
+}
+
 struct Core {
     ctx: Context,
     /// A Kakao-only client: no redirects, retries or environment/system proxies,
@@ -453,25 +465,52 @@ impl Core {
         Ok(page)
     }
 
-    async fn push(&self, output_id: &str, id: &str, message: &str) -> Result<(), EffectError> {
+    async fn verify_destination(&self) -> Result<(), EffectError> {
+        // Legacy bridges would ignore extra fields on the old send endpoint.
+        // Confirm the new contract and exact fixed destination before sending any text.
+        let rejected = || EffectError::rejected("Kakao bridge destination could not be verified");
         let response = self
             .http
-            .post(self.endpoint("superagent/send")?)
+            .get(self.endpoint("superagent/v2/destination")?)
             .header(TOKEN_HEADER, self.token.clone())
             .timeout(REQUEST_TIMEOUT)
-            .json(&json!({"message":message, "pushId":id, "outputId":output_id}))
+            .send()
+            .await
+            .map_err(|_| rejected())?;
+        if response.status() != StatusCode::OK || !json_response(&response) {
+            return Err(rejected());
+        }
+        let body = bounded_body(response, MAX_RECEIPT_BYTES).await.map_err(|_| rejected())?;
+        let destination: Policy = serde_json::from_slice(&body).map_err(|_| rejected())?;
+        if destination != self.policy {
+            return Err(rejected());
+        }
+        Ok(())
+    }
+
+    async fn push(&self, output_id: &str, id: &str, message: &str) -> Result<String, EffectError> {
+        let response = self
+            .http
+            .post(self.endpoint("superagent/v2/send")?)
+            .header(TOKEN_HEADER, self.token.clone())
+            .timeout(REQUEST_TIMEOUT)
+            .json(&json!({
+                "message":message, "pushId":id, "outputId":output_id, "expectedDestination":self.policy
+            }))
             .send()
             .await
             .map_err(uncertain)?;
         let status = response.status();
-        if status.is_success() {
+        if status == StatusCode::OK && json_response(&response) {
             let body = bounded_body(response, MAX_RECEIPT_BYTES).await?;
-            let body: Value = serde_json::from_slice(&body)
-                .map_err(|_| EffectError::uncertain("Kakao push receipt was not JSON"))?;
-            if body["ok"] == true && matches!(body["state"].as_str(), Some("queued" | "delivered")) {
-                return Ok(());
+            let receipt: DeliveryReceipt = serde_json::from_slice(&body)
+                .map_err(|_| EffectError::uncertain("Kakao delivery receipt was not confirmed"))?;
+            if receipt.ok && receipt.state == "delivered" && receipt.push_id == id
+                && receipt.destination == self.policy && kakao_id(&receipt.message_id)
+            {
+                return Ok(receipt.message_id);
             }
-            return Err(EffectError::uncertain("Kakao push receipt was not confirmed"));
+            return Err(EffectError::uncertain("Kakao delivery receipt was not confirmed"));
         }
         if status == StatusCode::CONFLICT {
             return Err(EffectError {
@@ -504,11 +543,17 @@ impl Core {
                 "Kakao output is too long; summarize or attach it elsewhere",
             ));
         }
-        let first = push_id(output_id, 0, parts.len());
+        self.verify_destination().await?;
+        let mut message_ids = Vec::with_capacity(parts.len());
         for (index, part) in parts.iter().enumerate() {
-            self.push(output_id, &push_id(output_id, index, parts.len()), part).await?;
+            match self.push(output_id, &push_id(output_id, index, parts.len()), part).await {
+                Ok(message_id) if !message_ids.contains(&message_id) => message_ids.push(message_id),
+                Ok(_) => return Err(EffectError::uncertain("Kakao returned the same receipt for different chunks")),
+                Err(error) if message_ids.is_empty() => return Err(error),
+                Err(_) => return Err(EffectError::uncertain("Kakao output was partially delivered")),
+            }
         }
-        Ok(first)
+        message_ids.into_iter().next().ok_or_else(|| EffectError::rejected("Kakao output is empty"))
     }
 
     async fn effect(&self, operation: &str, args: &[Value]) -> Result<Value, EffectError> {
@@ -554,7 +599,7 @@ impl Core {
                 let receipt = self
                     .send_text(&format!("approval:{id}"), UNSUPPORTED_APPROVAL)
                     .await?;
-                // Cancel only after the notice is queued; never accept on the owner's behalf.
+                // Cancel after confirmed notice delivery; never accept on the owner's behalf.
                 self.ctx
                     .cancel_unsupported_approval(id, &json!(approval_route))
                     .map_err(|_| EffectError::uncertain("Kakao approval cancellation was not recorded"))?;
@@ -599,6 +644,9 @@ impl Core {
             return Err(EffectError::uncertain("Kakao bridge inbox has no generation"));
         }
         if page.generation != cursor.generation {
+            if !page.messages.is_empty() {
+                return Err(EffectError::uncertain("Kakao bridge sent rows from an unacknowledged generation"));
+            }
             // First contact: skip rows written before this adapter ever ran.
             // A later generation change (inbox rebuilt or rolled back) starts
             // from 0; admission is idempotent by message ID and old rows are stale.
@@ -607,34 +655,43 @@ impl Core {
             self.save_cursor(&cursor)?;
             return Ok(cursor);
         }
+        let mut previous = cursor.after;
+        if page.latest < previous || page.messages.iter().any(|item| {
+            let valid = item.id > previous && item.id <= page.latest;
+            previous = item.id;
+            !valid
+        }) {
+            return Err(EffectError::uncertain("Kakao bridge inbox rows are out of order or range"));
+        }
         for item in page.messages {
-            if item.id <= cursor.after {
-                continue;
-            }
-            if item.stale {
-                // Too old to act on safely; tell the owner once instead of executing it.
-                if let Some(event) = self.policy.inbound(&item) {
-                    let id = event["input"]["id"].as_str().unwrap_or_default().to_owned();
+            if let Some(event) = self.policy.inbound(&item) {
+                let id = event["input"]["id"].as_str().unwrap_or_default();
+                let notice_id = format!("stale:{id}");
+                let mark = format!("{notice_id}:discarded");
+                let discarded = self.ctx
+                    .get_meta(&mark)
+                    .map_err(|_| EffectError::uncertain("Kakao stale row state is unreadable"))?
+                    .is_some();
+                if !discarded && item.stale {
+                    // The same Kakao log can reappear after a row failure or
+                    // rebuild, even with a different stale flag. Retire it
+                    // before any notice, so neither command nor notice replays.
+                    self.ctx.set_meta(&mark, "true")
+                        .map_err(|_| EffectError::uncertain("Kakao stale row could not be retired"))?;
                     let notice = self
                         .send_text(
-                            &format!("stale:{id}"),
+                            &notice_id,
                             "오래 밀린 요청이라 실행하지 않았어요. 필요하면 다시 보내 주세요.",
                         )
                         .await;
-                    // An uncertain notice holds the cursor and is retried with the same
-                    // push ID. A refused notice is final: skip it rather than stall intake.
-                    match notice {
-                        Ok(_) => {}
-                        Err(error) if error.certainty == "rejected" && error.retry_after_ms.is_none() => {
-                            eprintln!("{} Kakao stale notice for row {} was refused", log_time(), item.id);
-                        }
-                        Err(error) => return Err(error),
+                    if notice.is_err() {
+                        eprintln!("{} Kakao stale notice for row {} was not confirmed", log_time(), item.id);
                     }
+                } else if !discarded {
+                    self.ctx
+                        .admit(event)
+                        .map_err(|_| EffectError::uncertain("Kakao durable admission failed"))?;
                 }
-            } else if let Some(event) = self.policy.inbound(&item) {
-                self.ctx
-                    .admit(event)
-                    .map_err(|_| EffectError::uncertain("Kakao durable admission failed"))?;
             } else {
                 // Row ID only: never log message text, sender or chat identifiers.
                 eprintln!("{} Kakao inbox row {} rejected by policy (identity or size)", log_time(), item.id);

@@ -1,3 +1,5 @@
+import { existsSync, watch, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -79,11 +81,30 @@ export default function nativeFixture(pi: ExtensionAPI): void {
   });
   let agentStarts = 0;
   let networkAttempts = 0;
+  const loopbackOrigin = process.env.OMP_TEST_NATIVE_LOOPBACK_ORIGIN;
+  if (loopbackOrigin !== undefined && !/^http:\/\/127\.0\.0\.1:\d+$/.test(loopbackOrigin))
+    throw new Error("Native fixture provider must be on IPv4 loopback");
+  const fetch = globalThis.fetch;
   const refuseNetwork = () => {
     networkAttempts++;
     throw new Error("Native host lifecycle fixture forbids network access");
   };
-  globalThis.fetch = Object.assign(async () => refuseNetwork(), { preconnect: refuseNetwork });
+  globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.origin !== loopbackOrigin || url.pathname !== "/v1/chat/completions") return refuseNetwork();
+    return fetch(input, { ...init, redirect: "error" });
+  }, { preconnect: refuseNetwork });
+  if (loopbackOrigin && fixtureRoot) pi.on("input", async event => {
+    if (event.text !== "Input held by the extension") return;
+    const release = join(fixtureRoot, "release-voice-input");
+    const resumed = Promise.withResolvers<void>();
+    const watcher = watch(fixtureRoot, () => { if (existsSync(release)) resumed.resolve(); });
+    try {
+      writeFileSync(join(fixtureRoot, "voice-input-entered"), "");
+      if (!existsSync(release)) await resumed.promise;
+      return { handled: true };
+    } finally { watcher.close(); }
+  });
   pi.on("agent_start", () => { agentStarts++; });
 
   const record = (ctx: ExtensionContext, phase: string, token: string, confirmed?: boolean) => {

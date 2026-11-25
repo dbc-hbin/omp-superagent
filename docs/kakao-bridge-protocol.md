@@ -1,4 +1,4 @@
-# KakaoTalk bridge protocol (version 1)
+# KakaoTalk bridge protocol (version 2)
 
 [Operations guide (Korean)](OPERATIONS.md#24-kakaotalk-로컬-브리지-주인-11-전용) ·
 [Operations guide (English)](OPERATIONS.en.md#24-kakaotalk-local-bridge-owner-one-to-one-only) ·
@@ -25,7 +25,7 @@ with an in-memory inbox for tests and local demos.
 | Adapter (Gateway) | Polls the inbox, admits rows that exactly match the configured owner and chat, and posts the head's replies. It cannot choose a destination. |
 
 Group chats, open chats and other people's one-to-one chats are out of scope for
-version 1. A bridge MUST NOT place their messages in the Superagent inbox.
+version 2. A bridge MUST NOT place their messages in the Superagent inbox.
 
 ## Transport and authentication
 
@@ -34,7 +34,8 @@ version 1. A bridge MUST NOT place their messages in the Superagent inbox.
   HTTPS, credentials, query strings and fragments in `bridgeUrl`. It uses a dedicated
   HTTP client with environment/system proxies disabled, no redirects and no retries.
 - A path in `bridgeUrl` is a base: `http://127.0.0.1:8080/kakao` uses
-  `/kakao/superagent/inbox` and `/kakao/superagent/send`.
+  `/kakao/superagent/inbox`, `/kakao/superagent/v2/destination`, and
+  `/kakao/superagent/v2/send`.
 - Every request carries exactly one `X-Superagent-Token` header. The token is a
   dedicated secret for this interface only: at least 24 characters from
   `[A-Za-z0-9_-]`. Do not reuse a token that also authorizes other bridge features.
@@ -50,8 +51,11 @@ The bridge MUST:
 3. Reject (`403`) zero or several token headers and compare the token in constant
    time.
 4. Never log the token or message bodies at default verbosity.
-5. Never send replies anywhere but the owner's one-to-one chat. The send request does
-   not name a chat, and the bridge MUST ignore any extra field that tries to.
+5. Never send replies anywhere but the owner's one-to-one chat. Check the required
+   expected destination against the actual authenticated account and fixed chat
+   before each write. It is a precondition, not a destination selector. A mismatch
+   MUST be refused before any queueing or delivery; ignore fields that try to select
+   another destination.
 
 ## `GET /superagent/inbox`
 
@@ -102,44 +106,69 @@ Response: `200`, `Content-Type: application/json`.
 - `text`: 1 to 4000 characters after trimming. Longer rows are dropped.
 - `receivedAtMs`: positive Unix milliseconds no greater than 2^53 − 1.
 - `stale` (optional, default `false`): the bridge sets it for a row that is too old to
-  act on safely (the reference bridge uses 30 minutes since recording). The adapter does not
-  execute a stale row and sends the owner one notice instead.
+  act on safely (the reference bridge uses 30 minutes since recording). The adapter
+  durably retires the Kakao log ID before attempting one notice, so a rebuilt
+  inbox cannot later execute it as fresh or replay an ambiguous notice.
 - The whole response body MUST stay below 4 MiB.
 
 A non-JSON `200` (for example an HTML page from an older bridge), a non-`2xx` status,
-invalid JSON, an oversized body or an over-limit page leaves the adapter's cursor
-unchanged. It retries after a short back-off and logs one line per distinct error per
-minute.
+invalid JSON, an oversized body, or an invalid page (limit, order, range, or
+generation) produces no admissions and leaves the adapter's cursor unchanged.
+It retries after a short back-off and logs one line per distinct error per minute.
 
-## `POST /superagent/send`
+## `GET /superagent/v2/destination`
+
+Return `200 application/json` with the authenticated bridge account, owner, and
+fixed one-to-one chat: `{"botUserId":"900","ownerId":"42","chatId":"777"}`.
+The adapter compares all three fields with its configuration before sending
+any output. Missing, unverifiable, or different identity stops the send without
+posting any text. Version 1's send endpoint is never used.
+
+## `POST /superagent/v2/send`
 
 Request body (`Content-Type: application/json`):
 
 ```json
-{ "pushId": "sa-0123456789abcdef01234567-0-2", "outputId": "out-17", "message": "plain text" }
+{
+  "pushId": "sa-0123456789abcdef01234567-0-2",
+  "outputId": "out-17",
+  "message": "plain text",
+  "expectedDestination": {"botUserId":"900","ownerId":"42","chatId":"777"}
+}
 ```
 
 - `pushId`: `sa-` followed by at most 120 characters from `[A-Za-z0-9._:-]`. It is
   derived deterministically from the durable output, chunk index and chunk count.
-  The bridge MUST deliver a given `pushId` at most once. A repeated `pushId` returns
-  success without sending again.
+  The bridge MUST deliver a given `pushId` at most once, including across restarts.
+  An identical repeated request returns the same known receipt or unconfirmed
+  state, without another send. Conflicting reuse of a push ID is refused.
 - `outputId`: the Superagent output that produced this chunk (informational; useful for
   matching answers to requests). Every chunk of one output shares it.
 - `message`: plain text, 1 to 1500 characters. The adapter strips Markdown and splits
   long replies at line breaks (at most 20 chunks per output).
+- `expectedDestination`: the required fixed tuple. The bridge rechecks it
+  against the actual destination immediately before queueing or writing, even
+  if the previous read succeeded.
 
 Responses:
 
 | Status | Body | Adapter behaviour |
 | --- | --- | --- |
-| `200` | `{"ok": true, "state": "queued" \| "delivered"}` | Accepted. Duplicates also return this. |
-| `409` | any | The chat is temporarily quiet. Rejected; Superagent may retry after 60 s. |
-| other `4xx` | any | Rejected; the message is not retried. |
+| `200` | `{"ok":true,"state":"delivered","pushId":"…","destination":{"botUserId":"900","ownerId":"42","chatId":"777"},"messageId":"1234"}` | Confirmed only for a matching push ID and destination, with the actual Kakao log ID as a decimal string. |
+| `2xx` | `{"ok":true,"state":"queued"}` | Queue acceptance only. The delivery is uncertain; no automatic resend. |
+| `409` | any | Definitely refused before any effect; the chat is temporarily quiet. |
+| other `4xx` | any | Definitely refused before any effect, including `403` for a wrong destination. |
 | `5xx`, timeout, invalid or oversized (> 64 KiB) receipt | any | Outcome unknown. Superagent does not resend automatically. |
+
+Each chunk needs its own confirmed Kakao log ID. A failed later chunk after
+confirmed delivery of an earlier one leaves the output uncertain, never
+definitely rejected or fully sent. Reconcile with the original bridge and
+chat before authorizing any follow-up. The reference bridge simulates log IDs
+from its in-memory delivery list; it cannot verify a live Kakao delivery.
 
 ## Unsupported features
 
-Version 1 carries text only. Threads, attachments, reactions, typing indicators and
+Version 2 carries text only. Threads, attachments, reactions, typing indicators and
 presence are unsupported. Approval cards cannot be shown: the adapter sends a short
 notice and records the approval as **cancelled**. It never accepts one on the owner's
 behalf.
@@ -159,6 +188,6 @@ behalf.
 
 ## Versioning
 
-This document describes version 1. A future incompatible change will use new
-endpoint paths (for example `/superagent/v2/...`). New optional response fields may be
-added; adapters ignore unknown fields.
+Version 2 retains the inbox endpoint and uses versioned destination and send
+endpoints so an older bridge cannot ignore the new precondition on a write.
+New optional response fields may be added; adapters ignore unknown fields.

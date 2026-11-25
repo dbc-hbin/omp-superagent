@@ -1,4 +1,5 @@
 import { isAbsolute, normalize } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export type LaneWaitTarget =
   | { kind: "tool" | "approval" | "job"; id: string; target: string }
@@ -22,6 +23,27 @@ export interface LaneReportEvent {
   sessionId: string;
   reportId: string;
   report: LaneReport;
+}
+
+/** Evidence of a tool execution only; it does not authorize a scope change. */
+export type ScopeReviewReceipt = {
+  readonly type: "superagent-scope-review";
+  readonly sourceId: string;
+  readonly sessionId: string;
+  readonly sessionFile: string;
+  readonly toolCallId: string;
+};
+
+/** Stock OMP select wire for this tool. A positive answer describes this call
+ * only; the native Host, not the controller, handles any session-wide choice. */
+export function scopeReviewApproval(request: Record<string, unknown>, response?: { value?: string }): boolean {
+  if (request.method !== "select" || request.secret === true) return false;
+  const options = request.options;
+  const session = "Approve lane_report for this session";
+  if (!isDeepStrictEqual(options, ["Approve", "Deny"]) && !isDeepStrictEqual(options, ["Approve", session, "Deny"])) return false;
+  if (!response) return true;
+  return isDeepStrictEqual(response, { value: "Approve" })
+    || Array.isArray(options) && options.includes(session) && isDeepStrictEqual(response, { value: session });
 }
 
 export function laneWaitKey(waiting: LaneWaitTarget): string {

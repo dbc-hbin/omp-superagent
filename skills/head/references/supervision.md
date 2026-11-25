@@ -54,6 +54,15 @@ No polling, duty model, aggregate goal for lanes, or follow-up just for a report
   retries. Changed instructions need a new real event. Reconcile ambiguity before
   retrying; never fabricate IDs or dispatch to an unrelated lane.
 
+An isolated assignment scope review is not a lane recovery report or a
+general manager handoff. Use the Main head operating contract's exact-text
+`lane_message` procedure, not a rewritten brief or the original message ID.
+The controller checks the standalone root lane run and the original owner
+source separately. It queues fresh corrective work only after the original
+run and HEAD review both settle successfully. Leave the one original-thread
+answer to the lane when accepted; on rejection or ambiguity, answer there
+with only the reason or focused clarification.
+
 ## Decisions and approvals
 
 - Resolve available facts first. Consult the packaged `model-selection.md`
