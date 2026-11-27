@@ -45,7 +45,7 @@ import { DeferredRoutingQueue, type DeferredChoiceRow } from "./deferred-routing
 
 const ACTIVE_INPUTS = "state IN ('pending','submitted','uncertain')";
 const SCOPE_CORRECTION_PREFIX = `handoff:${SCOPE_REVIEW_PREFIX}`;
-const SCOPE_REVIEW_NOT_GRANTED = "Scope correction was not authorized. The existing lane scope is unchanged. If needed, send a new, explicit request in this topic.";
+const SCOPE_REVIEW_NOT_APPLIED = "The scope correction was not applied. The existing lane scope is unchanged.";
 const SCOPE_CORRECTION_NOT_CURRENT = "The scope correction is no longer current. It was not repeated; the existing lane scope is unchanged.";
 const SCOPE_CORRECTION_NO_ANSWER = "The corrective request settled, but the lane returned no final answer.";
 
@@ -1260,7 +1260,7 @@ export class Store implements StorePort {
         const answer = settlement?.text.trim();
         const text = correction
           ? answer || (state === "done" ? SCOPE_CORRECTION_NO_ANSWER : SCOPE_CORRECTION_NOT_CURRENT)
-          : eligible && scope && row.correction_requested === 0 && answer && answer.length <= 1200 ? answer : SCOPE_REVIEW_NOT_GRANTED;
+          : eligible && scope && row.correction_requested === 0 && answer && answer.length <= 1200 ? answer : SCOPE_REVIEW_NOT_APPLIED;
         this.queueOutput({ id: settlement?.id ?? `${id}:answer`, text, sourceId: original.id, route: original.route });
       }
       return true;
@@ -1279,7 +1279,7 @@ export class Store implements StorePort {
       const original = this.input(row.source_id);
       if (!original || this.getMeta(`user-source:${original.id}`) !== "true"
         || routeKey(original.route) !== routeKey(input.route)) return false;
-      this.queueOutput({ id: settlement.id, text: SCOPE_REVIEW_NOT_GRANTED, sourceId: original.id, route: original.route });
+      this.queueOutput({ id: settlement.id, text: SCOPE_REVIEW_NOT_APPLIED, sourceId: original.id, route: original.route });
       return true;
     }
     this.insertInput({
@@ -1964,7 +1964,13 @@ export class Store implements StorePort {
         if (owner?.target !== approval.target || owner.generation !== approval.generation)
           throw new Error(`Approval does not match its topic source: ${approval.id}`);
         const reportSource = this.reportApprovalSource(owner.id);
-        if (reportSource) {
+        if (owner.id.startsWith(SCOPE_REVIEW_PREFIX)) {
+          const scope = this.scopeReview(owner.id);
+          if (approval.target !== "main" || owner.state !== "submitted" || !scope
+            || routeKey(scope.original.route) !== routeKey(approval.route))
+            throw new ScopeReviewError("Approval does not match the active HEAD scope review");
+          this.setMeta(`scope-head-approval-input:${approval.id}`, owner.id);
+        } else if (reportSource) {
           if (routeKey(reportSource.route) !== routeKey(approval.route))
             throw new Error(`Approval does not match its original report source: ${approval.id}`);
           if (owner.id.startsWith(SCOPE_CORRECTION_PREFIX)) {
@@ -2008,7 +2014,11 @@ export class Store implements StorePort {
       const lane = this.lane(approval.target);
       if (state === "answered" && lane && (lane.generation !== generation || lane.workState !== "open")) return false;
       const correction = this.getMeta(`scope-correction-approval-input:${approval.id}`);
-      if (correction && state === "answered" && !this.reportApprovalSource(correction)) {
+      const headReview = this.getMeta(`scope-head-approval-input:${approval.id}`);
+      // The Gateway can durably admit a newer source on another connection
+      // after the controller's native readback but before this claim.
+      if (state === "answered" && (correction && !this.reportApprovalSource(correction)
+        || headReview && !this.scopeReview(headReview))) {
         const response = resolution?.response;
         const request = approval.request;
         const denied = isDeepStrictEqual(response, { cancelled: true })

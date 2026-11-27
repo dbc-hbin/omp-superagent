@@ -12,7 +12,7 @@ const provider = "gateway-native";
 const model = "local";
 const managers = [
   "head_recovery", "head_set_model", "cron_create", "lane_models", "lane_init_presets", "lane_set_model", "lane_start",
-  "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect",
+  "lane_inspect", "lane_message", "lane_scope_accept", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect",
   "lane_thread_update", "discord_context", "discord_purpose_list", "discord_purpose_set", "discord_purpose_clear",
   "pr_watch", "pr_watch_list", "decision_list", "decision_inspect", "decision_withdraw",
 ];
@@ -140,9 +140,11 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
         const lane = /Assignment scope review for lane ("[^"]+")/.exec(text)?.[1];
         const original = /Authenticated original owner message \(only source of a scope change\): ([^\n]+)/.exec(text)?.[1];
         if (!lane || !original || !text.includes("Read-only parser inspection.")) throw new Error("Missing original scope review evidence");
-        if (!called("lane_message")) return invoke("lane_message", {
-          id: JSON.parse(lane), sourceId: requestId, text: JSON.parse(original),
-        });
+        const schema = context.tools?.find(tool => tool.name === "lane_scope_accept")?.parameters;
+        const properties = schema && "properties" in schema ? schema.properties : undefined;
+        if (!properties || typeof properties !== "object" || Object.keys(properties).join() !== "reviewId")
+          throw new Error("Scope review must advertise a direct tool with only the review ID, not a workflow or dispatch override");
+        if (!called("lane_scope_accept")) return invoke("lane_scope_accept", { reviewId: requestId });
         return { content: ["Correction requested."] };
       }
       if (requestId === "240") {
@@ -200,8 +202,17 @@ export default function gatewayProvider(pi: ExtensionAPI): void {
           const binding = /Bound lane reference \(coordination state, not a transcript\): (\{[^\n]+\})/.exec(text)?.[1];
           const id: unknown = binding ? JSON.parse(binding).id : undefined;
           if (typeof id !== "string") throw new Error("Follow-up did not enter head with its original lane binding context");
+          if (requestId === "203") {
+            const schema = context.tools?.find(tool => tool.name === "lane_message")?.parameters;
+            const properties = schema && "properties" in schema ? schema.properties : undefined;
+            const workflow = properties && typeof properties === "object" && "workflow" in properties ? properties.workflow : undefined;
+            if (!workflow || typeof workflow !== "object" || !("anyOf" in workflow) || !Array.isArray(workflow.anyOf)
+              || !workflow.anyOf.some(branch => branch?.type === "null"))
+              throw new Error("The provider-visible workflow schema must explicitly permit null for ordinary dispatch");
+          }
           return invoke("lane_message", {
             id, sourceId: requestId, text: `Head explicitly delegates follow-up ${requestId} after receiving the original user input.`,
+            ...(requestId === "203" ? { workflow: null } : {}),
           });
         }
         return { content: [] };

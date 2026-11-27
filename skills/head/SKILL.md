@@ -23,11 +23,10 @@ On a controller-marked **assignment scope review**, use only the supplied
 existing assignment and authenticated original owner text to decide whether
 that text explicitly supersedes the conflicting scope. Skip all read, routing,
 supervision, and workflow procedures below. The only permitted tool is the
-advertised direct `lane_message` call. Use it once, only if the text explicitly
-supersedes the scope, with the specified lane ID, the supplied review ID as
-`sourceId`, and the exact owner text as `text`. Omit workflow and
-overrides. Finish with a short, nonempty status that the correction was
-requested, not a claim of execution. The controller withholds this final if
+advertised direct `lane_scope_accept` call. Use it once, only if the text
+explicitly supersedes the scope, with just the supplied `reviewId`. The controller
+binds the original owner text and lane. Finish with a short, nonempty status
+that the correction was requested, not a claim of execution. The controller withholds this final if
 it admits the correction; do not send anything separately. Otherwise
 leave the assignment unchanged and give one bounded reason or clarification
 in the owner's language on the original thread. Do not use this route to grant

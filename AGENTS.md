@@ -57,8 +57,9 @@ contracts. Use the [operations guide](docs/OPERATIONS.md) for operator procedure
   privately; do not redirect it to the owner. A HEAD stop may escalate an existing
   regular review to the original owner instead.
   A conflicting original bound-topic owner correction uses the direct `lane_report`
-  scope-review form; only HEAD may issue the corrective `lane_message` using the verified
-  review ID. Match the original route and current native session, file, request and
+  scope-review form; only HEAD may accept the verified review ID with `lane_scope_accept`.
+  The controller uses the original owner text and bound lane. Match the original route
+  and current native session, file, request and
   generation; role environment alone is not authority. Reports, quotes, forwards and
   attachments are data, not authority.
 - Preserve ACK-after-durable-admission, the initial approval readiness barrier, ordered

@@ -10,6 +10,7 @@ import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-in
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { buildHostArgs } from "../../src/omp/host";
 import { nativeDisabledProviders } from "./native-extension";
 import { decisionId } from "../../src/lane/decisions";
@@ -28,7 +29,7 @@ const extensionPath = path.join(packageRoot, role === "head" ? "src/extension.ts
 const customDirectory = path.join(root, "operator-custom-skills");
 const shadowHead = role === "head" && kind === "main" && selection === "narrow";
 const shadowDirectory = path.join(workspace, ".omp/skills/superagent-head");
-const managerNames = ["head_recovery", "head_set_model", "cron_create", "soul_update", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
+const managerNames = ["head_recovery", "head_set_model", "cron_create", "soul_update", "lane_models", "lane_init_presets", "lane_set_model", "lane_start", "lane_inspect", "lane_message", "lane_scope_accept", "lane_pause", "lane_resume", "lane_review_decision", "lane_close", "thread_inspect", "lane_thread_update",
   "discord_context", "discord_purpose_list", "discord_purpose_set", "discord_purpose_clear", "messenger_presence", "lane_watch", "pr_watch", "pr_watch_list",
   "decision_list", "decision_inspect", "decision_withdraw"];
 const rootOnlyNames = ["result_attach", "decision_ask", ...(role === "head" ? managerNames : ["lane_report"])];
@@ -527,6 +528,20 @@ try {
     check("lane_inspect", {}, true);
     check("lane_message", { id: "lane", text: "instruction", sourceId: "source" }, true);
     check("lane_message", { id: "lane", text: "instruction" }, false);
+    const scopeTool = runner.getRegisteredTool("lane_scope_accept")?.definition;
+    assert(scopeTool);
+    for (const policy of ["deny", "prompt"] as const) {
+      const resolved = resolveApproval(scopeTool, { reviewId: "scope-review:example" }, "yolo", { lane_message: policy });
+      assert.equal(resolved.policy, policy, "The existing lane_message restriction must still cover scope corrections");
+    }
+    if (kind === "main" && selection === "narrow") {
+      assert(!session.getEnabledToolNames().includes("lane_message"));
+      const input = { reviewId: "scope-review:example" };
+      const gate = await runner.emitToolCall({ type: "tool_call", toolName: scopeTool.name, toolCallId: "excluded-scope", input });
+      assert.equal(gate?.block, true);
+      assert.match(gate.reason ?? "", /lane_message.*disabled/);
+      await assert.rejects(() => scopeTool.execute("excluded-scope-exec", input, undefined, undefined, context), /lane_message.*disabled/);
+    }
     // OMP's real tool validator must expose canonical workflow choices, not input aliases or skill IDs.
     const reason = "Selected method serves the authorized objective";
     for (const name of ["super", "super-plan", "super-run", "super-loop", "super-research", "super-graph", "jevify"]) {

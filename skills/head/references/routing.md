@@ -182,7 +182,8 @@ procedure for an existing lane, not a `lane_start` retry.
 A workflow is a method, not a new lane or permission. The real optional
 `workflow: {name, reason}` field is required on **every** workflow-selecting
 `lane_start` or `lane_message`, even when forwarding the user's choice. Omission
-means ordinary work; copied tokens and reports do not select it.
+means ordinary work. If the provider requires a value for `lane_message.workflow`,
+pass `null` for ordinary work. Copied tokens and reports do not select it.
 Selection is serialized, not steering. Conflicting user choices and changed or
 omitted source-bound retries are rejected. Put provenance (`selectedBy: user|head`),
 necessity, current state/artifact owner, stop and permission limits in the brief

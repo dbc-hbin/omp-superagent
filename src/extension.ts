@@ -31,7 +31,7 @@ const headReferenceDirectory = fileURLToPath(new URL("../skills/head/references"
 const managerTools: Record<string, true> = {
   head_recovery: true, head_set_model: true, cron_create: true, soul_update: true,
   lane_models: true, lane_init_presets: true, lane_set_model: true, lane_review_decision: true,
-  lane_start: true, lane_inspect: true, lane_message: true,
+  lane_start: true, lane_inspect: true, lane_message: true, lane_scope_accept: true,
   lane_pause: true, lane_resume: true, lane_close: true,
   lane_watch: true,
   thread_inspect: true, lane_thread_update: true,
@@ -45,10 +45,11 @@ const result = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
   details: {},
 });
-const workflowSchema = Type.Optional(Type.Object({
+const workflowSelection = Type.Object({
   name: Type.Union(WORKFLOW_NAMES.map(name => Type.Literal(name))),
   reason: Type.String({ minLength: 1 }),
-}, { additionalProperties: false }));
+}, { additionalProperties: false });
+const workflowSchema = Type.Optional(workflowSelection);
 const threadTagsSchema = Type.Array(Type.String({ pattern: "^[0-9]{1,20}$" }), { maxItems: 5, uniqueItems: true });
 const threadTitleSchema = Type.String({ minLength: 1, maxLength: 100, pattern: "\\S" });
 const threadChangeFields = {
@@ -86,6 +87,11 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     if (ctx.agent.kind !== "main") throw new Error("Lane management is restricted to the main superagent head");
     if (!runtime) throw new Error(startupError ? `Superagent startup failed: ${String(startupError)}` : "Superagent is starting; retry once startup completes");
     return runtime;
+  };
+  const requireScopeRuntime = (ctx: ExtensionContext) => {
+    if (ctx.agent.kind === "main" && !pi.getActiveTools().includes("lane_message"))
+      throw new Error("Assignment scope correction is disabled by the active tool selection (lane_message is disabled)");
+    return requireRuntime(ctx);
   };
   registerResultAttach(pi, intent => {
     if (!runtime) throw new Error("The head controller is unavailable for result delivery");
@@ -135,7 +141,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   pi.on("tool_call", (event, ctx) => {
     if (runtime?.laneDecisionReviewActive() && (ctx.agent.kind !== "main" || event.toolName !== "lane_review_decision"))
       return { block: true, reason: "A lane question permits only answering or escalating its original decision" };
-    if (runtime?.scopeReviewActive() && (ctx.agent.kind !== "main" || event.toolName !== "lane_message"))
+    if (runtime?.scopeReviewActive() && (ctx.agent.kind !== "main" || event.toolName !== "lane_scope_accept"))
       return { block: true, reason: "This assignment review permits only a direct same-lane correction from its verified owner message" };
     if (event.toolName === "soul_update") {
       try { requireRuntime(ctx).authorizeSoulUpdate(event.input, ctx.sessionManager.getSessionId()); }
@@ -168,10 +174,16 @@ export default function superagentExtension(pi: ExtensionAPI): void {
       return { block: true, reason: "HEAD recovery is restricted to the original main head" };
     if (["cron_create", "decision_list", "decision_inspect", "decision_withdraw"].includes(event.toolName) && ctx.agent.kind !== "main")
       return { block: true, reason: "Lane management is restricted to the main superagent head" };
-    if (!runtime?.headRecoveryActive()) return;
-    if (ctx.agent.kind !== "main" || event.toolName !== "head_recovery") {
+    if (runtime?.headRecoveryActive() && (ctx.agent.kind !== "main" || event.toolName !== "head_recovery")) {
       runtime.blockHeadRecoveryTool();
       return { block: true, reason: "The isolated HEAD recovery turn permits only head_recovery; original work is not replayed" };
+    }
+    if (event.toolName === "lane_scope_accept") {
+      try { requireScopeRuntime(ctx).assertScopeReview(event.input.reviewId, ctx.sessionManager.getSessionId()); }
+      catch (error) {
+        if (!(error instanceof Error)) throw error;
+        return { block: true, reason: error.message };
+      }
     }
   });
   pi.on("turn_end", (_event, ctx) => {
@@ -484,11 +496,23 @@ export default function superagentExtension(pi: ExtensionAPI): void {
     },
   });
   pi.registerTool({
+    name: "lane_scope_accept", label: "Accept the current lane scope correction", loadMode: "essential", approval: "exec",
+    legacyName: "lane_message",
+    description: "Only during the isolated assignment scope review and only if the authenticated original owner message explicitly supersedes the conflicting assignment. Supply just the current review ID. The controller binds the original text and lane; no text, destination or workflow can be selected. Records intent, not dispatch. The correction may be admitted only after successful settlement of this review.",
+    parameters: Type.Object({ reviewId: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return result(requireScopeRuntime(ctx).acceptScopeReview(params.reviewId, ctx.sessionManager.getSessionId()));
+    },
+  });
+  pi.registerTool({
     name: "lane_message", label: "Message independent work", loadMode: "essential", approval: "exec",
     description: "Durably admit a follow-up to a specific open lane. For an original owner request from the exact guild parent of the lane's physical Discord thread, HEAD-reviewed progress and final reports go to that thread, not the parent. Do not duplicate them. Returns its input ID and durable state; pending work reports runtime blocks, blocking uncertain input IDs, and any unconfirmed kickoff. Report such holds instead of retrying. Ordinary same-topic follow-ups steer an eligible active native run by default; ineligible work stays queued. Do not require a separate user /steer command. sourceId identifies the original received user instruction for duplicate suppression. Optional workflow {name,reason} is explicit head selection within that objective; text/quotes/reports never select one. Workflow selections remain serialized, not steered into an active run. The exact workflow/source/handoff is durable and conflicting retries reject. Admission is not execution or completion.",
-    parameters: Type.Object({ id: Type.String(), text: Type.String(), sourceId: Type.String(), workflow: workflowSchema }),
+    parameters: Type.Object({
+      id: Type.String(), text: Type.String(), sourceId: Type.String(),
+      workflow: Type.Optional(Type.Union([workflowSelection, Type.Null({ description: "No explicit workflow; use ordinary lane dispatch." })])),
+    }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      return result(await requireRuntime(ctx).messageLane(params.id, params.text, params.sourceId, params.workflow));
+      return result(await requireRuntime(ctx).messageLane(params.id, params.text, params.sourceId, params.workflow ?? undefined));
     },
   });
   pi.registerTool({

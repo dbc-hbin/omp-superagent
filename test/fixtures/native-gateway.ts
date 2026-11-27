@@ -706,11 +706,13 @@ try {
       [answerId, "Reviewed correction received on the original lane.", thread, original.messageId],
     ]);
     const journal = parseSessionEntries(await fs.readFile(mainPaths.sessionFile, "utf8"));
-    const grants = nativeJournalDispatches(journal).filter(call => call.name === "lane_message" && call.args?.sourceId === review);
+    const grants = nativeJournalDispatches(journal).filter(call => call.name === "lane_scope_accept" && call.args?.reviewId === review);
     assert.deepEqual(grants.map(call => [call.presentation, call.ok, call.args]),
-      [["direct", true, { sourceId: review, id: firstLane.id, text: original.text }]]);
+      [["direct", true, { reviewId: review }]]);
     assert.equal(input(review)?.state, "done");
     assert.equal(input(correction)?.target, firstLane.id);
+    const corrected = db.query("SELECT data FROM inputs WHERE id = ?").get(correction) as { data: string };
+    assert.equal(JSON.parse(corrected.data).text, original.text, "The controller supplies the authenticated owner text");
 
     const topicChoice: Inbound = { id: "discord:2:242:original", messageId: "242", route: thread,
       text: "Use HEAD to choose the reversible local index format, then report here.", receivedAt: Date.now(), attachments: [] };

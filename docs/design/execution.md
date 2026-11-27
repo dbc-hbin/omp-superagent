@@ -136,16 +136,23 @@ the eligible text against the existing assignment and receives no lane
 prose, quote, or attachment as part of the review.
 
 If the original text explicitly supersedes the conflicting scope, the only
-allowed dispatch is a direct `lane_message` to that same lane with its review
-ID as `sourceId` and the exact verified owner text as `text`, without a
-workflow or override. The controller may dispatch one fresh, deduplicated
+allowed tool is direct `lane_scope_accept`, which takes only the review ID.
+The controller resolves the exact verified owner text and the same lane from
+that ID; there is no workflow or destination override. It may dispatch one fresh, deduplicated
 corrective input only after the original lane run and HEAD review both
 settle successfully. The correction applies only to that assignment, not to
-tool availability, native approvals, operator settings, or other work. It
-cannot replay denied or uncertain effects. The lane delivers the corrected
+tool availability, native approvals, operator settings, or other work.
+OMP carries restrictive `lane_message` approval settings over to the new
+tool unless the operator configures an explicit policy for `lane_scope_accept`.
+Disabling `lane_message` in the native tool selection also disables correction.
+A newer owner message invalidates affirmative consent on a pending HEAD review
+card; an exact stale dialog can only be declined or cancelled, not granted.
+A correction cannot replay denied or uncertain effects. The lane delivers the corrected
 outcome on the original thread; HEAD does not echo the request or add a
 second reply. If the correction is unsupported or unclear, HEAD gives one
-bounded reason or clarification there, without dispatching work.
+bounded reason or clarification there, without dispatching work. A failed or
+incomplete review reports that the correction was not applied, without
+attributing the failure to the owner's authority.
 
 ### Failed lane requests
 

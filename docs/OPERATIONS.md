@@ -161,8 +161,8 @@ SUPER 스킬 조회·추가 레인·goal·모델 변경·workflow artifact가 �
   내부에서 취소한다.
 - **기존 범위와 충돌하는 운영자 정정:** 연결 주제의 독립된 원본 메시지가 요건을 충족하면
   레인 root가 원본 source ID로 `lane_report({status:"scope_review", sourceId})`를 직접 호출한다.
-  헤드만 검증된 검토 ID와 운영자 원문 그대로를 사용해 같은 레인에 정정 `lane_message`를 보낼 수
-  있다. 정정 지시가 도착할 때까지 충돌하는 작업은 보류한다. 질문 카드로 범위 검토나 native
+  헤드만 검증된 검토 ID로 `lane_scope_accept`를 호출할 수 있다. 컨트롤러가 운영자 원문을
+  그대로 같은 레인에 전달한다. 정정 지시가 도착할 때까지 충돌하는 작업은 보류한다. 질문 카드로 범위 검토나 native
   승인을 대신하지 않는다.
 
 [직접 조율](design/execution.md#direct-lane-coordination) 및

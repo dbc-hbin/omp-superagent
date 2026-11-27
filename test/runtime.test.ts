@@ -5672,7 +5672,7 @@ describe("bound owner assignment scope review", () => {
     requestScopeReview(worker, original.id);
     worker.complete("");
     await expectEvent(reviewReady, "HEAD review of the original assignment");
-    const { inputId: correctionId } = await runtime.messageLane(lane.id, ownerText, reviewId);
+    const { inputId: correctionId } = runtime.acceptScopeReview(reviewId);
     const correctionReady = worker.whenPrompts(2);
     main.complete("");
     await expectEvent(correctionReady, "native corrective assignment");
@@ -5759,14 +5759,15 @@ describe("bound owner assignment scope review", () => {
     expect(review).not.toContain(quoteText);
     expect(messenger.sent).toEqual([]);
 
-    await expect(runtime.messageLane(lane.id, laneSummary, reviewId)).rejects.toThrow();
+    await expect(runtime.messageLane(lane.id, instruction, reviewId)).rejects.toThrow();
     await expect(runtime.messageLane(lane.id, instruction, original.id)).rejects.toThrow();
-    await expect(runtime.messageLane("different-lane", instruction, reviewId)).rejects.toThrow();
+    expect(() => runtime.acceptScopeReview(original.id)).toThrow();
+    expect(() => runtime.acceptScopeReview(`${reviewId}:different-lane`)).toThrow();
     await expect(runtime.messageLane(lane.id, instruction, reviewId, { name: "super", reason: "Scope review is not workflow consent" }))
       .rejects.toThrow();
     await expect(runtime.pause(lane.id)).rejects.toThrow();
-    const intent = await runtime.messageLane(lane.id, instruction, reviewId);
-    expect(await runtime.messageLane(lane.id, instruction, reviewId)).toEqual(intent);
+    const intent = runtime.acceptScopeReview(reviewId);
+    expect(runtime.acceptScopeReview(reviewId)).toEqual(intent);
     await runtime.kick();
     expect(store.input(intent.inputId)).toBeNull();
     expect(worker.prompts).toHaveLength(1);
@@ -5793,7 +5794,7 @@ describe("bound owner assignment scope review", () => {
     await admit(runtime, original);
     worker.emit(call.end);
     await runtime.kick();
-    await expect(runtime.messageLane(lane.id, instruction, reviewId)).rejects.toThrow();
+    expect(() => runtime.acceptScopeReview(reviewId)).toThrow();
     expect(main.prompts).toHaveLength(1);
     expect(worker.prompts).toHaveLength(2);
     expect(store.laneForRoute(original.route)).toMatchObject({ id: lane.id, brief, acceptance });
@@ -5860,7 +5861,7 @@ describe("bound owner assignment scope review", () => {
       if (accepted) {
         expect(messenger.sent).toEqual([]);
         expect(store.input(reviewId)?.state).toBe("submitted");
-        const correction = await runtime.messageLane(lane.id, ownerText, reviewId);
+        const correction = runtime.acceptScopeReview(reviewId);
         const correctionReady = worker.whenPrompts(2);
         main.complete("");
         await expectEvent(correctionReady, "corrective assignment after the approved signal and HEAD settlement");
@@ -6070,7 +6071,7 @@ describe("bound owner assignment scope review", () => {
       expect(newerReply.text).toBe("The parser currently requires a memo.");
       if (final) expect(disposition.text).toBe(final);
       else {
-        expect(disposition.text).toMatch(/scope.*not authorized/i);
+        expect(disposition.text).toMatch(/scope.*not applied/i);
         expect(disposition.text.length).toBeLessThanOrEqual(1200);
         expect(disposition.text).not.toContain(ownerText);
       }
@@ -6131,7 +6132,7 @@ describe("bound owner assignment scope review", () => {
       if (scenario === "rejects") {
         main.complete(rejection);
       } else {
-        await runtime.messageLane(lane.id, ownerText, reviewId);
+        runtime.acceptScopeReview(reviewId);
         if (scenario === "is cancelled" || scenario === "is uncertain") {
           finishNative(main, scenario === "is cancelled" ? "aborted" : "error");
         } else if (scenario === "runs a second native turn") {
@@ -6150,7 +6151,7 @@ describe("bound owner assignment scope review", () => {
       expect(worker.prompts).toHaveLength(1);
       expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route,
         replyTo: { route: original.route, messageId: original.messageId },
-        ...(scenario === "rejects" ? { text: rejection } : {}) }]);
+        text: scenario === "rejects" ? rejection : expect.stringMatching(/scope.*not applied/i) }]);
     },
   );
 
@@ -6163,7 +6164,7 @@ describe("bound owner assignment scope review", () => {
       const managerReady = main.whenPrompts(1);
       worker.complete("Review whether the existing assignment was superseded.");
       await expectEvent(managerReady, "HEAD review");
-      finalInputId = (await runtime.messageLane(lane.id, ownerText, reviewId)).inputId;
+      finalInputId = runtime.acceptScopeReview(reviewId).inputId;
       const correctionReady = worker.whenPrompts(2);
       main.complete("");
       await expectEvent(correctionReady, "corrective lane prompt");
@@ -6342,6 +6343,58 @@ describe("bound owner assignment scope review", () => {
     expect(store.approvals("main")).toEqual([]);
   });
 
+  test.each(["current", "before callback", "before durable claim"] as const)("a presented HEAD scope-review card forwards a session grant only while current (%s)", async timing => {
+    const { runtime, store, lane, original, worker, main, messenger, reviewId, directory } = await setup();
+    const managerReady = main.whenPrompts(1);
+    requestScopeReview(worker, original.id);
+    worker.complete("");
+    await expectEvent(managerReady, "HEAD review before the native approval");
+    const grant = "Approve lane_scope_accept for this session";
+    const frame = { type: "extension_ui_request", method: "select", id: "head-scope-select",
+      title: "Allow tool: lane_scope_accept", options: ["Approve", grant, "Deny"] };
+    const shown = messenger.whenApproval();
+    main.state.pendingUiRequests = [frame];
+    main.emit(frame);
+    await expectEvent(shown, "native scope review approval on the original thread");
+    const [card] = messenger.shown.values();
+    if (!card || !messenger.handlers) throw new Error("Missing HEAD scope approval");
+    expect(card).toMatchObject({ target: "main", route: original.route, requestId: frame.id });
+
+    const superseded = timing !== "current";
+    const newer = originalMessage("1750000000000000145", original.route, "Keep the parser read-only.");
+    if (timing === "before callback") {
+      await admit(runtime, newer);
+      expect(store.scopeReview(reviewId)).toBeNull();
+    } else if (timing === "before durable claim") {
+      const claim = store.resolveApproval.bind(store);
+      store.resolveApproval = (id, generation, state, resolution) => {
+        if (id === card.id && state === "answered") {
+          // A different writer can commit after the runtime's last read.
+          const ingress = new Database(join(directory, "coordination.sqlite"));
+          try {
+            ingress.exec(`CREATE TABLE gateway_events (
+              sequence INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL UNIQUE,
+              data TEXT NOT NULL, received_at INTEGER NOT NULL,
+              delivered_at INTEGER, delivery_error TEXT, attempted_at INTEGER
+            ); CREATE INDEX gateway_events_pending ON gateway_events(delivered_at, sequence);`);
+            ingress.query("INSERT INTO gateway_events(identity, data, received_at) VALUES (?, ?, ?)")
+              .run(newer.id, JSON.stringify({ kind: "message", input: newer }), newer.receivedAt);
+          } finally { ingress.close(); }
+        }
+        return claim(id, generation, state, resolution);
+      };
+    }
+    const response = { value: grant };
+    const answered = messenger.handlers.answer(card.id, response, original.route);
+    if (superseded) await expect(answered).rejects.toMatchObject({ certainty: "rejected" });
+    else await answered;
+    expect(main.responses).toEqual([{ id: frame.id, response: superseded ? { cancelled: true } : response }]);
+    expect(store.approval(card.id)?.state).toBe(superseded ? "cancelled" : "answered");
+    await expect(messenger.handlers.answer(card.id, response, original.route)).rejects.toThrow();
+    expect(main.responses).toHaveLength(1);
+    expect(store.input(`handoff:${reviewId}:${lane.id}`)).toBeNull();
+  });
+
   test("missing route attestation withholds scope review without blocking ordinary bound input", async () => {
     const { runtime, store, original, worker, main, messenger, handoffId, reviewId } = await setup({ attest: false });
     expect(store.input(handoffId)?.state).toBe("submitted");
@@ -6363,7 +6416,7 @@ describe("bound owner assignment scope review", () => {
     requestScopeReview(worker, original.id);
     worker.complete("");
     await expectEvent(managerReady, "review under the original authenticated account");
-    const { inputId } = await runtime.messageLane(lane.id, ownerText, reviewId);
+    const { inputId } = runtime.acceptScopeReview(reviewId);
     expect(store.input(inputId)).toBeNull();
     attestation.identity.accountId = "900";
 
@@ -6393,7 +6446,7 @@ describe("bound owner assignment scope review", () => {
       worker.complete("Conflicting assignment needs review.");
       if (managerReady) {
         await expectEvent(managerReady, "original HEAD review");
-        await runtime.messageLane(lane.id, ownerText, reviewId);
+        runtime.acceptScopeReview(reviewId);
       }
       await drainFrames(runtime);
       const correctionId = `handoff:${reviewId}:${lane.id}`;
@@ -6440,7 +6493,7 @@ describe("bound owner assignment scope review", () => {
       }
       await expectEvent(head.whenPrompts(1), "pending HEAD review after controller reopens the ledger");
       expect(head.prompts[0]?.command.message).toContain(ownerText);
-      await restarted.messageLane(lane.id, ownerText, reviewId);
+      restarted.acceptScopeReview(reviewId);
       expect(resident.prompts).toEqual([]);
       const correctionReady = resident.whenPrompts(1);
       head.complete("");

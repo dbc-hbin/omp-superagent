@@ -196,8 +196,8 @@ use the owner's language.
   cancelled privately, not redirected to the owner.
 - **A conflicting owner correction:** For an eligible standalone original message in
   a bound topic, the root lane calls `lane_report({status:"scope_review", sourceId})`
-  directly with the original source ID. Only HEAD may send a corrective `lane_message`
-  to that same lane with the verified review ID and exact owner text. Hold the
+  directly with the original source ID. Only HEAD may accept the verified review
+  ID with `lane_scope_accept`; the controller binds the original text and lane. Hold the
   disputed work until a corrective assignment arrives. A decision card is not a
   substitute for scope review or native approval.
 

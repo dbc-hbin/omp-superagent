@@ -60,8 +60,8 @@ aggregate goal for lanes, or follow-up just for a report.
   retrying; never fabricate IDs or dispatch to an unrelated lane.
 
 An isolated assignment scope review is not a lane recovery report or a
-general manager handoff. Use the Main head operating contract's exact-text
-`lane_message` procedure, not a rewritten brief or the original message ID.
+general manager handoff. Use the Main head operating contract's `lane_scope_accept`
+procedure with only the supplied review ID, not a rewritten brief or the original message ID.
 The controller checks the standalone root lane run and the original owner
 source separately. It queues fresh corrective work only after the original
 run and HEAD review both settle successfully. Leave the one original-thread
