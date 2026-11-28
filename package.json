@@ -1,6 +1,6 @@
 {
   "name": "omp-superagent",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "One messenger-connected OMP head with independent work sessions",
   "license": "MIT",
   "author": "dbc-hbin",
