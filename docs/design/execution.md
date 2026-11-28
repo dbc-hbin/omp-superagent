@@ -602,6 +602,25 @@ keyword interpretation; keep generated metadata fenced. Selection is
 serialized, not injected as steering. A conflict or missing advertised
 capability does not silently downgrade a selected SUPER request to ordinary work.
 
+HEAD supports native Superstack as a separate branch-local mode, based on
+[omp-superkit `12d19ec96eb44e87acec9492269cbe638392cbef`](https://github.com/dbc-hbin/omp-superkit/tree/12d19ec96eb44e87acec9492269cbe638392cbef).
+For an original owner request routed to HEAD, a leading `/superstack` or
+`superstack` is pinned at admission before checking the native Host's command
+advertisement at dispatch. Discord's physically written text must corroborate
+the selector. Telegram must corroborate it independently of the arguments,
+which may contain protected formatting. Redaction cannot turn a task into a
+toggle. Existing receipts without a selection stay ordinary across replay.
+It is not a messenger control, a lane `workflow` value, or a native goal.
+The native task prefix is followed immediately by the original route envelope,
+so later task prose cannot establish background job ownership. A pending
+selection fences later HEAD prompts and steers. Bare enable and exact `off`
+wait for full native idle and carry no task or envelope. A matching native
+no-model receipt and current-branch journal state confirm the toggle; verified
+non-application cancels, and unavailable evidence holds later work without
+replay. Native flags still govern whether the policy is applied; edits, quoted
+text and reports do not select it. An older Host without the command holds the
+explicit request instead of running it as ordinary work.
+
 SUPER's commands and defaults are based on
 [omp-superkit `c11a6e4e185f9c31f484a05a13528ef724337bc1`](https://github.com/dbc-hbin/omp-superkit/tree/c11a6e4e185f9c31f484a05a13528ef724337bc1).
 [Revision `e8825367bed06985ccb1ee1e635dce850e22bbb9`](https://github.com/dbc-hbin/omp-superkit/tree/e8825367bed06985ccb1ee1e635dce850e22bbb9)

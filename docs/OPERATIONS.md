@@ -126,6 +126,13 @@ HEAD가 저장소와 작업 범위를 판단하는 데 참고하며, 메모를 �
 `lane_start`/`lane_message`의 실제 `workflow: {name, reason}`에는 `jevify` 또는 위 여섯 이름
 중 하나와 비어 있지 않은 이유를 전달한다. 기존 ULW 호출은 원본 사용자 요청에서만 호환되며,
 새 구조화 선택에는 쓰지 않는다.
+
+메신저에서 `/head /superstack <작업>`을 보내면 공유 HEAD의 현재 브랜치에서 모드를 켜고
+관리형 Superkit 스킬로 작업의 처리 방식을 고른다. `/head /superstack`과
+`/head /superstack off`는 Host가 완전히 유휴 상태가 된 뒤 작업 시작 없이 모드를 켜거나 끈다.
+레인 워크플로 선택값이나 별도로
+등록된 메신저 명령은 아니다. 실행 중인 구버전 Host는 교체 전까지 시작 시 선택한 Superkit을 쓴다.
+
 기존 source/provenance·dedupe를 유지하며 workflow 선택은 실행 중 steering이 아닌 직렬
 dispatch다. SUPER 워크플로는 더 가벼운 대안보다 유용한 이유를 남기고 선택한 스킬을 읽는다.
 호출 이름과 스킬 ID는 다르다. 예를 들어 `super-run`은 `skill://ulw-execute`를 읽는다.

@@ -152,6 +152,13 @@ commands. Pass `jevify` or one of the six names above and a nonempty reason in t
 `workflow: {name, reason}` argument to `lane_start` or `lane_message`. Legacy ULW invocations
 are supported only in the original user request, not as new structured selections.
 
+Send `/head /superstack <task>` as message text to enable Superstack for the
+shared HEAD's current branch and route the task using the managed skill.
+`/head /superstack` and `/head /superstack off` wait for that Host to become fully
+idle, then enable or disable the mode without starting work.
+It is not a lane workflow or a registered messenger command. An older running
+Host may not have the command; it keeps its launch-time Superkit revision until replaced.
+
 Existing source, provenance, and deduplication behavior is preserved. Workflow selection
 is a serialized dispatch, not steering while execution is underway. For a SUPER workflow,
 record why it is more useful than a lighter option and read the selected skill. Invocation

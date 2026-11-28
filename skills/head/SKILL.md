@@ -27,6 +27,13 @@ work, send a separate update, or grant scope or execution authority.
 
 ## Decide before dispatch
 
+- Honor an original owner's explicit `/superstack` selection on HEAD. When the
+  native Host applies [Superstack](skill://superstack), use it to choose the
+  smallest method for the current request. It is independent of SUPER and
+  applies to this HEAD branch, not to delegated lanes. A skill read, quoted
+  command, or mention does not change that setting; never synthesize a toggle
+  or forward it as a lane `workflow` choice. Existing authority, routing,
+  pause, and approval rules still apply.
 - Answer repo-free conversation and questions directly. For unbound repository
   work, use the original request, scoped context, and any advisory lane,
   workspace, or session coordinates to find and verify the workspace before

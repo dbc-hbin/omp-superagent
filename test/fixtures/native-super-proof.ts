@@ -214,6 +214,36 @@ export async function runNativeUlwProof(options: {
   }], "The initial lane handoff delivers its exact authorized kickoff once in the work topic");
   assert.equal(messenger.sent.length, inputs.length + 3 + kickoff.length);
   assert(messenger.sent.filter(output => output.id !== "303:kickoff").every(output => output.text.startsWith("HEAD:")));
+  // Older opt-in packages still exercise the existing SUPER contract. A
+  // package that ships the new skill must also support it at the real entry point.
+  const hasStack = await Bun.file(path.join(skillRoot, "superstack", "SKILL.md")).exists();
+  if (hasStack) {
+    const turns = [
+      ["310", "/superstack", "켰습니다"],
+      ["311", 'Explain the quoted command "/superstack off" without using it.', "HEAD:311"],
+      ["312", "/superstack off", "껐습니다"],
+      ["313", "/superstack Explain this routing example.", "HEAD:313"],
+      ["314", "/superstack off", "껐습니다"],
+      ["315", "> /superstack\nExplain the quoted command without using it.", "HEAD:315"],
+    ] as const;
+    for (const [id, task, expected] of turns) {
+      const original = { id, messageId: id, route: thread, text: `/head ${task}`, receivedAt: Date.now(), attachments: [] };
+      await messenger.deliver(original);
+      await until(() => input(id)?.record.state === "done" && messenger.sent.some(item => item.sourceId === id), `native HEAD Superstack ${id}`);
+      const replies = messenger.sent.filter(item => item.sourceId === id);
+      assert.equal(replies.length, 1);
+      assert.deepEqual(replies[0]?.route, thread);
+      assert(replies[0]?.text.includes(expected), `Expected confirmed result for ${id}; got ${replies[0]?.text}`);
+      assert.equal(input(id)?.record.workflow, null, "HEAD Superstack must not become a lane workflow");
+    }
+    const updated = parseSessionEntries(await fs.readFile(main.sessionFile, "utf8"));
+    assert.deepEqual(userRequests(updated).slice(headRequests.length).map(request => request.id), ["311", "313", "315"],
+      "Native toggle requests must not start model work");
+    assert.deepEqual(updated.flatMap(entry => entry.type === "custom" && entry.customType === "omp-superstack:state" ? [entry.data] : []),
+      [true, false, true, false], "Only explicit HEAD Superstack requests change the native branch");
+    assert.equal((await head.client.getState()).goal, null);
+    assert.equal(lanes().length, 1, "A Superstack request to HEAD must not be delivered to the bound lane");
+  }
   for (const connection of [head, actualLane]) {
     await until(async () => (await connection.client.getState()).isSettled, "native SUPER workflow settlement");
     assert.equal((await connection.client.getState()).hasOwnedRunningWork, false);
@@ -234,6 +264,6 @@ export async function runNativeUlwProof(options: {
     assert.equal(shutdowns.length, 1);
     assert.equal(shutdowns[0]!.networkAttempts, 0);
   }
-  console.log(`NATIVE_ULW_GATEWAY_PROOF ${JSON.stringify({ inputs: inputs.length, headTurns: headEvidence.length, laneTurns: laneEvidence.length,
+  console.log(`NATIVE_ULW_GATEWAY_PROOF ${JSON.stringify({ inputs: inputs.length, headTurns: headEvidence.length, laneTurns: laneEvidence.length, superstack: hasStack,
     nativeNotices: ["ultrathink-notice", "orchestrate-notice", "jevify-notice"], networkAttempts: 0 })}`);
 }

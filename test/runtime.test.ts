@@ -310,6 +310,29 @@ class HostTransport implements RuntimeHost {
   }
 }
 
+function advertiseHeadSuperstack(host: HostTransport): void {
+  host.workflowCommands.push({ name: "superstack", source: "extension",
+    description: "Enable branch-local skill routing for an optional task, or use off to disable it" });
+}
+
+function recordHeadSuperstackBranch(host: HostTransport, enabled: boolean): string {
+  host.journalLeaf = true;
+  const id = `stack-state-${host.entries.length}`;
+  host.entries.push({ id, parentId: null, type: "custom", customType: "omp-superstack:state", data: enabled });
+  return id;
+}
+
+function yieldHeadAnswer(host: HostTransport, prompt: Prompt, text: string, jobs = ["bg_1"]): void {
+  const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] };
+  host.emit({ type: "message_end", message });
+  Object.assign(host.state, {
+    isSettled: false, isStreaming: false, hasPendingAsyncWork: true, hasOwnedRunningWork: true,
+    headJobs: { running: jobs, awaitingOnly: true },
+  });
+  host.emit({ type: "agent_end", isTerminal: false, yielded: true, awaitingAsyncWork: true, messages: [message] });
+  host.emit({ type: "prompt_result", id: prompt.id, status: "completed", agentInvoked: true, sessionSettled: false });
+}
+
 type Handlers = Parameters<Messenger["start"]>[0];
 class MessengerTransport implements Messenger {
   handlers?: Handlers;
@@ -9797,6 +9820,16 @@ describe("trusted workflow activation", () => {
     expect(main.commands.some(command => command.type === "goal")).toBe(false);
   });
 
+  test("a HEAD Superstack request is held when the Host advertises SUPER but not Superstack", async () => {
+    const { runtime, store, main, messenger } = fixture();
+    await runtime.start();
+    const original = headMessage("old-head-stack", route(), "/superstack inspect this");
+    await admit(runtime, original);
+    expect(main.prompts).toEqual([]);
+    expect(store.input(original.id)?.state).toBe("cancelled");
+    expect(messenger.sent[0]).toMatchObject({ sourceId: original.id, route: original.route, text: expect.stringContaining("/superstack") });
+  });
+
   test("an already running pre-SUPER Host uses the graph-only old registration, not a new alias description", async () => {
     const old = fixture();
     old.main.workflowCommands = [
@@ -9854,6 +9887,190 @@ describe("trusted workflow activation", () => {
     await admit(other.runtime, headMessage("workflow-cancel-race", route(), "super inspect"));
     expect(other.main.prompts).toEqual([]);
     expect(other.store.input("workflow-cancel-race")?.state).toBe("cancelled");
+  });
+});
+
+describe("HEAD Superstack", () => {
+  test.each(["edge addresses", "interior address"] as const)(
+    "Discord %s cannot change the authority of the written Superstack selector", async addresses => {
+      const { runtime, main, store, messenger } = fixture();
+      advertiseHeadSuperstack(main);
+      const task = "Inspect the release parser.";
+      const normalized = headMessage("431", route(), `/superstack ${task}`);
+      const input = { ...normalized, discordOriginalText: addresses === "edge addresses"
+        ? `<@2> ${normalized.text} <@!2>` : `/head <@2>/superstack ${task}` };
+      await runtime.start();
+      await admit(runtime, input);
+
+      expect(main.prompts).toHaveLength(1);
+      const prompt = String(main.prompts[0]?.command.message);
+      if (addresses === "edge addresses") {
+        expect(prompt).toMatch(/^superstack\n\n`{3,}superagent-runtime-context\n/);
+        expect(prompt).toEndWith(`\n\n${task}`);
+      } else {
+        expect(prompt).toMatch(/^`{3,}superagent-runtime-context\n/);
+      }
+      const answer = "The release parser was reviewed.";
+      main.complete(answer);
+      await runtime.kick();
+      expect(store.input(input.id)?.state).toBe("done");
+      expect(messenger.sent).toMatchObject([{ sourceId: input.id, route: input.route, text: answer }]);
+    },
+  );
+
+  test.each([
+    ["visible task", "@sample ^choice orchestrate\nReview the release parser.", "\nReview the release parser.", "Review the release parser."],
+    ["visible off with masked data", "off @sample orchestrate", "off ", "off"],
+    ["entire task masked", "@sample ^choice orchestrate", "", null],
+    ["off itself masked", "off", "", null],
+  ] as const)("Telegram Superstack uses only attested task text (%s)", async (_scenario, written, view, task) => {
+    const { runtime, config, main, store, messenger } = fixture();
+    advertiseHeadSuperstack(main);
+    config.telegram = { tokenEnv: "TEST_TELEGRAM_TOKEN", ownerId: "1", allowedChatIds: [] };
+    const dm = route(null, { platform: "telegram", guildId: null, channelId: "1" });
+    const input = {
+      ...message("432", dm, `/superstack ${written}`), id: "telegram:2:1:432:original",
+      routingText: `/superstack ${view}`, telegramProtectedCommand: false,
+    };
+    await runtime.start();
+    await admit(runtime, input);
+
+    if (task === null) {
+      expect(main.prompts).toEqual([]);
+      expect(store.input(input.id)?.state).toBe("cancelled");
+      expect(messenger.sent).toMatchObject([{ sourceId: input.id, route: dm }]);
+      return;
+    }
+    expect(main.prompts).toHaveLength(1);
+    const prompt = String(main.prompts[0]?.command.message);
+    const envelope = /^superstack\n\n(`{3,})superagent-runtime-context\n([\s\S]*?)\n\1\n\n([\s\S]*)$/.exec(prompt);
+    if (!envelope) throw new Error("Expected a native Superstack task with its routing envelope");
+    expect(envelope[2]).toContain(input.text.replaceAll("@", "\\u0040").replaceAll("^", "\\u005e"));
+    expect(envelope[3]).toBe(task);
+    expect(containsMagicKeyword(prompt, "orchestrate")).toBe(false);
+    expect(store.input(input.id)).toMatchObject({ state: "submitted", text: input.text, route: dm });
+    const answer = "The visible task was handled.";
+    main.complete(answer);
+    await runtime.kick();
+    expect(store.input(input.id)?.state).toBe("done");
+    expect(messenger.sent).toMatchObject([{ sourceId: input.id, route: dm, text: answer }]);
+  });
+
+  test.each(["on restore", "after redelivery while pending"] as const)(
+    "a legacy pending HEAD Superstack heading remains ordinary %s", async scenario => {
+      const { runtime, main, store, messenger } = fixture();
+      advertiseHeadSuperstack(main);
+      const text = "superstack was an ordinary heading.";
+      const input = headMessage("433", route(), text);
+      expect(store.receive(input, "main", { [`user-source:${input.id}`]: "true" })).toBe(true);
+      Object.assign(main.state, { isSettled: false, isStreaming: true });
+      await runtime.start();
+      if (scenario === "after redelivery while pending") await admit(runtime, input);
+      expect(store.input(input.id)?.state).toBe("pending");
+      expect(main.prompts).toEqual([]);
+
+      Object.assign(main.state, { isSettled: true, isStreaming: false });
+      main.emit({ type: "session_settled" });
+      await runtime.kick();
+      expect(main.prompts).toHaveLength(1);
+      const prompt = String(main.prompts[0]?.command.message);
+      expect(prompt).toMatch(/^`{3,}superagent-runtime-context\n/);
+      expect(prompt).toEndWith(`\n\n${text}`);
+
+      const answer = "The original request was handled.";
+      main.complete(answer);
+      await runtime.kick();
+      await admit(runtime, input);
+      expect(main.prompts).toHaveLength(1);
+      expect(store.input(input.id)?.state).toBe("done");
+      expect(messenger.sent).toMatchObject([{ sourceId: input.id, route: input.route, text: answer }]);
+    },
+  );
+
+  test("earlier queued Superstack off fences a same-route steer until the toggle settles", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    advertiseHeadSuperstack(main);
+    const destination = route("51");
+    const active = headMessage("434", destination, "Review the release.");
+    const off = message("435", destination, "/superstack off");
+    const later = message("436", destination, "Now check the changelog.");
+    await runtime.start();
+    await admit(runtime, active);
+    await admit(runtime, off);
+    await admit(runtime, later);
+    expect(main.prompts).toHaveLength(1);
+    expect(store.input(active.id)?.state).toBe("submitted");
+    expect(store.input(off.id)?.state).toBe("pending");
+    expect(store.input(later.id)?.state).toBe("pending");
+
+    main.beforePrompt = () => {
+      main.local = main.prompts.length === 2;
+      if (main.local) recordHeadSuperstackBranch(main, false);
+    };
+    const activeAnswer = "The initial release review is complete.";
+    main.complete(activeAnswer);
+    await runtime.kick();
+    expect(main.prompts).toHaveLength(3);
+    expect(main.prompts[1]?.command.message).toBe("superstack off");
+    expect(store.input(off.id)?.state).toBe("done");
+    expect(store.input(later.id)).toMatchObject({ state: "submitted", requestId: main.prompts[2]?.id });
+    expect(main.prompts[2]?.command.streamingBehavior).toBeUndefined();
+
+    const laterAnswer = "The changelog review is complete.";
+    main.complete(laterAnswer);
+    await runtime.kick();
+    expect(messenger.sent).toMatchObject([
+      { sourceId: active.id, route: destination, text: activeAnswer },
+      { sourceId: off.id, route: destination },
+      { sourceId: later.id, route: destination, text: laterAnswer },
+    ]);
+  });
+
+  test.each([
+    ["enabled as requested", "", true, "done"],
+    ["disabled as requested", " off", false, "done"],
+    ["opposite on active branch", " off", true, "cancelled"],
+    ["unavailable journal", " off", null, "uncertain"],
+    ["malformed journal", " off", "malformed", "uncertain"],
+  ] as const)("a Superstack toggle settles against native readback (%s)", async (_scenario, args, observed, state) => {
+    const { runtime, main, store, messenger } = fixture();
+    advertiseHeadSuperstack(main);
+    const toggle = message("437", route("51"), `/superstack${args}`);
+    const later = headMessage("438", route("52"));
+    await runtime.start();
+
+    main.local = true;
+    main.beforePrompt = () => {
+      if (observed === null) {
+        main.beforeEntries = () => { throw new Error("No native journal response"); };
+      } else if (observed === "malformed") {
+        main.journalLeaf = true;
+        main.entries.push({ id: "malformed-stack-state", parentId: null,
+          type: "custom", customType: "omp-superstack:state", data: "false" });
+      } else {
+        // A more recently appended state on a sibling is not active branch evidence.
+        const parentId = recordHeadSuperstackBranch(main, observed);
+        recordHeadSuperstackBranch(main, !observed);
+        main.entries.push({ id: "active-branch-leaf", parentId, type: "custom", customType: "checkpoint" });
+      }
+    };
+    await admit(runtime, toggle);
+    expect(main.prompts.map(prompt => prompt.command.message)).toEqual([`superstack${args}`]);
+    expect(store.input(toggle.id)?.state).toBe(state);
+    expect(messenger.sent).toMatchObject([{ sourceId: toggle.id, route: toggle.route }]);
+
+    main.local = false;
+    main.beforePrompt = undefined;
+    await admit(runtime, later);
+    await admit(runtime, toggle);
+    if (state === "uncertain") {
+      expect(main.prompts).toHaveLength(1);
+      expect(store.input(later.id)?.state).toBe("pending");
+      expect(messenger.sent[0]?.text).toContain(`/resolve ${toggle.id}`);
+    } else {
+      expect(main.prompts).toHaveLength(2);
+      expect(store.input(later.id)).toMatchObject({ state: "submitted", requestId: main.prompts[1]?.id });
+    }
   });
 });
 
@@ -12486,12 +12703,15 @@ describe("real Store runtime coordination", () => {
   });
 
   test.each(["separate", "with-attachment", "coincident", "after-answer", "multiple-jobs", "same-topic-joined",
-    "after-answer-joined", "notification-before-answer"] as const)("HEAD background job preserves its original route (%s delivery)", async delivery => {
+    "after-answer-joined", "notification-before-answer", "Superstack task"] as const)("HEAD background job preserves its original route (%s delivery)", async delivery => {
     const { runtime, main, store, messenger } = fixture();
+    const superstack = delivery === "Superstack task";
+    if (superstack) advertiseHeadSuperstack(main);
     const sameTopic = delivery === "same-topic-joined";
     const notified = delivery === "notification-before-answer";
     const afterAnswer = delivery === "after-answer" || delivery === "after-answer-joined" || notified;
-    const original = headMessage("background-job-original", route(sameTopic ? "52" : "51"));
+    const original = headMessage("background-job-original", route(sameTopic ? "52" : "51"),
+      superstack ? "/superstack Check the build output in the background." : undefined);
     const second = headMessage("background-job-second", route("52"));
     const joined = sameTopic || delivery === "after-answer-joined" || notified
       ? message("106", second.route, "Include the third message in the foreground answer.") : undefined;
@@ -12511,21 +12731,15 @@ describe("real Store runtime coordination", () => {
       { sourceId: original.id, route: original.route, text: followUp },
     ];
     const sent = () => messenger.sent.map(({ sourceId, route, text }) => ({ sourceId, route, text }));
-    const yieldAnswer = (prompt: Prompt, text: string, jobs = ["bg_1"]) => {
-      const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] };
-      main.emit({ type: "message_end", message });
-      Object.assign(main.state, {
-        isSettled: false, isStreaming: false, hasPendingAsyncWork: true, hasOwnedRunningWork: true,
-        headJobs: { running: jobs, awaitingOnly: true },
-      });
-      main.emit({ type: "agent_end", isTerminal: false, yielded: true, awaitingAsyncWork: true, messages: [message] });
-      main.emit({ type: "prompt_result", id: prompt.id, status: "completed", agentInvoked: true, sessionSettled: false });
-    };
 
     await runtime.start();
     await admit(runtime, original);
     expect(main.prompts).toHaveLength(1);
     const promptText = String(main.prompts[0]!.command.message);
+    if (superstack) {
+      expect(promptText).toMatch(/^superstack\n\n`{3,}superagent-runtime-context\n/);
+      expect(store.input(original.id)).toMatchObject({ target: "main", workflow: null, state: "submitted" });
+    }
     const content = delivery === "separate" ? promptText.replaceAll("\n", "\r\n")
       : delivery === "with-attachment"
         ? [{ type: "image", data: "eA==", mimeType: "image/png" }, { type: "text", text: promptText }]
@@ -12535,10 +12749,11 @@ describe("real Store runtime coordination", () => {
       role: "toolResult", toolName: "bash", toolCallId: "call-bg-1", isError: false,
       details: { async: { state: "running", jobId: "bg_1", type: "bash" } },
     } });
-    yieldAnswer(main.prompts[0]!, originalAnswer);
+    yieldHeadAnswer(main, main.prompts[0]!, originalAnswer);
     await runtime.kick();
     expect(sent()).toEqual(expected.slice(0, 1));
     expect(messenger.sent[0]?.id).toBe(`${original.id}:answer`);
+    if (superstack) expect(store.input(original.id)?.state).toBe("done");
 
     await admit(runtime, second);
     expect(main.prompts).toHaveLength(2);
@@ -12562,7 +12777,7 @@ describe("real Store runtime coordination", () => {
       } });
     }
     if (!duringSecond) {
-      yieldAnswer(main.prompts[1]!, secondAnswer, delivery === "multiple-jobs" ? ["bg_1", "bg_2"] : undefined);
+      yieldHeadAnswer(main, main.prompts[1]!, secondAnswer, delivery === "multiple-jobs" ? ["bg_1", "bg_2"] : undefined);
       await runtime.kick();
       expect(sent()).toEqual(expected.slice(0, 2));
       expect(messenger.sent[1]?.id).toBe(`${second.id}:answer`);
@@ -12617,6 +12832,70 @@ describe("real Store runtime coordination", () => {
     await runtime.kick();
     expect(sent()).toEqual(delivered);
     expect(messenger.attempted).toHaveLength(delivered.length);
+  });
+
+  test("a bare HEAD Superstack toggle waits for full native idle after an owned job is released", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    advertiseHeadSuperstack(main);
+    const original = headMessage("439", route("51"), "Run the check in the background.");
+    const toggle = message("440", route("52"), "/superstack");
+    const later = headMessage("441", route("53"), "Review the changelog.");
+    const originalAnswer = "The background check has started.";
+    const jobAnswer = "The background check passed.";
+    await runtime.start();
+    await admit(runtime, original);
+    const [prompt] = main.prompts;
+    if (!prompt) throw new Error("Expected a native prompt for the original request");
+    main.emit({ type: "message_end", message: { role: "user", content: prompt.command.message } });
+    main.emit({ type: "message_end", message: {
+      role: "toolResult", toolName: "bash", toolCallId: "launch-check", isError: false,
+      details: { async: { state: "running", jobId: "bg_1", type: "bash" } },
+    } });
+    yieldHeadAnswer(main, prompt, originalAnswer);
+    await runtime.kick();
+    expect(store.input(original.id)?.state).toBe("done");
+    expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route, text: originalAnswer }]);
+
+    main.beforePrompt = () => {
+      main.local = main.prompts.length === 2;
+      if (main.local) recordHeadSuperstackBranch(main, true);
+    };
+    await admit(runtime, toggle);
+    await admit(runtime, later);
+    expect(main.prompts).toHaveLength(1);
+    expect(store.input(toggle.id)?.state).toBe("pending");
+    expect(store.input(later.id)?.state).toBe("pending");
+
+    const result = { role: "custom", customType: "async-result", content: "Original check stdout.",
+      details: { jobs: [{ jobId: "bg_1", status: "completed" }] } };
+    const answer = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: jobAnswer }] };
+    Object.assign(main.state, { isStreaming: true, headJobs: { running: [], awaitingOnly: false } });
+    main.emit({ type: "agent_start" });
+    main.emit({ type: "message_end", message: result });
+    main.emit({ type: "message_end", message: answer });
+    main.emit({ type: "agent_end", isTerminal: true, messages: [result, answer] });
+    main.state.isStreaming = false;
+    await runtime.kick();
+    expect(main.prompts).toHaveLength(1);
+    expect(store.input(toggle.id)?.state).toBe("pending");
+    expect(store.input(later.id)?.state).toBe("pending");
+    expect(messenger.sent).toMatchObject([
+      { sourceId: original.id, route: original.route, text: originalAnswer },
+      { sourceId: original.id, route: original.route, text: jobAnswer },
+    ]);
+
+    Object.assign(main.state, { isSettled: true, hasOwnedRunningWork: false, hasPendingAsyncWork: false });
+    main.emit({ type: "session_settled" });
+    await runtime.kick();
+    expect(main.prompts).toHaveLength(3);
+    expect(main.prompts[1]?.command.message).toBe("superstack");
+    expect(store.input(toggle.id)?.state).toBe("done");
+    expect(store.input(later.id)).toMatchObject({ state: "submitted", requestId: main.prompts[2]?.id });
+    expect(messenger.sent).toMatchObject([
+      { sourceId: original.id, route: original.route, text: originalAnswer },
+      { sourceId: original.id, route: original.route, text: jobAnswer },
+      { sourceId: toggle.id, route: toggle.route },
+    ]);
   });
 
   test.each(["failed launch", "envelope in later text"] as const)("HEAD does not release an unverified background job (%s)", async scenario => {

@@ -202,6 +202,12 @@ necessity, current state/artifact owner, stop and permission limits in the brief
 or message, not new API fields. Head selection is permitted for the already
 entrusted objective, not permission to expand it or impersonate the user.
 
+- **`/superstack`:** HEAD's native branch-local routing policy, not a lane
+  workflow. `/head /superstack <task>` routes that task using the installed
+  `skill://superstack` policy. `/head /superstack` and `/head /superstack off`
+  change the branch setting without starting or resuming work. Follow the
+  actual injected policy; do not submit the command yourself. If the Host
+  lacks support, do not claim it ran or treat a skill read as activation.
 - **`jevify`:** Many homogeneous items, a frozen independent classification rubric,
   and a material context/reading benefit. Prefer deterministic search for exact
   rules, direct reading for small sets, contextual reasoning for interdependent

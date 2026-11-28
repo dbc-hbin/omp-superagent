@@ -66,6 +66,10 @@ export default function nativeUlwProvider(pi: ExtensionAPI): void {
     const policy = (context.systemPrompt ?? []).filter(block => /^<omp-ulw-policy>/.test(block));
     const expectedPolicy = role === "lane" || !["301", "302", "303", "report:handoff:303:lane"].includes(requestId);
     assert.deepEqual(policy, expectedPolicy ? [expectedBlock] : [], `Actual model request SUPER policy before reply: ${role}/${requestId}`);
+    if (["311", "313", "315"].includes(requestId)) {
+      const active = context.messages.some(message => JSON.stringify(message.content).includes("<omp-superstack-policy>"));
+      assert.equal(active, requestId !== "315", `Actual HEAD Superstack policy for ${requestId}`);
+    }
     if (recorded.size === 0) {
       const commands = pi.getCommands();
       for (const name of WORKFLOW_NAMES) {
