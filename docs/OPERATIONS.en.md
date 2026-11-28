@@ -325,9 +325,9 @@ bun --no-env-file "$PROBE" capture gateway "$GATEWAY_SOCKET" > "$EVIDENCE_DIR/ga
   `gateway: null`, or a failed probe. Do not wake a sleeping HEAD for evidence.
 - Do not run `stop` or `start` for an instance or lane already confirmed intentionally
   stopped. Use the known prior stop/exit and machine process inventory to establish
-  this; a missing socket, saved state, or an unrelated receipt is not proof. An absent
-  or unconfirmed owner, an in-progress wake/rotation, or a failed capture is a reason to
-  resolve ownership before replacing files, not to mark it stopped or force a start.
+  this; a missing socket, saved state, or an unrelated receipt is not proof. If
+  capture fails for a previously running instance, follow the recovery path below
+  before attempting any replacement.
 
 For each affected resident lane, take `id`, `socketPath` and `sessionId` from the
 corresponding `lanes[]` entry and confirm `placement.target`. On the physical machine
@@ -356,6 +356,33 @@ to the affected worker, cannot correlate all its dependent Hosts to their managi
 HEADs, or cannot prove their ownership, leave that installation intact. A HEAD-only
 update does not replace worker files or require stopping lanes on unchanged
 installations.
+
+#### Recover an unreachable Gateway before upgrading
+
+An unreachable `gateway.sock` can outlive a crash. The last
+`main.sock.exit.json` may describe an older Host that used the **same** session ID
+and journal. It does not prove the exit of a later PID. Do not manufacture a
+receipt or use that older one to authorize an update.
+
+1. Keep the old installation in place. Establish that the instance was running
+   before the incident, was not intentionally stopped, and that no other launch
+   or maintenance is in progress. Match the configured state directory to the
+   process inventory, including the native HEAD and adapter owner. For a dead
+   instance, take a private backup of the state directory before recovery,
+   including `coordination.sqlite` and any SQLite sidecars, the session journals,
+   and existing receipts. Unix socket files are not needed in the backup.
+2. Use the **old** CLI with the same account and config to run
+   `"$OLD_OMP_SA" start --config "$CONFIG"` once. This is recovery, not proof of
+   a clean exit. The native launcher checks recorded dead PIDs and socket
+   identities before reclaiming stale endpoints. It does not make a live or
+   unverified owner, PID reuse, or a pending restart handoff safe to override.
+   If it refuses, or HEAD cannot be identified, keep the old installation and
+   backup; do not delete sockets, edit ownership records, or force another start.
+3. Verify transport, intake, and HEAD readiness and compare the resumed native
+   session ID and journal path with the pre-crash records. Do not resubmit
+   uncertain inputs. Take a **new** status and physical-socket capture of the
+   recovered owners, re-inventory resident lanes, then follow the normal stop
+   procedure. Only the recovered owners' verified exit permits replacement.
 
 #### Stop, verify, and replace
 
