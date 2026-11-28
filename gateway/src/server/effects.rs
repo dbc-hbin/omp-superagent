@@ -38,14 +38,14 @@ impl Hub {
             | "sendGroup"
             | "showApproval"
             | "dismissApproval"
-            | "inspectThread"
             | "inspectDiscordContext"
             | "discordPurpose"
             | PRESENCE => args.len() == 1,
             "setActivity" | "updateThread" => args.len() == 2,
             "fetchAfter" => (2..=3).contains(&args.len()),
-            "canCreateThread" => (1..=2).contains(&args.len()),
-            "createThread" => (2..=4).contains(&args.len()),
+            "inspectThread" => (1..=2).contains(&args.len()),
+            "canCreateThread" => (1..=3).contains(&args.len()),
+            "createThread" => (2..=5).contains(&args.len()),
             _ => false,
         };
         if !allowed {
@@ -201,6 +201,9 @@ impl Hub {
                 }
             }
             ("canCreateThread", [_, tags]) | ("createThread", [_, _, _, tags]) => {
+                thread_tags(tags)?
+            }
+            ("canCreateThread", [_, tags, _]) | ("createThread", [_, _, Value::Null, tags, _]) if !tags.is_null() => {
                 thread_tags(tags)?
             }
             ("updateThread", [_, update]) => validate_thread_update(update)?,

@@ -474,6 +474,7 @@ export interface StorePort {
   /** Reopen the verified lane and submit its goal resume together, without admitting a prompt. */
   submitGoalResume(input: Inbound, target: string, sourceId: string, owner: {
     requestId: string; generation: number; sessionId: string; sessionFile: string; cursor: string | null; goalId?: string;
+    scopedWorkOwnerId?: string;
   }, priorWorkState?: Lane["workState"]): InputRecord;
   /** Nonterminal native assistant observation; never settles or dispatches its owner. */
   progress(id: string, generation: number, sessionId: string, eventId: string, text: string, editInPlace?: boolean): boolean;
@@ -622,10 +623,10 @@ export interface Messenger {
   showApproval(approval: Approval): Promise<string>;
   dismissApproval(approval: Approval): Promise<void>;
   /** Read-only authenticated capability probe; false is unsupported, not a failed creation. */
-  canCreateThread?(route: Route, appliedTags?: readonly string[]): Promise<boolean>;
-  createThread(route: Route, title: string, sourceMessageId?: string, appliedTags?: readonly string[]): Promise<Route>;
+  canCreateThread?(route: Route, appliedTags?: readonly string[], placementSource?: Route): Promise<boolean>;
+  createThread(route: Route, title: string, sourceMessageId?: string, appliedTags?: readonly string[], placementSource?: Route): Promise<Route>;
   /** Optional native thread management; unsupported transports must not simulate it. */
-  inspectThread?(route: Route): Promise<ThreadInfo>;
+  inspectThread?(route: Route, placementSource?: Route): Promise<ThreadInfo>;
   updateThread?(route: Route, update: ThreadUpdate): Promise<ThreadInfo>;
   inspectDiscordContext?(route: Route): Promise<DiscordContext>;
   discordPurpose?(request: DiscordPurposeRequest): Promise<readonly DiscordPurposeNote[]>;

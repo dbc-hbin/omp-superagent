@@ -112,6 +112,10 @@ impl Context {
         self.rooms.get(self.platform, guild, channel)
     }
 
+    pub(crate) fn owner_route(&self, route: &Value) -> Result<(), EffectError> {
+        self.rooms.owner_route(route)
+    }
+
     pub(crate) fn has_group_guild(&self, guild: Option<&str>) -> bool {
         self.rooms.has_guild(self.platform, guild)
     }
@@ -519,10 +523,11 @@ impl Hub {
         }
         if route["platform"] != "discord"
             && ((op == "canCreateThread" && args.len() > 1)
-                || (op == "createThread" && args.len() > 3))
+                || (op == "createThread" && args.len() > 3)
+                || (op == "inspectThread" && args.len() > 1))
         {
             return Err(EffectError::rejected(
-                "Forum tags are only supported on Discord",
+                "Forum tags and scoped thread placement are only supported on Discord",
             ));
         }
         self.for_route(route)?.effect(op, args).await

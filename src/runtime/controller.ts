@@ -8,6 +8,7 @@ import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { MemoryRuntimeContext } from "@oh-my-pi/pi-coding-agent/memory-backend";
 import type { Approval, ApprovalResolution, DialogResponse, DiscordContext, DiscordPurposeNote, DiscordPurposeRequest, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, HistoryPlatform, Inbound, InputRecord, Lane, LaneModel, LaneModelChoice, LanePresetSnapshot, ResolvedLanePreset, ModelPreset, Messenger, OutputRecord, Route, StorePort, ThreadInfo, ThreadUpdate, WorkflowChoice } from "../contracts";
 import { authorizeDiscordPurpose, discordPurposeRequest } from "../messaging/discord-context";
+import { discordWorkThreadKey, discordWorkThreadOwnerKey, discordWorkThreadSource, guildThreadParent } from "../messaging/discord-work-thread";
 import { isObservationRequest } from "./observation-request";
 import type { PresenceAction } from "../contracts";
 import { deferredRecoveryCandidate, HEAD_MODEL_CONTROL, headRecoveryEffectsSettled, isRetiredScopeInput, laneFallbackKey, laneModelPickerRestoreKey, physicalRoute, physicalRouteKey, resolvePickerOption, routeKey, routingConversation, type HeadModelChange, type HeadPicker } from "../contracts";
@@ -35,7 +36,7 @@ import { discordThreadSplit, editsTopicPlacement, existingWorkspace, inferredWor
 import { findPastTopic, findRoutingTopics, joinedTopicProvenance, pastTopicQuery, readPastTopic, routingExcerpt, routingSubject, transportRoutingProse } from "../routing/topic-history";
 import { parseLaneReportResult } from "../lane/lane-report";
 import { isLaneWatchNotice, LaneWatcher, type LaneWatchCommand } from "../lane/lane-watch";
-import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../contracts";
+import type { HeadRecoveryAttempt, HeadRecoveryDecision, LaneRecoveryScope } from "../contracts";
 import { headRecoveryEvidence, laneQuotaExhausted, settledLaneReceipt, type HeadQuotaFailure } from "./head-recovery";
 import { HEAD_QUOTA_CHECK_MS } from "./head-quota";
 import { isPrObservation, PrWatcher, type PrWatchCommand } from "../pr/pr-watch";
@@ -1611,7 +1612,7 @@ export class Superagent {
     this.assertRestartOpen();
     if (this.stopped) throw new Error("Controller is stopped");
     this.assertWorkSourceNotPrObservation(input.sourceId);
-    if (!operatorSource) this.assertLaneRecoveryTarget(input.sourceId, input.id);
+    const recovery = operatorSource ? null : this.assertLaneRecoveryTarget(input.sourceId, input.id);
     if (typeof input.modelReason !== "string" || !input.modelReason.trim()) throw new Error("A nonempty modelReason is required");
     if ((input.model !== undefined) === (input.preset !== undefined)
       || (input.model !== undefined && !isLaneModel(input.model))
@@ -1621,8 +1622,8 @@ export class Superagent {
     input = { ...input, ...(input.model ? { model: { provider: input.model.provider, id: input.model.id } } : {}) };
     const source = this.store.input(input.sourceId);
     if (!source) throw new Error("sourceId must name a received authorized request");
-    this.authorized(source.route);
-    this.authorized(this.requireLane(input.id).route);
+    this.authorizeLaneManagerSource(source, recovery);
+    this.authorized(this.requireLane(input.id).route, "work");
     const request = JSON.stringify([input.model ? { provider: input.model.provider, id: input.model.id } : null, input.preset ?? null, input.modelReason]);
     const receipt = this.store.getMeta(`lane-model:${input.id}:receipt:${input.sourceId}`);
     const pending = this.modelIntent(input.id);
@@ -1767,7 +1768,7 @@ export class Superagent {
     if (live && live.modelIdleVersion !== idleVersion)
       throw new Error(`Lane ${id} native goal or UI activity changed during model selection`);
     lane = checked;
-    this.authorized(lane.route);
+    this.authorized(lane.route, "work");
     if (this.remoteShutdownPending(lane) || this.remoteOpenPending(lane))
       throw new Error(`Lane ${id} has unresolved remote lifecycle ownership`);
     const currentQuotaHold = this.store.getMeta(`lane-quota-hold:${id}`) || null;
@@ -1782,10 +1783,10 @@ export class Superagent {
       if (live && (!state?.modelSettings || !isLaneModel(state.model))) throw new Error("Native lane lacks authoritative prior model/settings");
     } else {
       this.assertWorkSourceNotPrObservation(sourceId);
-      this.assertLaneRecoveryTarget(sourceId, id);
+      const recovery = this.assertLaneRecoveryTarget(sourceId, id);
       const source = this.store.input(sourceId);
       if (!source || source.state === "cancelled") throw new Error("sourceId must name a received authorized request");
-      this.authorized(source.route);
+      this.authorizeLaneManagerSource(source, recovery);
       if (currentQuotaHold) throw new Error("Quota exhaustion requires an explicit /model --lane choice from the owner in the bound topic");
     }
     this.assertModelChangeIdle(lane, live, state);
@@ -1877,7 +1878,7 @@ export class Superagent {
       || !sameLaneModel(actual, confirmed.model) || this.modelChanges.has(lane.id) || this.modelIntent(lane.id)
       || this.modelIntent(lane.id, "apply") || current.modelPreset !== null || current.modelReason !== lane.modelReason
       || !sameLaneModel(current.model, lane.model) || this.store.getMeta(laneFallbackKey(lane.id)) !== saved
-      || !authorizeRoute(this.config, current.route)) return null;
+      || !this.workRoute(current.route)) return null;
 
     if (!previouslySelected) {
       const text = [
@@ -2354,8 +2355,21 @@ export class Superagent {
     }
   }
 
-  private authorized(route: Route): void {
-    if (!authorizeRoute(this.config, route)) throw new Error("Unauthorized messenger route");
+  private workRoute(route: Route): boolean {
+    return authorizeRoute(this.config, route) || discordWorkThreadSource(this.config, this.store, route) !== null;
+  }
+
+  private authorized(route: Route, purpose?: "work"): void {
+    if (!(purpose === "work" ? this.workRoute(route) : authorizeRoute(this.config, route)))
+      throw new Error("Unauthorized messenger route");
+  }
+
+  private placementOnlyReportOwner(input: InputRecord): InputRecord | null {
+    if (this.store.getMeta(`user-source:${input.id}`) === "true") return null;
+    const source = discordWorkThreadSource(this.config, this.store, input.route);
+    if (!source) return null;
+    const original = this.store.reportApprovalSource(input.id);
+    return original && routeKey(physicalRoute(original.route)) === routeKey(source) ? original : null;
   }
 
   private activity(input: InputRecord, active: boolean): void {
@@ -2620,7 +2634,7 @@ export class Superagent {
     if (candidate.kind === "restart" || candidate.kind === "head-stop") return { priority: "immediate" };
     if (candidate.kind === "lane-stop") {
       const lane = this.explicitLaneStop(candidate.laneId);
-      return lane && authorizeRoute(this.config, lane.route) ? { priority: "immediate", laneId: lane.id } : null;
+      return lane && this.workRoute(lane.route) ? { priority: "immediate", laneId: lane.id } : null;
     }
     // Only an unquoted command on a directly bound physical Discord thread
     // has a bare-stop target that queued topics, placement or replies cannot change.
@@ -2933,7 +2947,7 @@ export class Superagent {
       const current = head?.input;
       const exact = !!input.reply || receipt?.kind === "workspace" || receipt?.kind === "lane" || receipt?.kind === "unverified";
       const lane = receipt?.kind === "lane" ? receipt.lane : !exact ? bound : null;
-      if (lane && !authorizeRoute(this.config, lane.route)) throw new DeliveryError("The stop lane is not authorized", "rejected");
+      if (lane && !this.workRoute(lane.route)) throw new DeliveryError("The stop lane is not authorized", "rejected");
       const conflictingHead = receipt?.kind === "lane" && head && current && receipt.unplaced.some(source => source.id === current.id)
         && this.headStopCohort(head, current.id, true).length > 0;
       if (conflictingHead) {
@@ -3087,6 +3101,33 @@ export class Superagent {
   private sameConversation(left: Route, right: Route): boolean {
     return left.platform === right.platform && left.accountId === right.accountId
       && left.authorityId === right.authorityId && left.guildId === right.guildId && left.channelId === right.channelId;
+  }
+
+  /**
+   * Structural shape of an opted-in cross-channel parent: an explicit native
+   * Discord guild parent in the same bot account, owner and guild as the source,
+   * but a different channel. The policy opt-in is checked separately so a later
+   * config change can never make an interrupted creation replayable.
+   */
+  private crossChannelParent(source: Route, parent: Route): boolean {
+    return source.platform === "discord" && parent.platform === "discord"
+      && source.guildId !== null && parent.guildId === source.guildId
+      && parent.accountId === source.accountId && parent.authorityId === source.authorityId
+      && parent.threadId === null && parent.topicId === undefined
+      && !this.sameConversation(source, parent);
+  }
+
+  /**
+   * Repair only the exact thread the adapter journaled as its native result for
+   * the journaled cross-channel parent. A thread in the source parent, or any
+   * other thread in the destination channel, is not evidence of this attempt.
+   */
+  private journaledCrossChannelThread(original: InputRecord, parent: Route | null, destination: Route): boolean {
+    if (!parent || !this.crossChannelParent(original.route, parent)) return false;
+    const saved = this.store.getMeta(`handoff-route-result:${original.id}`);
+    if (!saved) return false;
+    const result = JSON.parse(saved) as Route;
+    return result.threadId !== null && this.sameConversation(parent, result) && routeKey(result) === routeKey(destination);
   }
 
   private rememberThread(route: Route): void {
@@ -3434,21 +3475,28 @@ export class Superagent {
 
   private laneRecoveryScope(reportId: string) {
     const scope = this.store.laneRecoveryScope(reportId);
-    if (!scope || [scope.lane.route, scope.original.route].some(route =>
-      !authorizeRoute(this.config, route) || groupRoom(this.config, route))) return null;
+    if (!scope || !this.workRoute(scope.lane.route) || !authorizeRoute(this.config, scope.original.route)) return null;
     return scope;
   }
 
-  private assertLaneRecoveryTarget(sourceId: string, target?: string): boolean {
+  private assertLaneRecoveryTarget(sourceId: string, target?: string): LaneRecoveryScope | null {
     const head = this.live.get("main");
     const reportId = this.activeLaneReviewId;
-    if (!reportId && !this.isLaneRecoveryReport(sourceId)) return false;
+    if (!reportId && !this.isLaneRecoveryReport(sourceId)) return null;
     const scope = reportId === sourceId ? this.laneRecoveryScope(reportId) : null;
     if (!head || !this.current(head) || head.input?.id !== sourceId || this.store.input(sourceId)?.state !== "submitted"
       || !scope || scope.lane.id !== target || scope.failed.state === "uncertain") {
       throw new Error("Lane recovery requires the active HEAD report ID and its original lane, settled admission and current owner authority");
     }
-    return true;
+    return scope;
+  }
+
+  private authorizeLaneManagerSource(input: InputRecord, recovery: LaneRecoveryScope | null): void {
+    // An active corrective report may be delivered to a placement-only thread,
+    // but only its pinned original conversation supplies manager authority.
+    const route = recovery && routeKey(input.route) === routeKey(recovery.lane.route)
+      && this.placementOnlyReportOwner(input)?.id === recovery.original.id ? recovery.original.route : input.route;
+    this.authorized(route);
   }
 
   private laneReviewDispatchAllowed(input: InputRecord): boolean {
@@ -3547,10 +3595,11 @@ export class Superagent {
     return false;
   }
 
-  private requireManagerSource(sourceId: string, destination?: Route, target?: string): void {
+  private requireManagerSource(sourceId: string, destination?: Route, target?: string): LaneRecoveryScope | null {
     if (isLaneWatchNotice(sourceId)) throw new Error("Lane watch notices cannot authorize lane work");
     this.assertWorkSourceNotPrObservation(sourceId);
-    if (this.assertLaneRecoveryTarget(sourceId, target)) return;
+    const recovery = this.assertLaneRecoveryTarget(sourceId, target);
+    if (recovery) return recovery;
     const original = this.store.ownerSource(sourceId);
     if (this.store.getMeta(`topic-owner:${original?.id ?? sourceId}`)) throw new Error("Topic-owned intake cannot authorize a manager handoff; use an explicit HEAD request");
     if (original) this.assertFirstDmHandoffSource(original, sourceId);
@@ -3559,6 +3608,7 @@ export class Superagent {
       throw new Error("Work from this Discord thread stays in the original thread unless the owner explicitly requests a split");
     }
     this.assertCronDelegationOpen(sourceId);
+    return null;
   }
 
   private assertWorkSourceNotPrObservation(sourceId: string): void {
@@ -3704,27 +3754,45 @@ export class Superagent {
     const intent = JSON.stringify({ destination: input.destination ?? null,
       ...(input.appliedTags === undefined ? {} : { appliedTags: input.appliedTags }) });
     const previousIntent = this.store.getMeta(intentKey);
-    const requestedParent = input.destination && !input.destination.threadId && !input.destination.topicId ? input.destination : null;
+    // Durable intent written before the first remote effect; read it back so a
+    // retried request cannot restate what the interrupted attempt asked for.
+    const journaledIntent = previousIntent === null ? null : JSON.parse(previousIntent) as { destination: Route | null };
+    const journaledParent: Route | null = journaledIntent?.destination ?? null;
+    const requestedParent = input.destination && input.destination.threadId === null && input.destination.topicId === undefined
+      ? input.destination : null;
     const logicalTopicId = this.isDm(original.route)
       ? (!requestedParent && original.route.topicId) || newLogicalTopicId(original.id)
       : null;
+    const savedDestination = this.store.getMeta(destinationKey);
+    const crossChannelIntent = journaledParent !== null && this.crossChannelParent(original.route, journaledParent);
+    // A cross-channel attempt never repairs against a source-parent thread; only
+    // the exact journaled native result can prove which thread it created.
+    const reconciling = savedDestination === "uncertain" && input.destination?.threadId
+      && (crossChannelIntent
+        ? this.journaledCrossChannelThread(original, journaledParent, input.destination)
+        : this.sameConversation(original.route, input.destination));
+    const alternateParent = requestedParent ?? (reconciling ? journaledParent : null);
+    const placementSource = alternateParent && !authorizeRoute(this.config, alternateParent)
+      && original.target === "main" && this.store.getMeta(`user-source:${original.id}`) === "true" && !messengerEdit(original)
+      && guildThreadParent(this.config, physicalRoute(original.route), alternateParent)
+      ? physicalRoute(original.route) : undefined;
     if (input.destination) {
-      this.authorized(input.destination);
+      if (!placementSource) this.authorized(input.destination);
       if (input.destination.guildId !== null && input.destination.topicId !== undefined) {
         throw new Error("A logical channel topic can only be placed by ordinary owner intake");
       }
     }
     if (requestedParent && !this.sameConversation(original.route, requestedParent)) {
-      throw new Error("A new sibling topic must use the source conversation's authorized parent");
+      // The destination was authorized above (same owner, allowed guild and
+      // channel). Only the opt-in owner policy widens the source parent.
+      if (this.config.discord?.allowCrossChannelThreads !== true || !this.crossChannelParent(original.route, requestedParent))
+        throw new Error("A new sibling topic must use the source conversation's authorized parent");
     }
-    const savedDestination = this.store.getMeta(destinationKey);
-    const reconciling = savedDestination === "uncertain" && input.destination?.threadId
-      && this.sameConversation(original.route, input.destination);
     // A read-only capability rejection has created nothing. Let the head select
     // valid tags after inspection, but never change a submitted creation.
-    const correctingTags = previousIntent !== null && !this.store.getMeta(destinationKey)
+    const correctingTags = journaledIntent !== null && !this.store.getMeta(destinationKey)
       && !this.store.input(`handoff:${original.id}:lane`)
-      && isDeepStrictEqual(JSON.parse(previousIntent).destination, input.destination ?? null);
+      && isDeepStrictEqual(journaledIntent.destination, input.destination ?? null);
     if (previousIntent && previousIntent !== intent && !reconciling && !correctingTags)
       throw new Error("Lane handoff destination intent conflict");
     const knownDestination: Route | undefined = savedDestination && savedDestination !== "uncertain"
@@ -3776,7 +3844,9 @@ export class Superagent {
           else if (!requestedParent && original.route.threadId) destination = original.route;
           else {
             const parent = physicalRoute(requestedParent ?? original.route);
-            const supported = this.messenger.canCreateThread ? await this.messenger.canCreateThread(parent, input.appliedTags) : !this.isDm(parent);
+            const supported = this.messenger.canCreateThread
+              ? await this.messenger.canCreateThread(parent, input.appliedTags, placementSource)
+              : !placementSource && !this.isDm(parent);
             this.assertRestartOpen();
             if (this.store.input(original.id)?.state === "cancelled") throw new Error("A cancelled main request cannot create new delegated work");
             if (supported) {
@@ -3788,7 +3858,7 @@ export class Superagent {
               this.store.setMeta(nativeKey, "true");
               const sourceMessageId = input.appliedTags === undefined && original.route.threadId === null && physicalRouteKey(parent) === physicalRouteKey(original.route)
                 ? original.messageId ?? undefined : undefined;
-              destination = await this.messenger.createThread(parent, input.title, sourceMessageId, input.appliedTags);
+              destination = await this.messenger.createThread(parent, input.title, sourceMessageId, input.appliedTags, placementSource);
               this.store.setMeta(`handoff-route-result:${original.id}`, JSON.stringify(destination));
               if (!this.sameConversation(parent, destination) || !destination.threadId || destination.topicId) {
                 throw new Error("Created thread did not return the exact authorized native conversation identity; reconcile the uncertain creation");
@@ -3803,7 +3873,17 @@ export class Superagent {
             } else throw new Error("This conversation does not support creating an independent native thread/topic; choose an existing authorized topic instead");
           }
         }
-        this.authorized(destination);
+        if (placementSource) {
+          if (!alternateParent || !this.sameConversation(alternateParent, destination) || !destination.threadId
+            || destination.topicId !== undefined)
+            throw new Error("Created thread did not return the exact authorized native conversation identity; reconcile the uncertain creation");
+          const workKey = discordWorkThreadKey(destination.threadId);
+          const saved = this.store.getMeta(workKey);
+          const binding = { source: placementSource, route: destination };
+          if (saved && !isDeepStrictEqual(JSON.parse(saved), binding)) throw new Error("Discord work thread identity conflict");
+          if (!saved) this.store.setMeta(workKey, JSON.stringify(binding));
+        }
+        this.authorized(destination, "work");
         if (!destination.threadId && !destination.topicId) throw new Error("Delegation needs an independent destination topic");
         if (destination.threadId && routeKey(destination) !== routeKey(original.route)
           && this.sameConversation(original.route, destination) && (!input.destination || requestedParent)) {
@@ -3814,6 +3894,7 @@ export class Superagent {
         handoff = { ...sourceFields, id: handoffId, route: destination };
         handoffMetadata = {
           [`handoff-source:${handoffId}`]: original.id,
+          ...(placementSource ? { [discordWorkThreadOwnerKey(handoffId)]: original.id } : {}),
           ...(destination.topicId && destination.guildId === null && routeKey(destination) !== routeKey(original.route)
             ? this.dmTimeline.topicMetadata(original, destination.topicId) : {}),
         };
@@ -3878,9 +3959,16 @@ export class Superagent {
         this.store.setMeta(aliasKey, JSON.stringify(alias));
         for (const [name, value] of Object.entries(this.dmTimeline.topicMetadata(original, logicalTopicId))) this.store.setMeta(name, value);
       }
-      this.rememberThread(lane.route);
+      // The opt-in grants delivery, not Discord history or request ingestion.
+      if (authorizeRoute(this.config, lane.route)) this.rememberThread(lane.route);
       const topicLabel = lane.route.platform === "telegram" ? "작업 주제" : "작업 스레드";
-      const thread = lane.route.platform === "discord" && lane.route.threadId ? `<#${lane.route.threadId}>` : lane.title;
+      // One placement notice. A same-channel native thread keeps its exact prior
+      // text; a cross-channel lane also names the destination channel so the
+      // owner can reach it from the source conversation.
+      const thread = lane.route.platform === "discord" && lane.route.threadId
+        ? this.sameConversation(original.route, lane.route) ? `<#${lane.route.threadId}>`
+          : `<#${lane.route.channelId}> <#${lane.route.threadId}>`
+        : lane.title;
       this.store.queueOutput({
         id: `${original.id}:topic-bound`, sourceId: original.id, route: original.route,
         text: `${topicLabel}: ${thread}`,
@@ -3897,10 +3985,10 @@ export class Superagent {
   }
 
   async messageLane(id: string, text: string, sourceId: string, choice?: WorkflowChoice) {
-    this.requireManagerSource(sourceId, this.store.lane(id)?.route, id);
-    if (this.isLaneRecoveryReport(sourceId) && this.laneQueueHolds(id).uncertainInputIds.length)
+    const recovery = this.requireManagerSource(sourceId, this.store.lane(id)?.route, id);
+    if (recovery && this.laneQueueHolds(id).uncertainInputIds.length)
       throw new Error("Reconcile the uncertain original admission and its effects before submitting corrective work");
-    const handoffId = this.enqueueLaneMessage(id, text, sourceId, choice);
+    const handoffId = this.enqueueLaneMessage(id, text, sourceId, choice, recovery);
     await this.kick();
     const handoff = this.store.input(handoffId);
     if (!handoff) throw new Error("Durable lane follow-up is missing");
@@ -3910,7 +3998,7 @@ export class Superagent {
     };
   }
 
-  private enqueueLaneMessage(id: string, text: string, sourceId: string, choice?: WorkflowChoice): string {
+  private enqueueLaneMessage(id: string, text: string, sourceId: string, choice?: WorkflowChoice, recovery: LaneRecoveryScope | null = null): string {
     this.assertRestartOpen();
     const topicOwner = this.store.getMeta(`topic-owner:${sourceId}`);
     if (topicOwner && topicOwner !== id) throw new Error("Cannot move an admitted topic request to another lane");
@@ -3919,8 +4007,12 @@ export class Superagent {
     const original = this.store.input(sourceId);
     if (!original) throw new Error("sourceId must name a received authorized request");
     if (original.state === "cancelled") throw new Error("A cancelled request cannot delegate new work");
-    this.authorized(original.route);
-    this.authorized(lane.route);
+    this.authorizeLaneManagerSource(original, recovery);
+    this.authorized(lane.route, "work");
+    const scopedThread = !authorizeRoute(this.config, lane.route) && discordWorkThreadSource(this.config, this.store, lane.route);
+    const scopedOwner = scopedThread && this.store.ownerSource(sourceId);
+    if (scopedThread && (!scopedOwner || routeKey(physicalRoute(scopedOwner.route)) !== routeKey(scopedThread)))
+      throw new Error("Work in this placement-only thread requires its original authorized conversation");
     const workflow = headWorkflow(original, choice);
     if (workflow && this.store.getMeta(`user-source:${sourceId}`) !== "true") {
       throw new Error("Workflow selection requires an original authorized user source, not internal data");
@@ -3953,6 +4045,7 @@ export class Superagent {
     }, id, {
       [`handoff-source:${handoffId}`]: sourceId,
       ...(reportInThread ? { [`handoff-reply:${handoffId}`]: routeKey(lane.route) } : {}),
+      ...(scopedOwner ? { [discordWorkThreadOwnerKey(handoffId)]: scopedOwner.id } : {}),
     }, workflow);
     if (queued) this.background(this.syncLaneThreadTitle(lane));
     return handoffId;
@@ -4125,13 +4218,23 @@ export class Superagent {
     this.presetRoles.observe();
   }
 
-  async inspectThread(sourceId: string, laneId?: string): Promise<ThreadInfo> {
+  async inspectThread(sourceId: string, laneId?: string, destination?: Route): Promise<ThreadInfo> {
     const source = this.store.input(sourceId);
     if (!source || this.store.getMeta(`user-source:${sourceId}`) !== "true")
       throw new Error("Thread inspection requires an original received user source");
     this.authorized(source.route);
+    if (destination) {
+      const from = physicalRoute(source.route);
+      const configured = authorizeRoute(this.config, destination);
+      if (laneId || source.target !== "main" || messengerEdit(source)
+        || this.config.discord?.allowCrossChannelThreads !== true || !this.crossChannelParent(from, destination)
+        || !configured && !guildThreadParent(this.config, from, destination) || !this.messenger.inspectThread)
+        throw new Error("Thread inspection requires an eligible same-guild parent for this owner request");
+      this.requireManagerSource(sourceId, destination);
+      return this.messenger.inspectThread(destination, configured ? undefined : from);
+    }
     const route = physicalRoute(laneId ? this.requireLane(laneId).route : source.route);
-    this.authorized(route);
+    this.authorized(route, laneId ? "work" : undefined);
     if (route.platform !== "discord" || !route.guildId || !this.messenger.inspectThread)
       throw new Error("Thread inspection requires a supported Discord guild conversation");
     return this.messenger.inspectThread(route);
@@ -4198,7 +4301,7 @@ export class Superagent {
     if (source.state === "cancelled") throw new Error("A cancelled source cannot change a thread");
     this.authorized(source.route);
     const lane = this.requireLane(input.id);
-    this.authorized(lane.route);
+    this.authorized(lane.route, "work");
     const { messenger } = this;
     if (lane.route.platform !== "discord" || !lane.route.guildId || !lane.route.threadId || !messenger.updateThread)
       throw new Error("Thread changes require a managed Discord guild thread");
@@ -4260,7 +4363,7 @@ export class Superagent {
     };
     await this.editThreadInOrder(route, async () => {
       if (!active()) return;
-      this.authorized(route);
+      this.authorized(route, "work");
       const thread = await inspect(route);
       if (physicalRouteKey(thread.route) !== physicalRouteKey(route))
         throw new DeliveryError("Work thread title lookup returned a different destination", "rejected");
@@ -4426,7 +4529,7 @@ export class Superagent {
     try {
       let lane = this.requireLane(id);
       if (lane.workState === "cancelled") throw new Error("Cancelled work requires an explicit new/reopened request");
-      this.authorized(lane.route);
+      this.authorized(lane.route, "work");
       const source = sourceId ? this.store.input(sourceId) : null;
       if (sourceId && (!source || source.state === "cancelled")) throw new Error("Resume requires a received uncancelled sourceId");
       if (source) this.authorized(source.route);
@@ -4475,7 +4578,7 @@ export class Superagent {
       if (state?.goal?.goal?.status === "paused") {
         if (!source || source.state === "cancelled") throw new Error("Resuming a native goal requires a received uncancelled sourceId");
         this.authorized(source.route);
-        this.authorized(lane.route);
+        this.authorized(lane.route, "work");
         if (live?.input || !state.isSettled || state.pendingUiRequests?.length || this.store.approvals(id).length
           || this.store.inputs(id).some(input => input.state === "submitted" || input.state === "uncertain")
           || this.kickoffHeld(id)) throw new Error("Resolve native work, approvals, kickoff delivery and uncertain submissions before resuming the goal");
@@ -4535,7 +4638,16 @@ export class Superagent {
         || (live.id === "main" ? this.headStopping || this.store.getMeta("head:stop-boundary") !== stopBoundary
           : this.pauseRevisions.get(live.id) !== pauseRevision || this.requireLane(live.id).workState !== priorWorkState))
         throw new Error("Native goal ownership or approval state changed before resume");
-      this.authorized(route);
+      this.authorized(route, live.id === "main" ? undefined : "work");
+      let scopedWorkOwnerId: string | undefined;
+      if (live.id !== "main" && !authorizeRoute(this.config, route)) {
+        const placement = discordWorkThreadSource(this.config, this.store, route);
+        const owner = this.store.ownerSource(original.id);
+        if (!placement || !owner || owner.state === "cancelled" || owner.state === "uncertain"
+          || routeKey(physicalRoute(owner.route)) !== routeKey(placement))
+          throw new Error("Goal resume in this placement-only thread requires its original authorized conversation");
+        scopedWorkOwnerId = owner.id;
+      }
       const requestId = `sg-${key(inputId)}-${live.generation}`;
       const { discordOriginalText: _discordOriginalText, ...sourceFields } = original;
       const input = this.store.submitGoalResume({
@@ -4543,6 +4655,7 @@ export class Superagent {
         text: "Resume the existing native goal within its entrusted objective.", attachments: [],
       }, live.id, original.id, {
         requestId, generation: live.generation, sessionId: live.sessionId, sessionFile: state.sessionFile, cursor, goalId,
+        scopedWorkOwnerId,
       }, priorWorkState);
       submitted = true;
       live.input = input;
@@ -5866,7 +5979,7 @@ export class Superagent {
     if (target !== "main") {
       const lane = target ? this.store.lane(target) : null;
       if (!lane) return;
-      try { this.authorized(lane.route); }
+      try { this.authorized(lane.route, "work"); }
       catch { return; } // The existing stop handler will refuse the unauthorized target.
       for (const candidate of this.store.inputs("main", "pending")) {
         if (candidate.id === input.id) break;
@@ -5950,7 +6063,7 @@ export class Superagent {
     }
     if (target !== "main") {
       try {
-        this.authorized(this.requireLane(target).route);
+        this.authorized(this.requireLane(target).route, "work");
         if (!this.store.submit(input.id, `sg-stop-${key(input.id)}`, this.live.get("main")?.generation ?? 0)) return;
         await this.pauseLane(target);
         this.controlReply(input, `Lane ${JSON.stringify(target)} is paused. Gateway, HEAD and unrelated lanes remain running.`, "cancelled");
@@ -7214,7 +7327,10 @@ export class Superagent {
         }));
         for (const input of this.store.inputs(undefined, "pending")) {
           if (this.stopped) continue;
-          try { this.authorized(input.route); }
+          try {
+            const work = input.target && input.target !== "main" || this.placementOnlyReportOwner(input);
+            this.authorized(input.route, work ? "work" : undefined);
+          }
           catch {
             this.store.settle(input.id, "cancelled");
             this.report(new Error("Cancelled a queued request whose messenger route is no longer authorized"));
@@ -7460,7 +7576,7 @@ export class Superagent {
     const sourceId = this.store.getMeta(`handoff-source:${input.id}`);
     const source = sourceId ? this.store.input(sourceId) : input;
     if (!source) throw new Error("Attachment source identity is unavailable");
-    this.authorized(source.route);
+    this.authorized(source.route, this.placementOnlyReportOwner(input) ? "work" : undefined);
     if (!input.attachments.length) return { descriptions, images };
     for (const attachment of input.attachments) {
       if (attachment.size !== null && (!Number.isSafeInteger(attachment.size) || attachment.size < 0 || attachment.size > MAX_ATTACHMENT_BYTES)) throw new Error("Invalid attachment size");
@@ -8681,6 +8797,11 @@ export class Superagent {
     }
     const topic = !persisted && live.input ? this.store.topicDelivery(live.input.id) : null;
     const reportApprovalSource = !persisted && live.input ? this.store.reportApprovalSource(live.input.id) : null;
+    if (!persisted && lane && !authorizeRoute(this.config, lane.route)
+      && (!reportApprovalSource || !authorizeRoute(this.config, reportApprovalSource.route))) {
+      this.report(new Error(`Approval ${id} held: no original authorized source for the placement-only work thread`));
+      return;
+    }
     if (!persisted && lane && live.input && this.requiresReportApprovalSource(live.input, lane) && !reportApprovalSource) {
       this.report(new Error(`Approval ${id} held: no original report approval source`));
       return;
@@ -9001,6 +9122,8 @@ export class Superagent {
           if (groupRoom(this.config, output.route)) {
             throw new DeliveryError("Owner output is not authorized in a restricted group room", "rejected");
           }
+          if (output.route.platform === "discord" && !this.workRoute(output.route))
+            throw new DeliveryError("Discord output route is no longer authorized", "rejected");
           if (output.resultAttachment) {
             try { this.resultAttachments.authorizeOwner(output.route); }
             catch (error) { throw new DeliveryError("Result attachment route is no longer authorized", "rejected", undefined, { cause: error }); }

@@ -220,7 +220,7 @@ impl State {
         }
         output.validate_reply()?;
         let not_started = || EffectError::rejected("Discord output deadline expired before sending");
-        let channel = timeout_at(deadline, self.destination(&output.route))
+        let channel = timeout_at(deadline, self.work_output_destination(&output.route))
             .await
             .map_err(|_| not_started())??;
         #[derive(Deserialize)]
@@ -256,6 +256,9 @@ impl State {
         if let Some(target) = &output.edit_of {
             return self.edit_status(output, target, deadline).await;
         }
+        if output.picker.is_some() {
+            self.assert_route(&output.route)?;
+        }
         if output.status && output.picker.is_some() {
             return Err(EffectError::rejected(
                 "Discord status requires a plain message",
@@ -264,7 +267,7 @@ impl State {
         output.validate_reply()?;
         let not_started =
             || EffectError::rejected("Discord output deadline expired before sending");
-        let channel = timeout_at(deadline, self.destination(&output.route))
+        let channel = timeout_at(deadline, self.work_output_destination(&output.route))
             .await
             .map_err(|_| not_started())??;
         let first_nonce = nonce(&output.id, &output.route, 0);
@@ -374,7 +377,7 @@ impl State {
         }
         let not_started =
             || EffectError::rejected("Discord output deadline expired before sending");
-        let channel = timeout_at(deadline, self.destination(&output.route))
+        let channel = timeout_at(deadline, self.work_output_destination(&output.route))
             .await
             .map_err(|_| not_started())??;
         let mut payload = self.output_payloads(

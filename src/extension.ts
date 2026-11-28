@@ -89,6 +89,13 @@ const laneModelSelection = {
   modelReason: Type.String({ minLength: 1 }),
 } as const;
 const threadTagsSchema = Type.Array(Type.String({ pattern: "^[0-9]{1,20}$" }), { maxItems: 5, uniqueItems: true });
+const laneRouteSchema = Type.Object({
+  platform: Type.Union([Type.Literal("discord"), Type.Literal("telegram"), Type.Literal("slack"), Type.Literal("kakao")]),
+  accountId: Type.String(), authorityId: Type.String(),
+  guildId: Type.Union([Type.String(), Type.Null()]), channelId: Type.String(),
+  threadId: Type.Union([Type.String(), Type.Null()]),
+  topicId: Type.Optional(Type.String()),
+});
 const threadTitleSchema = Type.String({ minLength: 1, maxLength: 100, pattern: "\\S" });
 const threadChangeFields = {
   title: Type.Optional(threadTitleSchema),
@@ -356,7 +363,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "lane_start", label: "Start independent work", loadMode: "essential", approval: "exec",
-    description: "Bind an independent topic to its own OMP session at an explicit cwd. By default create a supported native thread/topic, or reuse the source's existing binding; unsupported private chats use a logical topic. For a clearly new topic inside an existing thread, supply its same authorized parent as destination with threadId:null and no topicId to create a sibling. An existing independent destination binds directly. Do not ask the user to run /new merely to create a topic. Consult lane_models and native judge; choose exactly one model {provider,id} or native preset name, with concise modelReason. The resolved model and full preset snapshot persist; retries/global edits do not retarget the lane. Optional workflow {name,reason} is explicit head selection within the user's authorized objective, never inferred from brief/report prose. It binds to this source/handoff; conflicting retries reject. Native capability/permissions own activation; selecting SUPER through RPC does not create a goal. Returns queued identity, not completion. Small main work stays direct. sourceId is the original trusted request ID.",
+    description: "Bind an independent topic to its own OMP session at an explicit cwd. By default create a supported native thread/topic, or reuse the source's existing binding; unsupported private chats use a logical topic. For a clearly new topic inside an existing thread, supply an authorized parent as destination with threadId:null and no topicId to create a sibling. Use the source parent unless discord.allowCrossChannelThreads is enabled. In the same Discord guild, the default scope allows listed parents; explicit guild scope additionally permits a supported parent that the bot can use. Out-of-list placements do not accept new requests there. An existing independent destination binds directly only under the ordinary route policy. Do not ask the user to run /new merely to create a topic. Consult lane_models and native judge; choose exactly one model {provider,id} or native preset name, with concise modelReason. The resolved model and full preset snapshot persist; retries/global edits do not retarget the lane. Optional workflow {name,reason} is explicit head selection within the user's authorized objective, never inferred from brief/report prose. It binds to this source/handoff; conflicting retries reject. Native capability/permissions own activation; selecting SUPER through RPC does not create a goal. Returns queued identity, not completion. Small main work stays direct. sourceId is the original trusted request ID.",
     parameters: Type.Object({
       sourceId: Type.String(), title: Type.String(), cwd: Type.String(),
       kickoff: Type.String({ minLength: 1, description: "A concise message in the user's language stating the concrete approach. Delivered in the work topic before native lane execution; failed or uncertain delivery holds execution." }),
@@ -372,13 +379,7 @@ export default function superagentExtension(pi: ExtensionAPI): void {
         description: "Execution location for new work at the verified local cwd. Omit for local or an eligible operator-configured default. Remote, platform, or worker requires an approved paired worker and a clean committed Git checkout, with no local fallback. A bound worker can hold execution until ready. Local opts out and cannot be combined with platform or worker.",
       })),
       appliedTags: Type.Optional(threadTagsSchema),
-      destination: Type.Optional(Type.Object({
-        platform: Type.Union([Type.Literal("discord"), Type.Literal("telegram"), Type.Literal("slack"), Type.Literal("kakao")]),
-        accountId: Type.String(), authorityId: Type.String(),
-        guildId: Type.Union([Type.String(), Type.Null()]), channelId: Type.String(),
-        threadId: Type.Union([Type.String(), Type.Null()]),
-        topicId: Type.Optional(Type.String()),
-      })),
+      destination: Type.Optional(laneRouteSchema),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) { return result(await requireRuntime(ctx).startLane(params)); },
   });
@@ -416,12 +417,13 @@ export default function superagentExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "thread_inspect", label: "Inspect Discord forum or thread", approval: "read",
-    description: "Read the original user source's Discord guild channel/thread, or an explicitly selected managed lane's thread. Returns available tag IDs, required-tag policy, applied tags, title and archive state. Use before selecting appliedTags for lane_start. This never creates a topic or changes lane state.",
+    description: "Read the original user source's Discord guild channel/thread, an explicitly selected managed lane's thread, or an eligible alternate guild parent (destination with threadId:null and no topicId, instead of laneId). Returns available tag IDs, required-tag policy, applied tags, title and archive state. Use before selecting appliedTags for lane_start. This never creates a topic, changes lane state, or reads message history.",
     parameters: Type.Object({
       sourceId: Type.String({ minLength: 1 }), laneId: Type.Optional(Type.String({ minLength: 1 })),
+      destination: Type.Optional(laneRouteSchema),
     }, { additionalProperties: false }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      return result(await requireRuntime(ctx).inspectThread(params.sourceId, params.laneId));
+      return result(await requireRuntime(ctx).inspectThread(params.sourceId, params.laneId, params.destination));
     },
   });
   pi.registerTool({

@@ -225,14 +225,21 @@ class GatewayMessenger implements GatewayHeadMessenger {
   }
   showApproval(approval: Approval): Promise<string> { return this.effect("showApproval", [approval]); }
   dismissApproval(approval: Approval): Promise<void> { return this.effect("dismissApproval", [approval]); }
-  canCreateThread(route: Route, appliedTags?: readonly string[]): Promise<boolean> {
+  canCreateThread(route: Route, appliedTags?: readonly string[], placementSource?: Route): Promise<boolean> {
+    if (placementSource) return this.effect("canCreateThread", [route, appliedTags ?? null, placementSource]);
     return this.effect("canCreateThread", appliedTags === undefined ? [route] : [route, appliedTags]);
   }
-  createThread(route: Route, title: string, sourceMessageId?: string, appliedTags?: readonly string[]): Promise<Route> {
+  createThread(route: Route, title: string, sourceMessageId?: string, appliedTags?: readonly string[], placementSource?: Route): Promise<Route> {
+    if (placementSource) {
+      if (sourceMessageId !== undefined) throw new Error("Cross-channel threads cannot use a source message");
+      return this.effect("createThread", [route, title, null, appliedTags ?? null, placementSource]);
+    }
     return this.effect("createThread", appliedTags !== undefined ? [route, title, sourceMessageId ?? null, appliedTags]
       : sourceMessageId !== undefined ? [route, title, sourceMessageId] : [route, title]);
   }
-  inspectThread(route: Route): Promise<ThreadInfo> { return this.effect("inspectThread", [route]); }
+  inspectThread(route: Route, placementSource?: Route): Promise<ThreadInfo> {
+    return this.effect("inspectThread", placementSource ? [route, placementSource] : [route]);
+  }
   updateThread(route: Route, update: ThreadUpdate): Promise<ThreadInfo> { return this.effect("updateThread", [route, update]); }
   inspectDiscordContext(route: Route): Promise<DiscordContext> { return this.effect("inspectDiscordContext", [route]); }
   messengerPresence(request: MessengerPresenceRequest): Promise<DiscordPresenceStatus> {

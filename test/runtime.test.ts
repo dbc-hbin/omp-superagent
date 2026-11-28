@@ -4905,11 +4905,31 @@ describe("lane failure recovery", () => {
     expect(messenger.attempted.map(output => output.id)).toEqual(["choose-new-model:head-control", "restore-original-model:head-control"]);
   });
 
-  test("a parent-origin lane recovery keeps native approvals on the parent through correction and descendant report", async () => {
+  test.each(["allowed parent", "guild-scoped placement"] as const)("lane recovery from %s keeps native approvals on the parent through correction and descendant report", async placement => {
     const instance = fixture();
-    const { runtime, store, main, messenger } = instance;
-    const { lane, worker } = codexLane(instance, "parent-approval-recovery");
+    const { runtime, config, store, main, messenger, launchBehavior, hosts } = instance;
+    const scoped = placement === "guild-scoped placement";
+    const existing = scoped ? null : codexLane(instance, "parent-approval-recovery");
+    if (scoped) {
+      config.discord = { ...config.discord!, allowCrossChannelThreads: true, crossChannelThreadScope: "guild" };
+      messenger.canCreateThread = async () => true;
+      main.models.push(codexModel);
+      launchBehavior.model = codexModel;
+      launchBehavior.journalLeaf = true;
+    }
     const original = headMessage("parent-corrected-request", route(null), "Verify the existing importer.");
+    await runtime.start();
+    await admit(runtime, original);
+    await main.whenPrompts(1);
+    const lane = existing?.lane ?? await runtime.startLane({
+      ...selection, model: codexModel, sourceId: original.id, cwd: config.headCwd,
+      title: "Importer check", kickoff: "Checking the importer.", destination: route(null, { channelId: "5" }),
+    });
+    const inputId = scoped ? `handoff:${original.id}:lane`
+      : (await runtime.messageLane(lane.id, "Verify the existing importer.", original.id)).inputId;
+    await runtime.kick();
+    const worker = existing?.worker ?? hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Missing the admitted lane host");
     const confirmAtParent = async (host: HostTransport, target: string, id: string) => {
       const frame = { type: "extension_ui_request", id, method: "confirm", title: "Confirm", message: "Review this step?" };
       host.state.pendingUiRequests = [frame];
@@ -4918,22 +4938,24 @@ describe("lane failure recovery", () => {
       const card = [...messenger.shown.values()].find(approval => approval.requestId === id);
       if (!card || !messenger.handlers) throw new Error(`Missing original-route approval ${id}`);
       expect(card).toMatchObject({ route: original.route, target });
-      await expect(messenger.handlers.answer(card.id, { confirmed: true }, lane.route)).rejects.toThrow("Stale or foreign approval");
+      await expect(messenger.handlers.answer(card.id, { confirmed: true }, lane.route))
+        .rejects.toThrow(scoped ? "Unauthorized approval route" : "Stale or foreign approval");
       await messenger.handlers.answer(card.id, { confirmed: true }, original.route);
       messenger.shown.delete(card.id);
     };
-    await runtime.start();
-    await admit(runtime, original);
-    await main.whenPrompts(1);
-    const delegated = await runtime.messageLane(lane.id, "Verify the existing importer.", original.id);
     await worker.whenPrompts(1);
     main.complete("");
     failLaneRun(worker, "HTTP 503 Service Unavailable", false);
 
     await main.whenPrompts(2);
-    const reportId = `report:${delegated.inputId}`;
+    const reportId = `report:${inputId}`;
+    expect(store.input(inputId)?.state).toBe("cancelled");
+    expect(store.laneRecoveryScope(reportId)?.original.id).toBe(original.id);
+    expect(store.input(reportId)?.route).toEqual(lane.route);
     expect(main.prompts[1]?.id).toBe(nativeRequestId(store, reportId));
     await confirmAtParent(main, "main", "failed-lane-report-approval");
+    await runtime.changeModel({ id: lane.id, sourceId: reportId, model: otherModel, modelReason: "Use the available fallback for the corrective check." });
+    expect(worker.state.model).toEqual(otherModel);
     const corrected = await runtime.messageLane(lane.id, "Verify the importer without replaying the failed action.", reportId);
     await worker.whenPrompts(2);
     await confirmAtParent(worker, lane.id, "corrective-lane-approval");
@@ -4947,9 +4969,17 @@ describe("lane failure recovery", () => {
     main.complete("Verified the importer in the existing work thread.");
     await waitForOutput(messenger, `${descendant}:answer`);
 
-    expect(messenger.sent).toMatchObject([{ sourceId: descendant, route: lane.route }]);
-    expect(messenger.sent[0]?.replyTo).toBeUndefined();
-    expect(messenger.threads).toEqual([]);
+    expect(messenger.sent.map(output => output.id).sort()).toEqual((scoped
+      ? [`${original.id}:kickoff`, `${original.id}:topic-bound`, `${descendant}:answer`] : [`${descendant}:answer`]).sort());
+    expect(store.output(`${descendant}:answer`)).toMatchObject({ sourceId: descendant, route: lane.route, state: "sent" });
+    expect(store.output(`${descendant}:answer`)?.replyTo).toBeUndefined();
+    expect(worker.prompts.map(prompt => prompt.id)).toEqual([nativeRequestId(store, inputId), nativeRequestId(store, corrected.inputId)]);
+    expect(messenger.threads).toEqual(scoped ? [lane.route] : []);
+    if (scoped) {
+      await expect(runtime.messageLane(lane.id, "Reuse the settled report.", reportId)).rejects.toThrow("active HEAD report ID");
+      await expect(runtime.receive(message("unlisted-thread-input", lane.route))).rejects.toThrow("Unauthorized messenger route");
+      expect(store.input("unlisted-thread-input")).toBeNull();
+    }
   });
 
   test.each(["unbound", "missing source", "wrong source", "ambiguous", "restored admission", "saved card",

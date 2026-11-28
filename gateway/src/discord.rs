@@ -61,6 +61,18 @@ struct Config {
     allowed_channel_ids: HashSet<String>,
     #[serde(default)]
     require_addressing: bool,
+    #[serde(default)]
+    allow_cross_channel_threads: bool,
+    #[serde(default)]
+    cross_channel_thread_scope: ThreadScope,
+}
+
+#[derive(Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ThreadScope {
+    #[default]
+    Allowlist,
+    Guild,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -181,10 +193,19 @@ impl Adapter for Discord {
                 state.dismiss_approval(&read(approval)?).await?;
                 Ok(Value::Null)
             }
+            ("canCreateThread", [route, tags, origin]) => {
+                let tags: Option<Vec<String>> = read(tags)?;
+                state.can_create_thread(&read(route)?, tags.as_deref(), Some(&read(origin)?)).await.map(Value::Bool)
+            }
+            ("createThread", [route, title, Value::Null, tags, origin]) => {
+                let tags: Option<Vec<String>> = read(tags)?;
+                state.create_thread(&read(route)?, read(title)?, None, tags.as_deref(), Some(&read(origin)?)).await
+            }
+            ("inspectThread", [route, origin]) => state.inspect_thread(&read(route)?, Some(&read(origin)?)).await,
             ("canCreateThread", [route, tags @ ..]) if tags.len() <= 1 => {
                 let tags = tags.first().map(read::<Vec<String>>).transpose()?;
                 state
-                    .can_create_thread(&read(route)?, tags.as_deref())
+                    .can_create_thread(&read(route)?, tags.as_deref(), None)
                     .await
                     .map(Value::Bool)
             }
@@ -196,10 +217,10 @@ impl Adapter for Discord {
                     .flatten();
                 let tags = extra.get(1).map(read::<Vec<String>>).transpose()?;
                 state
-                    .create_thread(&read(route)?, read(title)?, source, tags.as_deref())
+                    .create_thread(&read(route)?, read(title)?, source, tags.as_deref(), None)
                     .await
             }
-            ("inspectThread", [route]) => state.inspect_thread(&read(route)?).await,
+            ("inspectThread", [route]) => state.inspect_thread(&read(route)?, None).await,
             ("updateThread", [route, update]) => {
                 state.update_thread(&read(route)?, &read(update)?).await
             }
@@ -258,6 +279,13 @@ impl State {
     }
 
     fn route_for(&self, channel: &Channel) -> Effect<Route> {
+        let route = self.channel_identity(channel)?;
+        self.assert_route(&route)?;
+        Ok(route)
+    }
+
+    /// Physical identity from Discord's response; does not authorize any operation.
+    fn channel_identity(&self, channel: &Channel) -> Effect<Route> {
         let identity = self
             .identity
             .get()
@@ -280,7 +308,7 @@ impl State {
                 "Discord DM does not belong to the owner",
             ));
         }
-        let route = Route {
+        Ok(Route {
             platform: "discord".to_owned(),
             account_id: identity.account.clone(),
             authority_id: self.config.owner_id.clone(),
@@ -288,9 +316,7 @@ impl State {
             channel_id: channel_id.clone(),
             thread_id,
             topic_id: None,
-        };
-        self.assert_route(&route)?;
-        Ok(route)
+        })
     }
 
     async fn channel_by_id(&self, id: &str, refresh: bool) -> Effect<Channel> {

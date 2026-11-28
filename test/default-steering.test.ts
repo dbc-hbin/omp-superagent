@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import type { Approval, DialogResponse, Inbound, LaneModel, Messenger, OutputRecord, Route } from "../src/contracts";
+import type { Approval, DialogResponse, Inbound, LaneModel, Messenger, OutputRecord, Route, ThreadInfo } from "../src/contracts";
 import { physicalRoute, physicalRouteKey } from "../src/contracts";
 import { type Config, hostPaths } from "../src/config/config";
 import { Superagent, type RuntimeAdapters } from "../src/runtime/controller";
@@ -22,6 +22,7 @@ const headInbound = (id: string, destination = route(), task = `Request ${id}`):
 
 class TrackedHost implements RuntimeHost {
   readonly prompts: Array<{ id: string; command: Record<string, unknown> }> = [];
+  readonly goalOperations: unknown[] = [];
   readonly listeners = new Set<(frame: Record<string, unknown>) => void>();
   readonly exit = Promise.withResolvers<void>();
   disconnected = false;
@@ -50,7 +51,19 @@ class TrackedHost implements RuntimeHost {
     if (command.type === "get_available_models") return { success: true, data: { models: [model] } };
     if (command.type === "get_available_commands") return { success: true, data: { commands: [] } };
     if (command.type === "get_entries") return { success: true, data: { entries: [], leafId: null } };
-    if (command.type === "goal") { this.state.goal = null; return { success: true }; }
+    if (command.type === "goal") {
+      this.goalOperations.push(command.op);
+      const goal = this.state.goal?.goal;
+      if (goal && command.op === "pause") {
+        this.state.goal = { enabled: false, goal: { ...goal, status: "paused" } };
+      } else if (goal && command.op === "resume") {
+        this.state.goal = { enabled: true, goal: { ...goal, status: "active" } };
+        this.state.isSettled = false;
+        this.state.isStreaming = true;
+        this.emit({ type: "agent_start" });
+      } else this.state.goal = null;
+      return { success: true };
+    }
     if (command.type === "shutdown_host") return { success: true };
     if (command.type !== "prompt" || !id) throw new Error(`Unexpected request ${command.type}`);
     this.prompts.push({ id, command });
@@ -84,6 +97,8 @@ class TopicMessenger implements Messenger {
   readonly sent: OutputRecord[] = [];
   readonly creations: Array<{ route: Route; sourceMessageId?: string }> = [];
   readonly capabilities: Route[] = [];
+  readonly scopedPlacements: Array<{ operation: "inspect" | "probe" | "create"; route: Route; source: Route; tags?: readonly string[] }> = [];
+  readonly approvals: Approval[] = [];
   supported = true;
   capabilityError?: Error;
   creationError?: Error;
@@ -92,20 +107,27 @@ class TopicMessenger implements Messenger {
     if (destination.accountId !== (destination.platform === "slack" ? "TTEAM:UBOT" : "2"))
       throw new Error("Unrecognized fixture account");
   }
-  canCreateThread: Messenger["canCreateThread"] = async route => {
+  canCreateThread: Messenger["canCreateThread"] = async (route, tags, source) => {
     this.capabilities.push(route);
+    if (source) this.scopedPlacements.push({ operation: "probe", route, source, tags });
     if (this.capabilityError) throw this.capabilityError;
     return this.supported;
   };
   async start(): Promise<void> {}
   async send(output: OutputRecord): Promise<string> { this.sent.push(output); return output.id; }
-  async createThread(route: Route, _title: string, sourceMessageId?: string): Promise<Route> {
+  async inspectThread(route: Route, source?: Route): Promise<ThreadInfo> {
+    if (source) this.scopedPlacements.push({ operation: "inspect", route, source });
+    return { route, title: "Forum", archived: null, requiresTag: true,
+      availableTags: [{ id: "81", name: "Work", moderated: false }], appliedTags: [] };
+  }
+  async createThread(route: Route, _title: string, sourceMessageId?: string, tags?: readonly string[], source?: Route): Promise<Route> {
     this.creations.push({ route, sourceMessageId });
+    if (source) this.scopedPlacements.push({ operation: "create", route, source, tags });
     this.beforeCreate?.();
     if (this.creationError) throw this.creationError;
     return { ...physicalRoute(route), threadId: route.platform === "slack" ? sourceMessageId ?? "1750000001.000001" : "900" };
   }
-  async showApproval(_approval: Approval): Promise<string> { return "card"; }
+  async showApproval(approval: Approval): Promise<string> { this.approvals.push(approval); return "card"; }
   async dismissApproval(_approval: Approval): Promise<void> {}
   async fetchAfter(): Promise<Inbound[]> { return []; }
   async openAttachment(): Promise<never> { throw new Error("No attachment in this case"); }
@@ -120,13 +142,15 @@ afterEach(async () => {
     rmSync(fixture.directory, { recursive: true, force: true });
   }
 });
-function fixture(maxHosts = 1, requestRestart?: RuntimeAdapters["requestRestart"], topicMemory?: RuntimeAdapters["topicMemory"]) {
+function fixture(maxHosts = 1, requestRestart?: RuntimeAdapters["requestRestart"], topicMemory?: RuntimeAdapters["topicMemory"],
+  overrides: { discord?: Partial<NonNullable<Config["discord"]>>; groupRooms?: Config["groupRooms"] } = {}) {
   const directory = realpathSync(mkdtempSync("/tmp/default-steering-"));
   const config: Config = { path: join(directory, "config.json"), stateDir: directory, headCwd: directory,
     command: [process.execPath], maxHosts, maxSubagents: 4, idleMs: 60_000,
-    discord: { tokenEnv: "TEST_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4"] },
+    discord: { tokenEnv: "TEST_TOKEN", ownerId: "1", allowedGuildIds: ["3"], allowedChannelIds: ["4"], ...overrides.discord },
     slack: { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "UOWNER", teamId: "TTEAM", allowedChannelIds: ["CCHANNEL"] },
-    telegram: { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: ["-3"] } };
+    telegram: { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: ["-3"] },
+    ...(overrides.groupRooms === undefined ? {} : { groupRooms: overrides.groupRooms }) };
   const store = new Store(join(directory, "coordination.sqlite"));
   const messenger = new TopicMessenger();
   const main = new TrackedHost(hostPaths(config, "main").sessionFile, "main-session");
@@ -821,5 +845,370 @@ describe("native topic binding", () => {
     expect(store.outputs().find(output => output.id === "original-head-reply")?.route).toEqual(original.route);
     expect(() => store.queueOutput({ id: "arbitrary-redirect", sourceId: original.id, route: lane.route, text: "Forbidden" })).toThrow("route differs");
     expect(messenger.sent.some(output => output.text === "Untrusted lane result")).toBe(false);
+  });
+});
+
+describe("cross-channel native topic creation", () => {
+  const enabled = { allowCrossChannelThreads: true, allowedChannelIds: ["4", "5"] };
+  const destination = () => route(null, { channelId: "5" });
+
+  test("guild scope places work outside the allowlist without admitting the parent or thread", async () => {
+    const { runtime, store, messenger, hosts, main, select } = fixture(2, undefined, undefined, {
+      discord: { allowCrossChannelThreads: true, crossChannelThreadScope: "guild" },
+    });
+    const source = headInbound("1190", route(null));
+    await runtime.start();
+    await receive(runtime, source);
+    expect(await runtime.inspectThread(source.id, undefined, destination())).toMatchObject({ requiresTag: true,
+      availableTags: [expect.objectContaining({ id: "81" })] });
+    const input = { ...select(source.id, destination()), appliedTags: ["81"] };
+    const lane = await runtime.startLane(input);
+    await drain(runtime);
+    expect(messenger.scopedPlacements).toEqual([
+      { operation: "inspect", route: destination(), source: source.route },
+      { operation: "probe", route: destination(), source: source.route, tags: ["81"] },
+      { operation: "create", route: destination(), source: source.route, tags: ["81"] },
+    ]);
+    expect(store.output(`${source.id}:kickoff`)).toMatchObject({ route: lane.route, state: "sent" });
+    expect(store.output(`${source.id}:topic-bound`)).toMatchObject({ route: source.route, text: "작업 스레드: <#5> <#900>" });
+    expect((await runtime.startLane(input)).id).toBe(lane.id);
+    expect(messenger.creations).toEqual([{ route: destination(), sourceMessageId: undefined }]);
+    await expect(runtime.receive(inbound("1191", destination()))).rejects.toThrow("Unauthorized messenger route");
+    await expect(runtime.receive(inbound("1192", lane.route))).rejects.toThrow("Unauthorized messenger route");
+    expect(store.input("1191")).toBeNull();
+    expect(store.input("1192")).toBeNull();
+
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected work to run in the created thread lane");
+    expect(worker.prompts).toHaveLength(1);
+    const approval = { type: "extension_ui_request", id: "confirm-guild-work", method: "confirm", title: "Confirm work" };
+    worker.state.pendingUiRequests = [approval];
+    worker.emit(approval);
+    await drain(runtime);
+    expect(messenger.approvals).toEqual([expect.objectContaining({ target: lane.id, route: source.route })]);
+    worker.state.pendingUiRequests = [];
+    worker.emit({ type: "extension_ui_request", method: "cancel", targetId: approval.id });
+    worker.yield("Verified lane result");
+    worker.result(0);
+    worker.emit({ type: "session_settled" });
+    main.yield("Head acknowledgment");
+    main.result(0);
+    main.emit({ type: "session_settled" });
+    await drain(runtime);
+    const report = store.input(`report:handoff:${source.id}:lane`);
+    expect(report).toMatchObject({ target: "main", route: lane.route, state: "submitted" });
+    expect(main.prompts[1]?.command.message).toContain("Verified lane result");
+    main.yield("Verified result delivered");
+    main.result(1);
+    main.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(messenger.sent.filter(output => output.text === "Verified result delivered"))
+      .toEqual([expect.objectContaining({ route: lane.route })]);
+
+    const continuation = headInbound("1196", source.route, "Continue the same work");
+    await receive(runtime, continuation);
+    const followUp = await runtime.messageLane(lane.id, "Continue the same work", continuation.id);
+    expect(worker.prompts).toHaveLength(2);
+    worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse",
+      content: [{ type: "text", text: "Ongoing follow-up work" }] } });
+    main.yield("Continuation acknowledged");
+    main.result(2);
+    main.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(main.prompts[3]?.command.message).toContain("Ongoing follow-up work");
+    main.yield("Follow-up progress");
+    main.result(3);
+    main.emit({ type: "session_settled" });
+    await drain(runtime);
+    worker.yield("Completed follow-up work");
+    worker.result(1);
+    worker.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(store.input(`report:${followUp.inputId}`)?.route).toEqual(lane.route);
+    expect(main.prompts[4]?.command.message).toContain("Completed follow-up work");
+    main.yield("Follow-up finished");
+    main.result(4);
+    main.emit({ type: "session_settled" });
+    await drain(runtime);
+    expect(messenger.sent.filter(output => /^Follow-up (?:progress|finished)$/.test(output.text)).map(output => output.route))
+      .toEqual([lane.route, lane.route]);
+    expect(messenger.creations).toHaveLength(1);
+  });
+
+  test("resuming a scoped lane goal keeps its new native approval on the original allowed conversation", async () => {
+    const { runtime, store, messenger, hosts, select } = fixture(2, undefined, undefined, { discord: {
+      allowCrossChannelThreads: true, crossChannelThreadScope: "guild", allowedChannelIds: ["4", "6"],
+    } });
+    await runtime.start();
+    const source = headInbound("1197", route(null));
+    await receive(runtime, source);
+    const lane = await runtime.startLane(select(source.id, destination()));
+    await drain(runtime);
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected the scoped lane Host");
+    worker.state.goal = { enabled: true, goal: { id: "existing-goal", status: "active" } };
+    await runtime.pause(lane.id);
+    expect(store.lane(lane.id)?.workState).toBe("paused");
+    expect(worker.state.goal?.goal?.status).toBe("paused");
+
+    const different = headInbound("1198", route(null, { channelId: "6" }), "Resume the existing goal");
+    await receive(runtime, different);
+    await expect(runtime.resume(lane.id, different.id)).rejects.toThrow("requires its original authorized conversation");
+    expect(worker.goalOperations).toEqual(["pause"]);
+    expect(store.input(`resume:${different.id}:${lane.id}`)).toBeNull();
+
+    const resume = headInbound("1199", source.route, "Resume the existing goal");
+    await receive(runtime, resume);
+    await runtime.resume(lane.id, resume.id);
+    await runtime.resume(lane.id, resume.id);
+    const resumed = `resume:${resume.id}:${lane.id}`;
+    expect(store.input(resumed)).toMatchObject({ target: lane.id, state: "submitted", route: lane.route });
+    expect(store.reportApprovalSource(resumed)?.id).toBe(resume.id);
+    expect(worker.goalOperations).toEqual(["pause", "resume"]);
+    expect(worker.prompts).toHaveLength(1);
+    const approval = { type: "extension_ui_request", id: "resume-goal-confirm", method: "confirm", title: "Continue the native goal?" };
+    worker.state.pendingUiRequests = [approval];
+    worker.emit(approval);
+    await drain(runtime);
+    expect(messenger.approvals).toEqual([expect.objectContaining({ target: lane.id, requestId: approval.id, route: source.route })]);
+    expect(store.approvals(lane.id)).toEqual([expect.objectContaining({ requestId: approval.id, route: source.route })]);
+  });
+
+  test("unlisted guild scope refuses an ineligible thread and cannot be used while disabled", async () => {
+    const scoped = { crossChannelThreadScope: "guild" as const, allowedGuildIds: ["3", "33"] };
+    const disabled = fixture(1, undefined, undefined, { discord: scoped });
+    await disabled.runtime.start();
+    await receive(disabled.runtime, headInbound("1193", route(null)));
+    await expect(disabled.runtime.startLane(disabled.select("1193", destination()))).rejects.toThrow("Unauthorized messenger route");
+    expect(disabled.messenger.capabilities).toEqual([]);
+
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, { discord: {
+      ...scoped, allowCrossChannelThreads: true,
+    } });
+    await runtime.start();
+    await receive(runtime, headInbound("1194", route(null)));
+    await expect(runtime.startLane(select("1194", route(null, { channelId: "5", guildId: "33" }))))
+      .rejects.toThrow("Unauthorized messenger route");
+    await expect(runtime.startLane(select("1194", route("77", { channelId: "5" }))))
+      .rejects.toThrow("Unauthorized messenger route");
+    messenger.supported = false;
+    await expect(runtime.startLane(select("1194", destination()))).rejects.toThrow("does not support creating");
+    expect(messenger.capabilities).toEqual([destination()]);
+    expect(messenger.creations).toEqual([]);
+    expect(store.lanes()).toEqual([]);
+  });
+
+  test("guild scope repairs only the exact confirmed thread without repeating creation", async () => {
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, {
+      discord: { allowCrossChannelThreads: true, crossChannelThreadScope: "guild" },
+    });
+    await runtime.start();
+    const source = headInbound("1195", route(null));
+    await receive(runtime, source);
+    const parent = destination();
+    const created = { ...parent, threadId: "900" };
+    messenger.creationError = new Error("Creation outcome unavailable");
+    await expect(runtime.startLane(select(source.id, parent))).rejects.toThrow("outcome unavailable");
+    expect(store.getMeta(`handoff-route:${source.id}`)).toBe("uncertain");
+    messenger.creationError = undefined;
+    await expect(runtime.startLane(select(source.id, parent))).rejects.toThrow("interrupted");
+    await expect(runtime.startLane(select(source.id, created))).rejects.toThrow("Unauthorized messenger route");
+    // An acknowledged adapter result was persisted before lane binding.
+    store.setMeta(`handoff-route-result:${source.id}`, JSON.stringify(created));
+    await expect(runtime.startLane(select(source.id, { ...created, threadId: "901" })))
+      .rejects.toThrow("Unauthorized messenger route");
+    const lane = await runtime.startLane(select(source.id, created));
+    expect(lane.route).toEqual(created);
+    expect(messenger.creations).toHaveLength(1);
+    expect(store.output(`${source.id}:kickoff`)).toMatchObject({ route: created, state: "sent" });
+  });
+
+  test("flag on creates one thread from an explicit guild parent with a dual-mention source pointer and destination kickoff", async () => {
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, { discord: enabled });
+    await runtime.start();
+    const original = headInbound("1200", route(null));
+    await receive(runtime, original);
+    const lane = await runtime.startLane(select(original.id, destination()));
+    await runtime.kick();
+
+    expect(messenger.capabilities).toEqual([destination()]);
+    expect(messenger.creations).toEqual([{ route: destination(), sourceMessageId: undefined }]);
+    expect(lane.route).toMatchObject({ platform: "discord", accountId: "2", authorityId: "1", guildId: "3",
+      channelId: "5", threadId: "900" });
+    expect(lane.route.topicId).toBeUndefined();
+    const recordedDestination = store.getMeta(`handoff-route:${original.id}`);
+    if (recordedDestination === null) throw new Error("Missing recorded lane route");
+    expect(JSON.parse(recordedDestination)).toMatchObject({ channelId: "5", threadId: "900" });
+    expect(store.laneForRoute(lane.route)?.id).toBe(lane.id);
+    expect(messenger.sent.filter(output => output.id === `${original.id}:topic-bound`)).toEqual([
+      expect.objectContaining({ id: `${original.id}:topic-bound`, sourceId: original.id, route: original.route,
+        text: "작업 스레드: <#5> <#900>" }),
+    ]);
+    expect(messenger.sent.find(output => output.id === `${original.id}:kickoff`)).toMatchObject({ route: lane.route });
+    expect(store.output(`${original.id}:kickoff`)).toMatchObject({ route: lane.route, state: "sent" });
+
+    const repeated = await runtime.startLane(select(original.id, destination()));
+    await runtime.kick();
+    expect(repeated.id).toBe(lane.id);
+    expect(messenger.creations).toHaveLength(1);
+    expect(messenger.sent).toHaveLength(2);
+    expect(messenger.sent.filter(output => output.id === `${original.id}:topic-bound`)).toHaveLength(1);
+  });
+
+  test("flag off refuses the same cross-channel parent with the existing sibling-topic error", async () => {
+    const { runtime, messenger, store, select } = fixture(1, undefined, undefined, { discord: { allowedChannelIds: ["4", "5"] } });
+    await runtime.start();
+    await receive(runtime, headInbound("1210", route(null)));
+    await expect(runtime.startLane(select("1210", destination())))
+      .rejects.toThrow("A new sibling topic must use the source conversation's authorized parent");
+    expect(messenger.creations).toEqual([]);
+    expect(messenger.sent).toEqual([]);
+    expect(store.lanes()).toHaveLength(0);
+  });
+
+  test("flag on still requires the destination channel to be authorized", async () => {
+    const { runtime, messenger, store, select } = fixture(1, undefined, undefined, { discord: { allowCrossChannelThreads: true } });
+    await runtime.start();
+    await receive(runtime, headInbound("1230", route(null)));
+    await expect(runtime.startLane(select("1230", destination()))).rejects.toThrow("Unauthorized messenger route");
+    expect(messenger.capabilities).toEqual([]);
+    expect(messenger.creations).toEqual([]);
+    expect(store.lanes()).toHaveLength(0);
+  });
+
+  test("flag on keeps creation inside the source Discord guild", async () => {
+    const { runtime, messenger, store, select } = fixture(1, undefined, undefined, {
+      discord: { allowCrossChannelThreads: true, allowedGuildIds: ["3", "33"], allowedChannelIds: ["4", "5"] } });
+    await runtime.start();
+    await receive(runtime, headInbound("1240", route(null)));
+    await expect(runtime.startLane(select("1240", route(null, { guildId: "33", channelId: "5" }))))
+      .rejects.toThrow("A new sibling topic must use the source conversation's authorized parent");
+    expect(messenger.creations).toEqual([]);
+    expect(messenger.sent).toEqual([]);
+    expect(store.lanes()).toHaveLength(0);
+  });
+
+  test("flag on refuses a group room destination even when its channel is allowed", async () => {
+    const { runtime, messenger, store, select } = fixture(1, undefined, undefined, { discord: enabled,
+      groupRooms: [{ platform: "discord", guildId: "3", channelId: "5", userIds: ["1"], dailyLimit: 5,
+        mode: "request", revision: "fixture" }] });
+    await runtime.start();
+    await receive(runtime, headInbound("1250", route(null)));
+    await expect(runtime.startLane(select("1250", destination()))).rejects.toThrow("Unauthorized messenger route");
+    expect(messenger.creations).toEqual([]);
+    expect(store.lanes()).toHaveLength(0);
+  });
+
+  test("flag on refuses when the bot cannot create a thread instead of falling back", async () => {
+    const { runtime, messenger, store, select } = fixture(1, undefined, undefined, { discord: enabled });
+    messenger.supported = false;
+    await runtime.start();
+    await receive(runtime, headInbound("1260", route(null)));
+    await expect(runtime.startLane(select("1260", destination())))
+      .rejects.toThrow("does not support creating an independent native thread");
+    expect(messenger.capabilities).toEqual([destination()]);
+    expect(messenger.creations).toEqual([]);
+    expect(store.lanes()).toHaveLength(0);
+    expect(store.getMeta("handoff-route:1260")).toBeNull();
+  });
+
+  test("an uncertain cross-channel creation is never replayed, including a wrong source-parent explicit thread", async () => {
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, { discord: enabled });
+    await runtime.start();
+    await receive(runtime, headInbound("1270", route(null)));
+    messenger.creationError = new Error("Remote result lost");
+    await expect(runtime.startLane(select("1270", destination()))).rejects.toThrow("Remote result lost");
+    expect(messenger.creations).toHaveLength(1);
+    expect(store.getMeta("handoff-route:1270")).toBe("uncertain");
+    messenger.creationError = undefined;
+    await expect(runtime.startLane(select("1270", destination())))
+      .rejects.toThrow("Thread creation was interrupted; provide an explicit destination after reconciling the messenger");
+    await expect(runtime.startLane(select("1270", route("77"))))
+      .rejects.toThrow("Lane handoff destination intent conflict");
+    expect(messenger.creations).toHaveLength(1);
+    expect(store.lanes()).toHaveLength(0);
+  });
+
+  test("only the exact journaled cross-channel result repairs an uncertain creation without replaying it", async () => {
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, { discord: enabled });
+    await runtime.start();
+    const original = headInbound("1271", route(null));
+    await receive(runtime, original);
+    const parent = destination();
+    const created = { ...parent, threadId: "900" };
+    store.setMeta(`handoff-intent:${original.id}`, JSON.stringify({ destination: parent }));
+    store.setMeta(`handoff-route:${original.id}`, "uncertain");
+    store.setMeta(`handoff-native:${original.id}`, "true");
+    store.setMeta(`handoff-route-result:${original.id}`, JSON.stringify(created));
+
+    const lane = await runtime.startLane(select(original.id, created));
+    await runtime.kick();
+    expect(messenger.creations).toEqual([]);
+    expect(lane.route).toEqual(created);
+    expect(messenger.sent.filter(output => output.id === `${original.id}:topic-bound`)).toEqual([
+      expect.objectContaining({ sourceId: original.id, route: original.route, text: "작업 스레드: <#5> <#900>" }),
+    ]);
+    expect(messenger.sent.find(output => output.id === `${original.id}:kickoff`)).toMatchObject({ route: lane.route });
+    expect(store.laneForRoute(created)?.id).toBe(lane.id);
+  });
+
+  test("flag on keeps a same-channel thread notice plain without a channel mention", async () => {
+    const { runtime, messenger, select } = fixture(1, undefined, undefined, { discord: { allowCrossChannelThreads: true } });
+    await runtime.start();
+    await receive(runtime, headInbound("1280", route(null)));
+    const lane = await runtime.startLane(select("1280"));
+    await runtime.kick();
+    expect(messenger.creations).toEqual([{ route: route(null), sourceMessageId: "1280" }]);
+    expect(lane.route).toMatchObject({ channelId: "4", threadId: "900" });
+    const notice = messenger.sent.find(output => output.id === "1280:topic-bound");
+    expect(notice?.text).toBe("작업 스레드: <#900>");
+    expect(notice?.text).not.toContain("<#4>");
+    expect(messenger.sent.find(output => output.id === "1280:kickoff")).toMatchObject({ route: lane.route });
+  });
+
+  test("flag on leaves a native DM topic unchanged", async () => {
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, { discord: { allowCrossChannelThreads: true } });
+    await runtime.start();
+    const slackDm = route(null, { platform: "slack", accountId: "TTEAM:UBOT", authorityId: "UOWNER", guildId: null, channelId: "DDIRECT" });
+    await receive(runtime, { ...headInbound("1290", slackDm), messageId: "1750000000.000001" });
+    const lane = await runtime.startLane(select("1290"));
+    await runtime.kick();
+    expect(messenger.creations).toEqual([{ route: slackDm, sourceMessageId: "1750000000.000001" }]);
+    expect(lane.route).toEqual({ ...slackDm, threadId: "1750000000.000001" });
+    expect(messenger.sent.find(output => output.id === "1290:topic-bound")?.text).toBe("작업 스레드: Independent task");
+    expect(messenger.sent.find(output => output.id === "1290:kickoff")).toMatchObject({ route: lane.route });
+    expect(store.laneForRoute(lane.route)?.id).toBe(lane.id);
+  });
+
+  test("flag on leaves a Discord logical DM topic unchanged", async () => {
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, { discord: { allowCrossChannelThreads: true } });
+    messenger.supported = false;
+    await runtime.start();
+    const dm = route(null, { guildId: null, channelId: "9" });
+    await receive(runtime, headInbound("1291", dm));
+    const lane = await runtime.startLane(select("1291"));
+    await runtime.kick();
+    expect(messenger.creations).toEqual([]);
+    const { threadId, topicId } = lane.route;
+    if (!topicId) throw new Error("Expected a logical DM topic");
+    expect(threadId).toBeNull();
+    expect(topicId).toMatch(/^topic-/);
+    expect(messenger.sent.filter(output => output.id === "1291:topic-bound")).toHaveLength(0);
+    expect(messenger.sent.find(output => output.id === "1291:kickoff")).toMatchObject({ route: lane.route });
+    expect(store.input("handoff:1291:lane")).toMatchObject({ route: lane.route, target: lane.id });
+    expect(store.getMeta(`dm:active:${physicalRouteKey(dm)}`)).toBe(topicId);
+  });
+
+  test("flag on leaves an explicit thread in another channel on the existing path", async () => {
+    const { runtime, store, messenger, select } = fixture(1, undefined, undefined, { discord: enabled });
+    await runtime.start();
+    await receive(runtime, headInbound("1300", route("10")));
+    const lane = await runtime.startLane(select("1300", route("88", { channelId: "5" })));
+    await runtime.kick();
+    expect(messenger.creations).toEqual([]);
+    expect(lane.route).toMatchObject({ channelId: "5", threadId: "88" });
+    expect(messenger.sent.filter(output => output.id === "1300:topic-bound")).toHaveLength(0);
+    expect(messenger.sent.find(output => output.id === "1300:kickoff")).toMatchObject({ route: lane.route });
+    expect(store.output("1300:kickoff")).toMatchObject({ route: lane.route, state: "sent" });
   });
 });

@@ -36,6 +36,7 @@ import { compareMessageIds } from "../routing/message-order";
 import { storedWorkflowName, workflowChoice } from "../lane/workflow";
 import { laneWaitKey, type LaneReport } from "../lane/lane-report";
 import { laneWatchReplySource } from "../lane/lane-watch";
+import { discordWorkThreadOwnerKey, recordedDiscordWorkThreadSource } from "../messaging/discord-work-thread";
 import { isResultAttachmentSnapshot } from "../messaging/result-attachment";
 import { existingWorkspace, TOPIC_CHOICE_WAIT_MS, topicRequest } from "../routing/topic-request";
 import type { CronUpdate } from "../cron/cron-jobs";
@@ -467,9 +468,27 @@ export class Store implements StorePort {
     return { lane, failed, original };
   }
 
+  private scopedWorkSource(input: InputRecord): { sourceId: string; owner: InputRecord } | null {
+    const ownerId = this.getMeta(discordWorkThreadOwnerKey(input.id));
+    if (ownerId === null) return null;
+    const sourceId = this.getMeta(`handoff-source:${input.id}`);
+    const source = sourceId && this.ownerSource(sourceId);
+    const placement = recordedDiscordWorkThreadSource(this, input.route);
+    if (!sourceId || !source || source.id !== ownerId || !placement
+      || routeKey(physicalRoute(source.route)) !== routeKey(placement)
+      || !input.target || input.target === "main" || this.laneForRoute(input.route)?.id !== input.target
+      || (input.id !== `handoff:${sourceId}:lane` && input.id !== `handoff:${sourceId}:${input.target}`
+        && (input.id !== `resume:${sourceId}:${input.target}` || this.getMeta(`native-goal-resume-owner:${input.id}`) === null))) {
+      throw new Error(`Invalid scoped Discord work-thread binding: ${input.id}`);
+    }
+    return { sourceId, owner: source };
+  }
+
   reportApprovalSource(id: string): InputRecord | null {
     const input = this.input(id);
     if (!input || isRetiredScopeInput(id)) return null;
+    const scoped = this.scopedWorkSource(input);
+    if (scoped) return scoped.owner;
     const reportId = input.target === "main" ? id : this.getMeta(`handoff-source:${id}`);
     if (!reportId || isRetiredScopeInput(reportId) || this.input(reportId)?.target !== "main") return null;
     const sourceId = this.getMeta(`report-approval-source:${reportId}`);
@@ -945,7 +964,10 @@ export class Store implements StorePort {
       if (!this.receive(input, target, {
         [`handoff-source:${input.id}`]: sourceId,
         [`native-goal-resume-owner:${input.id}`]: JSON.stringify(owner),
-      }) || !this.submit(input.id, owner.requestId, owner.generation)) throw new Error("Native goal resume was not admitted");
+        ...(owner.scopedWorkOwnerId === undefined ? {} : { [discordWorkThreadOwnerKey(input.id)]: owner.scopedWorkOwnerId }),
+      })) throw new Error("Native goal resume was not admitted");
+      if (owner.scopedWorkOwnerId !== undefined) this.scopedWorkSource(this.requireInput(input.id));
+      if (!this.submit(input.id, owner.requestId, owner.generation)) throw new Error("Native goal resume was not admitted");
       return this.requireInput(input.id);
     }).immediate();
   }
@@ -1382,6 +1404,11 @@ export class Store implements StorePort {
   }
 
   laneReplyRoute(input: InputRecord, source: InputRecord): Route {
+    const scoped = this.scopedWorkSource(input);
+    if (scoped) {
+      if (scoped.sourceId !== source.id) throw new Error(`Invalid scoped Discord reply source: ${input.id}`);
+      return input.route;
+    }
     const handoffReply = this.getMeta(`handoff-reply:${input.id}`);
     if (handoffReply !== null) {
       const { route } = input;

@@ -39,6 +39,8 @@ mod history_gap_tests;
 mod model_picker_tests;
 #[path = "tests/presence.rs"]
 mod presence_tests;
+#[path = "tests/work_threads.rs"]
+mod work_thread_tests;
 
 struct Temp(PathBuf);
 impl Temp {

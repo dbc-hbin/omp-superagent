@@ -947,6 +947,8 @@ high/middle/low는 명시적 `start`의 전용 초기 설정 턴에서 기존 �
 | `discord` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedGuildIds`, `allowedChannelIds` 모두 필수. |
 | `discord.requireAddressing` | 선택 불리언, 기본값 `false`. `true`이면 허용된 서버의 부모 채널과 이 봇이 만들지 않은 스레드에서 이 봇의 실제 멘션 또는 이 봇이 보낸 메시지에 대한 답장이 포함된 소유자의 일반 메시지만 접수한다. |
 | `discord.editProgressInPlace` | 선택 불리언, 기본값 `false`. `true`이면 Discord에서 한 요청의 중간 진행 보고를 새 메시지로 쌓지 않고 하나의 `⏳` 상태 메시지로 제자리 수정한다. |
+| `discord.allowCrossChannelThreads` | 선택 불리언, 기본값 `false`. `true`이면 헤드가 `lane_start`로 인계할 때 같은 봇 계정·소유자·서버의 다른 적격 채널을 새 작업 스레드의 부모로 명시할 수 있다. |
+| `discord.crossChannelThreadScope` | 선택 항목. 기본값 `"allowlist"`, 또는 `"guild"`. `allowCrossChannelThreads`가 `true`일 때만 적용된다. `"guild"`는 같은 허용 서버에서 `allowedChannelIds`에 없는 적격 채널까지 배치 대상으로 허용한다. 요청·명령 접수와 기록 조회 권한은 바뀌지 않는다. |
 | `telegram` | 선택 블록. 존재하면 `tokenEnv`, `ownerId`, `allowedChatIds` 모두 필수. 그룹 chat ID의 음수 부호를 보존한다. |
 | `slack` | 선택 블록. 존재하면 `botTokenEnv`, `appTokenEnv`, `ownerId`, `teamId`, `allowedChannelIds` 모두 필수. |
 | `groupRooms` | 선택 목록. 등록한 방과 사용자에게만 아래 그룹 모드를 열며, 해당 방에서는 운영자도 일반 그룹 권한만 갖는다. 기본값은 빈 목록이다. |
@@ -1166,6 +1168,17 @@ HEAD 답변에서 저장한 리비전을 확인한다. 설정은 재시작 후�
 `이건 따로 빼줘`처럼 작업을 특정하지 않으면 같은 스레드에서 `/new`로 작업을 명시해 달라고
 안내하고 새 스레드를 만들지 않는다. 수정 메시지·인용·첨부는 새 스레드 지시가 아니다.
 이 평문 분리 지시는 Discord DM이나 다른 플랫폼에는 적용되지 않는다. Gateway는 LLM 분류나 lane 실행을 하지 않는다.
+새 Discord 스레드는 기본적으로 원래 대화의 부모 채널에 만든다. `/new`와 평문 분리
+지시는 계속 그 부모를 쓴다. 운영자가 `discord.allowCrossChannelThreads`를 켜면 HEAD가
+허용된 소유자 요청을 `lane_start`로 인계하면서 다른 부모를 명시할 수 있다. 연결되지 않은
+스레드의 일반 요청은 그 스레드에 남는다. 기본 `"allowlist"` 범위는 `allowedChannelIds`에
+있는 채널만 대상으로 삼는다. `"guild"` 범위는 같은 허용 서버·봇 계정·소유자에 한해
+목록에 없는 적격 채널도 대상으로 삼는다. `groupRooms`로 제한된 방은 제외하며, 봇이
+스레드를 만들고 메시지를 보낼 권한을 실제로 가져야 한다. forum/media 필수 태그는
+`thread_inspect`로 확인한다. 실패하면 다른 채널로 대체하지 않는다.
+원래 대화에는 채널과 스레드를 알리는 배치 안내 한 건을 보낸다. 작업 출력은 새 스레드로
+보내고 HEAD 자체 확인은 별개다. 목록에 없는 스레드는 요청·명령 접수나 기록 조회에
+사용하지 않는다. 후속 지시와 승인은 원래 허용된 대화에서 한다. Discord 권한은 바꾸지 않는다.
 
 | 플랫폼 | 자동 주제 생성 |
 | --- | --- |

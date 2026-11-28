@@ -1122,6 +1122,8 @@ completed. Do not add a separate preset block to this configuration file.
 | `discord` | Optional block. If present, `tokenEnv`, `ownerId`, `allowedGuildIds`, and `allowedChannelIds` are all required. |
 | `discord.requireAddressing` | Optional boolean, default `false`. With `true`, in parent channels of allowed servers and threads not created by this bot, only ordinary messages from the owner with an actual mention of this bot or a reply to a message it sent are accepted. |
 | `discord.editProgressInPlace` | Optional boolean, default `false`. With `true`, intermediate progress updates for a Discord request edit one `⏳` status message in place instead of posting new messages. |
+| `discord.allowCrossChannelThreads` | Optional boolean, default `false`. With `true`, HEAD can explicitly select a different eligible parent in the same Discord bot account, owner, and guild via `lane_start`. |
+| `discord.crossChannelThreadScope` | Optional `"allowlist"` (default) or `"guild"`. Only applies when `allowCrossChannelThreads` is `true`. Guild scope allows eligible parents outside `allowedChannelIds` in the same allowed server. It does not change request, command, or history authorization. |
 | `telegram` | Optional block. If present, `tokenEnv`, `ownerId`, and `allowedChatIds` are all required. Keep the minus sign on group chat IDs. |
 | `slack` | Optional block. If present, `botTokenEnv`, `appTokenEnv`, `ownerId`, `teamId`, and `allowedChannelIds` are all required. |
 | `groupRooms` | Optional list. Enables the group modes below only for the specified rooms and users. Even the operator has only ordinary group permissions in those rooms. Defaults to an empty list. |
@@ -1380,6 +1382,18 @@ asks you to specify the task with `/new` in the same thread and does not create 
 Edited messages, quotes, and attachments do not count as instructions to create a thread.
 The plain-text split instruction does not apply in Discord DMs or on other platforms. The Gateway
 does not use an LLM for classification or execute lanes.
+A new Discord thread uses the source conversation's parent by default. `/new` and plain
+split directives keep that parent. When the operator enables `discord.allowCrossChannelThreads`,
+HEAD can explicitly select another parent via `lane_start` for an authorized owner request.
+An ordinary request in an unbound thread stays there. The default `"allowlist"` scope requires
+the destination in `allowedChannelIds`. Explicit `"guild"` scope also permits an unlisted parent
+in the same trusted guild, with the same bot account and owner. Restricted `groupRooms` remain
+ineligible. The bot needs permission to create and post in that thread; `thread_inspect`
+can verify required forum or media tags. Failure does not choose a different parent.
+The source receives one notice identifying the channel and thread. Work output stays in the
+thread; HEAD's own acknowledgments are separate. Unlisted threads do not accept requests
+or commands or enable history reads. Continue work and answer approvals from the original
+allowed conversation. This setting does not change Discord permissions.
 
 | Platform | Automatic topic creation |
 | --- | --- |

@@ -5,6 +5,7 @@ import { getAgentDbPath } from "@oh-my-pi/pi-utils/dirs";
 import { authorizeRoute, type Config } from "../config/config";
 import type { InputRecord, Route, StorePort } from "../contracts";
 import { messengerCommandText, telegramCommandBlocked } from "../messaging/messenger-commands";
+import { discordWorkThreadSource } from "../messaging/discord-work-thread";
 import { discardResultAttachment, isOriginalAttachmentMessage, pruneResultAttachments, readResultAttachmentIntent,
   readResultAttachmentStart, requestedResultPath, ResultAttachmentError, stageResultAttachment,
   type ResultAttachmentIntent, type ResultAttachmentPayload } from "../messaging/result-attachment";
@@ -56,7 +57,8 @@ export class ResultAttachments {
     if (route.authorityId !== this.config[route.platform]?.ownerId) {
       throw new ResultAttachmentError("Result attachments require the configured messenger owner");
     }
-    if (!authorizeRoute(this.config, route)) throw new Error("Unauthorized messenger route");
+    if (!authorizeRoute(this.config, route) && !discordWorkThreadSource(this.config, this.store, route))
+      throw new Error("Unauthorized messenger route");
   }
 
   queue(run: AttachmentRun, intent: ResultAttachmentIntent, admission: {
