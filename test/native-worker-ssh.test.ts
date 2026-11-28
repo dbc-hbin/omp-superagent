@@ -130,7 +130,7 @@ async function verifyChatLane(config: Config, enrollment: string, path: string) 
     messenger.thread = { route, title: "SSH worker QA", archived: false, requiresTag: false, availableTags: [], appliedTags: [] };
     await submit("102", "/head Test on the enrolled worker.");
     const lane = await runtime.startLane({ sourceId: "102", title: "SSH worker QA", cwd: config.headCwd, model,
-      modelReason: "Use the offline native fixture.", kickoff: "Starting the remote check.", placement: { target: "remote" } });
+      modelReason: "Use the offline native fixture.", kickoff: "Starting the remote check." });
     expect(lane.remote?.workerId).toBe(enrollment);
     await wait(() => messenger.sent.some(output => output.sourceId === "report:handoff:102:lane"), "Missing remote result on original thread");
     const first = store.lane(lane.id);
