@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -236,6 +236,13 @@ sshTest("enroll stock OMP over SSH, reconnect, and sync explicit remote project 
     const invitation = cliJson(head, ...add);
     expect(invitation.status).toBe("pending");
     expect(cliJson(target, "worker", "init", "--head-key", invitation.publicKey, "--repo", checkout)).toMatchObject({ status: "initialized" });
+    // Simulate an inherited group-write default at the private fixture's
+    // forced command without altering the enrollment/authorization guards.
+    const authorizedKeys = join(target, ".ssh", "authorized_keys");
+    const authorization = await readFile(authorizedKeys, "utf8");
+    const forced = 'restrict,command="';
+    assert(authorization.startsWith(forced + "exec "));
+    await writeFile(authorizedKeys, forced + "umask 002; " + authorization.slice(forced.length));
     expect(cliJson(head, ...add, "--default", "--local-repo", workspace)).toMatchObject({ status: "verified", default: true });
     process.env.PATH = `${bin}:${path}`;
     const config = await loadConfig(configPath);
@@ -269,6 +276,9 @@ sshTest("enroll stock OMP over SSH, reconnect, and sync explicit remote project 
     await writeFile(settings, before);
     const { pid } = await workerOpen(reg, ref, launch);
     owned = { ...remoteLanePaths(placement, ref.laneId), pid };
+    const journal = await lstat(owned.sessionFile);
+    assert(journal.isFile() && journal.uid === process.getuid?.(), "Worker did not publish an owned session journal");
+    expect(journal.mode & 0o022).toBe(0);
     expect(await workerOpen(reg, ref, launch)).toMatchObject({ pid });
     await verifyNativeBridge({ ssh, known, port, worker: reg, ref, pid });
     live = await workerConnect(reg, ref);
